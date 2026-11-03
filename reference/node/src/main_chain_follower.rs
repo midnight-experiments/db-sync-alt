@@ -1,0 +1,479 @@
+// This file is part of midnight-node.
+// Copyright (C) Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// You may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use authority_selection_inherents::AuthoritySelectionDataSource;
+use midnight_primitives_mainchain_follower::CandidatesDataSourceImpl;
+use midnight_primitives_mainchain_follower::MidnightDataSourceMetrics;
+use pallet_sidechain_rpc::SidechainRpcDataSource;
+use partner_chains_db_sync_data_sources::{
+	BlockDataSourceImpl, CachedTokenBridgeDataSourceImpl, DbSyncBlockDataSourceConfig,
+	McFollowerMetrics, McHashDataSourceImpl, SidechainRpcDataSourceImpl,
+};
+use partner_chains_mock_data_sources::{
+	AuthoritySelectionDataSourceMock, BlockDataSourceMock, McHashDataSourceMock,
+	SidechainRpcDataSourceMock, TokenBridgeDataSourceMock,
+};
+use sc_service::error::Error as ServiceError;
+use sidechain_mc_hash::McHashDataSource;
+use sp_partner_chains_bridge::TokenBridgeDataSource;
+use sqlx::{Pool, Postgres};
+
+use super::cfg::midnight_cfg::MidnightCfg;
+use midnight_primitives::BridgeRecipient;
+use partner_chains_mock_data_sources::MockRegistrationsConfig;
+use sidechain_domain::mainchain_epoch::{Duration, MainchainEpochConfig, Timestamp};
+use std::{error::Error, str::FromStr as _, sync::Arc};
+
+use midnight_primitives_mainchain_follower::{
+	CNightObservationDataSourceMock, FederatedAuthorityObservationDataSource,
+	FederatedAuthorityObservationDataSourceImpl, FederatedAuthorityObservationDataSourceMock,
+	MidnightCNightObservationDataSource, MidnightCNightObservationDataSourceImpl,
+};
+
+// TODO: Decide if it should be experimental
+// #[cfg(feature = "experimental")]
+
+#[derive(Clone)]
+pub struct DataSources {
+	pub mc_hash: Arc<dyn McHashDataSource + Send + Sync>,
+	pub authority_selection: Arc<dyn AuthoritySelectionDataSource + Send + Sync>,
+	pub cnight_observation: Arc<dyn MidnightCNightObservationDataSource + Send + Sync>,
+	pub sidechain_rpc: Arc<dyn SidechainRpcDataSource + Send + Sync>,
+	pub federated_authority_observation:
+		Arc<dyn FederatedAuthorityObservationDataSource + Send + Sync>,
+	pub bridge: Arc<dyn TokenBridgeDataSource<BridgeRecipient> + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub struct DbPoolCfg {
+	acquire_timeout: std::time::Duration,
+	max_connections: u32,
+}
+
+pub(crate) async fn create_cached_main_chain_follower_data_sources(
+	cfg: MidnightCfg,
+	mc_metrics_opt: Option<McFollowerMetrics>,
+	midnight_metrics_opt: Option<MidnightDataSourceMetrics>,
+) -> std::result::Result<DataSources, ServiceError> {
+	if cfg.use_main_chain_follower_mock {
+		let mock = create_mock_data_sources(cfg.clone()).await.map_err(|err| {
+			ServiceError::Application(
+				format!("Failed to create main chain follower mock: {err}. Check configuration.")
+					.into(),
+			)
+		})?;
+
+		Ok(mock)
+	} else {
+		create_cached_data_sources(cfg, mc_metrics_opt, midnight_metrics_opt)
+			.await
+			.map_err(|err| {
+				ServiceError::Application(
+					format!("Failed to create db-sync main chain follower: {err}").into(),
+				)
+			})
+	}
+}
+
+pub async fn create_mock_data_sources(
+	cfg: MidnightCfg,
+) -> std::result::Result<DataSources, Box<dyn Error + Send + Sync + 'static>> {
+	let block = Arc::new(BlockDataSourceMock::new(cfg.mc_epoch_duration_millis as u32));
+
+	let authority_selection_data_source_mock = AuthoritySelectionDataSourceMock {
+		registrations_data: MockRegistrationsConfig::read_registrations(
+			&cfg.mock_registrations_file.ok_or(missing("mock_registrations_file"))?,
+		)?,
+	};
+
+	Ok(DataSources {
+		sidechain_rpc: Arc::new(SidechainRpcDataSourceMock::new(block.clone())),
+		mc_hash: Arc::new(McHashDataSourceMock::new(block)),
+		authority_selection: Arc::new(authority_selection_data_source_mock),
+		cnight_observation: Arc::new(CNightObservationDataSourceMock::new()),
+		federated_authority_observation: Arc::new(
+			FederatedAuthorityObservationDataSourceMock::new(),
+		),
+		bridge: Arc::new(TokenBridgeDataSourceMock::<BridgeRecipient>::new()),
+	})
+}
+
+pub async fn create_index_if_not_exists(pool: &Pool<Postgres>) {
+	// Check if index already exists
+	let index_exists: bool = sqlx::query_scalar(
+		r#"
+			SELECT EXISTS (
+				SELECT 1 FROM pg_indexes
+				WHERE indexname = 'idx_multi_asset_policy_name_hex'
+			)
+		"#,
+	)
+	.fetch_one(pool)
+	.await
+	.unwrap_or(false);
+
+	if index_exists {
+		log::info!("Index idx_multi_asset_policy_name_hex already exists, skipping creation.");
+	} else {
+		log::info!("Creating idx_multi_asset_policy_name_hex index. This may take a while.");
+		let index_query_result = sqlx::query(
+			r#"
+				CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_multi_asset_policy_name_hex
+				ON multi_asset ((encode(policy, 'hex')), (encode(name, 'hex')));
+			"#,
+		)
+		.execute(pool)
+		.await;
+
+		if let Err(e) = index_query_result {
+			log::warn!(
+				"Warning: failed to create idx_multi_asset_policy_name_hex index (is your db-sync readonly?). Performance may be degraded: {e}"
+			);
+		}
+	}
+}
+
+pub const CANDIDATES_FOR_EPOCH_CACHE_SIZE: usize = 64;
+pub const BRIDGE_TRANSFER_CACHE_LOOKAHEAD: u32 = 1000;
+
+// FIXME: these should almost certainly be Cfg in MidnightCfg, so users can tweak as needed
+const CANDIDATES_POOL_CFG: DbPoolCfg =
+	DbPoolCfg { acquire_timeout: std::time::Duration::from_secs(30), max_connections: 5 };
+const SIDECHAIN_POOL_CFG: DbPoolCfg =
+	DbPoolCfg { acquire_timeout: std::time::Duration::from_secs(30), max_connections: 5 };
+const MC_HASH_POOL_CFG: DbPoolCfg =
+	DbPoolCfg { acquire_timeout: std::time::Duration::from_secs(30), max_connections: 5 };
+const CNIGHT_OBSERVATION_POOL_CFG: DbPoolCfg =
+	DbPoolCfg { acquire_timeout: std::time::Duration::from_secs(30), max_connections: 10 };
+const FEDERATED_AUTHORITY_OBSERVATION_POOL_CFG: DbPoolCfg =
+	DbPoolCfg { acquire_timeout: std::time::Duration::from_secs(30), max_connections: 5 };
+const BRIDGE_POOL_CFG: DbPoolCfg =
+	DbPoolCfg { acquire_timeout: std::time::Duration::from_secs(30), max_connections: 5 };
+const ICS_POOL_CFG: DbPoolCfg =
+	DbPoolCfg { acquire_timeout: std::time::Duration::from_secs(30), max_connections: 5 };
+
+pub async fn create_cached_data_sources(
+	cfg: MidnightCfg,
+	mc_metrics_opt: Option<McFollowerMetrics>,
+	midnight_metrics_opt: Option<MidnightDataSourceMetrics>,
+) -> Result<DataSources, Box<dyn Error + Send + Sync + 'static>> {
+	let postgres_uri = &cfg
+		.db_sync_postgres_connection_string
+		.ok_or(missing("db_sync_postgres_connection_string"))?;
+
+	let db_sync_block_data_source_config = DbSyncBlockDataSourceConfig {
+		cardano_security_parameter: cfg
+			.cardano_security_parameter
+			.ok_or(missing("cardano_security_parameter"))?,
+		cardano_active_slots_coeff: cfg
+			.cardano_active_slots_coeff
+			.ok_or(missing("cardano_active_slots_coeff"))?,
+		block_stability_margin: cfg
+			.block_stability_margin
+			.ok_or(missing("block_stability_margin"))?,
+	};
+
+	let mc = MainchainEpochConfig {
+		first_epoch_timestamp_millis: Timestamp::from_unix_millis(
+			cfg.mc_first_epoch_timestamp_millis,
+		),
+		epoch_duration_millis: Duration::from_millis(cfg.mc_epoch_duration_millis),
+		first_epoch_number: cfg.mc_first_epoch_number,
+		first_slot_number: cfg.mc_first_slot_number,
+		slot_duration_millis: Duration::from_millis(cfg.mc_slot_duration_millis),
+	};
+
+	let candidates_pool = get_connection(
+		postgres_uri,
+		CANDIDATES_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await
+	.map_err(|e| {
+		log::warn!("Failed to connect to database for candidates data source: {e}");
+		e
+	})?;
+
+	// All these pools are connections to the same database, so we can use any pool to create the index
+	create_index_if_not_exists(&candidates_pool).await;
+
+	let candidates_data_source =
+		CandidatesDataSourceImpl::new(candidates_pool, midnight_metrics_opt.clone())
+			.await
+			.map_err(|e| {
+				log::warn!("Failed to initialise candidates data source: {e}");
+				e
+			})?;
+	let candidates_data_source_cached =
+		candidates_data_source.cached(CANDIDATES_FOR_EPOCH_CACHE_SIZE).map_err(|e| {
+			log::warn!("Failed to create candidates data source cache: {e}");
+			e
+		})?;
+
+	let sidechain_pool = get_connection(
+		postgres_uri,
+		SIDECHAIN_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await
+	.map_err(|e| {
+		log::warn!("Failed to connect to database for sidechain data source: {e}");
+		e
+	})?;
+	let sidechain_block_data_source = Arc::new(BlockDataSourceImpl::from_config(
+		sidechain_pool,
+		db_sync_block_data_source_config.clone(),
+		&mc,
+	));
+	let sidechain_rpc = SidechainRpcDataSourceImpl::new(
+		sidechain_block_data_source.clone(),
+		mc_metrics_opt.clone(),
+	);
+
+	let mc_hash_pool = get_connection(
+		postgres_uri,
+		MC_HASH_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await
+	.map_err(|e| {
+		log::warn!("Failed to connect to database for mc_hash data source: {e}");
+		e
+	})?;
+	let mc_hash_block_data_source = BlockDataSourceImpl::from_config(
+		mc_hash_pool,
+		db_sync_block_data_source_config.clone(),
+		&mc,
+	);
+	let mc_hash =
+		McHashDataSourceImpl::new(Arc::new(mc_hash_block_data_source), mc_metrics_opt.clone());
+
+	let cnight_observation_pool = get_connection(
+		postgres_uri,
+		CNIGHT_OBSERVATION_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await
+	.map_err(|e| {
+		log::warn!("Failed to connect to database for cnight_observation data source: {e}");
+		e
+	})?;
+	let cnight_observation = MidnightCNightObservationDataSourceImpl::new(
+		cnight_observation_pool,
+		midnight_metrics_opt.clone(),
+		1000,
+	);
+
+	let federated_authority_observation_pool = get_connection(
+		postgres_uri,
+		FEDERATED_AUTHORITY_OBSERVATION_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await
+	.map_err(|e| {
+		log::warn!(
+			"Failed to connect to database for federated_authority_observation data source: {e}"
+		);
+		e
+	})?;
+	let federated_authority_observation = FederatedAuthorityObservationDataSourceImpl::new(
+		federated_authority_observation_pool,
+		midnight_metrics_opt,
+		1000,
+	);
+
+	let bridge_pool = get_connection(
+		postgres_uri,
+		BRIDGE_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await
+	.map_err(|e| {
+		log::warn!("Failed to connect to database for bridge data source: {e}");
+		e
+	})?;
+
+	let bridge = CachedTokenBridgeDataSourceImpl::new(
+		bridge_pool,
+		mc_metrics_opt,
+		sidechain_block_data_source,
+		BRIDGE_TRANSFER_CACHE_LOOKAHEAD,
+	);
+
+	Ok(DataSources {
+		sidechain_rpc: Arc::new(sidechain_rpc),
+		mc_hash: Arc::new(mc_hash),
+		authority_selection: Arc::new(candidates_data_source_cached),
+		cnight_observation: Arc::new(cnight_observation),
+		bridge: Arc::new(bridge),
+		federated_authority_observation: Arc::new(federated_authority_observation),
+	})
+}
+
+// Helper for users who only need native token observation data source
+pub async fn create_cnight_observation_data_source(
+	cfg: MidnightCfg,
+	metrics_opt: Option<MidnightDataSourceMetrics>,
+) -> Result<Arc<dyn MidnightCNightObservationDataSource>, Box<dyn Error + Send + Sync + 'static>> {
+	let pool = get_connection(
+		&cfg.db_sync_postgres_connection_string
+			.ok_or(missing("db_sync_postgres_connection_string"))?,
+		CNIGHT_OBSERVATION_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await?;
+
+	midnight_primitives_mainchain_follower::db::create_cnight_observation_indexes(&pool).await?;
+
+	Ok(Arc::new(MidnightCNightObservationDataSourceImpl::new(pool, metrics_opt, 1000)))
+}
+
+pub async fn create_federated_authority_observation_data_source(
+	cfg: MidnightCfg,
+	metrics_opt: Option<MidnightDataSourceMetrics>,
+) -> Result<Arc<dyn FederatedAuthorityObservationDataSource>, Box<dyn Error + Send + Sync + 'static>>
+{
+	let pool = get_connection(
+		&cfg.db_sync_postgres_connection_string
+			.ok_or(missing("db_sync_postgres_connection_string"))?,
+		FEDERATED_AUTHORITY_OBSERVATION_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await?;
+
+	Ok(Arc::new(FederatedAuthorityObservationDataSourceImpl::new(pool, metrics_opt, 1000)))
+}
+
+pub async fn create_authority_selection_data_source(
+	cfg: MidnightCfg,
+	metrics_opt: Option<MidnightDataSourceMetrics>,
+) -> Result<
+	Arc<dyn AuthoritySelectionDataSource + Send + Sync>,
+	Box<dyn Error + Send + Sync + 'static>,
+> {
+	let (data_source, _pool) =
+		create_authority_selection_data_source_with_pool(cfg, metrics_opt).await?;
+	Ok(data_source)
+}
+
+pub async fn create_authority_selection_data_source_with_pool(
+	cfg: MidnightCfg,
+	metrics_opt: Option<MidnightDataSourceMetrics>,
+) -> Result<
+	(Arc<dyn AuthoritySelectionDataSource + Send + Sync>, sqlx::PgPool),
+	Box<dyn Error + Send + Sync + 'static>,
+> {
+	let pool = get_connection(
+		&cfg.db_sync_postgres_connection_string
+			.ok_or(missing("db_sync_postgres_connection_string"))?,
+		CANDIDATES_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await?;
+
+	let candidates_data_source = CandidatesDataSourceImpl::new(pool.clone(), metrics_opt).await?;
+	let candidates_data_source_cached =
+		candidates_data_source.cached(CANDIDATES_FOR_EPOCH_CACHE_SIZE)?;
+
+	Ok((Arc::new(candidates_data_source_cached), pool))
+}
+
+/// Create a database pool for ICS genesis queries
+pub async fn create_ics_genesis_pool(
+	cfg: MidnightCfg,
+) -> Result<sqlx::PgPool, Box<dyn Error + Send + Sync + 'static>> {
+	let pool = get_connection(
+		&cfg.db_sync_postgres_connection_string
+			.ok_or(missing("db_sync_postgres_connection_string"))?,
+		ICS_POOL_CFG,
+		cfg.allow_non_ssl,
+		cfg.ssl_root_cert.as_deref(),
+	)
+	.await?;
+	Ok(pool)
+}
+
+// Copied from internal utility in partner-chains-db-sync-data-sources
+async fn get_connection(
+	connection_string: &str,
+	pool_cfg: DbPoolCfg,
+	allow_non_ssl: bool,
+	ssl_root_cert: Option<&str>,
+) -> Result<sqlx::PgPool, Box<dyn Error + Send + Sync + 'static>> {
+	let mut connect_options =
+		sqlx::postgres::PgConnectOptions::from_str(connection_string)?.ssl_mode(if allow_non_ssl {
+			//Note: PgSslMode::Prefer has issues with some environments.
+			sqlx::postgres::PgSslMode::Disable
+		} else if ssl_root_cert.is_some() {
+			sqlx::postgres::PgSslMode::VerifyFull
+		} else {
+			log::warn!("No ssl_root_cert configured: using PgSslMode::Require (encrypted but no certificate validation). Set ssl_root_cert for full MITM protection.");
+			sqlx::postgres::PgSslMode::Require
+		});
+	if let Some(cert_path) = ssl_root_cert {
+		connect_options = connect_options.ssl_root_cert(cert_path);
+	}
+
+	let pool = sqlx::postgres::PgPoolOptions::new()
+		.max_connections(pool_cfg.max_connections)
+		.acquire_timeout(pool_cfg.acquire_timeout)
+		.connect_with(connect_options.clone())
+		.await
+		.map_err(|e| {
+			log::debug!(
+				"Database connection details: host={}, port={}, database={}; error: {e}",
+				connect_options.get_host(),
+				connect_options.get_port(),
+				connect_options.get_database().unwrap_or("cexplorer"),
+			);
+			PostgresConnectionError(e.to_string())
+		})?;
+	Ok(pool)
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Could not connect to database; error: {0}")]
+struct PostgresConnectionError(String);
+
+fn missing(field: &str) -> sc_service::Error {
+	ServiceError::Application(format!("Missing {field}. Check configuration.").into())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn connection_error_redacts_infrastructure_details() {
+		let error = PostgresConnectionError("pool timed out".to_string());
+		let message = error.to_string();
+
+		assert!(
+			message.contains("Could not connect to database"),
+			"error must indicate connection failure"
+		);
+		assert!(message.contains("pool timed out"), "error must contain underlying error");
+		assert!(!message.contains("localhost"), "error must not contain host");
+		assert!(!message.contains("5432"), "error must not contain default port");
+		assert!(!message.contains("cexplorer"), "error must not contain database name");
+	}
+}

@@ -1,0 +1,80 @@
+{
+  "format": "db-sync-alt-network-profile-v1",
+  "network": "preprod",
+  "profile": "midnight-preprod-node-1.0.400",
+  "algorithm": "preprod-selective-v1",
+  "cardano": {
+    "network_magic": 1,
+    "security_parameter": 2160,
+    "active_slots_coefficient": 0.05,
+    "epoch_length": 432000,
+    "system_start": 1654041600,
+    "epochs": {
+      "first_epoch_number": 4,
+      "first_slot_number": 86400,
+      "epoch_duration_millis": 432000000,
+      "first_epoch_timestamp_millis": 1655769600000,
+      "slot_duration_millis": 1000
+    },
+    "stake_address_prefix": "stake_test1",
+    "dbsync_network_name": "preprod"
+  },
+  "midnight": {
+    "genesis": "df831b09a8baa92badf47762ce5ac439b7e47e3ed3d39600cfdd44fad552361b",
+    "chain_spec_raw_sha256": "fe96d5070ab4b624f114087482a373c3c210310449c1253bcc0261822f941560",
+    "config_sha256": "88a096f98b01f55c0680eb523f58fa9c4c141f3546794e4f5fd1084a76e32304",
+    "start": {
+      "block_number": 4500197,
+      "tx_index_in_block": 4
+    },
+    "genesis_cardano_reference": "121c92dde3aa55b2b85e5ebd9b6cf9d1f42ad51848584ef6e2fc553f535e2e94",
+    "block_stability_margin": 10
+  },
+  "blockfrost": {
+    "host": "cardano-preprod.blockfrost.io",
+    "key_prefix": "preprod",
+    "adapter": "blockfrost-preprod-cbor-v1",
+    "openapi": "1d4d5d8bac8f0c641eea5c6f7b1f3fbbed8d1505"
+  },
+  "node_queries": {
+    "tag": "node-1.0.400",
+    "commit": "3acfd2edecdcd91373b6a506933f4c14ad3f0308"
+  },
+  "health": {
+    "serving_lag_max_blocks": 9
+  },
+  "provenance": {
+    "midnight_configs": {
+      "repository": "https://github.com/midnightntwrk/midnight-node",
+      "tag": "node-1.0.400",
+      "commit": "3acfd2edecdcd91373b6a506933f4c14ad3f0308",
+      "files": "source-manifest.json",
+      "reference_node_1_0_0_identical": true
+    },
+    "network_values": {
+      "repository": "https://github.com/midnightntwrk/midnight-node",
+      "tag": "node-1.0.0",
+      "commit": "f4a4cd543e6fbdfa34e11671737598f5b40c19fd",
+      "files": {
+        "res/cfg/default.toml": "b9a2511ebeb39be7c28f856419e7911a1b9c2414015beaffaeb2b62180a49e35",
+        "res/cfg/preprod.toml": "ede9f3335666c792929f33c040ebfb31dd18e7859827edc1b0c88c4a8854efe1",
+        "res/preprod/pc-chain-config.json": "e7fc9469c2d4415fd6a8bbe41ece0dfde34d19045e60ccd51e9462775bae6c64",
+        "res/preprod/cardano-tip.json": "8317373b5d112d8da6363e28dea1d6559a350a056cedbd4aad97b0db7aa39610",
+        "res/preprod/chain-spec-raw.json": "fe96d5070ab4b624f114087482a373c3c210310449c1253bcc0261822f941560"
+      }
+    },
+    "midnight_genesis": {
+      "method": "header of block 0 from res/<network>/chain-spec-raw.json (node/src/service.rs construct_genesis_block)",
+      "state_root": "f65155ad0b8861db6d0398d84bb6943b75fe7ea37b9db6cf428410f84846d0e9",
+      "extrinsics_root": "95d634559031c845aa0def324151757cf9c52bf32747164d84e612901f4c474b",
+      "runtime_spec_version": 22000,
+      "state_version": 1
+    },
+    "cardano_system_start": "first_epoch_timestamp_millis / 1000 - first_epoch_number * 432000 (Byron epochs of 21,600 slots x 20 s)",
+    "cardano_shelley_genesis": {
+      "file": "preprod/shelley-genesis.json",
+      "sha256": "4b9d32c09159c2948e4386ba1f59db5a249a89b43b84dfd8368f465e650095de",
+      "source": "official Cardano preprod configuration file shelley-genesis.json, identified by its SHA-256"
+    }
+  }
+}

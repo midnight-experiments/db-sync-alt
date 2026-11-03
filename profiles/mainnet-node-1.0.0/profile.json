@@ -1,0 +1,6 @@
+{
+  "network": "mainnet",
+  "name": "midnight-mainnet-node-1.0.0",
+  "native_validated": false,
+  "source_commit": "f4a4cd543e6fbdfa34e11671737598f5b40c19fd"
+}

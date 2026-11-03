@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:17.11-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea5649807491a0545b5eeeb8f0b8bb11857a5
+    restart: "no"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?private compose.env required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes: ["database:/var/lib/postgresql/data"]
+    # midnight-node connects on the node network as the reader login; nothing is published on the host.
+    networks: [backend, node]
+    healthcheck:
+      # Over TCP: while the image initialises a new data directory it runs a temporary
+      # server on the Unix socket only, which would report ready before the real one.
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  service: &application
+    image: ${APP_IMAGE:-db-sync-alt:local}
+    command: [db-sync-alt, service, --config, /run/db-sync-alt/service.json]
+    restart: "no"
+    user: "${APP_UID:?}:${APP_GID:?}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=67108864"]
+    environment:
+      PGSERVICEFILE: /run/db-sync-alt/pg_service.conf
+      PGPASSFILE: /run/db-sync-alt/pgpass
+      DBSYNC_PROVIDER_KEY_FILE: /run/db-sync-alt/provider.key
+      DBSYNC_PROVIDER_STATE: /var/lib/db-sync-alt
+    volumes:
+      - ${PRIVATE_DIR:?private configuration required}/service:/run/db-sync-alt:ro
+      - ${PRIVATE_DIR}/accounting:/var/lib/db-sync-alt:rw
+    networks: [backend, frontend]
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-18080}:18080"
+    stop_grace_period: 15s
+  bootstrap:
+    <<: *application
+    command: [db-sync-alt, compose, provision]
+    profiles: [tools]
+    environment:
+      PGSERVICEFILE: /run/db-sync-alt-operator/pg_service.conf
+      PGPASSFILE: /run/db-sync-alt-operator/pgpass
+    volumes:
+      - ${PRIVATE_DIR:?private configuration required}/operator:/run/db-sync-alt-operator:ro
+    networks: [backend]
+    ports: []
+networks:
+  backend: {internal: true}
+  frontend: {}
+  # Attach midnight-node here (for example `docker network connect <project>_node <node container>`,
+  # or `networks: {db-sync-alt: {external: true, name: <project>_node}}` in the node's Compose file).
+  # Internal: PostgreSQL gets no route out through it.
+  node: {internal: true}
+volumes:
+  database: {}

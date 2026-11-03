@@ -1,0 +1,6 @@
+{
+  "network": "preprod",
+  "name": "midnight-preprod-node-1.0.400",
+  "native_validated": false,
+  "source_commit": "3acfd2edecdcd91373b6a506933f4c14ad3f0308"
+}

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "db-sync-alt"
+version = "0.1.0"
+description = "Cardano data for Midnight's main-chain follower, kept in PostgreSQL without a full Cardano node and db-sync stack."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]==3.2.13"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+
+[project.urls]
+Source = "https://github.com/midnight-experiments/db-sync-alt"
+
+[project.scripts]
+db-sync-alt = "db_sync_alt.cli:main"
+
+[tool.setuptools]
+# The pinned profiles and reference sources live at the repository root and ship inside the package.
+package-dir = { "" = "src", "db_sync_alt.profiles" = "profiles", "db_sync_alt.reference" = "reference" }
+packages = [
+    "db_sync_alt",
+    "db_sync_alt.cli",
+    "db_sync_alt.service",
+    "db_sync_alt.sources",
+    "db_sync_alt.sources.blockfrost",
+    "db_sync_alt.sources.dbsync",
+    "db_sync_alt.store",
+    "db_sync_alt.verify",
+    "db_sync_alt.profiles",
+    "db_sync_alt.reference",
+]
+
+[tool.setuptools.package-data]
+"db_sync_alt.service" = ["service.example.json"]
+"db_sync_alt.store" = ["*.sql"]
+"db_sync_alt.profiles" = ["**/*.json", "**/*.md"]
+"db_sync_alt.reference" = ["**/*.rs", "*.json"]
+
+[tool.ruff]
+target-version = "py311"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+# The code keeps short guard clauses and grouped statements on one line and names small lambdas.
+ignore = ["E701", "E702", "E731", "E741"]

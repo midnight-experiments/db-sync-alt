@@ -1,0 +1,36 @@
+{
+  "pg_service": "db_sync_alt_owner",
+  "network": "preprod",
+  "profile": "midnight-preprod-node-1.0.400",
+  "http_host": "127.0.0.1",
+  "http_port": 18080,
+  "http_allow_external": false,
+  "reader": {
+    "role": "db_sync_alt_reader",
+    "pg_service": "db_sync_alt_reader"
+  },
+  "backup_archive": null,
+  "backup_manifest": null,
+  "shutdown_seconds": 5,
+  "policy": {
+    "poll_seconds": 20,
+    "heartbeat_seconds": 5,
+    "worker_stall_seconds": 120,
+    "observation_max_age_seconds": 120,
+    "serving_lag_max_seconds": 600,
+    "provider_operation_seconds": 120,
+    "local_operation_seconds": 300,
+    "database_max_age_seconds": 5
+  },
+  "storage_reserves": {
+    "/var/lib/db-sync-alt": 10737418240
+  },
+  "sync": {
+    "max_batch_blocks": 100,
+    "publication_interval_seconds": 20,
+    "acquisition_request_budget": 10000,
+    "daily_poll_request_budget": 10000,
+    "follow_min_blocks": 1,
+    "follow_max_wait_seconds": 40
+  }
+}

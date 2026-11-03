@@ -1,0 +1,78 @@
+{
+  "format": "db-sync-alt-network-profile-v1",
+  "network": "mainnet",
+  "profile": "midnight-mainnet-node-1.0.0",
+  "algorithm": "mainnet-selective-v1",
+  "cardano": {
+    "network_magic": 764824073,
+    "security_parameter": 2160,
+    "active_slots_coefficient": 0.05,
+    "epoch_length": 432000,
+    "system_start": 1506203091,
+    "epochs": {
+      "first_epoch_number": 208,
+      "first_slot_number": 4492800,
+      "epoch_duration_millis": 432000000,
+      "first_epoch_timestamp_millis": 1596059091000,
+      "slot_duration_millis": 1000
+    },
+    "stake_address_prefix": "stake1",
+    "dbsync_network_name": "mainnet"
+  },
+  "midnight": {
+    "genesis": "1941ca8e2bb88146c14dea084d3be7eb6e96ca7135429c543848b628124f2854",
+    "chain_spec_raw_sha256": "bd81ad4571575f29309d8a10aefb731b6ea6dc3f6b9df7d2d3e3aca94df45e81",
+    "config_sha256": "5f630ea7ed06c7ef3ce9c56b8604dd1c48acb9d0efe3cf20c9e15d4f42bec87d",
+    "start": {
+      "block_number": 13164005,
+      "tx_index_in_block": 1
+    },
+    "genesis_cardano_reference": "fa1ef4f32aa53504f24f59503604f687d15e0314d1446a29c6900d54785cd5b8",
+    "block_stability_margin": 10
+  },
+  "blockfrost": {
+    "host": "cardano-mainnet.blockfrost.io",
+    "key_prefix": "mainnet",
+    "adapter": "blockfrost-mainnet-cbor-v1",
+    "openapi": "1d4d5d8bac8f0c641eea5c6f7b1f3fbbed8d1505"
+  },
+  "node_queries": {
+    "tag": "node-1.0.400",
+    "commit": "3acfd2edecdcd91373b6a506933f4c14ad3f0308"
+  },
+  "health": {
+    "serving_lag_max_blocks": 9
+  },
+  "provenance": {
+    "midnight_configs": {
+      "repository": "https://github.com/midnightntwrk/midnight-node",
+      "tag": "node-1.0.0",
+      "commit": "f4a4cd543e6fbdfa34e11671737598f5b40c19fd",
+      "files": "source-manifest.json",
+      "reference_node_1_0_0_identical": true
+    },
+    "network_values": {
+      "repository": "https://github.com/midnightntwrk/midnight-node",
+      "tag": "node-1.0.0",
+      "commit": "f4a4cd543e6fbdfa34e11671737598f5b40c19fd",
+      "files": {
+        "res/cfg/default.toml": "b9a2511ebeb39be7c28f856419e7911a1b9c2414015beaffaeb2b62180a49e35",
+        "res/cfg/mainnet.toml": "6faa3d2c7ea8f9364e8ca1cec37aa19deee87ac2b047c0594c59c25585914460",
+        "res/mainnet/pc-chain-config.json": "8a3ed6d0a06273b8381cf1b576f4b63c1d98c5f3bc656cb832ceaadfcfa357b8",
+        "res/mainnet/cardano-tip.json": "730f14a7f24aeed56da2a12c51164e56f75de192f26ce082b1029917fef9c659",
+        "res/mainnet/chain-spec-raw.json": "bd81ad4571575f29309d8a10aefb731b6ea6dc3f6b9df7d2d3e3aca94df45e81"
+      }
+    },
+    "midnight_genesis": {
+      "method": "header of block 0 from res/<network>/chain-spec-raw.json (node/src/service.rs construct_genesis_block)",
+      "state_root": "01001b04408d8cd07765438ed0370102a85946d53c98be7fa9a5b1dc10e3907e",
+      "extrinsics_root": "fb7b093374a18b00e5c13e021279c692454b8b82d9879591cab645f4a7d3564a",
+      "runtime_spec_version": 22000,
+      "state_version": 1
+    },
+    "cardano_system_start": "first_epoch_timestamp_millis / 1000 - first_epoch_number * 432000 (Byron epochs of 21,600 slots x 20 s)",
+    "unverified": [
+      "cardano.network_magic: public Cardano Mainnet value; not cross-checked against the Mainnet shelley-genesis.json"
+    ]
+  }
+}

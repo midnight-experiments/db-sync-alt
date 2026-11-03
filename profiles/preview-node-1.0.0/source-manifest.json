@@ -1,0 +1,37 @@
+{
+  "repository": "https://github.com/midnightntwrk/midnight-node",
+  "tag": "node-1.0.0",
+  "commit": "f4a4cd543e6fbdfa34e11671737598f5b40c19fd",
+  "files": {
+    "cnight-config.json": {
+      "source": "res/preview/cnight-config.json",
+      "sha256": "b21739b50545a81bb4074d91eb94ee3fa6ec76595ee5a0fa37ff00ce7810028d"
+    },
+    "federated-authority-config.json": {
+      "source": "res/preview/federated-authority-config.json",
+      "sha256": "7317028efa644061c5ac4743b63e9352221a08d80f2d6c48d1e4f15d1314c363"
+    },
+    "permissioned-candidates-config.json": {
+      "source": "res/preview/permissioned-candidates-config.json",
+      "sha256": "c7d15098c98ff0f1e99e860c75d4e8f0498afe95e1a6e474c93d4cb2fd724a94"
+    },
+    "registered-candidates-addresses.json": {
+      "source": "res/preview/registered-candidates-addresses.json",
+      "sha256": "e0e6e1723f6d7e6586f5a157b1527d257511b1bb613d046ea5b346c003c8aa8e"
+    },
+    "ics-config.json": {
+      "source": "res/preview/ics-config.json",
+      "sha256": "6a08c3c4f64e1e9a5df478a94ec9b5126d260dc443dce41a02299c73c018754f"
+    },
+    "reserve-config.json": {
+      "source": "res/preview/reserve-config.json",
+      "sha256": "62747113ba443f92720bed56206720e98723191a9c52fbd01ae92f456e2dfd18"
+    }
+  },
+  "encoding_references": {
+    "primitives/mainchain-follower/src/data_source/cnight_observation.rs": "a625d74725b779dc206c6305fea5aac648d9ffb53de075f7b4686907cfabc24d",
+    "primitives/ics-observation/src/lib.rs": "2e5b5812f2e379f0b90bf5234327600eef41210ce7c690106d1ba34fc1969c4b",
+    "primitives/reserve-observation/src/lib.rs": "b39e6ef9fa4b7dd8ed2f41100cc2d0a28ae210b984590422418ea57bda7a3ae2",
+    "node/src/chain_spec/mod.rs": "979edc8a4146394f0fef1a2494e24c8e2d064c4735ae5d31900eb4d09f0080ac"
+  }
+}

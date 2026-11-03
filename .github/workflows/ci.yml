@@ -1,0 +1,49 @@
+name: source-and-tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check public source and pinned provenance
+        run: python3 .github/scripts/check_public_source.py
+      - name: Lint (ruff)
+        run: python3 tools/dev.py lint
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Unit tests (no database, no network)
+        run: python3 tools/dev.py unit
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Integration tests with PostgreSQL 17 (shard ${{ matrix.shard }} of 3)
+        run: python3 tools/dev.py integration --shard ${{ matrix.shard }}/3
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compose smoke of the built image
+        run: python3 tools/dev.py e2e

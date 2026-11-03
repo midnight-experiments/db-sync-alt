@@ -1,0 +1,31 @@
+{
+  "repository": "https://github.com/midnightntwrk/midnight-node",
+  "tag": "node-1.0.400",
+  "commit": "3acfd2edecdcd91373b6a506933f4c14ad3f0308",
+  "files": {
+    "primitives/mainchain-follower/src/db/queries/cnight_observation.rs": {
+      "source": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+      "sha256": "ea64edeea9d9053b94da7410fffdb677067e9d458fcc7c14937072397496396b"
+    },
+    "primitives/mainchain-follower/src/db/queries/federated_authority_observation.rs": {
+      "source": "primitives/mainchain-follower/src/db/queries/federated_authority_observation.rs",
+      "sha256": "eaf508cb65ca614f980f554cf271d3c647bf0741430387616c9c2ec469ecf571"
+    },
+    "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs": {
+      "source": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+      "sha256": "766ca723443a3ab5eef62dde4382accbff9070047a16be7a1f79e46c13d0eb90"
+    },
+    "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs": {
+      "source": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+      "sha256": "caa4c336e5d74ac9d1b33fffb278b3b133e4d6b9d6a56362ebdc6803f5ff09bf"
+    },
+    "node/src/main_chain_follower.rs": {
+      "source": "node/src/main_chain_follower.rs",
+      "sha256": "5ec07c1f59ee2b605f0fca1d21602cf78f44fac7973a38bc71fb5367c54bf284"
+    },
+    "primitives/mainchain-follower/src/db/multi_asset_cache.rs": {
+      "source": "primitives/mainchain-follower/src/db/multi_asset_cache.rs",
+      "sha256": "78ba4fc3a0ec63ab43364b0a8b8c428f7accebd6da3a6e6f97598ba17bdf3bc3"
+    }
+  }
+}

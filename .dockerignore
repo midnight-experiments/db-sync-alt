@@ -1,0 +1,14 @@
+.git
+**/__pycache__
+**/*.py[cod]
+.venv
+.env
+.env.*
+private
+state
+backups
+*.dump
+*.log
+coverage
+build
+*.egg-info
