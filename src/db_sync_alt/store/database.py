@@ -425,6 +425,21 @@ class PgStore:
             result[table]={'count':count,'sha256':hasher.hexdigest()}
             self.progress('digest_family_complete',generation=generation,family=table,rows=count)
         return result
+    def lifecycle_state(self):
+        """Fresh startup state without materializing historical manifests.
+
+        Keep the diagnostic inspection's state/relation/access refusal order:
+        one scalar ID establishes whether its per-generation SELECT privileges
+        are needed, LIMIT 0 checks those privileges without transferring a row.
+        Size/checkpoint access is still checked, without counting history.
+        Full history diagnostics and full verification remain separate.
+        """
+        state=self.state()
+        if self.db.execute('SELECT id FROM chain.generations ORDER BY id LIMIT 1').fetchone() is not None:
+            self.db.execute('SELECT * FROM chain.generations LIMIT 0')
+        self.db.execute('SELECT pg_database_size(current_database())').fetchone()
+        self.db.execute('SELECT 1 FROM chain.checkpoints LIMIT 0')
+        return state
     def status(self):
         return {'format':FORMAT,**self.state(),'generations':[self.generation(r[0]) for r in self.db.execute('SELECT id FROM chain.generations ORDER BY id')], 'bytes':self.db.execute('SELECT pg_database_size(current_database())').fetchone()[0],'checkpoints':self.db.execute('SELECT count(*) FROM chain.checkpoints').fetchone()[0]}
     def sync_job(self,job_id):
@@ -470,3 +485,5 @@ class PgStore:
 
 def inspect(service=None,*,conninfo=''):
     with PgStore(service,conninfo=conninfo,readonly=True,allow_incomplete=True) as store:return store.status()
+def inspect_lifecycle(service=None,*,conninfo=''):
+    with PgStore(service,conninfo=conninfo,readonly=True,allow_incomplete=True) as store:return store.lifecycle_state()

@@ -42,7 +42,7 @@ def blockfrost_once(store, profile, *, target_height=None, request_budget=None,
     day=dt.datetime.now(dt.timezone.utc).date().isoformat()
     poll=store.sync_job('provider-poll-'+day)
     if poll:options['daily_poll_request_budget']=poll['budget']
-    health=HealthState(service_version='0.1.0',schema_version=1,network=profile.network.network,profile=profile.identity['config_sha256'])
+    health=HealthState(service_version='0.1.1',schema_version=1,network=profile.network.network,profile=profile.identity['config_sha256'])
     serial=store.state()['publication_serial']
     if store.supports_incremental:store.certify_ready_full()
     SyncDriver(SimpleNamespace(sync=options),client=client,profile=profile,fixed_target=target_height).run_once(store,health,stop_event)

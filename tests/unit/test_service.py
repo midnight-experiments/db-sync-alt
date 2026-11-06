@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -63,6 +64,23 @@ class LifecycleTests(unittest.TestCase):
         self.addCleanup(service.stop)
         service.start()
         return service, runtime, sync
+
+    def test_unused_startup_history_is_not_retained_while_serving(self):
+        class Inspection(dict):pass
+        runtime=Runtime();refs=[]
+        original=runtime.inspect
+        def inspect():
+            value=Inspection(original())
+            value['generations']=[{'manifest':{'history':'x'*4096}}]
+            refs.append(weakref.ref(value))
+            return value
+        runtime.inspect=inspect
+        service,runtime,sync=self.make(runtime=runtime)
+        eventually(sync.entered.is_set)
+        self.assertEqual(runtime.verifications,1)
+        self.assertIsNone(refs[0](), 'unused startup inspection survived into the serving loop')
+        self.assertTrue(service.stop())
+        self.assertEqual(runtime.closed,1)
 
     def test_ready_idle_reader_check_and_graceful_owner_thread_close(self):
         service, runtime, sync = self.make()

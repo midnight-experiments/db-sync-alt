@@ -1,2 +1,2 @@
 """db-sync-alt: Cardano data for Midnight's main-chain follower, kept in PostgreSQL."""
-__version__ = '0.1.0'
+__version__ = '0.1.1'
