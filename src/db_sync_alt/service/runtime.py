@@ -96,7 +96,7 @@ class ServiceConfig:
     sync: dict = field(default_factory=dict)
     network: str | None = None
     profile: str | None = None
-    service_version: str = '0.1.0'
+    service_version: str = '0.1.1'
     http_host: str = '127.0.0.1'
     http_port: int = 18080
     http_allow_external: bool = False
@@ -215,11 +215,11 @@ class PostgresRuntime:
         self._owner_challenge = None
 
     def inspect(self):
-        from db_sync_alt.store.database import connect, empty_destination, inspect
+        from db_sync_alt.store.database import connect, empty_destination, inspect_lifecycle
         with connect(self.config.pg_service) as db:
             if empty_destination(db):
                 return {'empty': True}
-        return {'empty': False, **inspect(self.config.pg_service)}
+        return {'empty': False, **inspect_lifecycle(self.config.pg_service)}
 
     def reserve_check(self):
         try:
@@ -296,7 +296,7 @@ class PostgresRuntime:
             store.certify_ready_full()
         else:
             verify_store(store)
-        status = store.status()
+        status = store.lifecycle_state()
         if status['migration_state'] != 'ready' or status['canonical_ready'] is None:
             raise LifecycleFailure('invalid_coverage')
         if status['revoked']:
@@ -470,6 +470,7 @@ class Service:
                 raise LifecycleFailure('incomplete_restore')
             if inspection.get('revoked'):
                 raise LifecycleFailure('canonical_conflict')
+            del inspection  # Startup metadata is not part of the serving loop.
             if self.stop_event.is_set():
                 return
             store = self.runtime.open_writer(self.health)

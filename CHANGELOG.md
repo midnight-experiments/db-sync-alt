@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.1
+
+- Startup reads only the database's state row to decide whether to serve, and
+  keeps nothing from it. Memory after startup does not grow with the number of
+  published updates. On a copy of a Preprod database with 8,061 generations,
+  RSS at ready went from 3.99 GiB to 43 MiB, and the startup peak from 7.55 GiB
+  to 44 MiB.
+- Refusals for empty, importing, restoring, revoked, unowned, corrupt or
+  permission-limited databases are unchanged.
+- No schema or stored-data change: 0.1.0 and 0.1.1 run on the same database.
+  The Preprod snapshot of the 0.1.0 release restores with 0.1.1.
+
 ## 0.1.0
 
 Initial release; experimental.

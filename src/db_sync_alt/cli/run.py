@@ -240,7 +240,7 @@ def configure(args, params, key, state, db, existing, reader_login=(DEFAULT_READ
     empty = empty_destination(db)
     if not empty:
         with PgStore(conninfo=make_conninfo(**params), readonly=True) as store:
-            if (store.state()['schema_version'] != SCHEMA_VERSION or store.status()['revoked']
+            if (store.state()['schema_version'] != SCHEMA_VERSION or store.lifecycle_state()['revoked']
                     or store.meta('profile').get('network') != args.network):
                 raise LaunchError('database_not_ready_for_native_launch')
     if empty:

@@ -185,7 +185,7 @@ settings and report-only `warnings`.
 
 ## Status and roadmap
 
-db-sync-alt **0.1.0** is experimental. It serves the SQL queries of **Midnight
+db-sync-alt **0.1.1** is experimental. It serves the SQL queries of **Midnight
 node 1.0.400**.
 
 - **Networks** (`--network`): **Preprod** is supported and tested end to end.
