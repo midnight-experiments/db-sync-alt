@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **BREAKING:** every new incremental update records the network profile by its
+  SHA-256 digest (`identity_sha256`, integrity kind `certified-parent-delta-v2`)
+  instead of embedding the profile twice. Once the first such update is written,
+  versions before 0.2.0 refuse to start on that database (`completion_invalid`).
+- An update's manifest is about 4.5 KB of JSON instead of about 199 KB; on
+  Preprod the database grows about 150 MB a day less. Stored updates keep their
+  embedded profile (`certified-parent-delta-v1`) and are verified under their own
+  rules, in one lineage with the new ones; an update left pending by 0.1.x is
+  finished in its own form.
 - `db-sync-alt status` lists one summary row per generation (`id`, `parent`,
   `status`, `source` and the heights `start_height`, `start_index`,
   `target_height`, `witness_height`) and no manifest. Read a manifest with
