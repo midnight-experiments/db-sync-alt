@@ -44,7 +44,7 @@ class Store:
         return self
     def fetchone(self):return self.result
     def status(self):return {'migration_state':'ready','canonical_ready':0,'revoked':False}
-    def state(self):return dict(self.status(),schema_version=3)
+    def state(self):return dict(self.status(),schema_version=4)
     def lifecycle_state(self):return self.state()
     def meta(self,key):return {'network':'preprod'}
 
@@ -54,7 +54,7 @@ pg_store.empty_destination=lambda db:False
 pg_store.inspect=lambda *a,**kw:{'migration_state':'ready','canonical_ready':0,'revoked':False}
 pg_store.inspect_lifecycle=pg_store.inspect
 pg_store.PgStore=Store
-pg_store.SCHEMA_VERSION=3
+pg_store.SCHEMA_VERSION=4
 sys.modules['db_sync_alt.store.database']=pg_store
 reader=types.ModuleType('db_sync_alt.store.reader')
 reader.grant_reader=lambda db,role:{'reader':role}

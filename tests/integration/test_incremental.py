@@ -340,7 +340,7 @@ class IncrementalTests(SyncFixture):
         with PgStore(conninfo=dsn) as store:
             before=verify_store(store);old=store.generation();state=store.state()
             result=upgrade_store(store)
-            self.assertEqual(result['schema_version'],3)
+            self.assertEqual(result['schema_version'],4)
             self.assertEqual(verify_store(store)['digests'],before['digests'])
             self.assertEqual(store.generation(),old)
             self.assertEqual(store.db.execute('SELECT count(*) FROM public.block').fetchone()[0],before['digests']['blocks']['count'])
