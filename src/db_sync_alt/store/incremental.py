@@ -57,6 +57,20 @@ class VerifiedTransition:
     _proof_sha256: str=field(init=False,repr=False)
     def __post_init__(self):object.__setattr__(self,'_proof_sha256',digest(self.proof))
 
+@dataclass(frozen=True)
+class VerifiedCheckpoint:
+    """A full verification of `generation` by this writer session at integrity revision `revision`."""
+    _owner: object
+    _session: int
+    generation: int
+    revision: int
+    root: str
+    _report: dict
+    _sha256: str=field(init=False,repr=False)
+    def __post_init__(self):object.__setattr__(self,'_sha256',digest([self.generation,self.revision,self.root,self._report]))
+    @property
+    def report(self):return copy.deepcopy(self._report)
+
 
 def _session(store):
     store.require_writer()
@@ -81,14 +95,84 @@ def current_verified_parent(store):
     if integrity_reference(store.generation())!=cap._descriptor['integrity_ref']:raise Refusal('incremental_parent_uncertified')
     return cap
 
-def certify_ready_full(store):
+def _verify_canonical(store):
+    """Full verification of the canonical generation, with a checkpoint capability when nothing
+    changed the verified contents meanwhile (None otherwise)."""
     from db_sync_alt.verify.store import verify_store
-    pid=_session(store);g=store.generation();verify_store(store,g['id'])
+    pid=_session(store);g=store.generation();before=revision(store);store._verified_checkpoint=None
+    report=verify_store(store,g['id'])
+    cap=None
+    if revision(store)==before:
+        cap=VerifiedCheckpoint(store,pid,g['id'],before,integrity_reference(g)['sha256'],report)
+        store._verified_checkpoint=cap
+    return g,pid,cap
+
+def certify_ready_full(store):
+    g,pid,_=_verify_canonical(store)
     # Full verification already compared every derived projection binding in a
     # single statement snapshot. This owner still binds the exact ready marker.
     if store.db.execute('SELECT projection_generation FROM chain.integrity_state WHERE id=1').fetchone()[0]!=g['id']:raise Refusal('membership_projection_mismatch')
     cap=VerifiedParent(store,pid,_descriptor(store,g));store._verified_parent=cap
     return cap
+
+def certify_checkpoint(store):
+    """Verify the canonical generation in full; the result may become the next integrity checkpoint."""
+    cap=_verify_canonical(store)[2]
+    if cap is None:raise Refusal('integrity_revision_changed')
+    return cap
+
+def verified_checkpoint(store):
+    """The checkpoint capability of this writer session's last full verification."""
+    cap=getattr(store,'_verified_checkpoint',None)
+    _require_checkpoint_capability(store,cap)
+    return cap
+
+def _require_checkpoint_capability(store,cap):
+    if (not isinstance(cap,VerifiedCheckpoint) or cap is not getattr(store,'_verified_checkpoint',None) or cap._owner is not store
+            or cap._session!=_session(store) or cap.revision!=revision(store)
+            or digest([cap.generation,cap.revision,cap.root,cap._report])!=cap._sha256
+            or cap._report.get('generation')!=cap.generation):raise Refusal('checkpoint_uncertified')
+
+def integrity_base(store):
+    """The integrity base generation and its checkpoint row (None when the base has none)."""
+    base=store.db.execute('SELECT base_generation FROM chain.integrity_state WHERE id=1').fetchone()[0]
+    if not store.supports_checkpoints:return base,None
+    row=store.db.execute('SELECT generation,previous_base,root,digests,service_version,checkpointed_at FROM chain.integrity_checkpoints WHERE generation=%s',(base,)).fetchone()
+    return base,None if row is None else dict(zip(('generation','previous_base','root','digests','service_version','checkpointed_at'),row))
+
+def insert_checkpoint(store,cap):
+    """Insert the checkpoint `cap` certifies and move the integrity base to it.
+
+    Runs inside the caller's transaction, which holds the serving lock with the
+    projection-write flag on (the publication gate)."""
+    from db_sync_alt import __version__
+    _require_checkpoint_capability(store,cap)
+    state=store.state()
+    if state['revoked']:raise Refusal('checkpoint_database_revoked')
+    if not store.supports_checkpoints:raise Refusal('checkpoint_schema_required')
+    g=store.generation(cap.generation)
+    if g['status']!='ready':raise Refusal('checkpoint_generation_not_ready')
+    if state['canonical_ready'] is None or cap.generation!=state['canonical_ready'] and not store.db.execute('''WITH RECURSIVE lineage(id,parent) AS (
+          SELECT id,parent FROM chain.generations WHERE id=%s UNION ALL
+          SELECT g.id,g.parent FROM lineage l JOIN chain.generations g ON g.id=l.parent)
+        SELECT 1 FROM lineage WHERE id=%s''',(state['canonical_ready'],cap.generation)).fetchone():raise Refusal('checkpoint_not_canonical')
+    base,_=integrity_base(store)
+    if cap.generation<=base:raise Refusal('checkpoint_not_after_base')
+    if integrity_reference(g)['sha256']!=cap.root:raise Refusal('checkpoint_uncertified')
+    store.db.execute('INSERT INTO chain.integrity_checkpoints(generation,previous_base,root,digests,service_version) VALUES(%s,%s,%s,%s,%s)',
+                     (cap.generation,base,cap.root,Jsonb(cap._report['digests']),__version__))
+    store.db.execute('UPDATE chain.integrity_state SET base_generation=%s WHERE id=1',(cap.generation,))
+    return {'generation':cap.generation,'previous_base':base}
+
+def write_checkpoint(store,cap):
+    """One gated transaction: the checkpoint for `cap.generation` and the base move to it."""
+    from db_sync_alt.store.database import SERVING_LOCK,PROJECTION_WRITE
+    _require_checkpoint_capability(store,cap)
+    with store.atomic():
+        store.db.execute("SET LOCAL lock_timeout='5s'")
+        store.db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
+        store.db.execute('SELECT set_config(%s,%s,true)',(PROJECTION_WRITE,'on'))
+        return insert_checkpoint(store,cap)
 
 def begin_continuation(store,*,source,start,target,witness,manifest,parent_capability):
     cap=current_verified_parent(store)

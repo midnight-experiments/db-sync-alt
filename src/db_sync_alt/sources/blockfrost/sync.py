@@ -547,19 +547,22 @@ class SyncDriver:
         self._poller = None
         self._follow_sequence = 0
         self._eligible_at = None
+        self._checkpoint_due = None
         self.profile = profile or Profile(profile_dir(config.network), config.network)
         self.options = dict(getattr(config, 'sync', {}))
         defaults = {'max_batch_blocks': 100, 'publication_interval_seconds': 60,
                     'acquisition_request_budget': 10000, 'daily_poll_request_budget': 10000,
-                    'follow_min_blocks': 1, 'follow_max_wait_seconds': 40}
+                    'follow_min_blocks': 1, 'follow_max_wait_seconds': 40,
+                    'integrity_checkpoint_interval_seconds': 21600}
         if set(self.options) - set(defaults):
             raise LifecycleFailure('invalid_sync_configuration')
         for key, value in defaults.items():
             self.options.setdefault(key, value)
-        for key, high in (('max_batch_blocks', 1000), ('publication_interval_seconds', 1800),
-                          ('acquisition_request_budget', 10000), ('daily_poll_request_budget', 10000),
-                          ('follow_min_blocks', 100), ('follow_max_wait_seconds', 120)):
-            if type(self.options[key]) is not int or not 1 <= self.options[key] <= high:
+        for key, low, high in (('max_batch_blocks', 1, 1000), ('publication_interval_seconds', 1, 1800),
+                               ('acquisition_request_budget', 1, 10000), ('daily_poll_request_budget', 1, 10000),
+                               ('follow_min_blocks', 1, 100), ('follow_max_wait_seconds', 1, 120),
+                               ('integrity_checkpoint_interval_seconds', 600, 604800)):
+            if type(self.options[key]) is not int or not low <= self.options[key] <= high:
                 raise LifecycleFailure('invalid_sync_configuration')
 
     def check_follow_mode(self, store):
@@ -643,6 +646,37 @@ class SyncDriver:
             if direct_poll_lock and not store.db.closed:
                 store.db.execute('SELECT pg_advisory_unlock(%s,%s)',POLL_LOCK)
 
+    def _checkpoint(self, store, health):
+        """Between publications, once `integrity_checkpoint_interval_seconds` have passed since the
+        base's checkpoint: verify the canonical generation in full and make it the integrity base,
+        so a restart walks only what is published after it. Publication waits meanwhile."""
+        if not getattr(store, 'supports_checkpoints', False):
+            return False
+        interval = self.options['integrity_checkpoint_interval_seconds']
+        if self._checkpoint_due is None:
+            # A base without a checkpoint (a full-certified generation) counts from this writer's start.
+            at = store.integrity()['checkpointed_at']
+            self._checkpoint_due = (self.clock() if at is None else at) + interval
+        if self.clock() < self._checkpoint_due:
+            return False
+        if store.state()['revoked'] or store.generation()['id'] <= store.integrity()['base']:
+            return False
+        health.end_operation()
+        health.begin_operation('verification')
+        health.update(sync='checkpointing')
+        try:
+            store.write_checkpoint(store.certify_checkpoint())
+        except Refusal as error:
+            # Something changed the verified contents meanwhile: verify again on the next pass.
+            if error.code not in ('integrity_revision_changed', 'checkpoint_uncertified'):
+                raise
+            return True
+        integrity = store.integrity()
+        self._checkpoint_due = integrity['checkpointed_at'] + interval
+        health.integrity(**integrity)
+        health.update(sync='syncing')
+        return True
+
     def _run_once(self, store, health, stop_event):
         if stop_event.is_set():
             return
@@ -673,6 +707,8 @@ class SyncDriver:
             raise LifecycleFailure('request_budget_exhausted')
         if active and active['state'] != 'completed' and active.get('retry_at', 0) > self.clock():
             raise TransientSyncFailure(active.get('error_code', 'provider_unavailable'), retry_at=active['retry_at'])
+        if not pending and self._checkpoint(store, health):
+            return False
         observation = None
         if self._poller is not None:
             observation = self._poller.latest()

@@ -14,8 +14,8 @@ from db_sync_alt import networks
 from db_sync_alt.contract import TABLES, KEYS, FORMAT, Refusal, canonical, digest, jsonable, validate_numeric
 
 POSTGRES_MAJOR = 17
-SCHEMA_VERSION = 3
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3)
+SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4)
 OWNER = 'db-sync-alt'
 RESTORE_GUARD = 'db_sync_alt_restore_guard'
 PROJECTION_WRITE = 'db_sync_alt.projection_write'
@@ -225,6 +225,24 @@ class PgStore:
     def serves_directly(self):
         """Schema 3: the node reads the served tables; every publication keeps them current."""
         return self.state()['schema_version']>=3
+    @property
+    def supports_checkpoints(self):
+        """Schema 4: verification starts at the last integrity checkpoint."""
+        return self.state()['schema_version']>=4
+    def certify_checkpoint(self):
+        from db_sync_alt.store.incremental import certify_checkpoint
+        return certify_checkpoint(self)
+    def verified_checkpoint(self):
+        from db_sync_alt.store.incremental import verified_checkpoint
+        return verified_checkpoint(self)
+    def write_checkpoint(self,capability):
+        from db_sync_alt.store.incremental import write_checkpoint
+        return write_checkpoint(self,capability)
+    def integrity(self):
+        """The integrity base and when its checkpoint was written (None: the base has no checkpoint)."""
+        from db_sync_alt.store.incremental import integrity_base
+        base,checkpoint=integrity_base(self)
+        return {'base':base,'checkpointed_at':None if checkpoint is None else checkpoint['checkpointed_at'].timestamp()}
     def current_verified_parent(self):
         from db_sync_alt.store.incremental import current_verified_parent
         return current_verified_parent(self)

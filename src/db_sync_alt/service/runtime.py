@@ -290,10 +290,16 @@ class PostgresRuntime:
         from db_sync_alt.store.database import SCHEMA_VERSION
         from db_sync_alt.verify.store import verify_store
         if store.state()['schema_version'] != SCHEMA_VERSION:
-            # Only schema 3 gates the node-facing relations; `db-sync-alt upgrade` comes first.
+            # The service runs only on the current schema; `db-sync-alt upgrade` comes first.
             raise LifecycleFailure('schema_upgrade_required')
         if getattr(store, 'supports_incremental', False):
             store.certify_ready_full()
+            if getattr(store, 'supports_checkpoints', False):
+                # The startup audit becomes the integrity base: the next start re-hashes it and
+                # walks only what is published after it.
+                capability = store.verified_checkpoint()
+                if capability.generation > store.integrity()['base']:
+                    store.write_checkpoint(capability)
         else:
             verify_store(store)
         status = store.lifecycle_state()
@@ -493,6 +499,8 @@ class Service:
             from db_sync_alt.store.database import PgStore
             if isinstance(store,PgStore):
                 self.health.verified_schema(store.state()['schema_version'])
+                if getattr(store, 'supports_checkpoints', False):
+                    self.health.integrity(**store.integrity())
             if self.stop_event.is_set():
                 return
             self.health.end_operation()

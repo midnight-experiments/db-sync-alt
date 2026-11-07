@@ -31,7 +31,7 @@ ERROR_CODES = frozenset({
     'schema_upgrade_required', 'pending_target_changed', 'pending_suffix_base_changed', 'pending_anchor_changed',
 })
 LIFECYCLES = frozenset({'starting', 'restoring', 'ready', 'stopping', 'stopped', 'failed', 'halted'})
-SYNC_STATES = frozenset({'unknown', 'idle', 'syncing', 'degraded', 'backoff', 'quota_wait', 'halted'})
+SYNC_STATES = frozenset({'unknown', 'idle', 'syncing', 'checkpointing', 'degraded', 'backoff', 'quota_wait', 'halted'})
 SERVING_STATES = frozenset({'unknown', 'unready', 'ready', 'revoked', 'stopped'})
 # Report-only warnings: shown in /status and /health, never a reason for an unhealthy answer.
 WARNING_CODES = frozenset({
@@ -183,11 +183,20 @@ class HealthState:
         self._db = None
         self._reader = None
         self._node_warnings = []
+        self._integrity = {'base': None, 'checkpointed_at': None}
 
     def verified_schema(self, version):
-        if type(version) is not int or version not in (1,2,3):
+        if type(version) is not int or version not in (1,2,3,4):
             raise ValueError('unsupported schema identity')
         with self._lock:self._identity['schema_version']=str(version)
+
+    def integrity(self, *, base, checkpointed_at):
+        """The verified integrity base and when its checkpoint was written (None: no checkpoint yet)."""
+        _integer(base, 'integrity base')
+        if checkpointed_at is not None:
+            _number(checkpointed_at, 'checkpointed_at')
+        with self._lock:
+            self._integrity = {'base': base, 'checkpointed_at': checkpointed_at}
 
     def reader_verified(self, report):
         """The reader role midnight-node uses: verified privileges, its settings, what to set."""
@@ -410,6 +419,7 @@ class HealthState:
                         freshness={'provider_observation_age_seconds': observed_age},
                         last_successful_sync=self._success_at, retry_at=self._retry_at, quota=asdict(self._quota),
                         database=asdict(database), workers=workers, operation=operation, error_code=self._error_code, poll_error_code=self._poll_error,
+                        integrity=dict(self._integrity),
                         reader=None if self._reader is None else json.loads(json.dumps(self._reader)),
                         warnings=([] if self._reader is None else list(self._reader['warnings'])) + list(self._node_warnings),
                         policy=asdict(self.policy), healthy=not reasons, reason_codes=reasons)
