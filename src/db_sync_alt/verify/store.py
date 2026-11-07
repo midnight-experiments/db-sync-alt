@@ -74,11 +74,11 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     # The profile must be the packaged profile of the database's own network.
     if network is None or network!=store.network:raise Refusal('untrusted_profile_identity')
     units,governance=selected_asset_units(identity)
-    from db_sync_alt.store.incremental import delta_rows,integrity_reference
+    from db_sync_alt.store.incremental import delta_rows,integrity_reference,profile_digest
     for asset in (delta_rows(store,'assets',gen) if delta else store.rows('assets',gen)):
         policy=asset['policy'].hex();unit=policy+asset['name'].hex()
         if unit not in units and policy not in governance:raise Refusal('selected_asset_outside_profile')
-    if m.get('contracts')!=digest(network.contract) or digest(m.get('identity'))!=digest(identity):raise Refusal('manifest_contract_mismatch')
+    if m.get('contracts')!=digest(network.contract) or profile_digest(g)!=digest(identity):raise Refusal('manifest_contract_mismatch')
     if any(type(v) is not bool for v in m.get('capabilities',{}).values()):raise Refusal('unsupported_capabilities')
     if m.get('capabilities')!={'bridge_qualified':False,'candidates_empty':True}:raise Refusal('unsupported_capabilities')
     if g['witness_height']!=g['target_height']+network.security:raise Refusal('invalid_witness')

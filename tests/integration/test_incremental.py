@@ -76,12 +76,14 @@ class IncrementalTests(SyncFixture):
                 writer.certify_ready_full()
 
     def prepared_transition(self,store,*,transition=False):
-        """Copy generation 1 of a full-update reference into `store` as an incremental continuation."""
+        """Copy generation 1 of a full-update reference into `store` as an incremental continuation in the written form."""
+        from db_sync_alt.contract import digest
         routes,_=gen_fixture.fixtures(transition=transition)
         with gen_fixture.baseline(self.database(),transition=transition) as reference:
             expected=gen_fixture.advance(reference,routes,budget=500)
             m=copy.deepcopy(reference.generation()['manifest'])
             for key in ('digests','validation','completion'):m.pop(key,None)
+            m['identity_sha256']=digest(m.pop('identity'))
             gen=store.begin_continuation(source='blockfrost-cardano',start=self.profile.start,target=gen_fixture.OFFSET+12,witness=gen_fixture.OFFSET+2172,manifest=m,parent_capability=store.current_verified_parent())
             cutoff=store.generation(0)['witness_height']
             store.stage_metadata_reuse(gen,cutoff,{'height':cutoff,'hash':store.block_at(0,cutoff)['hash'].hex()})

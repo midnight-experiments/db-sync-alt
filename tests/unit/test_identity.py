@@ -74,7 +74,9 @@ class IdentityTests(unittest.TestCase):
                          ('db-sync-alt', 'db_sync_alt_restore_guard', 'db_sync_alt.projection_write'))
         self.assertEqual(backup.BACKUP_FORMAT, 'db-sync-alt-postgresql-backup-v2')
         self.assertEqual(backup.FORMATS, {'db-sync-alt-postgresql-backup-v1': (1, 2), 'db-sync-alt-postgresql-backup-v2': (3,)})
-        self.assertEqual((incremental.FULL_DIGESTS, incremental.KIND), ('full-digests-v1', 'certified-parent-delta-v1'))
+        self.assertEqual(incremental.FULL_DIGESTS, 'full-digests-v1')
+        self.assertEqual(incremental.PROFILE_FIELD, {'certified-parent-delta-v1': 'identity', 'certified-parent-delta-v2': 'identity_sha256'})
+        self.assertEqual((incremental.KIND_V1, incremental.KIND_V2), ('certified-parent-delta-v1', 'certified-parent-delta-v2'))
         store = Path(database.__file__).parent
         for name in ('schema.sql', 'schema_v2.sql', 'schema_v3.sql'):
             self.assertIn("s.owner='" + database.OWNER + "'", (store / name).read_text(), name)

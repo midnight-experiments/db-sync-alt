@@ -191,7 +191,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None):
         suffix=_fetch_suffix(provider,store,base,witness,hooks=hooks)
         if hooks.stopped():raise Refusal('interrupted')
         startepoch=store.block_at(ready['id'],ready['start_height'])['epoch']
-        manifest={'identity':profile.identity,'contracts':digest(profile.contract),'source_identity':source_identity,
+        manifest={'identity_sha256':digest(profile.identity),'contracts':digest(profile.contract),'source_identity':source_identity,
                   'anchors':{'start':ready['manifest']['anchors']['start'],
                              'target':{'height':target,'hash':targetrow['hash'].hex()},
                              'witness':{'height':witness,'hash':witnessrow['hash'].hex()}},

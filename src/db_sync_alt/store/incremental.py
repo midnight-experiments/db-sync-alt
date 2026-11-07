@@ -6,16 +6,33 @@ from psycopg.types.json import Jsonb
 from db_sync_alt.contract import TABLES,KEYS,Refusal,canonical,digest,jsonable,validate_numeric
 
 VERSION=2
-KIND='certified-parent-delta-v1'
+KIND_V1='certified-parent-delta-v1'
+KIND_V2='certified-parent-delta-v2'
+# The manifest field that binds an incremental generation to the stored profile,
+# per integrity kind: the whole profile (v1) or its digest (v2). The writer builds v2.
+PROFILE_FIELD={KIND_V1:'identity',KIND_V2:'identity_sha256'}
 FULL_DIGESTS='full-digests-v1'
 
 
 def incremental(g):return isinstance(g['manifest'].get('integrity'),dict) and g['manifest']['integrity'].get('version')==VERSION
 
+def form(m):
+    """Integrity kind of an incremental manifest's profile field, or None unless it has exactly one."""
+    kinds=[kind for kind,key in PROFILE_FIELD.items() if key in m]
+    return kinds[0] if len(kinds)==1 else None
+
+def profile_digest(g):
+    """Digest of the profile a generation's manifest is bound to, or None for an invalid form."""
+    m=g['manifest']
+    if not incremental(g):return digest(m.get('identity'))
+    kind=form(m)
+    if kind is None:return None
+    return m['identity_sha256'] if kind==KIND_V2 else digest(m['identity'])
+
 def integrity_reference(g):
     if incremental(g):
         value=g['manifest'].get('integrity',{})
-        if value.get('kind')!=KIND or not isinstance(value.get('root'),str):raise Refusal('completion_invalid')
+        if value.get('kind') not in PROFILE_FIELD or not isinstance(value.get('root'),str):raise Refusal('completion_invalid')
         return {'kind':'parent-delta-v2','sha256':value['root']}
     return {'kind':FULL_DIGESTS,'sha256':digest(g['manifest']['digests'])}
 
@@ -78,7 +95,7 @@ def begin_continuation(store,*,source,start,target,witness,manifest,parent_capab
     if cap is not parent_capability:raise Refusal('incremental_parent_uncertified')
     if source!='blockfrost-cardano':raise Refusal('incremental_source_unsupported')
     m=copy.deepcopy(manifest)
-    if 'completion' in m or 'integrity' in m:raise Refusal('completion_invalid')
+    if 'completion' in m or 'integrity' in m or form(m) is None:raise Refusal('completion_invalid')
     parent=store.generation();m['parent_ref']=integrity_reference(parent)
     m['parent_digest']=m['parent_ref']['sha256']
     m['integrity']={'version':2,'kind':'pending-delta'}
@@ -163,7 +180,10 @@ def compute_proof(store,g):
     oldcounts=parent['manifest']['integrity']['semantic']['counts'] if incremental(parent) else {k:v['count'] for k,v in parent['manifest']['digests'].items()}
     counts={k:oldcounts[k]+facts[k]['count'] for k in TABLES};counts['blocks']=oldcounts['blocks']-removed['count']+added['count']
     checkpoints=[r for r in store.checkpoint_rows(generation=gen) if r['phase'] not in ('final-anchors','completion-revalidation')]
-    return {'generation':gen,'parent':g['parent'],'parent_ref':integrity_reference(parent),'source':g['source'],'source_identity':m['source_identity'],'identity':m['identity'],'contracts':m['contracts'],'start':[g['start_height'],g['start_index']],'target':g['target_height'],'witness':g['witness_height'],'anchors':m['anchors'],'required_epochs':m['required_epochs'],'capabilities':m['capabilities'],'facts':facts,'membership':{'reuse_through':reuse[0],'reuse_receipt_sha256':digest(reuse[1]),'added':added,'removed':removed},'checkpoints_sha256':digest(checkpoints),'counts':counts}
+    kind=form(m)
+    if kind is None:raise Refusal('completion_invalid')
+    key=PROFILE_FIELD[kind]
+    return {'generation':gen,'parent':g['parent'],'parent_ref':integrity_reference(parent),'source':g['source'],'source_identity':m['source_identity'],key:m[key],'contracts':m['contracts'],'start':[g['start_height'],g['start_index']],'target':g['target_height'],'witness':g['witness_height'],'anchors':m['anchors'],'required_epochs':m['required_epochs'],'capabilities':m['capabilities'],'facts':facts,'membership':{'reuse_through':reuse[0],'reuse_receipt_sha256':digest(reuse[1]),'added':added,'removed':removed},'checkpoints_sha256':digest(checkpoints),'counts':counts}
 
 def verify_pending_incremental(store,generation):
     from db_sync_alt.verify.store import verify_structure,validate_prior_answers
@@ -195,17 +215,19 @@ def _validate_completion_v2(store,g,*,proof=None,require_seal=False,manifest=Non
     parent=store.generation(g['parent']);network=for_identity(store.meta('profile'))
     if m.get('parent_ref')!=integrity_reference(parent) or m.get('parent_digest')!=m['parent_ref']['sha256'] or g['source']!='blockfrost-cardano' or network is None or m.get('source_identity')!=network.source_identity:raise Refusal('completion_mismatch')
     if 'completion' not in m:
-        if require_seal or original or integrity!={'version':2,'kind':'pending-delta'}:raise Refusal('completion_invalid')
+        if require_seal or original or integrity!={'version':2,'kind':'pending-delta'} or form(m) is None:raise Refusal('completion_invalid')
         return None
-    seal=m['completion']
-    if set(integrity)!={'version','kind','root','semantic'} or integrity['kind']!=KIND or set(seal)!={'version','sha256','original_receipt_sha256'} or type(seal['version']) is not int or seal['version']!=2:raise Refusal('completion_invalid')
+    seal=m['completion'];kind=integrity.get('kind')
+    if set(integrity)!={'version','kind','root','semantic'} or kind not in PROFILE_FIELD or kind!=form(m) or set(seal)!={'version','sha256','original_receipt_sha256'} or type(seal['version']) is not int or seal['version']!=2:raise Refusal('completion_invalid')
     if len(original)!=1 or original[0]['unit']!='complete' or seal['original_receipt_sha256']!=_bounded(original[0]['receipt']):raise Refusal('completion_invalid')
     if integrity['root']!=digest(integrity['semantic']) or seal['sha256']!=digest({'integrity':integrity,'original_receipt_sha256':seal['original_receipt_sha256']}):raise Refusal('completion_mismatch')
     semantic=integrity['semantic']
     _bounded(semantic)
-    expected_keys={'generation','parent','parent_ref','source','source_identity','identity','contracts','start','target','witness','anchors','required_epochs','capabilities','facts','membership','checkpoints_sha256','counts'}
+    key=PROFILE_FIELD[kind]
+    expected_keys={'generation','parent','parent_ref','source','source_identity',key,'contracts','start','target','witness','anchors','required_epochs','capabilities','facts','membership','checkpoints_sha256','counts'}
     from db_sync_alt.verify.completion import _hash
     if not isinstance(semantic,dict) or set(semantic)!=expected_keys or 'digests' in m:raise Refusal('completion_invalid')
+    if kind==KIND_V2 and not _hash(m[key]):raise Refusal('completion_invalid')
     if set(semantic.get('facts',{}))!=set(TABLES) or set(semantic.get('counts',{}))!=set(TABLES):raise Refusal('completion_invalid')
     for value in semantic['facts'].values():
         if not isinstance(value,dict) or set(value)!={'count','sha256'} or type(value['count']) is not int or value['count']<0 or not _hash(value['sha256']):raise Refusal('completion_invalid')
@@ -214,8 +236,8 @@ def _validate_completion_v2(store,g,*,proof=None,require_seal=False,manifest=Non
     if not isinstance(membership,dict) or set(membership)!={'reuse_through','reuse_receipt_sha256','added','removed'} or type(membership['reuse_through']) is not int or not parent['target_height']<=membership['reuse_through']<=min(parent['witness_height'],g['witness_height']) or not _hash(membership['reuse_receipt_sha256']):raise Refusal('completion_invalid')
     for value in (membership['added'],membership['removed']):
         if not isinstance(value,dict) or set(value)!={'count','sha256'} or type(value['count']) is not int or value['count']<0 or not _hash(value['sha256']):raise Refusal('completion_invalid')
-    for key,value in {'generation':g['id'],'parent':g['parent'],'parent_ref':m['parent_ref'],'source':g['source'],'source_identity':m['source_identity'],'identity':m['identity'],'contracts':m['contracts'],'start':[g['start_height'],g['start_index']],'target':g['target_height'],'witness':g['witness_height'],'anchors':m['anchors'],'required_epochs':m['required_epochs'],'capabilities':m['capabilities']}.items():
-        if digest(semantic.get(key))!=digest(value):raise Refusal('completion_mismatch')
+    for name,value in {'generation':g['id'],'parent':g['parent'],'parent_ref':m['parent_ref'],'source':g['source'],'source_identity':m['source_identity'],key:m[key],'contracts':m['contracts'],'start':[g['start_height'],g['start_index']],'target':g['target_height'],'witness':g['witness_height'],'anchors':m['anchors'],'required_epochs':m['required_epochs'],'capabilities':m['capabilities']}.items():
+        if digest(semantic.get(name))!=digest(value):raise Refusal('completion_mismatch')
     if proof is not None and digest(proof)!=integrity['root']:raise Refusal('completion_mismatch')
     if manifest is not None and digest(manifest)!=digest(m):raise Refusal('completion_mismatch')
     if m.get('validation',{}).get('kind')!='provider-enumeration' or not store.completed(g['id'],'handoff','initial'):raise Refusal('provider_completeness_receipt_missing')
@@ -241,8 +263,9 @@ def finalize_pending_incremental(store,generation,manifest,receipt,ticket):
     original={k:v for k,v in g['manifest'].items() if k not in ('validation','provider_attempts_this_invocation')}
     candidate={k:v for k,v in m.items() if k not in ('validation','provider_attempts_this_invocation')}
     if digest(original)!=digest(candidate):raise Refusal('completion_mismatch')
-    rh=_bounded(receipt);m['integrity']={'version':2,'kind':KIND,'root':digest(ticket.proof),'semantic':ticket.proof}
-    m['validation']={'kind':'provider-enumeration','integrity_kind':KIND}
+    # The kind follows the manifest's form, fixed when the generation began.
+    kind=form(m);rh=_bounded(receipt);m['integrity']={'version':2,'kind':kind,'root':digest(ticket.proof),'semantic':ticket.proof}
+    m['validation']={'kind':'provider-enumeration','integrity_kind':kind}
     m['completion']={'version':2,'original_receipt_sha256':rh,'sha256':digest({'integrity':m['integrity'],'original_receipt_sha256':rh})}
     with store.atomic():
         _ticket(store,generation,ticket)
