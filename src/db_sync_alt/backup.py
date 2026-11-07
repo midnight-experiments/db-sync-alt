@@ -120,7 +120,6 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
     try:body=json.loads(manifest.read_text())
     except (ValueError,UnicodeError):raise Refusal('invalid_backup_manifest') from None
     if body.get('format') not in FORMATS or body.get('postgres_major')!=POSTGRES_MAJOR or body.get('schema_version') not in FORMATS[body['format']] or body.get('schema_version') not in SUPPORTED_SCHEMA_VERSIONS or body.get('owner')!=OWNER:raise Refusal('unsupported_backup_identity')
-    if body['format']==BACKUP_FORMAT and type(body.get('canonical_ready')) is not int:raise Refusal('invalid_backup_canonical')
     if reader_role is not None and body['format'] not in SERVING_FORMATS:raise Refusal('reader_requires_current_schema')
     if body.get('archive')!=file_hash(archive):raise Refusal('backup_checksum_mismatch')
     from db_sync_alt.networks import for_identity
@@ -148,7 +147,8 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
         apply_privileges(db)
         # Transfer ownership to PgStore without dropping the fencing session.
         store=PgStore.__new__(PgStore);store.db=db;store._writer=True;store.readonly=False;store.reserve_check=reserve_check;store.progress_callback=None
-        if store.meta('profile')!=profile or store.network!=network or format_reports(store,body['format'],body.get('canonical_ready'))!=body.get('generations') or physical_inventory(store)!=body.get('physical_inventory'):raise Refusal('restored_database_mismatch')
+        if type(body.get('canonical_ready')) is not int:raise Refusal('invalid_backup_canonical')
+        if store.meta('profile')!=profile or store.network!=network or format_reports(store,body['format'],body['canonical_ready'])!=body.get('generations') or physical_inventory(store)!=body.get('physical_inventory'):raise Refusal('restored_database_mismatch')
         # Explicit one-shot polling may create a poll policy even on schema 1;
         # jobs without a policy marker are left unchanged (the helper skips them).
         from db_sync_alt.sources.blockfrost.poller import bind_restored_poll_policy

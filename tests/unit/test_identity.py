@@ -72,15 +72,22 @@ class IdentityTests(unittest.TestCase):
         from db_sync_alt.store import database, incremental
         self.assertEqual((database.OWNER, database.RESTORE_GUARD, database.PROJECTION_WRITE),
                          ('db-sync-alt', 'db_sync_alt_restore_guard', 'db_sync_alt.projection_write'))
-        self.assertEqual(backup.BACKUP_FORMAT, 'db-sync-alt-postgresql-backup-v2')
-        self.assertEqual(backup.FORMATS, {'db-sync-alt-postgresql-backup-v1': (1, 2), 'db-sync-alt-postgresql-backup-v2': (3,)})
+        self.assertEqual(backup.BACKUP_FORMAT, 'db-sync-alt-postgresql-backup-v3')
+        self.assertEqual(backup.FORMATS, {'db-sync-alt-postgresql-backup-v1': (1, 2), 'db-sync-alt-postgresql-backup-v2': (3,),
+                                          'db-sync-alt-postgresql-backup-v3': (4,)})
+        self.assertEqual(backup.SERVING_FORMATS, ('db-sync-alt-postgresql-backup-v2', 'db-sync-alt-postgresql-backup-v3'))
+        self.assertEqual((database.SCHEMA_VERSION, database.SUPPORTED_SCHEMA_VERSIONS), (4, (1, 2, 3, 4)))
         self.assertEqual(incremental.FULL_DIGESTS, 'full-digests-v1')
         self.assertEqual(incremental.PROFILE_FIELD, {'certified-parent-delta-v1': 'identity', 'certified-parent-delta-v2': 'identity_sha256'})
         self.assertEqual((incremental.KIND_V1, incremental.KIND_V2), ('certified-parent-delta-v1', 'certified-parent-delta-v2'))
         store = Path(database.__file__).parent
-        for name in ('schema.sql', 'schema_v2.sql', 'schema_v3.sql'):
+        for name in ('schema.sql', 'schema_v2.sql', 'schema_v3.sql', 'schema_v4.sql'):
             self.assertIn("s.owner='" + database.OWNER + "'", (store / name).read_text(), name)
-        self.assertIn("current_setting('" + database.PROJECTION_WRITE + "',true)", (store / 'schema_v2.sql').read_text())
+        for name in ('schema_v2.sql', 'schema_v4.sql'):
+            self.assertIn("current_setting('" + database.PROJECTION_WRITE + "',true)", (store / name).read_text(), name)
+        self.assertEqual((database.WRITER_LOCK, database.SERVING_LOCK), ((36, 1), (36, 2)))
+        for lock in ('classid=36 AND objid=1 AND objsubid=2', 'classid=36 AND objid=2 AND objsubid=2'):
+            self.assertIn(lock, (store / 'schema_v4.sql').read_text())
 
     def test_packaged_reference_matches_its_manifest(self):
         reference = data_dir('reference')
