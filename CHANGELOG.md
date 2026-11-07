@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - **BREAKING: schema 4.** A database needs `db-sync-alt upgrade`, run once with
   the service stopped, before this version serves it; the service refuses an
