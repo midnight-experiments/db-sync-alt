@@ -246,7 +246,9 @@ class CheckpointPGTests(CheckpointFixture):
         driver, health, step = self.driver(store, dsn, lambda: now[0])
         step(OFFSET + 11)
         self.assertEqual((store.generation()['id'], store.integrity()['base']), (1, 0))
-        now[0] += 601
+        # Exactly one interval: the first checkpoint is due now. The next one is due an interval
+        # after the server time it is written at, which is after `now`, so it is not due yet.
+        now[0] += 600
         seen = []
         store.progress_callback = lambda phase, **fields: seen.append(health.snapshot()['sync'])
         self.assertIs(step(), False)
