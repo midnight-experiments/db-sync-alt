@@ -83,7 +83,26 @@ class StateTests(unittest.TestCase):
             'lifecycle', 'sync', 'serving', 'provider_head', 'provider_observed_at',
             'confirmed_target', 'committed_target', 'served_target', 'witness', 'pending',
             'lag', 'freshness', 'last_successful_sync', 'retry_at', 'quota', 'database',
-            'workers', 'operation', 'error_code', 'policy', 'healthy', 'reason_codes', 'reader', 'warnings'})
+            'workers', 'operation', 'error_code', 'policy', 'healthy', 'reason_codes', 'reader', 'warnings', 'integrity'})
+
+    def test_integrity_base_and_checkpointing_are_reported(self):
+        result, _ = healthy()
+        self.assertEqual(result.snapshot()['integrity'], {'base': None, 'checkpointed_at': None})
+        result.integrity(base=7, checkpointed_at=None)
+        self.assertEqual(result.snapshot()['integrity'], {'base': 7, 'checkpointed_at': None})
+        result.integrity(base=9, checkpointed_at=1700000000.5)
+        self.assertEqual(result.snapshot()['integrity'], {'base': 9, 'checkpointed_at': 1700000000.5})
+        for base, at in ((-1, None), (True, None), ('9', None), (9, float('nan')), (9, -1), (9, '2026-11-07')):
+            with self.subTest(base=base, at=at), self.assertRaises(ValueError):
+                result.integrity(base=base, checkpointed_at=at)
+        # A periodic checkpoint pauses publication briefly; health stays green while lag is within policy.
+        result.update(sync='checkpointing')
+        code, value = result.health()
+        self.assertEqual((code, value['sync'], value['reason_codes']), (200, 'checkpointing', []))
+        result.verified_schema(4)
+        self.assertEqual(result.snapshot()['schema_version'], '4')
+        with self.assertRaises(ValueError):
+            result.verified_schema(5)
 
     def test_every_unready_lifecycle_is_503(self):
         for lifecycle in ('starting', 'restoring', 'stopping', 'stopped', 'failed', 'halted'):

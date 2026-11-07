@@ -201,7 +201,7 @@ agree. It picks the highest confirmed target unless `--target-height` is given,
 works in windows of `--window-blocks` (default 1,000) and checks free space
 (`--reserve PATH:BYTES`, BYTES a whole number of bytes, default
 `/:10737418240`, 10 GiB). `upgrade` turns the new schema-1
-database into schema 3 and builds the served tables. After that, `db-sync-alt
+database into schema 4 and builds the served tables. After that, `db-sync-alt
 run` with the same database resumes it and follows Blockfrost.
 
 Measured on Preprod (a db-sync on the same machine, PostgreSQL 17 with 1 CPU and
@@ -231,6 +231,26 @@ Stop the service before backups, upgrades and other administrative commands;
 they take the same writer lock and refuse to run next to it. Stopping the
 service does not stop serving: the node keeps reading the last published update
 from PostgreSQL, and only freshness falls behind.
+
+## Integrity checkpoints
+
+Every start verifies the database in full from its
+[integrity base](glossary.md#integrity-checkpoint): it recomputes the digests of
+all stored facts at the base, compares them with the base's checkpoint, and
+verifies every update published since the base. Once the start has verified the
+canonical generation, that generation becomes the new base, so the next start
+walks only what is published after it.
+
+While the service runs, it writes a checkpoint between publications every
+`integrity_checkpoint_interval_seconds` of the `sync` section in
+`service.json` (default 21,600, 6 hours; 600 to 604,800). It verifies the
+canonical generation in full and makes it the base; publication waits meanwhile
+(about 1.5 to 2 minutes on Preprod, a few blocks of lag) and `/status` shows
+`sync: checkpointing`. `/status` reports the base and when its checkpoint was
+written (`integrity`). A database whose base is still its first generation
+(right after a restore of the snapshot) has no checkpoint yet; the first one is
+written once a newer update is published and the interval has passed, or at the
+next start.
 
 ## Provider configuration
 

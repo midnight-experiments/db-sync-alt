@@ -133,8 +133,8 @@ db-sync-alt run --network preprod \
   --manifest db-sync-alt-0.1.0-preprod-5366232.manifest.json
 ```
 
-db-sync-alt restores and verifies the snapshot, then serves it and follows new
-blocks from Blockfrost; `/health` returns 200 once it has caught up. Catching up
+db-sync-alt restores and verifies the snapshot, upgrades it to schema 4, then
+serves it and follows new blocks from Blockfrost; `/health` returns 200 once it has caught up. Catching up
 from the snapshot costs Blockfrost requests ([costs](docs/costs.md)). It runs in
 the foreground: Ctrl-C stops it and the same command resumes it. All options:
 `db-sync-alt run --help`.
@@ -146,6 +146,17 @@ db-sync-alt can build the initial data from it once: read-only, without
 Blockfrost requests, in about 18 minutes for Preprod. Then run
 `db-sync-alt upgrade` and `db-sync-alt run` without `--archive`. See
 [build initial data from your own db-sync](docs/operations.md#build-initial-data-from-your-own-db-sync).
+
+## Upgrade an existing database
+
+This version needs a schema-4 database; db-sync-alt 0.1.x serves schema 3. With
+the service stopped, run `db-sync-alt upgrade` once, then start the service with
+this version. The upgrade verifies the whole history once, as a 0.1.x start
+does, and writes the first [integrity checkpoint](docs/glossary.md#integrity-checkpoint);
+from then on a start verifies from the last checkpoint and takes about as long
+however long the history is. There is no downgrade: 0.1.x refuses a schema-4
+database, so take a `pg_dump` of the stopped database first if you may need to
+go back. See [upgrade to schema 4](docs/recovery.md#upgrade-to-schema-4).
 
 ## Connect a Midnight node
 
@@ -180,7 +191,10 @@ curl http://127.0.0.1:18080/status
 `/health` returns 200 when db-sync-alt is ready and up to date and the reader
 login reads the node's relations, otherwise 503 with reason codes. `/status`
 returns 200 with the full state, healthy or not, including the reader login's
-settings and report-only `warnings`.
+settings, report-only `warnings` and the integrity base (`integrity`: its
+generation and when its checkpoint was written). Every 6 hours by default the
+service writes an [integrity checkpoint](docs/operations.md#integrity-checkpoints);
+publication waits for it and `sync` reads `checkpointing`.
 [Troubleshooting](docs/troubleshooting.md) explains every code.
 
 ## Status and roadmap

@@ -10,6 +10,7 @@ importing or restoring. A restore drops all privileges: grant again afterwards (
 """
 from psycopg import sql
 from db_sync_alt.contract import Refusal
+from db_sync_alt.store.database import SCHEMA_VERSION
 
 NODE_RELATIONS = ('block', 'tx', 'tx_out', 'tx_in', 'ma_tx_out', 'multi_asset', 'datum', 'epoch_param', 'epoch_stake', 'pool_hash')
 UNGRANTED = ('tx_metadata',)
@@ -35,10 +36,10 @@ def _attributes(db, role):
 
 
 def grant_reader(db, role):
-    """Grant `role` read access to the node-facing relations of a schema-3 database."""
+    """Grant `role` read access to the node-facing relations of a database of the current schema."""
     _attributes(db, role)
     if db.execute("SELECT to_regprocedure('chain.gate()')").fetchone()[0] is None or \
-            db.execute('SELECT schema_version FROM chain.service_state WHERE id=1').fetchone() != (3,):
+            db.execute('SELECT schema_version FROM chain.service_state WHERE id=1').fetchone() != (SCHEMA_VERSION,):
         raise Refusal('reader_requires_current_schema')
     ident, database = sql.Identifier(role), sql.Identifier(db.info.dbname)
     with db.transaction():

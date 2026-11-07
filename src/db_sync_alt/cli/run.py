@@ -166,14 +166,14 @@ def accepted_backup(args):
             raise LaunchError('empty_database_requires_archive_and_manifest')
         archive = Path(input('Accepted backup archive absolute path: '))
         manifest = Path(input('Accepted manifest absolute path: '))
-    from db_sync_alt.backup import BACKUP_FORMAT, file_hash, safe_file
-    from db_sync_alt.store.database import OWNER, POSTGRES_MAJOR, SCHEMA_VERSION
+    from db_sync_alt.backup import FORMATS, SERVING_FORMATS, file_hash, safe_file
+    from db_sync_alt.store.database import OWNER, POSTGRES_MAJOR
     from db_sync_alt.networks import for_identity
     archive, manifest = safe_file(archive, existing=True), safe_file(manifest, existing=True)
     body = json.loads(manifest.read_text())
     network = for_identity(body.get('profile', {}))
-    if (body.get('format') != BACKUP_FORMAT or body.get('postgres_major') != POSTGRES_MAJOR
-            or body.get('schema_version') != SCHEMA_VERSION or body.get('owner') != OWNER
+    if (body.get('format') not in SERVING_FORMATS or body.get('postgres_major') != POSTGRES_MAJOR
+            or body.get('schema_version') not in FORMATS[body['format']] or body.get('owner') != OWNER
             or body.get('archive') != file_hash(archive) or network is None or network.network != args.network):
         raise LaunchError('invalid_accepted_backup')
     return archive, manifest

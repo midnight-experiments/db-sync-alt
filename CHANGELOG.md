@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **BREAKING: schema 4.** A database needs `db-sync-alt upgrade`, run once with
+  the service stopped, before this version serves it; the service refuses an
+  older schema (`schema_upgrade_required`). Versions before 0.2.0 refuse a
+  schema-4 database (`unsupported_database_identity`), so there is no downgrade:
+  keep a `pg_dump` of the stopped database taken before the upgrade to go back.
+  The upgrade verifies the whole history once and keeps node queries answering
+  from the last published update while it runs.
 - **BREAKING:** every new incremental update records the network profile by its
   SHA-256 digest (`identity_sha256`, integrity kind `certified-parent-delta-v2`)
   instead of embedding the profile twice. Once the first such update is written,
@@ -11,6 +18,29 @@
   embedded profile (`certified-parent-delta-v1`) and are verified under their own
   rules, in one lineage with the new ones; an update left pending by 0.1.x is
   finished in its own form.
+- Integrity checkpoints: after a full verification, db-sync-alt records the
+  digests of every fact family and the integrity root of the verified
+  generation, and makes it the integrity base. Startup recomputes the base's
+  digests, compares them with the checkpoint and verifies only the updates
+  published since: its time grows with the stored data, not with the number of
+  updates.
+  Checkpoints are written after each startup verification, by `upgrade`, by the
+  restore of a schema-3 backup, and every `integrity_checkpoint_interval_seconds`
+  while the service runs (`sync` section of `service.json`, default 21,600,
+  600 to 604,800); publication waits while one is written and `sync` reads
+  `checkpointing`.
+- `/health` and `/status` report `integrity`: the integrity base and when its
+  checkpoint was written.
+- `backup` and `verify` verify the canonical generation once, from the integrity
+  base: their time grows linearly with the data. Backups of schema 4 use the
+  format `db-sync-alt-postgresql-backup-v3` and include the checkpoints. Backups
+  of format v2 (schema 3, such as the 0.1.0 Preprod snapshot) still restore, are
+  compared generation by generation and are upgraded to schema 4 before the
+  reader is granted; the service's first run accepts both formats.
+- A generation older than the integrity base is not verified on its own
+  (`generation_before_integrity_base`). New refusals for a base whose facts or
+  checkpoint changed: `checkpoint_digest_mismatch`, `checkpoint_root_mismatch`,
+  `checkpoint_chain_mismatch`.
 - `db-sync-alt status` lists one summary row per generation (`id`, `parent`,
   `status`, `source` and the heights `start_height`, `start_index`,
   `target_height`, `witness_height`) and no manifest. Read a manifest with

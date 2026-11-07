@@ -30,7 +30,7 @@ flowchart LR
 | `src/db_sync_alt/service/` | `runtime.py`: the service lifecycle, writer, reader grants and checks, observers; `health.py`: `/health` and `/status` |
 | `src/db_sync_alt/sources/blockfrost/` | Blockfrost: HTTP client and request ledger (`provider.py`), CBOR decoding (`cbor.py`), fact adapter and full update (`adapter.py`), sync driver and accounted provider (`sync.py`), 20-second tip poller (`poller.py`), continuation of a ready store (`follow.py`) |
 | `src/db_sync_alt/sources/dbsync/` | Read-only cardano-db-sync reader (`reader.py`) and the initial build from it (`acquire.py`) |
-| `src/db_sync_alt/store/` | `database.py`: `PgStore` (generations, facts, membership, receipts, publication, locks); `incremental.py`: certified updates (schema 2 and later); `upgrade.py`: schema 1 → 2 → 3; `reader.py`: the node reader's grants; the SQL schema files |
+| `src/db_sync_alt/store/` | `database.py`: `PgStore` (generations, facts, membership, receipts, publication, locks); `incremental.py`: certified updates (schema 2 and later); `upgrade.py`: schema 1 → 2 → 3 → 4; `reader.py`: the node reader's grants; the SQL schema files |
 | `src/db_sync_alt/verify/` | `store.py`: independent verification of a generation; `completion.py`: completion seals of an update |
 | `src/db_sync_alt/backup.py` | PostgreSQL-native backup, restore, verify and status |
 | `src/db_sync_alt/contract.py`, `node_queries.py` | The fact contract and profile; the Midnight node's SQL catalogue read from `reference/` |
@@ -55,9 +55,13 @@ reconnecting without the lock. A committed block that disagrees with the source
 revokes serving (`canonical_conflict`). Headers above the target are provisional
 and can be replaced after a fork without touching committed history.
 
-Startup, backups and `db-sync-alt verify` verify all generations in full. From
-schema 2 on, the follower publishes certified updates: each update is proved against
-its already verified parent, so it does not re-read all history.
+Startup, backups and `db-sync-alt verify` verify the canonical generation in full
+from the [integrity base](glossary.md#integrity-checkpoint): the base's fact
+digests are recomputed and compared with its checkpoint, and every update
+published after it is verified again. A successful startup verification, and a
+periodic one while the service runs, makes the canonical generation the new base.
+From schema 2 on, the follower publishes certified updates: each update is proved
+against its already verified parent, so it does not re-read all history.
 
 ## Served tables
 

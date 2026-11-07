@@ -1,9 +1,9 @@
-"""Explicit, fenced schema upgrades (1 -> 2 -> 3); never run as an implicit live startup step."""
+"""Explicit, fenced schema upgrades (1 -> 2 -> 3 -> 4); never run as an implicit live startup step."""
 from pathlib import Path
 from psycopg import sql
 from db_sync_alt.contract import TABLES,Refusal
 
-LATEST=3
+LATEST=4
 
 
 def _upgrade_v2(store,state):
@@ -110,21 +110,50 @@ def _upgrade_v3(store,state,ordinal_source=None):
     return {'served_rows':counts,'ordinals_from_source':{t:len(v) for t,v in found.items()}}
 
 
+def _upgrade_v4(store,state,checkpoint):
+    """Integrity checkpoints; the serving gate requires schema 4. One transaction: the table, its guards,
+    the gate, the schema version and the first checkpoint (from the full verification `checkpoint`
+    holds, when its generation is newer than the integrity base)."""
+    from db_sync_alt.store.database import SERVING_LOCK,PROJECTION_WRITE,apply_privileges
+    from db_sync_alt.store.incremental import insert_checkpoint,integrity_base
+    with store.atomic():
+        store.db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
+        if store.state()!=state:raise Refusal('upgrade_state_changed')
+        store.db.execute('SELECT set_config(%s,%s,true)',(PROJECTION_WRITE,'on'))
+        store.db.execute(Path(__file__).with_name('schema_v4.sql').read_text())
+        store.db.execute('UPDATE chain.service_state SET schema_version=4 WHERE id=1')
+        written=None
+        if checkpoint is not None and checkpoint.generation>integrity_base(store)[0]:
+            written=insert_checkpoint(store,checkpoint)['generation']
+        apply_privileges(store.db)
+    return written
+
+
 def upgrade_store(store,ordinal_source=None):
-    """Upgrade a ready store to schema 3. A store whose inputs or output assets have no ledger
-    ordinal (written before schema 3) needs `ordinal_source`, a read-only db-sync source."""
+    """Upgrade a ready store to schema 4. A store whose inputs or output assets have no ledger
+    ordinal (written before schema 3) needs `ordinal_source`, a read-only db-sync source.
+
+    The full verification that starts the upgrade also writes the first integrity checkpoint."""
     from db_sync_alt.verify.store import verify_store
+    from db_sync_alt.store.incremental import certify_checkpoint
     store.require_writer()
     state=store.state()
     if state['schema_version']==LATEST:return {'schema_version':LATEST,'changed':False}
-    if state['schema_version'] not in (1,2) or state['migration_state']!='ready' or state['revoked']:raise Refusal('upgrade_requires_ready')
-    report=verify_store(store)
+    if state['schema_version'] not in (1,2,3) or state['migration_state']!='ready' or state['revoked']:raise Refusal('upgrade_requires_ready')
+    if state['schema_version']==1:
+        # Schema 2 makes the verified canonical generation the integrity base: nothing to checkpoint.
+        report=verify_store(store);checkpoint=None
+    else:
+        checkpoint=certify_checkpoint(store);report=checkpoint.report
+    served={}
     if state['schema_version']==1:
         _upgrade_v2(store,state);state=store.state()
-    served=_upgrade_v3(store,state,ordinal_source)
+    if state['schema_version']==2:
+        served=_upgrade_v3(store,state,ordinal_source);state=store.state()
+    written=_upgrade_v4(store,state,checkpoint)
     from db_sync_alt.store import serve
     serve.verify(store,store.state()['canonical_ready'])
-    return {'schema_version':LATEST,'changed':True,'base_generation':store.state()['canonical_ready'],'full_verification':report,**served}
+    return {'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served}
 
 
 def main(argv=None):

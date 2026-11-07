@@ -171,19 +171,42 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
             if not tx and not any(c['receipt'].get('epoch_end',{}).get('hash')==h.hex() for c in epochs):raise Refusal('unexpected_membership')
 
 
+def verify_checkpoint(store,g,computed,checkpoint,*,require_ready=True):
+    """The integrity base against its checkpoint: the recomputed digests, the root, the counts
+    and the chain of checkpoints back to the full-certified generation they started from."""
+    from db_sync_alt.store.incremental import incremental,integrity_reference,validate_completion_v2
+    if checkpoint['digests']!=computed:raise Refusal('checkpoint_digest_mismatch')
+    if checkpoint['root']!=integrity_reference(g)['sha256']:raise Refusal('checkpoint_root_mismatch')
+    if incremental(g):
+        validate_completion_v2(store,g,require_seal=require_ready)
+        if g['manifest']['integrity']['semantic']['counts']!={k:v['count'] for k,v in computed.items()}:raise Refusal('incremental_count_mismatch')
+    else:
+        from db_sync_alt.verify.completion import validate_completion
+        validate_completion(store,g,computed)
+        if require_ready:validate_publication(store,g,computed)
+    chain=store.db.execute('SELECT generation,previous_base FROM chain.integrity_checkpoints ORDER BY generation').fetchall()
+    first=store.generation(chain[0][1])
+    if chain[-1][0]!=g['id'] or incremental(first) or any(previous!=earlier for (earlier,_),(_,previous) in zip(chain,chain[1:])):
+        raise Refusal('checkpoint_chain_mismatch')
+
+
 def verify_store(store,generation=None,*,require_ready=True):
-    from db_sync_alt.store.incremental import incremental,compute_proof,validate_completion_v2
+    from db_sync_alt.store.incremental import incremental,compute_proof,validate_completion_v2,integrity_base
     g=store.generation(generation);gen=g['id'];m=g['manifest']
     verify_structure(store,g,require_ready=require_ready)
     computed=store.digests(gen)
-    if incremental(g):
-        base=store.db.execute('SELECT base_generation FROM chain.integrity_state WHERE id=1').fetchone()[0]
+    base,checkpoint=integrity_base(store) if store.supports_incremental else (None,None)
+    if checkpoint is not None and gen<base:raise Refusal('generation_before_integrity_base')
+    if checkpoint is not None and gen==base:
+        verify_checkpoint(store,g,computed,checkpoint,require_ready=require_ready)
+    elif incremental(g):
         if base>=gen:raise Refusal('invalid_incremental_base')
         verify_store(store,base)
         validate_completion_v2(store,g,proof=compute_proof(store,g),require_seal=require_ready)
         if 'completion' in m and m['integrity']['semantic']['counts']!={k:v['count'] for k,v in computed.items()}:raise Refusal('incremental_count_mismatch')
-        # Verify every transition from its immutable full-certified base. Startup
-        # remains deliberately a full audit, never persisted-JSON trust.
+        # Startup is a full audit from the integrity base: the base's digests are recomputed and
+        # compared with its checkpoint (or its own manifest), never trusted, and every transition
+        # published after the base is verified again.
         for (ancestor,) in store.db.execute('SELECT id FROM chain.generations WHERE id>%s AND id<%s ORDER BY id',(base,gen)):
             old=store.generation(ancestor)
             if incremental(old):validate_completion_v2(store,old,proof=compute_proof(store,old),require_seal=True)
@@ -244,6 +267,7 @@ def physical_inventory(store):
     from db_sync_alt.contract import TABLES, KEYS, canonical
     order={**{table:','.join(KEYS[table]) for table in TABLES},'metadata':'key','generations':'id','generation_blocks':'generation,height','checkpoints':'generation,phase,unit','provenance':'generation,kind,key','pools':'pool_hash','sync_jobs':'id'}
     if store.supports_incremental:order.update(integrity_state='id',current_membership='height',generation_reuse='generation',membership_delta='generation,height')
+    if store.supports_checkpoints:order.update(integrity_checkpoints='generation')
     if store.serves_directly:
         from db_sync_alt.store import serve
         order.update({'serve.'+table:key for table,key in serve.KEYS.items()})
@@ -251,6 +275,8 @@ def physical_inventory(store):
     for table,key in order.items():
         hasher=hashlib.sha256();count=0
         with store.db.transaction():
+            # Timestamps with a time zone serialize the same on every server.
+            store.db.execute("SET LOCAL TimeZone='UTC'")
             with store.db.cursor(name='physical_'+table.replace('.','_')) as cur:
                 cur.execute('SELECT to_jsonb(t) FROM '+(table if '.' in table else 'chain.'+table)+' t ORDER BY '+key)
                 for row, in cur:

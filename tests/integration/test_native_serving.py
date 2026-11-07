@@ -366,7 +366,7 @@ class ServedTablesTests(unittest.TestCase):
             self.assertEqual(store.state()['schema_version'], 2)
             source = Source({'inputs': {k: 3 for k in inputs}, 'output_assets': {k: 0 for k in assets}})
             result = upgrade_store(store, source)
-            self.assertEqual((result['schema_version'], result['ordinals_from_source']), (3, {'inputs': 1, 'output_assets': 2}))
+            self.assertEqual((result['schema_version'], result['ordinals_from_source']), (4, {'inputs': 1, 'output_assets': 2}))
             self.assertEqual(source.calls, [(inputs, assets, ['start', 'target'])])
             self.assertEqual(store.db.execute('SELECT id FROM serve.tx_in').fetchall(), [((START * 4096 + 4) * 4096 + 3,)])
             self.assertEqual(upgrade.missing_ordinals(store.db), {'inputs': [], 'output_assets': []})
@@ -379,7 +379,7 @@ class ServedTablesTests(unittest.TestCase):
         archive, manifest = folder / 'serve.dump', folder / 'serve.manifest.json'
         backup(archive, manifest, conninfo=dsn)
         body = json.loads(manifest.read_text())
-        self.assertEqual((body['format'], body['schema_version']), ('db-sync-alt-postgresql-backup-v2', 3))
+        self.assertEqual((body['format'], body['schema_version']), ('db-sync-alt-postgresql-backup-v3', 4))
         self.assertEqual(set(k for k in body['physical_inventory'] if k.startswith('serve.')), {'serve.' + t for t in serve.TABLES})
         role = self.reader()
         restored = self.database()
