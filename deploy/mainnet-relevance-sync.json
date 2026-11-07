@@ -1,0 +1,6 @@
+{
+  "sync": {
+    "follow_min_blocks": 3,
+    "follow_max_wait_seconds": 60
+  }
+}

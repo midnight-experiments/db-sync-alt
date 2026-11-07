@@ -186,7 +186,12 @@ class PgStore:
         return gen
     def require_pending(self,generation):
         self.require_writer()
-        if self.generation(generation)['status']!='pending' or self.meta('source_conflict'):raise Refusal('immutable_generation')
+        if generation is None:generation=self.meta('canonical_ready')
+        if generation is None:raise Refusal('no_ready_generation')
+        # Every mutation needs fresh status, not the potentially large manifest.
+        row=self.db.execute('SELECT status FROM chain.generations WHERE id=%s',(generation,)).fetchone()
+        if row is None:raise Refusal('generation_missing')
+        if row[0]!='pending' or self.meta('source_conflict'):raise Refusal('immutable_generation')
     def fact(self,table,key_values):
         if table not in TABLES:raise Refusal('unknown_fact_table')
         if isinstance(key_values,dict):key_values=tuple(key_values[k] for k in KEYS[table])

@@ -34,7 +34,7 @@ UNSUPPORTED = frozenset({'unsupported_nonempty_candidates', 'unsupported_candida
                          'unsupported_relevant_invalid_transaction', 'provider_relevant_invalid_transaction',
                          'unsupported_capabilities'})
 EPOCH_WAIT = frozenset({'provider_epoch_not_ready', 'provider_epoch_end_not_qualified',
-                         'provider_epoch_changed'})
+                         'provider_epoch_changed', 'epoch_preparation_not_ready'})
 # Fail-closed pending anchor refusals are reported under their own code.
 ANCHOR_REFUSALS = frozenset({'pending_target_changed', 'pending_suffix_base_changed',
                              'pending_anchor_changed'})
@@ -313,7 +313,7 @@ def validate_job(job, *, kind=None, security=None):
             or type(job.get('attempts')) is not int or type(job.get('budget')) is not int
             or not 0 <= job['attempts'] <= job['budget'] <= 10000 or job['budget'] < 1
             or job.get('state') not in {'active', 'completed', 'exhausted'}
-            or job.get('kind') not in {'poll', 'acquire'}
+            or job.get('kind') not in {'poll', 'acquire', 'epoch'}
             or (kind is not None and job['kind'] != kind)):
         raise LifecycleFailure('invalid_sync_job')
     for field in ('created_at', 'reserved_at', 'metrics_at', 'retry_at', 'completed_at'):
@@ -325,8 +325,13 @@ def validate_job(job, *, kind=None, security=None):
             raise LifecycleFailure('invalid_sync_job')
     if job.get('metrics_count', 0) > job['attempts'] or job.get('failure_count', 0) > 20:
         raise LifecycleFailure('invalid_sync_job')
-    if job.get('error_code') not in {None, 'provider_unavailable', 'provider_timeout', 'quota_exhausted', 'request_budget_exhausted'}:
+    if job.get('error_code') not in {None, 'provider_unavailable', 'provider_timeout', 'quota_exhausted', 'request_budget_exhausted', 'epoch_preparation_not_ready'}:
         raise LifecycleFailure('invalid_sync_job')
+    if job['kind'] == 'epoch':
+        if (job['budget'] > 8000 or type(job.get('epoch')) is not int or not 0 <= job['epoch'] < 2**31
+                or not isinstance(job.get('profile_sha256'), str)
+                or re.fullmatch('[0-9a-f]{64}', job['profile_sha256']) is None):
+            raise LifecycleFailure('invalid_sync_job')
     if job['kind'] == 'acquire':
         if any(type(job.get(field)) is not int or job[field] < 0 for field in ('target', 'witness', 'parent')):
             raise LifecycleFailure('invalid_sync_job')
@@ -448,6 +453,8 @@ class AccountedProvider(ProviderClient):
         try:
             result = self.client.get(path, purpose='db-sync-alt:' + self.job_id)
         except Exception as error:
+            if isinstance(error, Refusal) and error.code == 'interrupted' and self.stop_event.is_set():
+                raise
             usage = self._quota()
             text = str(error)  # classify known shared machine text, never serialize it
             status = getattr(error, 'http_status', None)
@@ -551,11 +558,16 @@ class SyncDriver:
         self.options = dict(getattr(config, 'sync', {}))
         defaults = {'max_batch_blocks': 100, 'publication_interval_seconds': 60,
                     'acquisition_request_budget': 10000, 'daily_poll_request_budget': 10000,
-                    'follow_min_blocks': 1, 'follow_max_wait_seconds': 40}
+                    'follow_min_blocks': 1, 'follow_max_wait_seconds': 40, 'epoch_preparation': False}
         if set(self.options) - set(defaults):
             raise LifecycleFailure('invalid_sync_configuration')
         for key, value in defaults.items():
             self.options.setdefault(key, value)
+        if type(self.options['epoch_preparation']) is not bool:
+            raise LifecycleFailure('invalid_sync_configuration')
+        if self.options['epoch_preparation'] and (self.profile.network.network != 'mainnet' or getattr(config, 'shutdown_seconds', 30) < 30):
+            raise LifecycleFailure('invalid_sync_configuration')
+        self._preparer = None
         for key, high in (('max_batch_blocks', 1000), ('publication_interval_seconds', 1800),
                           ('acquisition_request_budget', 10000), ('daily_poll_request_budget', 10000),
                           ('follow_min_blocks', 100), ('follow_max_wait_seconds', 120)):
@@ -577,11 +589,21 @@ class SyncDriver:
         binding = owner_binding(store)
         if self._client is None:
             self._client = shared_client(self.profile.network)
+        if self.options['epoch_preparation']:
+            from db_sync_alt.sources.blockfrost.epoch_prepare import PriorityClient
+            self._client = PriorityClient(self._client, stop_event)
         self._poller = HeadPoller(lambda: PollBudgetStore(self.config.pg_service, binding),
                                  lambda: self._client, health, stop_event,
                                  interval=self.config.policy.poll_seconds, on_fatal=on_fatal,
                                  network=self.profile.network)
-        return self._poller.start()
+        thread = self._poller.start()
+        if self.options['epoch_preparation']:
+            from db_sync_alt.sources.blockfrost.epoch_stage import EpochStageStore
+            from db_sync_alt.sources.blockfrost.epoch_prepare import EpochPreparer
+            self._preparer = EpochPreparer(lambda: EpochStageStore(self.config.pg_service, binding, self.profile),
+                                          self._client, self.profile, self._poller, health, stop_event)
+            self._preparer.start()
+        return thread
 
     def wait_for_observation(self, timeout=1):
         if self._poller is not None:
@@ -753,6 +775,7 @@ class SyncDriver:
         provider = self._provider(store, 'provider-active', active, health, stop_event)
         provider.set_failure_context('verification', generation=pending['id'] if pending else ready['id'])
         hooks = PgHooks(health, stop_event)
+        hooks.epoch_preparation = self._preparer
         try:
             if self.update_fn is update and getattr(store, 'supports_incremental', False) and (not pending or pending['manifest'].get('integrity', {}).get('version') == 2):
                 from db_sync_alt.sources.blockfrost.follow import update_follow
@@ -772,7 +795,7 @@ class SyncDriver:
                 store.mark_conflict()
                 raise LifecycleFailure('unsupported_capability' if error.code in UNSUPPORTED else 'canonical_conflict') from None
             if error.code in EPOCH_WAIT:
-                provider._wait('provider_unavailable', minimum=self.clock() + 60)
+                provider._wait('epoch_preparation_not_ready' if error.code == 'epoch_preparation_not_ready' else 'provider_unavailable', minimum=self.clock() + 60)
             if error.code in ANCHOR_REFUSALS:
                 raise LifecycleFailure(error.code) from None
             raise LifecycleFailure('invalid_coverage') from None
@@ -783,4 +806,6 @@ class SyncDriver:
             raise LifecycleFailure('invalid_coverage')
         provider.job.update(state='completed', completed_at=self.clock(), retry_at=0, failure_count=0)
         provider.save()
+        if self._preparer is not None:
+            self._preparer.published(store)
         health.update(pending=PendingProgress())

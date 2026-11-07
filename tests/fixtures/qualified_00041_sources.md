@@ -1,0 +1,3 @@
+# Frozen regression controls
+
+`qualified_00041_acquire.py` and `qualified_00041_completion.py` are byte-identical source files from this same Apache-2.0 db-sync-alt repository, qualified tree58dffa97d052973be34ede988db1a8674578596f. They are test-only baseline/old-reader controls, never imported by production code. SHA256: acquire95385711f0b82f44ee2aa493375cf7c5f6de947f26880a27ac6f67eb137265f8; completion76a45636ad34816ffbd4ad0aea54e3a32bdd91b9a0c7647d33d8b895e76042fa. Freezing them avoids accidentally using an installed candidate as its own baseline or old-reader control when testing a newly packaged image. Initial actual qualified-image density reproduction preceded the repair; its evidence is retained separately.

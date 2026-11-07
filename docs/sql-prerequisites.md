@@ -1,0 +1,23 @@
+# Bounded SQL prerequisites and receipt compatibility
+
+New direct-SQL generations use `acquisition.version=2`. They acquire the complete history before the network's start block using the configured `window_blocks` (integer 1–10,000, default 1,000), then bisect a window on the existing `source_timeout` or `work_unit_too_dense` refusal. A single irreducible block still refuses and cannot publish. The source's 100,000-ID per-family cap, 15-second statement timeout, 1-second lock timeout, 60-second idle timeout, read-only repeatable-read snapshots and anchor checks are unchanged. This does not filter historical data or reset ordinals.
+
+Each inclusive prerequisite chunk uses a distinct `prerequisites/<lo>:<hi>` unit. Its facts and receipt commit in the same destination transaction. Receipts bind the immutable source identity, generation, profile, anchors and acquisition settings. Successful empty windows are also receipted. Resume validates the committed contiguous prefix from 0 before doing further work; gaps, overlap, invalid types/bounds/units or mismatched bindings refuse rather than silently skipping or relabeling data.
+
+A separate `prerequisites/complete` seal is created only after exact coverage through start−1. It includes the count and digest of the canonical ordered chunk receipts. Full chunks without that seal remain incomplete; a completion label without valid full chunks is invalid. Structure verification and SQL finalization independently validate coverage. Fact counts in chunks describe work performed, not necessarily unique semantic facts: dependency closure can legitimately revisit an immutable natural fact.
+
+Crash before commit rolls back both the chunk facts and receipt. Crash after commit preserves both; resume skips its valid prefix and preserves stable fact IDs. Final independent verification still freshly queries the SQL source, checks every expected fact and ordinal, and rejects omitted or extra candidate facts before immutable completion/publication. Candidate inventory is not reused as independent truth.
+
+Incremental children inherit certified prerequisite facts and create no new prerequisite chunks. A start cursor at block 0 has no prerequisite range or receipt. Facts before a cursor's transaction index within the start block retain the existing event/dependency behavior; chunking changes only heights strictly before the start block.
+
+## Compatibility and recovery
+
+**New version 2 SQL generations require the updated reader/service.** Old readers accept only acquisition.version=1 when admitting SQL completion and reject version 2 ready generations. This is an explicit data-receipt compatibility change; deployment/release notes must call it out. Network profiles, fact contract, PostgreSQL schema, native node query interface and SQL adapter identity are unchanged. Existing Preprod is not modified.
+
+A valid qualified version 1 whole-range `prerequisites/complete` receipt remains accepted without rewriting its generation manifest or attestation. An interrupted legacy generation with that complete prerequisite receipt can continue metadata/events and seal under its original version 1 identity. Legacy incremental and block-zero work remains resumable. Older admitted pre-adapter histories retain their previous legacy receipt semantics.
+
+A pending version 1 root that needs prerequisites but lacks a valid whole-range receipt refuses `legacy_prerequisites_pending_requires_recovery`. Keep that database/backup as evidence. Under a separately admitted capacity plan, create a fresh compact destination using the updated candidate and the same independently qualified SQL source. Do not edit a pending manifest from version 1 to version 2, invent a complete receipt, discard old facts without authorization or change the source attestation. There is no Mainnet compact destination on the current host to migrate as part of this repair.
+
+## Performance remains a measured gate
+
+The global independent address/asset `MATERIALIZED` selection is unchanged. More windows can repeat its fixed cost, so chunking is not proof that a real Mainnet unit fits its deadline. After the actual source is loaded, indexed and analyzed, benchmark normal and independent selectors/facts in representative prerequisite/event windows, preserving all timeouts/caps and independent semantics. Select an admitted supported window before starting a generation; resume retains its stored setting. If even a single-block selector fails because global materialization dominates, refuse and request a separately scoped optimization. Fixture results are not Mainnet throughput estimates.
