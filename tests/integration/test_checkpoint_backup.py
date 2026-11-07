@@ -54,7 +54,9 @@ class CheckpointBackupPGTests(CheckpointFixture):
         self.assertEqual(walk.generations, {2, 3})
         destination = self.database(); role = self.reader(destination)
         calls.clear()
-        with patch.object(backups, 'verify_store', counted):
+        # The restore reads the database size, not the list of generations with their manifests.
+        with patch.object(backups, 'verify_store', counted), \
+                patch.object(PgStore, 'status', side_effect=AssertionError('restore_listed_generations')):
             result = restore(archive, manifest, conninfo=destination, expected_manifest_sha256=receipt['manifest_sha256'], reader_role=role)
         self.assertEqual(calls, [(3,)])
         self.assertEqual((result['status'], result['canonical_ready']), ('restored', 3))

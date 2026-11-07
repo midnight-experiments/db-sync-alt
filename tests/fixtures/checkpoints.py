@@ -3,10 +3,12 @@
 The fixture chain of `fixtures.blockfrost_generation`, extended so that several incremental
 generations can follow generation 0 (targets OFFSET+11 to OFFSET+16). No live provider.
 """
+import contextlib
 import os
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import psycopg
 from psycopg import sql
@@ -15,6 +17,7 @@ from db_sync_alt.service.runtime import PostgresRuntime
 from db_sync_alt.sources.blockfrost.poller import HeadPoller, PollBudgetStore, owner_binding
 from db_sync_alt.sources.blockfrost.sync import SyncDriver
 from db_sync_alt.store.database import PgStore
+from db_sync_alt.store.incremental import KIND_V1, KIND_V2, incremental
 from db_sync_alt.store.upgrade import upgrade_store
 import fixtures.blockfrost_generation as gen_fixture
 import fixtures.database as real
@@ -70,19 +73,34 @@ class CheckpointFixture(unittest.TestCase):
         self.addCleanup(store.close)
         return store
 
-    def follow(self, store, dsn, target):
-        """One step of the sync driver, publishing one incremental generation up to `target`."""
+    def follow(self, store, dsn, target, *, kind=KIND_V2):
+        """One step of the sync driver, publishing one incremental generation up to `target`.
+
+        The generation has integrity kind `kind`: the profile bound by its digest (v2, the form the
+        writer builds) or embedded in the manifest (v1)."""
         routes = chain_routes(); health = self.state(); stop = threading.Event(); client = real.AccountedFake(routes)
         pollstore = PollBudgetStore(None, owner_binding(store), conninfo=dsn)
+        begin = store.begin_continuation
+
+        def embedded(**kw):
+            m = dict(kw['manifest']); del m['identity_sha256']; m['identity'] = self.profile.identity
+            return begin(**{**kw, 'manifest': m})
         try:
-            poller = HeadPoller(lambda: pollstore, lambda: client, health, stop, network=PREPROD)
-            poller.tick(pollstore, client)
-            driver = SyncDriver(SimpleNamespace(sync={}), client=client, profile=self.profile, fixed_target=target)
-            driver._poller = poller
-            driver.run_once(store, health, stop)
+            with patch.object(store, 'begin_continuation', embedded) if kind == KIND_V1 else contextlib.nullcontext():
+                poller = HeadPoller(lambda: pollstore, lambda: client, health, stop, network=PREPROD)
+                poller.tick(pollstore, client)
+                driver = SyncDriver(SimpleNamespace(sync={}), client=client, profile=self.profile, fixed_target=target)
+                driver._poller = poller
+                driver.run_once(store, health, stop)
         finally:
             pollstore.close()
         self.assertEqual(store.generation()['target_height'], target)
+        self.assertEqual(self.written_kind(store), kind)
+
+    def written_kind(self, store):
+        """The integrity kind of the canonical generation (None for a full generation)."""
+        g = store.generation()
+        return g['manifest']['integrity']['kind'] if incremental(g) else None
 
     def history(self, generations, *, schema=4):
         """Generation 0 plus `generations` incremental generations, at `schema` (3 or 4)."""
@@ -131,5 +149,7 @@ class CheckpointFixture(unittest.TestCase):
         def step(target=None, stop=None):
             poller.tick(pollstore, client)
             driver.fixed_target = target
-            return driver.run_once(store, health, stop or threading.Event())
+            result = driver.run_once(store, health, stop or threading.Event())
+            self.assertIn(self.written_kind(store), (None, KIND_V2))
+            return result
         return driver, health, step

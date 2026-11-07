@@ -174,6 +174,32 @@ class CheckpointPGTests(CheckpointFixture):
             with self.subTest(generation), self.assertRaisesRegex(Refusal, 'generation_before_integrity_base'):
                 verify_store(store, generation)
 
+    def test_checkpoint_at_an_embedded_profile_generation_then_digest_bound_generations(self):
+        """Generations of integrity kind v1 at schema 3, the upgrade's checkpoint at the last of them,
+        then generations of kind v2: each start verifies the checkpoint and walks only what follows it."""
+        dsn, store = self.history(0, schema=3)
+        for n in range(2):
+            self.follow(store, dsn, OFFSET + 11 + n, kind=incremental.KIND_V1)
+        store.close()
+        store = self.open(dsn)
+        result = upgrade_store(store)
+        self.assertEqual((result['schema_version'], result['checkpoint_generation'], result['base_generation']), (4, 2, 2))
+        self.assertEqual(self.checkpoints(store), [(2, 0)])
+        store, walked = self.startup(dsn, store)
+        self.assertEqual(walked, set())
+        for n in range(2):
+            self.follow(store, dsn, OFFSET + 13 + n)
+        kinds = {g: store.generation(g)['manifest']['integrity']['kind'] for g in (1, 2, 3, 4)}
+        self.assertEqual(kinds, {1: incremental.KIND_V1, 2: incremental.KIND_V1, 3: incremental.KIND_V2, 4: incremental.KIND_V2})
+        store, walked = self.startup(dsn, store)
+        self.assertEqual(walked, {3, 4})
+        self.assertEqual(self.checkpoints(store), [(2, 0), (4, 2)])
+        store, walked = self.startup(dsn, store)
+        self.assertEqual(walked, set())
+        self.assertEqual(verify_store(store)['digests'], store.digests(4))
+        with self.assertRaisesRegex(Refusal, 'generation_before_integrity_base'):
+            verify_store(store, 2)
+
     def test_changes_at_or_below_the_base_are_refused_at_startup(self):
         dsn, store = self.history(2)
         store, _ = self.startup(dsn, store)
