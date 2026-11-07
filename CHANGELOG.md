@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `db-sync-alt status` lists one summary row per generation (`id`, `parent`,
+  `status`, `source` and the heights `start_height`, `start_index`,
+  `target_height`, `witness_height`) and no manifest. Read a manifest with
+  `SELECT manifest FROM chain.generations WHERE id = …`.
+
 ## 0.1.1
 
 - Startup reads only the database's state row to decide whether to serve, and

@@ -26,6 +26,7 @@ FACT_ORDER = ('blocks','transactions','datums','outputs','inputs','assets','outp
 # among all ordinary inputs of its transaction, of an asset among all assets of its output.
 ORDINAL_TABLES = ('inputs','output_assets')
 ORDINAL_LIMIT = 4096
+GENERATION_SUMMARY = ('id','parent','status','source','start_height','start_index','target_height','witness_height')
 
 
 def connect(service=None, *, conninfo='', **kwargs):
@@ -441,7 +442,16 @@ class PgStore:
         self.db.execute('SELECT 1 FROM chain.checkpoints LIMIT 0')
         return state
     def status(self):
-        return {'format':FORMAT,**self.state(),'generations':[self.generation(r[0]) for r in self.db.execute('SELECT id FROM chain.generations ORDER BY id')], 'bytes':self.db.execute('SELECT pg_database_size(current_database())').fetchone()[0],'checkpoints':self.db.execute('SELECT count(*) FROM chain.checkpoints').fetchone()[0]}
+        """Database state plus one summary row per generation; manifests stay in PostgreSQL.
+
+        Generation columns beyond id are read only when history exists, so status of an empty
+        database needs only SELECT(id) on chain.generations.
+        """
+        state=self.state();generations=[]
+        if self.db.execute('SELECT id FROM chain.generations ORDER BY id LIMIT 1').fetchone() is not None:
+            generations=[dict(zip(GENERATION_SUMMARY,r)) for r in self.db.execute('SELECT '+','.join(GENERATION_SUMMARY)+' FROM chain.generations ORDER BY id')]
+        return {'format':FORMAT,**state,'generations':generations,'bytes':self.database_bytes(),'checkpoints':self.db.execute('SELECT count(*) FROM chain.checkpoints').fetchone()[0]}
+    def database_bytes(self):return self.db.execute('SELECT pg_database_size(current_database())').fetchone()[0]
     def sync_job(self,job_id):
         row=self.db.execute('SELECT body FROM chain.sync_jobs WHERE id=%s',(job_id,)).fetchone()
         return row[0] if row else None
