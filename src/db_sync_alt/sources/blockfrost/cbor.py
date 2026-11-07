@@ -104,6 +104,43 @@ def inputs(value):
         refs.add(k)
     return frozenset(refs)
 
+def output_details(output):
+    """Exact supported value/datum fields, or None: unknown is never negative evidence.
+
+    The existing envelope/shape checks remain authoritative. Older or unfamiliar
+    address/datum/script encodings retain the accounted full provider path.
+    """
+    address=output[0];value=output[1];datum=None;safe=True;datum_known=True
+    if not isinstance(address,bytes) or not address:return None
+    if isinstance(output,list):
+        if len(output)==3:
+            if output[2] is not None and (not isinstance(output[2],bytes) or len(output[2])!=32):return None
+            datum=output[2]
+    else:
+        option=output.get(2)
+        if option is not None:
+            if not isinstance(option,list) or len(option)!=2 or type(option[0]) is not int:safe=False;datum_known=False
+            elif option[0]==0 and isinstance(option[1],bytes) and len(option[1])==32:datum=option[1]
+            elif option[0]==1 and isinstance(option[1],Tag) and option[1].number==24 and isinstance(option[1].value,bytes):
+                try:decode_datum(option[1].value)
+                except Refusal:safe=False
+                datum=hashlib.blake2b(option[1].value,digest_size=32).digest()
+            else:safe=False;datum_known=False
+        script=output.get(3)
+        # Script-reference language decoding is not qualified by this filter.
+        # Even a structurally plausible reference keeps the full provider path.
+        if script is not None:safe=False
+    if uint(value):coin=value;multi={}
+    elif isinstance(value,list) and len(value)==2 and uint(value[0]) and isinstance(value[1],dict):coin,multi=value
+    else:return None
+    assets=[]
+    for policy,names in multi.items():
+        if not isinstance(policy,bytes) or len(policy)!=28 or not isinstance(names,dict) or not names:return None
+        for name,quantity in names.items():
+            if not isinstance(name,bytes) or len(name)>32 or not uint(quantity) or quantity==0:return None
+            assets.append((policy,name,quantity))
+    return {'address':address,'value':str(coin),'assets':tuple(sorted(assets)),'datum_hash':datum,'classification_safe':safe,'datum_known':datum_known}
+
 def decode_transaction(raw_hex,expected_hash):
     if not isinstance(raw_hex,str) or len(raw_hex)>8*1024*1024 or len(raw_hex)%2 or re.fullmatch('[0-9a-f]+',raw_hex) is None:raise Refusal('cbor_invalid_hex')
     if not isinstance(expected_hash,str) or re.fullmatch('[0-9a-f]{64}',expected_hash) is None:raise Refusal('cbor_invalid_hash')
@@ -128,8 +165,11 @@ def decode_transaction(raw_hex,expected_hash):
         for name,amount in names.items():
             if not isinstance(name,bytes) or len(name)>32 or type(amount) is not int or amount==0 or not -(1<<63)<=amount<(1<<63):raise Refusal('cbor_mint_shape')
             facts.append((policy,name,amount))
+    returned=body.get(16)
+    supported_return=isinstance(returned,list) and len(returned) in (2,3) or isinstance(returned,dict) and {0,1}.issubset(returned) and set(returned)<={0,1,2,3}
     return {'hash':bytes.fromhex(actual),'valid':valid,'ordinary':inputs(body[0]),'collateral':inputs(body.get(13,[])),
-            'reference':inputs(body.get(18,[])),'mints':tuple(sorted(facts)),'output_count':len(body[1]),'collateral_return':16 in body,'body_bytes':end-start}
+            'reference':inputs(body.get(18,[])),'mints':tuple(sorted(facts)),'output_count':len(body[1]),'collateral_return':16 in body,'body_bytes':end-start,
+            'outputs':tuple(output_details(o) for o in body[1]),'collateral_output':output_details(returned) if supported_return else None}
 
 
 def decode_datum(raw):

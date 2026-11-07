@@ -19,6 +19,7 @@ import time
 
 
 ERROR_CODES = frozenset({
+    'epoch_preparation_not_ready', 'epoch_preparation_invalid', 'epoch_preparation_adoption_changed',
     'unsupported_follow_mode', 'completion_recovery_required', 'completion_invalid', 'completion_mismatch',
     'provider_unavailable', 'provider_timeout', 'quota_exhausted',
     'database_unavailable', 'database_timeout', 'canonical_conflict',
@@ -183,6 +184,19 @@ class HealthState:
         self._db = None
         self._reader = None
         self._node_warnings = []
+        self._preparation = None
+
+    def preparation(self, *, epoch, state, attempts=None, error=None, recovery=False):
+        states = {'collecting', 'complete', 'adopted', 'failed', 'backoff', 'exhausted', 'waiting-required'}
+        if (epoch is not None and (type(epoch) is not int or epoch < 0)) or state not in states:
+            raise ValueError('invalid epoch preparation')
+        if attempts is not None and (type(attempts) is not int or not 0 <= attempts <= 8000):
+            raise ValueError('invalid epoch preparation budget')
+        if type(recovery) is not bool:
+            raise ValueError('invalid epoch preparation mode')
+        with self._lock:
+            self._preparation = dict(version=1, epoch=epoch, state=state, attempts=attempts, budget=8000,
+                                     error=None if error is None else _error(error), recovery=recovery)
 
     def verified_schema(self, version):
         if type(version) is not int or version not in (1,2,3):
@@ -365,6 +379,10 @@ class HealthState:
                 'stage': self._operation[0], 'progress_at': self._operation[1],
                 'progress_age_seconds': age(self._operation[2]), 'deadline_seconds': self._operation[3]}
             reasons = []
+            if (self._error_code == 'epoch_preparation_not_ready'
+                    or (self._preparation is not None and self._preparation['recovery']
+                        and self._preparation['state'] != 'adopted')):
+                reasons.append('epoch_preparation_not_ready')
             if self._poll_error is not None:
                 reasons.append('provider_poll_' + self._poll_error)
             if self._lifecycle != 'ready':
@@ -402,7 +420,7 @@ class HealthState:
                 reasons.append('serving_lag_unknown')
             elif lag_seconds > self.policy.serving_lag_max_seconds:
                 reasons.append('serving_lag_exceeded')
-            return dict(self._identity, follow_mode=self._follow_mode, poll_interval_seconds=self._poll_interval, poll_timing=None if self._poll_timing is None else dict(self._poll_timing), lifecycle=self._lifecycle, sync=self._sync, serving=self._serving,
+            value = dict(self._identity, follow_mode=self._follow_mode, poll_interval_seconds=self._poll_interval, poll_timing=None if self._poll_timing is None else dict(self._poll_timing), lifecycle=self._lifecycle, sync=self._sync, serving=self._serving,
                         provider_head=point(self._head), provider_observed_at=self._observed_at,
                         confirmed_target=point(self._confirmed), committed_target=point(self._committed),
                         served_target=point(self._served), witness=point(self._witness),
@@ -413,6 +431,9 @@ class HealthState:
                         reader=None if self._reader is None else json.loads(json.dumps(self._reader)),
                         warnings=([] if self._reader is None else list(self._reader['warnings'])) + list(self._node_warnings),
                         policy=asdict(self.policy), healthy=not reasons, reason_codes=reasons)
+            if self._preparation is not None:
+                value['epoch_preparation'] = dict(self._preparation)
+            return value
 
     def health(self, database=None):
         snapshot = self.snapshot(database)

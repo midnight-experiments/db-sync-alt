@@ -163,7 +163,7 @@ large history.
 
 An alternative that makes no Blockfrost requests. You need:
 
-- cardano-db-sync 13.7.1.0 for the same network (schema 15.48.6, `meta.network_name` of the network) with its full history:
+- cardano-db-sync 13.7.1.0 (schema 15.48.6) or 13.8.0.0 (schema 16.52.6), for the same network (`meta.network_name`) with its full core history:
   `tx_in` and epoch stake kept. It must be a different database from the
   destination; db-sync-alt reads it in read-only transactions.
 - An empty PostgreSQL 17 destination, with a private libpq service entry for each
@@ -172,6 +172,8 @@ An alternative that makes no Blockfrost requests. You need:
 
   ```json
   {"dbsync_version": "13.7.1.0", "tx_in_retained": true, "epoch_stake_retained": true, "operator_attested": true}
+
+  For a qualified 13.8.0.0 source, use `"dbsync_version": "13.8.0.0"` instead. It must match actual schema 16.52.6; never copy the 13.7 label merely to pass a gate. `meta.version` may legitimately name an older creating binary. Attest only after checking full-history source settings, mode markers and required history. Unsupported modes and incomplete epochs fail closed before publication.
   ```
 
   This is your statement about the source; db-sync-alt does not verify it. Other
@@ -250,3 +252,8 @@ configured network, refuses a key whose prefix names another network, refuses
 redirects, reserves each attempt before sending it, keeps provider cooldowns,
 does not retry behind your back and refuses a corrupt ledger. All programs that
 use one key must share one ledger.
+
+
+### Older stores needing source ordinals
+
+When upgrading a pre-schema3store whose ledger ordinals are absent, provide both `--source-service SOURCE` and `--source-attestation ATTESTATION.json`. The JSON has the same truthful version/retention fields as `acquire`. Ordinary upgrades whose ordinals already exist need neither option. Candidate compatibility change: old `upgrade --source-service SOURCE` commands must now include the attestation; the source schema/mode/type and version checks apply before ordinal recovery. No current Preprod upgrade is required by installing this isolated candidate.

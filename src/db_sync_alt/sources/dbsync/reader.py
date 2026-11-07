@@ -1,10 +1,11 @@
-"""Fixed, parameterized db-sync 13.7.1.0 queries. Every session is read-only.
+"""Fixed, parameterized queries for qualified full-history core db-sync sources. Every session is read-only.
 
 The source must report the profile's `meta.network_name`; k comes from the profile."""
 import contextlib
 import datetime
 import re
-from db_sync_alt.contract import Refusal, SCHEMA_VERSION, canonical, required_epochs
+from db_sync_alt.contract import Refusal, canonical, required_epochs
+from db_sync_alt.sources.dbsync.compatibility import SOURCE_COLUMNS, source_version, validate_columns, validate_modes, validate_attestation
 
 BLOCK_COLUMNS='b.hash,b.block_no AS height,p.hash AS parent_hash,b.epoch_no AS epoch,b.slot_no AS slot,b.time,b.tx_count'
 # Position of an input among all ordinary inputs of its spending transaction, and of an output
@@ -70,18 +71,32 @@ class SQLSource:
     def check_anchors(self,manifest):
         for old in manifest['anchors'].values():
             if old['hash']!=self.anchor(old['height'])['hash']:raise Refusal('source_anchor_conflict')
-    def preflight(self,end=None):
-        schema=self.one('SELECT stage_one,stage_two,stage_three FROM schema_version')
-        if tuple(schema.values())!=SCHEMA_VERSION:raise Refusal('unsupported_source_schema')
+    def check_source(self):
+        row=self.one('SELECT stage_one,stage_two,stage_three FROM schema_version')
+        schema=tuple(row[k] for k in ('stage_one','stage_two','stage_three'))
+        version=source_version(schema)
         if self.one('SELECT network_name FROM meta')['network_name']!=self.profile.network.dbsync_network_name:raise Refusal('source_network_mismatch')
-        required={'block':{'hash','block_no','previous_id','epoch_no','slot_no','time','tx_count'},'tx':{'hash','block_id','block_index','valid_contract'},'tx_out':{'id','tx_id','index','address','value','data_hash','inline_datum_id'},'tx_in':{'tx_in_id','tx_out_id','tx_out_index'},'datum':{'id','hash','value'},'epoch_stake':{'epoch_no','pool_id','amount'},'epoch_param':{'epoch_no','nonce'},'epoch_stake_progress':{'epoch_no','completed'},'ma_tx_out':{'tx_out_id','ident','quantity'},'ma_tx_mint':{'tx_id','ident','quantity'},'multi_asset':{'id','policy','name'},'pool_hash':{'id','hash_raw'}}
-        columns={k:set() for k in required}
-        for r in self.stream("SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=ANY(%s::text[])",(list(required),)):columns[r['table_name']].add(r['column_name'])
-        if any(not required[k]<=columns[k] for k in required):raise Refusal('source_columns_missing')
-        a=self.attestation
-        if not isinstance(a,dict) or any(a.get(k)!=v for k,v in {'dbsync_version':'13.7.1.0','tx_in_retained':True,'epoch_stake_retained':True}.items()):raise Refusal('retention_attestation_required')
-        if not (a.get('operator_attested') is True or a.get('retention_evidence')=='observed-launch-and-indexed-history'):raise Refusal('retention_evidence_required')
-        if set(a)-{'dbsync_version','tx_in_retained','epoch_stake_retained','operator_attested','retention_evidence'}:raise Refusal('unknown_attestation_fields')
+        rows=self.stream("SELECT a.table_name,a.column_name,a.udt_name,a.domain_name,a.is_nullable,c.relkind "
+                         "FROM information_schema.columns a JOIN pg_namespace n ON n.nspname=a.table_schema "
+                         "JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=a.table_name "
+                         "WHERE a.table_schema='public' AND a.table_name=ANY(%s::text[])",(list(SOURCE_COLUMNS),))
+        validate_columns(rows)
+        validate_modes(r['token'] for r in self.stream('SELECT token FROM extra_migrations'))
+        validate_attestation(self.attestation,version)
+        self.validated_identity={'network':self.profile.network.network,'schema':list(schema),'dbsync_version':version}
+        return schema,version
+    def check_epoch_coverage(self,epochs):
+        missing=self.one("SELECT count(*) AS n FROM unnest(%s::bigint[]) e(epoch) WHERE NOT EXISTS "
+                         "(SELECT 1 FROM epoch_stake_progress p WHERE p.epoch_no=e.epoch AND p.completed IS TRUE)",(epochs,))['n']
+        if missing:raise Refusal('epoch_stake_not_complete')
+        missing=self.one("SELECT count(*) AS n FROM unnest(%s::bigint[]) e(epoch) WHERE NOT EXISTS "
+                         "(SELECT 1 FROM epoch_param p WHERE p.epoch_no=e.epoch AND p.nonce IS NOT NULL)",(epochs,))['n']
+        if missing:raise Refusal('epoch_nonce_unavailable')
+        missing=self.one("SELECT count(*) AS n FROM unnest(%s::bigint[]) e(epoch) WHERE NOT EXISTS "
+                         "(SELECT 1 FROM epoch_stake p WHERE p.epoch_no=e.epoch)",(epochs,))['n']
+        if missing:raise Refusal('epoch_stake_unavailable')
+    def preflight(self,end=None):
+        schema,version=self.check_source()
         head=self.one('SELECT block_no FROM block WHERE block_no IS NOT NULL ORDER BY block_no DESC LIMIT 1')['block_no']
         k=self.profile.security
         target=head-k if end is None else end
@@ -90,18 +105,19 @@ class SQLSource:
         bad=self.one('SELECT count(*) AS n FROM tx_out o JOIN tx t ON t.id=o.tx_id JOIN block b ON b.id=t.block_id WHERE o.address=%s AND b.block_no<=%s',(self.profile.candidate,target))['n']
         if bad:raise Refusal('candidates_unsupported')
         # Only what verification and provenance need; nothing that identifies the source host.
-        identity={'network':self.profile.network.network,'schema':list(SCHEMA_VERSION),'dbsync_version':a['dbsync_version'],
+        epochs=required_epochs(anchors['start']['epoch'],anchors['target']['epoch'])
+        self.check_epoch_coverage(epochs)
+        identity={'network':self.profile.network.network,'schema':list(schema),'dbsync_version':version,
                   'retention':{'tx_in':True,'epoch_stake':True}}
         return {'identity':self.profile.identity,'anchors':anchors,'source_identity':identity,
-                'required_epochs':required_epochs(anchors['start']['epoch'],anchors['target']['epoch']),
+                'required_epochs':epochs,
                 'capabilities':{'bridge_qualified':False,'candidates_empty':True},'sampled_head':head}
     def ordinals(self,inputs,output_assets,anchors):
         """Ledger ordinals of already stored facts: `inputs` as (tx, origin tx, origin index) and
         `output_assets` as (tx, output index, policy, name) keys; every key must be found."""
         found={'inputs':{},'output_assets':{}}
         with self.snapshot():
-            if tuple(self.one('SELECT stage_one,stage_two,stage_three FROM schema_version').values())!=SCHEMA_VERSION:raise Refusal('unsupported_source_schema')
-            if self.one('SELECT network_name FROM meta')['network_name']!=self.profile.network.dbsync_network_name:raise Refusal('source_network_mismatch')
+            self.check_source()
             self.check_anchors({'anchors':anchors})
             for start in range(0,len(inputs),5000):
                 part=inputs[start:start+5000]

@@ -139,7 +139,8 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
             position=hi+1
         if position!=end+1:raise Refusal('checkpoint_incomplete')
     # A start cursor at block 0 leaves no history before it to acquire.
-    if g['parent'] is None and g['start_height']>0 and not store.completed(gen,'prerequisites','complete'):raise Refusal('prerequisites_incomplete')
+    from db_sync_alt.verify.prerequisites import prerequisite_coverage
+    prerequisite_coverage(store,g)
     for epoch in m['required_epochs']:
         # Every completed required epoch has its end block: the node's latest block of an epoch
         # it reads must be exact, never an older block.
@@ -155,12 +156,17 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     # matches both epoch and hash. Pre-S endpoints need not include a successor.
     for checkpoint in store.checkpoint_rows(phase='epochs',**({'generation':gen} if delta else {'before':gen+1})):
         receipt=checkpoint['receipt'];anchor=receipt.get('epoch_end')
+        if 'preparation' in receipt:
+            from db_sync_alt.sources.blockfrost.epoch_prepare import verify_epoch_receipt
+            verify_epoch_receipt(store,gen,checkpoint)
         if anchor:
             epoch=receipt.get('epoch')
             if type(epoch) is not int or checkpoint['unit']!=str(epoch) or not isinstance(anchor,dict) or type(anchor.get('height')) is not int or anchor['height']>g['target_height']:raise Refusal('epoch_anchor_mismatch')
             row=store.block_at(gen,anchor['height'])
             if row is None or row['epoch']!=epoch or row['hash'].hex()!=anchor.get('hash'):raise Refusal('epoch_anchor_mismatch')
     store.progress('verify_structure_complete',generation=gen)
+    from db_sync_alt.sources.blockfrost.relevance import verify_generation
+    verify_generation(store,gen)
     if delta:
         # A new binding of an existing pre-S physical header is still a delta;
         # it must belong to an actual retained transaction or epoch-end closure.

@@ -1,5 +1,18 @@
 # Changelog
 
+## Mainnet-patched 0.1.1
+
+This host candidate combines published0.1.1 with the separately qualified Mainnet source13.8/provider/epoch/bounded-prerequisite/pending fixes. It is not an unmodified upstream release.
+
+## Unreleased source-compatibility candidate
+
+- Accept qualified core/full-history db-sync 13.8.0.0/schema 16.52.6 alongside 13.7.1.0/schema 15.48.6, without changing the persisted compact contract or network profiles.
+- Record actual source schema/version; check required upstream types/domains/nullability, unsupported mode markers, and required epoch coverage in every acquisition/ordinal source path.
+- Refuse unknown versions, schema/version mismatches, retained-history failures and unsafe source variants. New upstream-migration fixtures verify acquisition, independent certification, ordinals and unchanged semantic results.
+- CLI compatibility note: `upgrade --source-service` now also requires `--source-attestation`; upgrades without an external ordinal source are unchanged.
+- Real official Mainnet snapshot validation remains a deployment requirement; the running Preprod release is not changed by this candidate.
+
+
 ## 0.1.1
 
 - Startup reads only the database's state row to decide whether to serve, and

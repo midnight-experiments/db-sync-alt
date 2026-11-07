@@ -64,8 +64,8 @@ def fill_preview(c, profile, network_name='preview'):
     """A Preview-shaped db-sync: blocks 0..W (epoch 0 = blocks 0-1), events from the start cursor 0:0."""
     c.execute((ROOT / 'tests/fixtures/data/dbsync_schema.sql').read_text())
     c.execute("ALTER TABLE block ADD COLUMN previous_id bigint; ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint;"
-              "CREATE TABLE schema_version(stage_one int,stage_two int,stage_three int);INSERT INTO schema_version VALUES(15,48,6);"
-              "CREATE TABLE epoch_stake_progress(epoch_no int,completed boolean);CREATE TABLE meta(network_name text)")
+              "CREATE TABLE schema_version(stage_one bigint NOT NULL,stage_two bigint NOT NULL,stage_three bigint NOT NULL);INSERT INTO schema_version VALUES(15,48,6);"
+              "CREATE TABLE epoch_stake_progress(epoch_no word31type NOT NULL,completed boolean NOT NULL);CREATE TABLE meta(network_name varchar NOT NULL)")
     c.execute('INSERT INTO meta VALUES(%s)', (network_name,))
     with c.transaction():
         for h in range(0, W + 1):

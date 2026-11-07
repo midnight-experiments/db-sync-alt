@@ -513,6 +513,9 @@ class Service:
                 thread = self.sync_driver.start_polling(store, self.health, self.stop_event,
                                                        lambda error: self._fail(failure_code(error)))
                 self._threads.append(thread)
+                preparer = getattr(self.sync_driver, '_preparer', None)
+                if preparer is not None:
+                    self._threads.append(preparer.thread)
             while not self.stop_event.is_set():
                 self.health.heartbeat('sync')
                 try:
@@ -553,6 +556,9 @@ class Service:
             # Poll completion metadata is bound to this owner session. Keep it
             # alive during bounded cooperative poll shutdown; closing it first
             # turns an ordinary in-flight success into false owner-loss failure.
+            preparer = getattr(self.sync_driver, '_preparer', None)
+            if preparer is not None and preparer.thread is not None and preparer.thread is not threading.current_thread():
+                preparer.thread.join(self.config.shutdown_seconds)
             poller = getattr(self.sync_driver, '_poller', None)
             if poller is not None and poller.thread is not None and poller.thread is not threading.current_thread():
                 poller.thread.join(self.config.shutdown_seconds)

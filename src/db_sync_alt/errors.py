@@ -16,7 +16,7 @@ class LifecycleFailure(Exception):
 class TransientSyncFailure(LifecycleFailure):
     """The sync driver reports an accounted retry/quota pause, without invalidating data."""
     def __init__(self, code, *, retry_at):
-        if code not in {'provider_unavailable', 'provider_timeout', 'quota_exhausted'}:
+        if code not in {'provider_unavailable', 'provider_timeout', 'quota_exhausted', 'epoch_preparation_not_ready'}:
             raise ValueError('invalid_transient_error')
         if isinstance(retry_at, bool) or not isinstance(retry_at, (int, float)) or not math.isfinite(retry_at):
             raise ValueError('invalid_retry_time')

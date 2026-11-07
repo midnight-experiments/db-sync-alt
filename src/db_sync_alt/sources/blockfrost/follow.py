@@ -198,8 +198,12 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None):
                   'required_epochs':required_epochs(startepoch,targetrow['epoch']),
                   'capabilities':ready['manifest']['capabilities'],
                   'parent_ref':integrity_reference(ready)}
+        from db_sync_alt.sources.blockfrost.relevance import certificate
+        coverage=certificate(store,profile,target)
+        if coverage is not None:manifest['relevance_coverage']=coverage
         gen=store.begin_continuation(source='blockfrost-cardano',start=profile.start,target=target,
                                      witness=witness,manifest=manifest,parent_capability=parent_capability)
+        if coverage is not None:store.checkpoint(gen,'relevance','coverage',coverage)
         # The core owns the immutable inherited metadata receipt/proof shape.
         reuse_receipt={'source_kind':'blockfrost-cardano','parent':ready['id'],'height':cutoff,
                        'hash':base['hash'].hex(),
@@ -253,7 +257,16 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None):
     committed_events=store.last_event_height(gen)
     hooks.update(phase='events',committed=max(ready['target_height'],committed_events or ready['target_height']))
     for height in range(ready['target_height']+1,g['target_height']+1):
-        if store.completed(gen,'events',height):continue
+        if store.completed(gen,'events',height):
+            if source.coverage is not None:
+                # Rebuild both discovery streams from fresh provider inventories;
+                # an unsealed pending candidate is never its own coverage proof.
+                facts,stats=source.block_facts(store.block_at(gen,height))
+                old=store.checkpoint_rows(generation=gen,phase='events',unit=height)
+                if len(old)!=1 or old[0]['receipt'].get('relevance')!=stats.get('relevance'):raise Refusal('independent_provider_mismatch')
+                from db_sync_alt.sources.blockfrost.relevance import verify_inventory
+                verify_inventory(store,gen,stats['relevance']['inventory'])
+            continue
         if hooks.stopped():raise Refusal('interrupted')
         hooks.check_space(store)
         hooks.update(phase='events',range_start=height,range_end=height)
@@ -299,13 +312,22 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None):
             hooks.sample(store,phase='epochs',committed=epoch,rows=processed_rows)
             continue
         if hooks.stopped():raise Refusal('interrupted')
-        nonce,stakes,anchor,receipt=epoch_facts(provider,epoch,g['target_height'],stake_prefix=profile.network.stake_prefix)
+        preparer = getattr(hooks, 'epoch_preparation', None)
+        if preparer is not None:
+            nonce,stakes,anchor,receipt=preparer.adopt(store,gen,epoch,g['target_height'])
+        else:
+            nonce,stakes,anchor,receipt=epoch_facts(provider,epoch,g['target_height'],stake_prefix=profile.network.stake_prefix)
         diagnostic_context(provider,'epochs.commit',epoch=epoch)
         with store.atomic():
             store.insert('epoch_nonces',nonce,gen)
             for row in stakes:store.insert('epoch_stakes',row,gen)
             if anchor['height']<=g['target_height']:store.insert('blocks',anchor,gen);store.bind_block(gen,anchor['height'],anchor['hash'])
-            store.checkpoint(gen,'epochs',epoch,{'epoch':epoch,'source_kind':'blockfrost-cardano',**receipt,'provider':provider.drain()})
+            epoch_receipt = {'epoch':epoch,'source_kind':'blockfrost-cardano',**receipt}
+            epoch_receipt['publication_provider' if 'preparation' in receipt else 'provider'] = provider.drain()
+            store.checkpoint(gen,'epochs',epoch,epoch_receipt)
+            if 'preparation' in receipt:
+                from db_sync_alt.sources.blockfrost.epoch_prepare import commit_adoption
+                commit_adoption(store,epoch,receipt['preparation'])
         processed_rows+=len(stakes)+1
         hooks.sample(store,phase='epochs',committed=epoch,rows=processed_rows)
     diagnostic_context(provider,'anchors')

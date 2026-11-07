@@ -43,7 +43,7 @@ class SQLTests(unittest.TestCase):
     @classmethod
     def fill(cls,c):
         c.execute((ROOT/'tests/fixtures/data/dbsync_schema.sql').read_text())
-        c.execute("ALTER TABLE block ADD COLUMN previous_id bigint; ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint; CREATE TABLE schema_version(stage_one int,stage_two int,stage_three int);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE epoch_stake_progress(epoch_no int,completed boolean);CREATE TABLE meta(network_name text);INSERT INTO meta VALUES('preprod')")
+        c.execute("ALTER TABLE block ADD COLUMN previous_id bigint; ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint; CREATE TABLE schema_version(stage_one bigint NOT NULL,stage_two bigint NOT NULL,stage_three bigint NOT NULL);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE epoch_stake_progress(epoch_no word31type NOT NULL,completed boolean NOT NULL);CREATE TABLE meta(network_name varchar NOT NULL);INSERT INTO meta VALUES('preprod')")
         with c.transaction():
             for h,e in [(S-100,273),(S-50,274),(S-1,275)]+[(h,275) for h in range(S,W+1)]:
                 c.execute("INSERT INTO block(id,hash,block_no,epoch_no,slot_no,time,tx_count,previous_id) VALUES(%s,%s,%s,%s,%s,'2026-01-01',10,%s)",(h,H(h),h,e,h,h-1))
@@ -76,7 +76,11 @@ class SQLTests(unittest.TestCase):
     def source(self):return CountedSQLSource(self.source_service,self.profile,copy.deepcopy(ATTEST))
     def owner(self):
         dsn,alias=self.database();return PgStore(conninfo=dsn,create=True,network='preprod')
-    def run_acquire(self,store,target=T,**kw):return acquire(self.source(),store,self.profile,target_height=target,**kw)
+    def run_acquire(self,store,target=T,**kw):
+        # Explicit maximum supported fixture window avoids thousands of empty
+        # synthetic preprod ranges; production's default1000 is unchanged.
+        kw.setdefault('window_blocks',10000)
+        return acquire(self.source(),store,self.profile,target_height=target,**kw)
     def test_fresh_and_increment_preserve_ids_and_certify_nonempty_families(self):
         with self.owner() as store:
             started=time.monotonic();self.run_acquire(store,S)
@@ -165,7 +169,7 @@ sys.meta_path.insert(0,NoFixtures())
 import db_sync_alt.cli.acquire as pg_acquire
 raise SystemExit(pg_acquire.main(sys.argv[1:]))
 """
-        argv=[sys.executable,'-c',code,'--source','db-sync','--network','preprod','--destination-service',alias,'--create','--profile-dir',str(ROOT/'profiles/preprod-node-1.0.400'),'--source-service',self.source_service,'--source-attestation',str(att),'--target-height',str(T),'--reserve','/tmp:1']
+        argv=[sys.executable,'-c',code,'--source','db-sync','--network','preprod','--destination-service',alias,'--create','--profile-dir',str(ROOT/'profiles/preprod-node-1.0.400'),'--source-service',self.source_service,'--source-attestation',str(att),'--target-height',str(T),'--window-blocks','10000','--reserve','/tmp:1']
         result=subprocess.run(argv,capture_output=True,text=True,timeout=60)
         self.assertEqual(result.returncode,0,result.stderr[-1500:]);self.assertEqual(json.loads(result.stdout)['target'],T)
         with PgStore(conninfo=dsn,readonly=True) as store:verify_store(store)
@@ -295,7 +299,7 @@ class InterchangeTests(unittest.TestCase):
                 source_dsn=fixture.database();dest=fixture.database()
                 with psycopg.connect(source_dsn,autocommit=True) as db:
                     db.execute((ROOT/'tests/fixtures/data/dbsync_schema.sql').read_text())
-                    db.execute("ALTER TABLE block ADD COLUMN previous_id bigint;ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint;CREATE TABLE schema_version(stage_one int,stage_two int,stage_three int);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE meta(network_name text);INSERT INTO meta VALUES('preprod');CREATE TABLE epoch_stake_progress(epoch_no int,completed boolean)")
+                    db.execute("ALTER TABLE block ADD COLUMN previous_id bigint;ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint;CREATE TABLE schema_version(stage_one bigint NOT NULL,stage_two bigint NOT NULL,stage_three bigint NOT NULL);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE meta(network_name varchar NOT NULL);INSERT INTO meta VALUES('preprod');CREATE TABLE epoch_stake_progress(epoch_no word31type NOT NULL,completed boolean NOT NULL)")
                     # Distinct source IDs demonstrate namespace independence.
                     blocks=list(prepared.rows('blocks',1));block_ids={r['hash']:r['height']+123 for r in blocks}
                     original_blocks=copy.deepcopy(blocks)
@@ -329,7 +333,7 @@ class InterchangeTests(unittest.TestCase):
                 observed={r['hash']:r for r in check.blocks(min(r['height'] for r in original_blocks),max(r['height'] for r in original_blocks))}
             self.assertEqual({r['hash']:r for r in original_blocks},observed)
             with PgStore(conninfo=dest,create=True,network='preprod') as store:
-                acquire(source(),store,fixture.profile,target_height=it.gen_fixture.OFFSET+10)
+                acquire(source(),store,fixture.profile,window_blocks=10000,target_height=it.gen_fixture.OFFSET+10)
                 if self.incremental:
                     from db_sync_alt.store.upgrade import upgrade_store
                     upgrade_store(store);store.certify_ready_full()
@@ -340,7 +344,7 @@ class InterchangeTests(unittest.TestCase):
                 self.assertIsNone(store.sync_job('provider-active'));self.assertIsNone(store.pending());self.assertEqual(store.meta('canonical_ready'),0)
                 blockfrost_once(store,fixture.profile,target_height=it.gen_fixture.OFFSET+11,client=it.AccountedFake(routes))
                 self.assertEqual(store.generation()['source'],'blockfrost-cardano')
-                acquire(source(),store,fixture.profile,target_height=it.gen_fixture.OFFSET+12)
+                acquire(source(),store,fixture.profile,window_blocks=10000,target_height=it.gen_fixture.OFFSET+12)
                 self.assertEqual(store.digests(2),expected);self.assertEqual(store.digests(0),old_digest)
                 self.assertEqual(store.db.execute('SELECT hash,id FROM chain.transactions WHERE first_generation=0 ORDER BY id').fetchall(),old_ids)
                 self.assertEqual(store.generation()['manifest']['required_epochs'],[0,1,2,3])

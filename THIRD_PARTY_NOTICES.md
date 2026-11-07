@@ -33,3 +33,8 @@ vendored here; their own licenses apply. Versions are declared in
 `pyproject.toml`, `requirements.lock` and `deploy/Dockerfile`. A built image
 keeps the upstream license metadata of its components; redistributed images must
 preserve it.
+
+
+## Cardano db-sync migration fixtures
+
+`tests/fixtures/data/upstream-dbsync-migrations.json` retains exact SQL migrations from IntersectMBO/cardano-db-sync, Apache-2.0. Qualified tags13.7.1.0 (`ef00c76513947b356b81505ca3792b89322bd792`) and 13.8.0.0 (`ccb9c0f4f6168593ec8d8568a6358dbac84d2045`); each file path/content SHA-256 and the original SQL comments are preserved in the fixture. These test inputs are not snapshot data or a live chain.
