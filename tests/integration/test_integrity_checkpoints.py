@@ -74,7 +74,7 @@ class CheckpointPGTests(CheckpointFixture):
         with self.assertRaises(psycopg.errors.InsufficientPrivilege):
             node.execute('SELECT * FROM chain.integrity_checkpoints')
         self.assertTrue(store.db.execute("SELECT has_table_privilege(%s,'chain.integrity_checkpoints','SELECT')", (role,)).fetchone() == (False,))
-        # A second upgrade changes nothing; verification now starts at the checkpoint.
+        # A second upgrade changes nothing; the next start verifies from the checkpoint.
         self.assertEqual(upgrade_store(store), {'schema_version': 4, 'changed': False})
         store, walked = self.startup(dsn, store)
         self.assertEqual(walked, set())
