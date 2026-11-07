@@ -63,7 +63,8 @@ class InspectionTests(unittest.TestCase):
     def test_full_diagnostic_contract_and_no_history_on_lifecycle(self):
         dsn,service=self.database(rows=4)
         before=d.inspect(service)
-        self.assertEqual([x['manifest']['historical_manifest'] for x in before['generations']],['0','1','2','3'])
+        self.assertEqual([x['id'] for x in before['generations']],[0,1,2,3])
+        self.assertTrue(all('manifest' not in x for x in before['generations']))
         with patch.object(d.PgStore,'status',side_effect=AssertionError('lifecycle_loaded_full_diagnostics')):
             got=self.current(service)
         self.assertNotIn('generations',got);self.assertNotIn('bytes',got);self.assertNotIn('checkpoints',got)

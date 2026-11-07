@@ -18,7 +18,9 @@ db-sync-alt backup --service db_sync_alt \
   --archive /srv/backups/db-sync-alt-1.dump --manifest /srv/backups/db-sync-alt-1.json
 ```
 
-`status` reads the database state without changing it. `verify` checks every
+`status` reads the database state without changing it and lists one summary
+row per generation without its manifest; `SELECT manifest FROM
+chain.generations WHERE id = …` reads a manifest. `verify` checks every
 ready generation and the physical contents in full. `backup` verifies the same
 way, then writes an archive (`pg_dump` custom format) and a manifest with the
 archive's SHA-256, the profile and the verification result of every generation.

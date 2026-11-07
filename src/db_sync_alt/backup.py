@@ -150,7 +150,7 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
             # The reader may connect only now that the restored database serves.
             from db_sync_alt.store.reader import grant_reader
             granted=grant_reader(db,reader_role)
-        return {'status':'restored',**({'reader':granted} if granted else {}),'canonical_ready':ready,'database_bytes':store.status()['bytes'],'profile':profile,'freshness':'unknown',**({'poll_restore_binding':poll_binding} if poll_binding is not None else {})}
+        return {'status':'restored',**({'reader':granted} if granted else {}),'canonical_ready':ready,'database_bytes':store.database_bytes(),'profile':profile,'freshness':'unknown',**({'poll_restore_binding':poll_binding} if poll_binding is not None else {})}
 
 
 def main(argv=None):
