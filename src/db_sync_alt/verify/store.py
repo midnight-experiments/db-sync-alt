@@ -267,6 +267,7 @@ def physical_inventory(store):
     from db_sync_alt.contract import TABLES, KEYS, canonical
     order={**{table:','.join(KEYS[table]) for table in TABLES},'metadata':'key','generations':'id','generation_blocks':'generation,height','checkpoints':'generation,phase,unit','provenance':'generation,kind,key','pools':'pool_hash','sync_jobs':'id'}
     if store.supports_incremental:order.update(integrity_state='id',current_membership='height',generation_reuse='generation',membership_delta='generation,height')
+    if store.supports_checkpoints:order.update(integrity_checkpoints='generation')
     if store.serves_directly:
         from db_sync_alt.store import serve
         order.update({'serve.'+table:key for table,key in serve.KEYS.items()})
@@ -274,6 +275,8 @@ def physical_inventory(store):
     for table,key in order.items():
         hasher=hashlib.sha256();count=0
         with store.db.transaction():
+            # Timestamps with a time zone serialize the same on every server.
+            store.db.execute("SET LOCAL TimeZone='UTC'")
             with store.db.cursor(name='physical_'+table.replace('.','_')) as cur:
                 cur.execute('SELECT to_jsonb(t) FROM '+(table if '.' in table else 'chain.'+table)+' t ORDER BY '+key)
                 for row, in cur:

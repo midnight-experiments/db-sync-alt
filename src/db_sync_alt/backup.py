@@ -9,12 +9,15 @@ import subprocess
 import uuid
 
 from db_sync_alt.contract import Refusal, canonical
-from db_sync_alt.store.database import PgStore, OWNER, POSTGRES_MAJOR, RESTORE_GUARD, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, WRITER_LOCK, SERVING_LOCK, apply_privileges, connect, empty_destination
+from db_sync_alt.store.database import PgStore, OWNER, POSTGRES_MAJOR, RESTORE_GUARD, SUPPORTED_SCHEMA_VERSIONS, WRITER_LOCK, SERVING_LOCK, apply_privileges, connect, empty_destination
 from db_sync_alt.verify.store import verify_store, physical_inventory
 
-BACKUP_FORMAT='db-sync-alt-postgresql-backup-v2'
-# Backups of schema 1 and 2 (no served tables) are still restored, then upgraded.
-FORMATS={'db-sync-alt-postgresql-backup-v1':(1,2),BACKUP_FORMAT:(3,)}
+BACKUP_FORMAT='db-sync-alt-postgresql-backup-v3'
+# Backups of older schemas are still restored: schema 3 is upgraded to the current schema during the
+# restore, schemas 1 and 2 (no served tables) by `db-sync-alt upgrade` afterwards.
+FORMATS={'db-sync-alt-postgresql-backup-v1':(1,2),'db-sync-alt-postgresql-backup-v2':(3,),BACKUP_FORMAT:(4,)}
+# Formats whose restore serves the node.
+SERVING_FORMATS=('db-sync-alt-postgresql-backup-v2',BACKUP_FORMAT)
 
 
 def safe_file(path,*,existing):
@@ -61,7 +64,20 @@ def run_cli(argv,db,timeout=600):
     if result.returncode:raise Refusal('postgres_backup_tool_failure')
 
 
-def reports(store):return {str(row[0]):verify_store(store,row[0]) for row in store.db.execute("SELECT id FROM chain.generations WHERE status='ready' ORDER BY id").fetchall()}
+def reports(store,canonical=None):
+    """The full verification of the canonical generation (`canonical`, or the database's): one walk
+    from the integrity base."""
+    if canonical is None:canonical=store.state()['canonical_ready']
+    return {str(canonical):verify_store(store,canonical)}
+
+
+def generation_reports(store):
+    """The full verification of every ready generation, as backups of formats v1 and v2 record it."""
+    return {str(row[0]):verify_store(store,row[0]) for row in store.db.execute("SELECT id FROM chain.generations WHERE status='ready' ORDER BY id").fetchall()}
+
+
+def format_reports(store,backup_format,canonical=None):
+    return reports(store,canonical) if backup_format==BACKUP_FORMAT else generation_reports(store)
 
 
 def backup(archive,manifest,service=None,*,conninfo='',reserve_check=None,pg_dump='pg_dump'):
@@ -75,14 +91,15 @@ def backup(archive,manifest,service=None,*,conninfo='',reserve_check=None,pg_dum
             check_tool(pg_dump,store.db)
             if store.pending() is not None:raise Refusal('pending_generation_cannot_backup')
             if store.meta('source_conflict'):raise Refusal('revoked_database_cannot_backup')
-            verified=reports(store);physical=physical_inventory(store);state=store.state()
+            backup_format=next(f for f,versions in FORMATS.items() if store.state()['schema_version'] in versions)
+            verified=format_reports(store,backup_format);physical=physical_inventory(store);state=store.state()
             if state['canonical_ready'] is None:raise Refusal('no_ready_generation')
             with store.db.transaction():
                 store.db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
                 snapshot=store.db.execute('SELECT pg_export_snapshot()').fetchone()[0]
                 fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.close(fd)
                 run_cli([pg_dump,'--format=custom','--no-owner','--no-privileges','--schema=chain','--schema=serve','--schema=public','--exclude-table-data=chain.service_state','--snapshot='+snapshot,'--file='+str(temp)],store.db)
-            body={'format':next(f for f,versions in FORMATS.items() if state['schema_version'] in versions),'postgres_major':POSTGRES_MAJOR,'schema_version':state['schema_version'],'owner':OWNER,'profile':store.meta('profile'),'canonical_ready':state['canonical_ready'],'publication_serial':state['publication_serial'],'generations':verified,'physical_inventory':physical,'archive':file_hash(temp)}
+            body={'format':backup_format,'postgres_major':POSTGRES_MAJOR,'schema_version':state['schema_version'],'owner':OWNER,'profile':store.meta('profile'),'canonical_ready':state['canonical_ready'],'publication_serial':state['publication_serial'],'generations':verified,'physical_inventory':physical,'archive':file_hash(temp)}
             fd=os.open(temp_manifest,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
             with os.fdopen(fd,'w') as out:out.write(canonical(body)+'\n');out.flush();os.fsync(out.fileno())
             with open(temp,'rb') as inp:os.fsync(inp.fileno())
@@ -95,14 +112,16 @@ def backup(archive,manifest,service=None,*,conninfo='',reserve_check=None,pg_dum
 
 
 def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_check=None,pg_restore='pg_restore',expected_manifest_sha256=None,expected_network=None,reader_role=None):
-    """Restore into an empty database; `reader_role` (schema 3) gets the node reader's grants again
-    once the restored database serves. No other role may connect before (PUBLIC loses CONNECT)."""
+    """Restore into an empty database; `reader_role` gets the node reader's grants again once the
+    restored database serves. No other role may connect before (PUBLIC loses CONNECT). A schema-3
+    backup is upgraded to the current schema, with its first integrity checkpoint, before that."""
     archive=safe_file(archive,existing=True);manifest=safe_file(manifest,existing=True)
     if expected_manifest_sha256 and file_hash(manifest)['sha256']!=expected_manifest_sha256:raise Refusal('backup_manifest_checksum_mismatch')
     try:body=json.loads(manifest.read_text())
     except (ValueError,UnicodeError):raise Refusal('invalid_backup_manifest') from None
     if body.get('format') not in FORMATS or body.get('postgres_major')!=POSTGRES_MAJOR or body.get('schema_version') not in FORMATS[body['format']] or body.get('schema_version') not in SUPPORTED_SCHEMA_VERSIONS or body.get('owner')!=OWNER:raise Refusal('unsupported_backup_identity')
-    if reader_role is not None and body['schema_version']!=SCHEMA_VERSION:raise Refusal('reader_requires_current_schema')
+    if body['format']==BACKUP_FORMAT and type(body.get('canonical_ready')) is not int:raise Refusal('invalid_backup_canonical')
+    if reader_role is not None and body['format'] not in SERVING_FORMATS:raise Refusal('reader_requires_current_schema')
     if body.get('archive')!=file_hash(archive):raise Refusal('backup_checksum_mismatch')
     from db_sync_alt.networks import for_identity
     profile=body.get('profile',{})
@@ -129,7 +148,7 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
         apply_privileges(db)
         # Transfer ownership to PgStore without dropping the fencing session.
         store=PgStore.__new__(PgStore);store.db=db;store._writer=True;store.readonly=False;store.reserve_check=reserve_check;store.progress_callback=None
-        if store.meta('profile')!=profile or store.network!=network or reports(store)!=body.get('generations') or physical_inventory(store)!=body.get('physical_inventory'):raise Refusal('restored_database_mismatch')
+        if store.meta('profile')!=profile or store.network!=network or format_reports(store,body['format'],body.get('canonical_ready'))!=body.get('generations') or physical_inventory(store)!=body.get('physical_inventory'):raise Refusal('restored_database_mismatch')
         # Explicit one-shot polling may create a poll policy even on schema 1;
         # jobs without a policy marker are left unchanged (the helper skips them).
         from db_sync_alt.sources.blockfrost.poller import bind_restored_poll_policy
@@ -145,6 +164,9 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
             # Observations are runtime state; startup must refresh before healthy.
             db.execute("UPDATE chain.service_state SET canonical_ready=%s,migration_state='ready',publication_serial=%s WHERE id=1",(ready,body['publication_serial']))
             db.execute('DROP SCHEMA '+RESTORE_GUARD+' CASCADE')
+        if body['schema_version']==3:
+            from db_sync_alt.store.upgrade import upgrade_store
+            upgrade_store(store)
         granted=None
         if reader_role is not None:
             # The reader may connect only now that the restored database serves.

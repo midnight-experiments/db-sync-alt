@@ -31,6 +31,7 @@
     "acquisition_request_budget": 10000,
     "daily_poll_request_budget": 10000,
     "follow_min_blocks": 1,
-    "follow_max_wait_seconds": 40
+    "follow_max_wait_seconds": 40,
+    "integrity_checkpoint_interval_seconds": 21600
   }
 }
