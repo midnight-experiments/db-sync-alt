@@ -77,7 +77,7 @@ class RealServiceTests(unittest.TestCase):
         eventually(lambda:service.health.health()[0]==200 or service.failed.is_set(),seconds=15)
         self.assertFalse(service.failed.is_set(),service.failure)
         self.assertEqual(get(service,'/health')[0],200)
-        self.assertEqual(service.health.snapshot()['schema_version'],'3')
+        self.assertEqual(service.health.snapshot()['schema_version'],'4')
     def test_owned_restart_duplicate_fencing_and_writer_connection_loss(self):
         cfg,role=self.configuration(self.alias,self.dsn)
         service=self.start(cfg);self.wait_ready(service)
@@ -254,6 +254,19 @@ class RealServiceTests(unittest.TestCase):
         archive.unlink();manifest.unlink()  # Existing ready target must be sufficient.
         restarted=self.start(cfg);self.wait_ready(restarted)
         with PgStore(conninfo=dst,readonly=True) as store:self.assertEqual(store.generation()['target_height'],self.target)
+    def test_first_run_from_a_schema3_backup_serves_schema_4(self):
+        from fixtures.schema import to_schema3
+        source,_,_=self.database();make_store(source)
+        with PgStore(conninfo=source) as store:to_schema3(store)
+        archive=self.root/'schema3.dump';manifest=self.root/'schema3.json'
+        backup(archive,manifest,conninfo=source)
+        dst,name,alias=self.database();cfg,role=self.configuration(alias,dst,backup_archive=str(archive),backup_manifest=str(manifest))
+        service=self.start(cfg);self.wait_ready(service)
+        self.assertEqual(service.health.snapshot()['integrity'],{'base':2,'checkpointed_at':None})
+        with PgStore(conninfo=dst,readonly=True) as store:
+            self.assertEqual((store.state()['schema_version'],store.generation()['target_height']),(4,self.target))
+        with psycopg.connect(service=cfg.reader['pg_service'],autocommit=True) as node:
+            self.assertEqual(node.execute('SELECT max(block_no) FROM block').fetchone()[0],self.target+2160)
     def test_actual_postgres_restart_exits_then_resumes_same_durable_database(self):
         cfg,role=self.configuration(self.alias,self.dsn)
         service=self.start(cfg);self.wait_ready(service)
@@ -276,7 +289,7 @@ class RealServiceTests(unittest.TestCase):
             self.assertEqual(poll_after['budget'],poll_before['budget'])
             self.assertGreater(poll_after['attempts'],poll_before['attempts'])
             self.assertEqual(store.meta('poll-budget-policy:'+poll_before['day']),policy_before)
-            self.assertEqual(restarted.health.snapshot()['schema_version'],'3')
+            self.assertEqual(restarted.health.snapshot()['schema_version'],'4')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

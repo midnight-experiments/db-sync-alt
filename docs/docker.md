@@ -84,3 +84,19 @@ service is stopped. The database volume, the private directory and the request
 ledger stay. Nothing restarts automatically. For failures use
 [backup and recovery](recovery.md); never delete the volume or the ledger to get
 past an error.
+
+## Upgrade
+
+A database of an older schema needs `db-sync-alt upgrade` once, with the service
+stopped ([upgrade to schema 4](recovery.md#upgrade-to-schema-4)). Build the new
+image and set `APP_IMAGE` in `compose.env` to it, then:
+
+```sh
+docker compose -f deploy/compose.yaml --env-file "$env_file" stop service
+docker compose -f deploy/compose.yaml --env-file "$env_file" run --rm --no-deps service \
+  db-sync-alt upgrade --service db_sync_alt_owner
+docker compose -f deploy/compose.yaml --env-file "$env_file" up -d service
+```
+
+`run` starts a one-off container from the service's image with its private
+directory and network; it publishes no port.

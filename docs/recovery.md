@@ -20,13 +20,18 @@ db-sync-alt backup --service db_sync_alt \
 
 `status` reads the database state without changing it and lists one summary
 row per generation without its manifest; `SELECT manifest FROM
-chain.generations WHERE id = …` reads a manifest. `verify` checks every
-ready generation and the physical contents in full. `backup` verifies the same
-way, then writes an archive (`pg_dump` custom format) and a manifest with the
-archive's SHA-256, the profile and the verification result of every generation.
-It prints the manifest's SHA-256: keep that value apart from the files. Output
-files are never overwritten; an archive without its manifest is not a backup.
-Full verification reads all retained history and takes time on a large database.
+chain.generations WHERE id = …` reads a manifest. `verify` checks the
+database in full from its [integrity base](glossary.md#integrity-checkpoint): it
+recomputes the digests of every fact family at the base and compares them with
+the base's checkpoint, verifies every update published since the base, the
+canonical generation's structure and served tables, and the physical contents.
+`backup` verifies the same way, once, then writes an archive (`pg_dump` custom
+format) and a manifest with the archive's SHA-256, the profile, the verification
+result of the canonical generation and the physical inventory. It prints the
+manifest's SHA-256: keep that value apart from the files. Output files are never
+overwritten; an archive without its manifest is not a backup. Verification reads
+every stored fact once plus the updates published since the last checkpoint, so
+its time grows with the amount of data, not with the number of updates.
 
 ## Restore into a new, empty database
 
@@ -38,8 +43,11 @@ db-sync-alt restore --service empty_database \
 
 Restore checks the manifest's SHA-256 (when given), the archive's bytes, the
 format, the PostgreSQL major version and the profile; it then restores, verifies
-every generation and the physical inventory against the manifest, and only then
-marks the database ready. `db-sync-alt run --archive … --manifest …` does the same
+the canonical generation (every generation for a backup of format v2 or v1) and
+the physical inventory against the manifest, and only then marks the database
+ready. A backup of a schema-3 database (format v2, such as the 0.1.0 Preprod
+snapshot) is then upgraded to schema 4, with its first integrity checkpoint
+where one can be written, before the reader is granted. `db-sync-alt run --archive … --manifest …` does the same
 for an empty database. Each restore adds a receipt that binds every polling job
 to the new database; job identity, counts and back-off are kept. Freshness is
 unknown until the first poll.
@@ -49,18 +57,33 @@ database owned but not ready (`incomplete_restore`): keep it for diagnosis and
 restore into another empty database. There is no in-place overwrite and no
 automatic clean-up.
 
-## Upgrade to schema 3
+## Upgrade to schema 4
 
-The service needs schema 3. A database built with `db-sync-alt acquire --create`
-starts as schema 1; with the service stopped:
+The service needs schema 4. A database built with `db-sync-alt acquire --create`
+starts as schema 1; a database served by db-sync-alt 0.1.x is schema 3. Stop the
+service, upgrade, then start the service with this version:
 
 ```sh
 db-sync-alt upgrade --service db_sync_alt
-db-sync-alt verify --service db_sync_alt
 ```
 
 `upgrade` verifies the database in full, then adds the objects and guards of
 each newer schema, each step in one transaction, and builds the served tables.
+The step to schema 4 adds the [integrity checkpoints](glossary.md#integrity-checkpoint),
+makes the serving gate require schema 4 and writes the first checkpoint from that
+verification, all in one transaction: node queries keep answering from the last
+published update while it runs and answer from schema 4 once it commits. Its
+output reports the integrity base (`base_generation`) and the checkpoint written
+(`checkpoint_generation`). The first verification walks every update published
+since the database's first generation, as a 0.1.x start does: on a large
+database it takes about as long as one such start. The service then starts from
+the last checkpoint.
+
+There is no downgrade: db-sync-alt 0.1.x refuses a schema-4 database
+(`unsupported_database_identity`). To go back, keep a `pg_dump` of the database
+taken with the service stopped before the upgrade, and restore it.
+With the Compose deployment, run the same command in the image
+([Compose](docker.md#upgrade)).
 A database whose inputs and output assets were stored without their
 [ledger ordinal](glossary.md#ledger-ordinal) (written by a version before
 schema 3) also needs the read-only cardano-db-sync it can take them from:

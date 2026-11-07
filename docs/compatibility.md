@@ -20,13 +20,17 @@ treated as unsupported.
 ## Database and backup identity
 
 A database created by db-sync-alt is owned by the `db-sync-alt` identity and has
-a schema version (1 to 3). The service and the node's reader need schema 3;
-`db-sync-alt upgrade` brings a schema-1 or schema-2 database there
-([recovery](recovery.md#upgrade-to-schema-3)). Backups of a schema-3 database use
-the format `db-sync-alt-postgresql-backup-v2`; backups of schemas 1 and 2
-(`db-sync-alt-postgresql-backup-v1`) still restore, then need the upgrade. A
-manifest records the format, the PostgreSQL major version, the schema version,
-the profile and the verification result of every generation. A backup is
+a schema version (1 to 4). The service and the node's reader need schema 4;
+`db-sync-alt upgrade` brings a schema-1, -2 or -3 database there
+([recovery](recovery.md#upgrade-to-schema-4)); db-sync-alt 0.1.x refuses a
+schema-4 database. Backups of a schema-4 database use the format
+`db-sync-alt-postgresql-backup-v3`. Backups of schema 3
+(`db-sync-alt-postgresql-backup-v2`, such as the 0.1.0 Preprod snapshot) restore
+and are upgraded to schema 4 during the restore; backups of schemas 1 and 2
+(`db-sync-alt-postgresql-backup-v1`) restore, then need the upgrade. A manifest
+records the format, the PostgreSQL major version, the schema version, the
+profile, the verification result of the canonical generation (format v3) or of
+every generation (formats v1 and v2), and the physical inventory. A backup is
 restored only into an empty PostgreSQL 17 database by the same profile; a
 manifest that records another major version is refused
 (`unsupported_backup_identity`).

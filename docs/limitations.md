@@ -25,9 +25,11 @@
   by provider rate limits, the request ceiling and local load. A provider pause
   makes `/health` stale without losing the coverage already served; `/status`
   stays 200 while `/health` is 503.
-- **Verification costs time.** Startup, backups and `db-sync-alt verify` check
-  all retained history; plan for it on a long-running database. Backups need
-  the writer lock, so the service must be stopped.
+- **Verification costs time.** Startup, backups and `db-sync-alt verify` read
+  every stored fact once and the updates published since the last integrity
+  checkpoint; their time grows with the amount of stored data. The periodic
+  checkpoint pauses publication for that long every 6 hours by default. Backups
+  need the writer lock, so the service must be stopped.
 - **TLS is your PostgreSQL server's.** db-sync-alt's launcher connects over
   loopback without TLS; the node uses whatever your server offers.
 - **Growing history.** Every update adds its receipts and block membership to

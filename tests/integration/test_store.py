@@ -65,7 +65,7 @@ class PgCoreTests(unittest.TestCase):
             self.assertGreater(store.db.execute('SELECT count(*) FROM chain.blocks').fetchone()[0],len(list(store.rows('blocks',2))))
             for gen in range(3):self.assertEqual(verify_store(store,gen),reports[gen])
             self.assertEqual(store.fact('outputs',(h('origin'),0))['value'],str(2**64-1))
-            # Schema 1 until the explicit upgrade; no reader exists before schema 3.
+            # Schema 1 until the explicit upgrade; a reader is granted only on the current schema.
             self.assertEqual((store.state()['schema_version'],self.ready_generation(store)),(1,2))
             self.assert_closed_to_others(store)
             other='not_granted_'+uuid.uuid4().hex[:8]

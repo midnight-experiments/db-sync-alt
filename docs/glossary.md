@@ -56,15 +56,31 @@ database cannot see a query's parameters, so a node whose k or addresses differ
 from the profile gets empty answers outside it
 ([node requirements](connect-a-node.md#node-requirements)).
 
-## Schemas 1, 2 and 3
+## Schemas 1 to 4
 
 The layouts of a db-sync-alt database. A new database is created as schema 1;
-`db-sync-alt upgrade` turns it into schema 3, which the running service needs.
+`db-sync-alt upgrade` turns it into schema 4, which the running service needs.
 Schema 2 adds a projection of the current block membership and lets the follower
 publish small certified updates instead of re-checking all history each time.
 Schema 3 serves the node directly: every node-facing relation calls the
 [serving gate](#serving-gate), and a reader role gets read access to those
-relations only (the service, `restore --reader-role`, `db-sync-alt grant-reader`). Backups record their schema.
+relations only (the service, `restore --reader-role`, `db-sync-alt grant-reader`).
+Schema 4 adds [integrity checkpoints](#integrity-checkpoint), so verification
+starts at the last one instead of the first generation. Backups record their schema.
+
+## Integrity checkpoint
+
+A record, for one fully verified generation, of the digests of every fact family
+and of the generation's integrity root. Writing it moves the integrity base to
+that generation in the same transaction, under the same gate as a publication.
+Every later verification recomputes the base's digests and compares them with
+the checkpoint (it never trusts them), then verifies only the updates published
+after the base; a generation older than the base is not verified on its own.
+Checkpoints are never changed or removed, form a chain back to the first
+generation the base started from, and are not readable by the node's reader.
+The service writes one after each startup verification and periodically while
+it runs; `db-sync-alt upgrade` and the restore of a schema-3 backup write the
+first one.
 
 ## Positional ID
 
@@ -93,5 +109,6 @@ fails instead of answering with missing rows.
 ## Snapshot
 
 A db-sync-alt backup (a PostgreSQL archive plus its manifest) used as initial
-data. The manifest records the archive's SHA-256, the profile, and the
-verification result of every generation; restoring checks all of them.
+data. The manifest records the archive's SHA-256, the profile, the verification
+result of the canonical generation (of every generation in formats v1 and v2) and
+the physical inventory; restoring checks all of them.

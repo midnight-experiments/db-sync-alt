@@ -33,7 +33,10 @@ preserve a failed database for diagnosis and recover into a new empty one.
 | `provider_behind_served` | Blockfrost reports a confirmed target lower than the one already served | Usually a short provider delay; persistent: check the network setting and key |
 
 `/status` returns the same snapshot with HTTP 200, including `lag`, `quota`,
-`pending` progress, per-worker heartbeats and the verified `reader`.
+`pending` progress, per-worker heartbeats, the verified `reader` and the
+`integrity` base. `sync` reads `checkpointing` while the service writes a
+periodic [integrity checkpoint](operations.md#integrity-checkpoints); publication
+waits meanwhile, so the lag grows by a few blocks.
 
 ## Warnings
 
@@ -61,7 +64,7 @@ Shown as `error_code` in `/status`, or printed when the service exits.
 | `invalid_identity` | The database is not an empty one and not a db-sync-alt database for this profile, or its identity does not match | Point db-sync-alt at its own database or at an empty one |
 | `backend_identity_mismatch` | An observer or the reader's check reached a different PostgreSQL server or database than the writer | Fix the host, port and database of the owner's or the reader's libpq service; never copy identity rows |
 | `invalid_reader_role` | The configured reader login is missing, cannot log in, is privileged (superuser, `CREATEDB`, `CREATEROLE`, `REPLICATION`, `BYPASSRLS`), owns the database, is a member of another role, or can do more than read the node's relations (`TEMP`, `CREATE`, internal schemas, writes, other functions); or the reader's libpq service logs in as another role | Create the reader as in [provision PostgreSQL](operations.md#provision-postgresql) and give it nothing else; db-sync-alt grants what the node needs |
-| `schema_upgrade_required` | The database is schema 1 or 2; only schema 3 gates the node's relations | Run `db-sync-alt upgrade` while the service is stopped |
+| `schema_upgrade_required` | The database is of an older schema (1 to 3); the service runs on schema 4 only | Run `db-sync-alt upgrade` while the service is stopped ([upgrade to schema 4](recovery.md#upgrade-to-schema-4)) |
 | `writer_busy` | Another db-sync-alt process (or administrative command) holds the writer lock | Stop the other process first |
 | `canonical_conflict` | A committed block or fact disagrees with the source; serving is revoked | Stop, keep the database and the logs, check the provider and network; recover from a verified backup |
 | `unsupported_capability` | The data needs a capability this version does not have (for example candidate activity) | The database cannot be served by this version |
@@ -99,7 +102,9 @@ Administrative commands (`acquire`, `upgrade`, `backup`, `restore`, `verify`,
 | `ordinal_source_required`, `ordinal_source_incomplete`, `source_ordinal_conflict` (`upgrade`) | The database holds inputs or output assets without a ledger ordinal; give `--source-service` a read-only cardano-db-sync of the same network that holds every one of them |
 | `epoch_end_missing`, `unsupported_candidate_activity`, `no_served_spend` | A generation lacks the end block of a completed required epoch, holds an output at the registered-candidates address, or would serve no spend at all (the node then reads spent outputs as unspent); it is not published |
 | `serve_projection_mismatch`, `serve_rows_mismatch`, `ordinal_order_invalid`, `node_index_names_invalid` | The served tables do not match the stored facts; keep the database for diagnosis and restore a verified backup |
-| `reader_role_missing`, `invalid_reader_role`, `reader_privileges_not_exact`, `reader_requires_current_schema` (`grant-reader`, `restore --reader-role`) | The reader login does not exist, cannot log in, is privileged, the database owner or the connecting user, can do more than read the node's relations, or the database is not yet schema 3 |
+| `checkpoint_digest_mismatch`, `checkpoint_root_mismatch`, `checkpoint_chain_mismatch` | The facts at the integrity base, or its checkpoint, changed after the checkpoint was written; keep the database for diagnosis and restore a verified backup |
+| `generation_before_integrity_base` | A generation older than the integrity base is not verified on its own; verify the canonical generation (`db-sync-alt verify`) |
+| `reader_role_missing`, `invalid_reader_role`, `reader_privileges_not_exact`, `reader_requires_current_schema` (`grant-reader`, `restore --reader-role`) | The reader login does not exist, cannot log in, is privileged, the database owner or the connecting user, can do more than read the node's relations, or the database or backup is not of a schema the node can read (schema 4, or a schema-3 backup, which the restore upgrades) |
 | `source_network_mismatch`, `unsupported_source_schema`, `retention_attestation_required`, `unknown_attestation_fields` | The db-sync source's `meta.network_name` is not the selected network's or its schema is not 15.48.6, or the attestation file is missing, wrong or has extra fields |
 | `network_mismatch`, `network_required` | The database, `--profile-dir` or acquisition profile belongs to another network than `--network`, or a new database was created without a network; a database is always opened as the network it was created for |
 | `untrusted_network_profile`, `invalid_network_profile`, `unsupported_network` | A `--profile-dir` copy whose `network.json` differs from the packaged one, a malformed `network.json`, or a network without a packaged profile ([networks](networks.md)) |
