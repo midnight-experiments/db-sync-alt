@@ -96,7 +96,7 @@ reports a mismatch in `warnings` (`node_security_parameter_mismatch`,
 `node_configuration_mismatch`); serving continues:
 
 ```json
-"node": {"security_parameter": 2160, "configuration_dir": "/path/to/midnight-node/res/preprod"}
+{"node": {"security_parameter": 2160, "configuration_dir": "/path/to/midnight-node/res/preprod"}}
 ```
 
 `configuration_dir` is the node's network configuration directory (the
@@ -163,7 +163,7 @@ large history.
 
 An alternative that makes no Blockfrost requests. You need:
 
-- cardano-db-sync 13.7.1.0 for the same network (schema 15.48.6, `meta.network_name` of the network) with its full history:
+- cardano-db-sync 13.7.1.0 (schema 15.48.6) or 13.8.0.0 (schema 16.52.6), for the same network (`meta.network_name`) with its full core history:
   `tx_in` and epoch stake kept. It must be a different database from the
   destination; db-sync-alt reads it in read-only transactions.
 - An empty PostgreSQL 17 destination, with a private libpq service entry for each
@@ -174,8 +174,15 @@ An alternative that makes no Blockfrost requests. You need:
   {"dbsync_version": "13.7.1.0", "tx_in_retained": true, "epoch_stake_retained": true, "operator_attested": true}
   ```
 
-  This is your statement about the source; db-sync-alt does not verify it. Other
-  fields are refused.
+  For a 13.8.0.0 source, use `"dbsync_version": "13.8.0.0"` instead. It must
+  match actual schema 16.52.6. `meta.version` may name the older creating binary;
+  it is not the current source version. Check full-history settings, mode
+  markers and required history before attesting. Unsupported modes and
+  incomplete epochs refuse before publication.
+
+  This statement covers retained semantic history that schema inspection alone
+  cannot prove. The adapter checks its required fields and observable source
+  properties; unknown attestation fields are refused.
 
 The new generation records the network, the db-sync version and schema, the
 retention flags and an opaque fingerprint that binds the build to your source
@@ -270,3 +277,15 @@ configured network, refuses a key whose prefix names another network, refuses
 redirects, reserves each attempt before sending it, keeps provider cooldowns,
 does not retry behind your back and refuses a corrupt ledger. All programs that
 use one key must share one ledger.
+
+
+### Older stores needing source ordinals
+
+When upgrading a store from before schema 3 whose ledger ordinals are absent,
+provide both `--source-service SOURCE` and
+`--source-attestation ATTESTATION.json`. The JSON has the same truthful
+version/retention fields as `acquire`. Ordinary upgrades whose ordinals already
+exist need neither option. Existing `upgrade --source-service SOURCE` commands
+must include the attestation; source schema, mode, type and version checks run
+before ordinal recovery. Existing schema-4 databases and backup formats remain
+compatible; adding source support does not require reacquiring their facts.
