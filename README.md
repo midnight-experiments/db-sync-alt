@@ -141,7 +141,8 @@ the foreground: Ctrl-C stops it and the same command resumes it. All options:
 
 ### Option B: build it from your own db-sync
 
-If you run cardano-db-sync 13.7.1.0 for Preprod with its full history,
+If you run cardano-db-sync 13.7.1.0 or 13.8.0.0 for Preprod with its retained
+core/full history,
 db-sync-alt can build the initial data from it once: read-only, without
 Blockfrost requests, in about 18 minutes for Preprod. Then run
 `db-sync-alt upgrade` and `db-sync-alt run` without `--archive`. See

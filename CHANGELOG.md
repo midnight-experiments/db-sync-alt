@@ -4,6 +4,17 @@
 
 - Read pending generation status without loading its manifest, while preserving
   fresh ownership, status and revocation checks.
+- Accept retained core/full-history cardano-db-sync 13.8.0.0 (schema 16.52.6)
+  alongside 13.7.1.0 (schema 15.48.6). Record the actual source schema/version
+  separately from the unchanged compact contract and network profiles.
+- Check required source types, domains, nullability, mode markers and epoch
+  coverage. Unknown versions, unsupported modes and incomplete history refuse.
+- **BREAKING CLI change:** `upgrade --source-service SOURCE` also requires
+  `--source-attestation FILE`. Supply the pair only when an older compact
+  database needs external ledger ordinals. Ordinary local schema upgrades
+  remain unchanged. An incomplete pair returns exit code 2 with the JSON code
+  `source_attestation_pair_required`; unreadable or invalid JSON attestation
+  files return `schema_upgrade_failed` without a traceback.
 
 ## 0.2.0
 

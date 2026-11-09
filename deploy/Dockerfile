@@ -9,7 +9,7 @@ RUN echo '0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76  /usr
 WORKDIR /opt/db-sync-alt
 COPY requirements.lock ./
 RUN pip install --no-cache-dir --require-hashes -r requirements.lock
-COPY pyproject.toml README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md ./
+COPY pyproject.toml README.md CHANGELOG.md LICENSE NOTICE THIRD_PARTY_NOTICES.md ./
 COPY src ./src
 COPY profiles ./profiles
 COPY reference ./reference
@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir --no-deps --no-build-isolation . && rm -rf build 
 COPY tests ./tests
 COPY tools ./tools
 COPY deploy ./deploy
+COPY docs/operations.md ./docs/operations.md
 COPY docs/licenses ./docs/licenses
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 USER 65532:65532

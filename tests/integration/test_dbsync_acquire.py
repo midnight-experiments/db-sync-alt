@@ -43,7 +43,7 @@ class SQLTests(unittest.TestCase):
     @classmethod
     def fill(cls,c):
         c.execute((ROOT/'tests/fixtures/data/dbsync_schema.sql').read_text())
-        c.execute("ALTER TABLE block ADD COLUMN previous_id bigint; ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint; CREATE TABLE schema_version(stage_one int,stage_two int,stage_three int);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE epoch_stake_progress(epoch_no int,completed boolean);CREATE TABLE meta(network_name text);INSERT INTO meta VALUES('preprod')")
+        c.execute("ALTER TABLE block ADD COLUMN previous_id bigint; ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint; CREATE TABLE schema_version(stage_one bigint NOT NULL,stage_two bigint NOT NULL,stage_three bigint NOT NULL);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE epoch_stake_progress(epoch_no word31type NOT NULL,completed boolean NOT NULL);CREATE TABLE meta(network_name varchar NOT NULL);INSERT INTO meta VALUES('preprod')")
         with c.transaction():
             for h,e in [(S-100,273),(S-50,274),(S-1,275)]+[(h,275) for h in range(S,W+1)]:
                 c.execute("INSERT INTO block(id,hash,block_no,epoch_no,slot_no,time,tx_count,previous_id) VALUES(%s,%s,%s,%s,%s,'2026-01-01',10,%s)",(h,H(h),h,e,h,h-1))
@@ -295,7 +295,7 @@ class InterchangeTests(unittest.TestCase):
                 source_dsn=fixture.database();dest=fixture.database()
                 with psycopg.connect(source_dsn,autocommit=True) as db:
                     db.execute((ROOT/'tests/fixtures/data/dbsync_schema.sql').read_text())
-                    db.execute("ALTER TABLE block ADD COLUMN previous_id bigint;ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint;CREATE TABLE schema_version(stage_one int,stage_two int,stage_three int);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE meta(network_name text);INSERT INTO meta VALUES('preprod');CREATE TABLE epoch_stake_progress(epoch_no int,completed boolean)")
+                    db.execute("ALTER TABLE block ADD COLUMN previous_id bigint;ALTER TABLE tx_out ADD COLUMN inline_datum_id bigint;CREATE TABLE schema_version(stage_one bigint NOT NULL,stage_two bigint NOT NULL,stage_three bigint NOT NULL);INSERT INTO schema_version VALUES(15,48,6);CREATE TABLE meta(network_name varchar NOT NULL);INSERT INTO meta VALUES('preprod');CREATE TABLE epoch_stake_progress(epoch_no word31type NOT NULL,completed boolean NOT NULL)")
                     # Distinct source IDs demonstrate namespace independence.
                     blocks=list(prepared.rows('blocks',1));block_ids={r['hash']:r['height']+123 for r in blocks}
                     original_blocks=copy.deepcopy(blocks)

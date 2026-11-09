@@ -153,7 +153,11 @@ def upgrade_store(store,ordinal_source=None):
     written=_upgrade_v4(store,state,checkpoint)
     from db_sync_alt.store import serve
     serve.verify(store,store.state()['canonical_ready'])
-    return {'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served}
+    result={'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served}
+    if ordinal_source is not None and any(served.get('ordinals_from_source',{}).values()):
+        identity=getattr(ordinal_source,'validated_identity',None)
+        if identity is not None:result['ordinal_source_identity']=identity
+    return result
 
 
 def main(argv=None):
@@ -162,16 +166,18 @@ def main(argv=None):
     from db_sync_alt.store.database import PgStore
     parser=argparse.ArgumentParser(prog='db-sync-alt upgrade',description=__doc__)
     parser.add_argument('--service',required=True)
-    parser.add_argument('--source-service',help='read-only cardano-db-sync of the same network: ledger ordinals of facts stored before schema 3')
+    parser.add_argument('--source-service',help='read-only cardano-db-sync of the same network for missing ledger ordinals; requires --source-attestation')
+    parser.add_argument('--source-attestation',type=Path,help='truthful version/retention JSON, as for acquire; requires --source-service')
     args=parser.parse_args(argv)
     try:
+        if bool(args.source_service)!=bool(args.source_attestation):raise Refusal('source_attestation_pair_required')
         with PgStore(args.service) as store:
             source=None
             if args.source_service:
                 from db_sync_alt.contract import Profile
                 from db_sync_alt.resources import profile_dir
                 from db_sync_alt.sources.dbsync.reader import SQLSource
-                source=SQLSource(args.source_service,Profile(profile_dir(store.network.network),store.network.network))
+                source=SQLSource(args.source_service,Profile(profile_dir(store.network.network),store.network.network),json.loads(args.source_attestation.read_text()))
             result=upgrade_store(store,source)
         print(json.dumps(result,sort_keys=True,default=str))
     except Refusal as e:parser.exit(2,json.dumps({'error':e.code})+'\n')

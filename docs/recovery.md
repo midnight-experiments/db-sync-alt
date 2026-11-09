@@ -86,8 +86,21 @@ With the Compose deployment, run the same command in the image
 ([Compose](docker.md#upgrade)).
 A database whose inputs and output assets were stored without their
 [ledger ordinal](glossary.md#ledger-ordinal) (written by a version before
-schema 3) also needs the read-only cardano-db-sync it can take them from:
-`db-sync-alt upgrade --service db_sync_alt --source-service dbsync_readonly`. Take a new backup afterwards.
+schema 3) also needs the same-network, retained-history cardano-db-sync and a
+truthful source attestation, using both options together:
+
+```sh
+db-sync-alt upgrade --service db_sync_alt \
+  --source-service dbsync_readonly \
+  --source-attestation /run/secrets/source-attestation.json
+```
+
+Use the [source attestation format](operations.md#build-initial-data-from-your-own-db-sync)
+for the actual 13.7.1.0 or 13.8.0.0 source schema/version. Either option without
+the other refuses with `source_attestation_pair_required`. A missing, unreadable
+or malformed JSON file refuses with `schema_upgrade_failed`, without a
+traceback. Ordinary upgrades whose facts already contain ledger ordinals need
+neither source option. Take a new backup afterwards.
 The service never upgrades by itself. A restore drops all privileges: run
 `db-sync-alt grant-reader` for the node's reader role again afterwards, or pass
 `--reader-role` to `db-sync-alt restore`, which grants it once the restored

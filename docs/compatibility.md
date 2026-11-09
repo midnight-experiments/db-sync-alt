@@ -12,7 +12,7 @@ treated as unsupported.
 | PostgreSQL client tools | `pg_dump` / `pg_restore` 17 | Needed for backups and restores; the version must match the server |
 | Python | 3.11 or newer | The container image uses Python 3.12 |
 | Python packages | `psycopg[binary]` 3.2.13 | Pinned with hashes in `requirements.lock` |
-| cardano-db-sync (initial data only) | 13.7.1.0, schema 15.48.6, `meta.network_name` of the selected network | Must keep `tx_in` and epoch-stake history; read-only access |
+| cardano-db-sync (initial data only) | 13.7.1.0/schema 15.48.6 or 13.8.0.0/schema 16.52.6; `meta.network_name` of the selected network | Core full-history mode only; required types/domains/nullability, mode markers and epoch coverage checked; truthful retained `tx_in`/epoch-stake attestation |
 | Blockfrost | The selected network's API (`cardano-<network>.blockfrost.io`) | One project key of that network; requests are counted against a daily ceiling ([costs](costs.md)) |
 | Docker / Compose (optional) | Compose 2.24.4 or newer | Only for the [Compose deployment](docker.md) and the test lanes |
 | Operating system | Linux on amd64 | Tested there; other platforms are untested |
@@ -34,3 +34,27 @@ every generation (formats v1 and v2), and the physical inventory. A backup is
 restored only into an empty PostgreSQL 17 database by the same profile; a
 manifest that records another major version is refused
 (`unsupported_backup_identity`).
+
+
+## Source schema qualification
+
+Source schema support is separate from the persisted compact fact contract.
+The adapter accepts only `(15,48,6)` as 13.7.1.0 and `(16,52,6)` as 13.8.0.0.
+The source manifest stores the actual tuple/version. The compact contract and
+packaged profiles are unchanged; 13.6, unfinished stage-three indexes and
+unknown schemas remain unsupported. `meta.version` describes the creating
+binary and is not used to label the current schema.
+
+Required core relations must retain their upstream column types, domains and
+nullability. Address-table, consumed-output, pruning and UTxO bootstrap modes
+are refused even if ordinary inputs remain. Unknown extra-migration tokens are
+refused; empty mode history and `StakeDistrEnded` are allowed. Required epochs
+need completed stake progress, a nonce and stake rows. Extraction and
+independent verification keep their full checks.
+
+The operator must truthfully attest retained `tx_in` and epoch-stake history,
+including the absence of ledger, asset or Plutus filtering. Schema/mode and
+nonempty epoch checks cannot prove all semantic history. Use these same source
+options with any packaged network profile; source and destination must still
+belong to the selected network. Real-source retention and node acceptance
+remain deployment qualifications.
