@@ -10,7 +10,7 @@ resources when it finishes. None of the checks needs a Blockfrost key.
 python3 tools/dev.py lint                     # ruff (pinned version) on the source tree
 python3 tools/dev.py unit                     # tests/unit, no database, no network
 python3 tools/dev.py integration              # tests/integration against one disposable PostgreSQL 17
-python3 tools/dev.py integration --shard 2/3  # one of three balanced parts, as CI runs them
+python3 tools/dev.py integration --shard 2/8  # one of eight parts, as CI runs them
 python3 tools/dev.py e2e                      # Compose smoke of the built image
 python3 tools/dev.py all                      # lint, unit, integration and e2e
 python3 .github/scripts/check_public_source.py
@@ -112,9 +112,10 @@ python3 tools/memory.py summary samples.tsv
 ## CI
 
 `.github/workflows/ci.yml` runs, as parallel jobs with read-only permissions and
-no secrets: the source check and lint, the unit lane, three integration shards
-and the Compose smoke. Shards are balanced on the measured module times in
-`tools/dev.py`.
+no secrets: the source check and lint, the unit lane, eight integration shards
+and the Compose smoke. The density regression runs alone in shard 8. The other
+modules are assigned using relative weights in `tools/dev.py`, including
+conservative scheduling budgets; these weights are not module timing measurements.
 
 ## Lint
 

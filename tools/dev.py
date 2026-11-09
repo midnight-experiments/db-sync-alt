@@ -32,12 +32,19 @@ PG_IMAGE = 'postgres:17.11-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea56498074
 PYTHON_IMAGE = 'python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337'
 RUFF = 'ruff==0.17.3'
 LIMITS = ('--memory', '2g', '--cpus', '2')
-# Measured seconds per integration module; shards are balanced on these (new modules count as 1).
+# Conservative scheduling weights balance the non-density modules.
+# The density regression gets its own shard without changing the job deadline.
 WEIGHTS = {
-    'test_dbsync_acquire': 70, 'test_completion': 308, 'test_incremental': 190, 'test_blockfrost_follow': 110,
+    'test_dbsync_acquire': 900, 'test_dbsync_interchange': 700, 'test_completion': 308, 'test_incremental': 190, 'test_blockfrost_follow': 110,
     'test_tip_fork': 91, 'test_sync_store': 70, 'test_service_store': 60, 'test_store': 43,
     'test_service_cancellation': 34, 'test_sync_diagnostics': 30, 'test_cli_run': 24,
     'test_poll_accounting': 1, 'test_blockfrost_generation': 150,
+    'test_pending_check': 10, 'test_dbsync_versions': 900,
+    'test_prerequisites': 1165, 'test_prerequisite_resume': 74,
+    'test_coexistence': 60, 'test_conformance_client': 20, 'test_event_windows': 30,
+    'test_lifecycle_inspection': 57, 'test_native_serving': 120, 'test_network_profiles': 120,
+    'test_checkpoint_backup': 240, 'test_integrity_checkpoints': 300,
+    'test_manifest_kinds': 180, 'test_status_summaries': 120,
 }
 
 
@@ -52,6 +59,12 @@ def shard_modules(shard):
     index, count = (int(x) for x in shard.split('/'))
     if not 1 <= index <= count:
         raise SystemExit('--shard must be I/N with 1 <= I <= N')
+    density = 'test_prerequisites'
+    if count >= 2 and density in modules:
+        if index == count:
+            return ['integration.' + density]
+        modules.remove(density)
+        count -= 1
     loads = [[0, []] for _ in range(count)]
     for module in sorted(modules, key=lambda m: (-WEIGHTS.get(m, 1), m)):
         target = min(loads, key=lambda load: load[0])

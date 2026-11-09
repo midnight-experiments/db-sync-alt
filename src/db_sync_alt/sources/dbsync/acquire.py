@@ -11,6 +11,8 @@ from db_sync_alt.contract import TABLES, KEYS, Refusal, digest, canonical, jsona
 from db_sync_alt.sources.dbsync.reader import SQLSource
 from db_sync_alt.verify.completion import SQL_ADAPTER, SQL_VALIDATION, validate_completion
 from db_sync_alt.verify.store import verify_store
+from db_sync_alt.verify.prerequisites import acquisition_version,prerequisite_coverage,chunk_receipt,seal_receipt
+from db_sync_alt.verify.sql_receipt import admit_receipt_size
 
 
 class CountedSQLSource(SQLSource):
@@ -270,13 +272,6 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
     if ready:
         if store.meta('profile') != profile.identity:
             raise Refusal('resume_profile_mismatch')
-        verify_store(store)
-        try:
-            with source.snapshot():
-                source.check_anchors({'anchors': {k: ready['manifest']['anchors'][k] for k in ('start','target')}})
-        except Refusal as error:
-            if error.code == 'source_anchor_conflict':store.mark_conflict()
-            raise
     if pending:
         m = pending['manifest']
         if digest(fresh['source_identity']) != digest(m['source_identity']):
@@ -287,11 +282,25 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
             raise Refusal('resume_profile_mismatch')
         generation = pending['id']; window_blocks = m['acquisition']['window_blocks']
     else:
-        if ready and fresh['anchors']['target']['height'] <= ready['target_height']:
-            raise Refusal('no_confirmed_progress')
         from db_sync_alt.store.incremental import integrity_reference
         fresh['parent_digest'] = integrity_reference(ready)['sha256'] if ready else None
-        fresh['acquisition'] = {'version': 1, 'window_blocks': window_blocks}
+        fresh['acquisition'] = {'version': 2, 'window_blocks': window_blocks}
+    admission = m if pending else fresh
+    admit_receipt_size(admission, start=pending['start_height'] if pending else profile.start[0],
+        range_start=ready['target_height']+1 if ready else profile.start[0],
+        target=admission['anchors']['target']['height'], witness=admission['anchors']['witness']['height'],
+        root=ready is None, window=window_blocks, version=acquisition_version(pending) if pending else 2)
+    if ready:
+        verify_store(store)
+        try:
+            with source.snapshot():
+                source.check_anchors({'anchors': {k: ready['manifest']['anchors'][k] for k in ('start','target')}})
+        except Refusal as error:
+            if error.code == 'source_anchor_conflict':store.mark_conflict()
+            raise
+    if not pending:
+        if ready and fresh['anchors']['target']['height'] <= ready['target_height']:
+            raise Refusal('no_confirmed_progress')
         with store.atomic():
             if store.meta('profile') is None:store.set_meta('profile', profile.identity)
             generation = store.begin_generation(source='cardano-db-sync-postgresql', start=profile.start,
@@ -304,22 +313,31 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
                     'hi': ready['target_height'], 'parent': ready['id'], 'parent_digest': fresh['parent_digest'],
                     'source_kind': 'generation-inheritance', 'inherited_source_kind': ready['source']})
     g = store.generation(generation); m = g['manifest']
+    prerequisite_state=prerequisite_coverage(store,g,require_complete=False)
+    if pending and prerequisite_state['version']==1 and g['parent'] is None and g['start_height']>0 and not prerequisite_state['complete']:
+        raise Refusal('prerequisites_v1_pending_requires_recovery')
     ranges = []
     # Facts before the start cursor; a network whose cursor is block 0 has none.
-    if ready is None and g['start_height'] > 0:ranges.append(('prerequisites', 0, g['start_height']-1))
+    if g['parent'] is None and g['start_height'] > 0:
+        if acquisition_version(g)==2:ranges += [('prerequisites',lo,min(g['start_height']-1,lo+window_blocks-1)) for lo in range(0,g['start_height'],window_blocks)]
+        else:ranges.append(('prerequisites',0,g['start_height']-1))
     start = ready['target_height']+1 if ready else g['start_height']
     for phase, end in [('metadata', g['witness_height']), ('events', g['target_height'])]:
         ranges += [(phase, lo, min(end, lo+window_blocks-1)) for lo in range(start, end+1, window_blocks)]
 
     def unit(phase, lo, hi):
         _stop(stop_event); store.check_space()
-        covered = sorted((r['receipt']['lo'], r['receipt']['hi']) for r in store.checkpoint_rows(generation=generation, phase=phase)
-                         if r['receipt']['hi'] >= lo and r['receipt']['lo'] <= hi)
-        position = lo
-        for a,b in covered:
-            if a != position or b > hi:raise Refusal('checkpoint_overlap')
-            position = b+1
-        lo = position
+        if phase=='prerequisites':
+            if prerequisite_state['complete']:return
+            lo=max(lo,prerequisite_state['position'])
+        else:
+            covered = sorted((r['receipt']['lo'], r['receipt']['hi']) for r in store.checkpoint_rows(generation=generation, phase=phase)
+                             if r['receipt']['hi'] >= lo and r['receipt']['lo'] <= hi)
+            position = lo
+            for a,b in covered:
+                if a != position or b > hi:raise Refusal('checkpoint_overlap')
+                position = b+1
+            lo = position
         if lo > hi:return
         try:
             with source.snapshot() as snapshot:
@@ -328,17 +346,30 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
                 with store.atomic():
                     count = _put(store, generation, facts, stop_event)
                     if phase == 'metadata' and count != hi-lo+1:raise Refusal('source_metadata_gap')
-                    store.checkpoint(generation, phase, 'complete' if phase == 'prerequisites' else f'{lo}:{hi}',
-                        {'lo':lo,'hi':hi,**snapshot,'rows':count,'source_kind':g['source']})
+                    if snapshot.get('read_only') is not True:raise Refusal('source_not_read_only')
+                    receipt=chunk_receipt(g,lo,hi,count) if phase=='prerequisites' else {'lo':lo,'hi':hi,**snapshot,'rows':count,'source_kind':g['source']}
+                    store.checkpoint(generation,phase,f'{lo}:{hi}',receipt)
+                if phase=='prerequisites':prerequisite_state['position']=hi+1
         except Refusal as error:
-            if error.code in ('source_timeout','work_unit_too_dense') and phase != 'prerequisites' and hi > lo:
+            if error.code in ('source_timeout','work_unit_too_dense') and hi > lo:
                 middle = (lo+hi)//2; unit(phase,lo,middle);unit(phase,middle+1,hi);return
             if error.code == 'source_anchor_conflict':store.mark_conflict()
             raise
         _anchors(source, store, generation)
         store.progress('sql_checkpoint', generation=generation, phase_name=phase, height=hi)
         if progress:progress(phase, generation=generation, height=hi)
-    for phase,lo,hi in ranges:unit(phase,lo,hi)
+    def seal_prerequisites():
+        if acquisition_version(g)!=2 or g['parent'] is not None or not g['start_height'] or prerequisite_state['complete']:return
+        _stop(stop_event);_anchors(source,store,generation)
+        with store.atomic():
+            state=prerequisite_coverage(store,g,require_complete=False)
+            if state['position']!=g['start_height']:raise Refusal('prerequisites_incomplete')
+            store.checkpoint(generation,'prerequisites','complete',seal_receipt(g,state['chunks']))
+        prerequisite_state['complete']=True
+    for phase,lo,hi in ranges:
+        if phase!='prerequisites':seal_prerequisites()
+        unit(phase,lo,hi)
+    seal_prerequisites()
     epoch_list = m['acquisition'].get('epochs')
     if epoch_list is None:
         epoch_list = []

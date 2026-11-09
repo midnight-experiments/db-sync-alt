@@ -70,7 +70,7 @@ def validate_sql_receipt(store, generation, manifest, receipt):
         if digest(independent['parent_digest']) != digest(manifest['parent_digest']) or digest(receipt['independent']) != digest(independent):
             _invalid()
         acquisition=manifest['acquisition'];window=acquisition['window_blocks']
-        if type(acquisition['version']) is not int or acquisition['version'] != 1 or type(window) is not int or not 1<=window<=10000:
+        if type(acquisition['version']) is not int or acquisition['version'] not in (1,2) or type(window) is not int or not 1<=window<=10000:
             _invalid()
         parent=store.generation(generation['parent']) if generation['parent'] is not None else None
         start=parent['target_height']+1 if parent else generation['start_height']
@@ -82,7 +82,7 @@ def validate_sql_receipt(store, generation, manifest, receipt):
         for item in ranges:
             if not isinstance(item,(list,tuple)) or len(item)!=3:_invalid()
             phase,lo,hi=item
-            if phase not in expected or type(lo) is not int or type(hi) is not int or lo<0 or hi<lo or (phase!='prerequisites' and hi-lo+1>window):_invalid()
+            if phase not in expected or type(lo) is not int or type(hi) is not int or lo<0 or hi<lo or ((acquisition['version']==2 or phase!='prerequisites') and hi-lo+1>window):_invalid()
             covered[phase].append((lo,hi))
         for phase,(lo,hi) in expected.items():
             position=lo
@@ -90,6 +90,9 @@ def validate_sql_receipt(store, generation, manifest, receipt):
                 if first!=position or last>hi:_invalid()
                 position=last+1
             if position!=hi+1:_invalid()
+        if acquisition['version']==2:
+            from db_sync_alt.verify.prerequisites import prerequisite_coverage
+            prerequisite_coverage(store,{**generation,'manifest':manifest})
         expected_epochs=[]
         for epoch in manifest['required_epochs']:
             inherited=store.checkpoint_rows(phase='epochs',unit=epoch,before=generation['id'])

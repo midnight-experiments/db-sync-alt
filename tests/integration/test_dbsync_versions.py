@@ -105,7 +105,7 @@ class SourceVersions(unittest.TestCase):
         for version,stages in [('13.7.1.0',[15,48,6]),('13.8.0.0',[16,52,6])]:
             dsn,_=self.dbs.create();source=self.source(version)
             with PgStore(conninfo=dsn,create=True,network='mainnet') as store:
-                result=acquire(source,store,self.profile,target_height=self.target)
+                result=acquire(source,store,self.profile,target_height=self.target,window_blocks=10000)
                 verify_store(store);g=store.generation();validate_completion(store,g,result['digests'],require_seal=True)
                 identity=g['manifest']['source_identity'];self.assertEqual(identity['schema'],stages);self.assertEqual(identity['dbsync_version'],version)
                 anchors={k:g['manifest']['anchors'][k] for k in ['start','target']}
@@ -175,7 +175,7 @@ class SourceVersions(unittest.TestCase):
             with self.subTest(initial_schema=initial_schema):
                 dsn,_=self.dbs.create()
                 with PgStore(conninfo=dsn,create=True,network='mainnet') as store:
-                    acquire(self.source(),store,self.profile,target_height=self.target)
+                    acquire(self.source(),store,self.profile,target_height=self.target,window_blocks=10000)
                     before=store.digests(store.generation()['id']);profile=store.meta('profile')
                     if initial_schema>=2:upgrade._upgrade_v2(store,store.state())
                     if initial_schema==3:upgrade._upgrade_v3(store,store.state(),None)
@@ -194,7 +194,7 @@ class SourceVersions(unittest.TestCase):
         from db_sync_alt.store import upgrade
         dsn,alias=self.dbs.create()
         with PgStore(conninfo=dsn,create=True,network='mainnet') as store:
-            acquire(self.source(),store,self.profile,target_height=self.target)
+            acquire(self.source(),store,self.profile,target_height=self.target,window_blocks=10000)
             upgrade._upgrade_v2(store,store.state())
             for table in ('inputs','output_assets'):store.db.execute('ALTER TABLE chain.'+table+' DROP COLUMN ordinal')
         att=Path(self.dbs.tmp.name)/'upgrade-attestation.json'
