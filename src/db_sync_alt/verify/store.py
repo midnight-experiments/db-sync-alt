@@ -166,6 +166,9 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
             row=store.block_at(gen,anchor['height'])
             if row is None or row['epoch']!=epoch or row['hash'].hex()!=anchor.get('hash'):raise Refusal('epoch_anchor_mismatch')
     store.progress('verify_structure_complete',generation=gen)
+    if g['manifest'].get('relevance_coverage') is not None:
+        from db_sync_alt.sources.blockfrost.relevance import verify_generation
+        verify_generation(store,gen)
     if delta:
         # A new binding of an existing pre-S physical header is still a delta;
         # it must belong to an actual retained transaction or epoch-end closure.

@@ -283,6 +283,19 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn('do-not-print', json.dumps(get(service, '/status')[1]))
 
 
+    def test_relevance_failure_codes_remain_visible_in_service_health(self):
+        for code in ('relevance_parent_unsupported', 'relevance_mode_mismatch', 'relevance_coverage_invalid',
+                     'relevance_parent_changed', 'relevance_inventory_invalid', 'relevance_output_unqualified',
+                     'relevance_profile_address_invalid', 'relevance_work_unit_limit'):
+            with self.subTest(code=code):
+                runtime = Runtime(); sync = Sync(runtime); sync.error = LifecycleFailure(code)
+                service, _, _ = self.make(runtime=runtime, sync=sync)
+                eventually(service.failed.is_set)
+                self.assertEqual(service.failure, code)
+                status, body = get(service, '/health')
+                self.assertEqual((status, body['error_code']), (503, code))
+                self.assertTrue(service.stop())
+
 class ConfigTests(unittest.TestCase):
     def test_node_requirements_are_compared_with_the_profile_and_only_reported(self):
         from db_sync_alt.networks import directory

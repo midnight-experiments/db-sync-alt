@@ -58,6 +58,7 @@ def parser():
     p.add_argument('--archive', type=Path, help='Accepted PostgreSQL-native backup for an empty destination')
     p.add_argument('--manifest', type=Path, help='Accepted manifest paired with --archive')
     p.add_argument('--http-port', type=int, default=18080)
+    p.add_argument('--relevance', action=argparse.BooleanOptionalAction, dest='relevance_enabled', default=False, help='Enable coverage-certified relevance filtering (default: off)')
     p.add_argument('--node-security-parameter', type=int, help="The Midnight node's CARDANO_SECURITY_PARAMETER, compared with the network's k (report-only)")
     p.add_argument('--node-configuration-dir', type=Path, help="The node's network configuration directory (res/<network>), compared with the profile (report-only)")
     return p
@@ -228,6 +229,8 @@ def configure(args, params, key, state, db, existing, reader_login=(DEFAULT_READ
                     key_sha256=digest(key), http_port=args.http_port, node=node_values(args),
                     provider_adapter=os.environ.get('DBSYNC_PROVIDER_ADAPTER', 'portable'),
                     shared_root=os.environ.get('DBSYNC_SHARED_ROOT', ''), shared_profile=os.environ.get('DBSYNC_SHARED_PROFILE', args.network))
+    if getattr(args, 'relevance_enabled', False):
+        identity['relevance_enabled'] = True
     if identity['provider_adapter'] not in ('portable', 'shared'):
         raise LaunchError('unsupported_provider_adapter')
     if identity['provider_adapter'] == 'shared' and (not Path(identity['shared_root']).is_absolute() or identity['shared_profile'] != args.network):
@@ -288,6 +291,7 @@ def configure(args, params, key, state, db, existing, reader_login=(DEFAULT_READ
     cfg.update(network=network.network, profile=network.profile, http_port=args.http_port, backup_archive=str(archive) if archive else None,
                backup_manifest=str(manifest) if manifest else None, storage_reserves={str(state):10*1024**3},
                reader={'role': reader_role, 'pg_service': 'db_sync_alt_reader'}, node=node_values(args))
+    cfg['sync']['relevance_enabled'] = getattr(args, 'relevance_enabled', False)
     durable(state/'service.json', json.dumps(cfg, indent=2)+'\n')
     if identity['provider_adapter'] == 'portable':
         from db_sync_alt.sources.blockfrost.provider import PortableClient

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+
+- Add explicit, default-off relevance filtering on every supported network through
+  `sync.relevance_enabled` and `--relevance` / `--no-relevance`. Health reports
+  requested/effective mode and safe refusal reasons.
+- Persist relevance coverage atomically with pending generations. Validate missing-row
+  recovery and refuse resume mode changes before provider calls or budget changes.
+- Bind reusable relevance coverage to profile digests, mixed manifest forms and
+  integrity checkpoints; reject numeric substitutions in certificates and invalidate
+  the cached prefix when its checkpoint changes.
 - Acquire complete SQL prerequisite history in bounded, atomic windows with
   resumable contiguous coverage and independent source verification. Existing
   source-query deadlines, identity caps and confirmation rules are unchanged.

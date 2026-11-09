@@ -83,7 +83,7 @@ class StateTests(unittest.TestCase):
             'lifecycle', 'sync', 'serving', 'provider_head', 'provider_observed_at',
             'confirmed_target', 'committed_target', 'served_target', 'witness', 'pending',
             'lag', 'freshness', 'last_successful_sync', 'retry_at', 'quota', 'database',
-            'workers', 'operation', 'error_code', 'policy', 'healthy', 'reason_codes', 'reader', 'warnings', 'integrity'})
+            'workers', 'operation', 'error_code', 'policy', 'healthy', 'reason_codes', 'reader', 'warnings', 'integrity', 'relevance'})
 
     def test_integrity_base_and_checkpointing_are_reported(self):
         result, _ = healthy()

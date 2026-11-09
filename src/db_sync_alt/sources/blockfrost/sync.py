@@ -553,11 +553,13 @@ class SyncDriver:
         defaults = {'max_batch_blocks': 100, 'publication_interval_seconds': 60,
                     'acquisition_request_budget': 10000, 'daily_poll_request_budget': 10000,
                     'follow_min_blocks': 1, 'follow_max_wait_seconds': 40,
-                    'integrity_checkpoint_interval_seconds': 21600}
+                    'integrity_checkpoint_interval_seconds': 21600, 'relevance_enabled': False}
         if set(self.options) - set(defaults):
             raise LifecycleFailure('invalid_sync_configuration')
         for key, value in defaults.items():
             self.options.setdefault(key, value)
+        if type(self.options['relevance_enabled']) is not bool:
+            raise LifecycleFailure('invalid_sync_configuration')
         for key, low, high in (('max_batch_blocks', 1, 1000), ('publication_interval_seconds', 1, 1800),
                                ('acquisition_request_budget', 1, 10000), ('daily_poll_request_budget', 1, 10000),
                                ('follow_min_blocks', 1, 100), ('follow_max_wait_seconds', 1, 120),
@@ -574,6 +576,7 @@ class SyncDriver:
         if self._poller is not None:
             raise LifecycleFailure('startup_failed')
         self.check_follow_mode(store)
+        self._check_relevance(store, health, store.generation(), store.pending())
         if self.options['daily_poll_request_budget'] != 10000:
             raise LifecycleFailure('invalid_sync_configuration')
         health.configure_follow('incremental', self.config.policy.poll_seconds)
@@ -677,11 +680,29 @@ class SyncDriver:
         health.update(sync='syncing')
         return True
 
+    def _check_relevance(self, store, health, ready, pending):
+        enabled = self.options['relevance_enabled']
+        effective = 'relevance' if pending and pending['manifest'].get('relevance_coverage') is not None else 'full'
+        try:
+            if enabled or effective == 'relevance':
+                from db_sync_alt.sources.blockfrost.relevance import requested_coverage
+                if not getattr(store, 'supports_incremental', False):
+                    raise Refusal('relevance_parent_unsupported')
+                requested_coverage(store, self.profile, pending['target_height'] if pending else ready['target_height'] + 1, pending, enabled)
+        except Refusal as error:
+            code = error.code if error.code in ('relevance_parent_unsupported', 'relevance_mode_mismatch', 'relevance_coverage_invalid', 'relevance_parent_changed') else 'relevance_coverage_invalid'
+            if hasattr(health, 'relevance_mode'):
+                health.relevance_mode(enabled, effective=effective, reason=code)
+            raise LifecycleFailure(code) from None
+        if hasattr(health, 'relevance_mode'):
+            health.relevance_mode(enabled, effective='relevance' if enabled else 'full', reason='verified' if enabled else 'disabled')
+
     def _run_once(self, store, health, stop_event):
         if stop_event.is_set():
             return
         ready = store.generation()
         pending = store.pending()
+        self._check_relevance(store, health, ready, pending)
         if pending:
             try:
                 validate_completion(store, pending)
@@ -792,15 +813,22 @@ class SyncDriver:
         try:
             if self.update_fn is update and getattr(store, 'supports_incremental', False) and (not pending or pending['manifest'].get('integrity', {}).get('version') == 2):
                 from db_sync_alt.sources.blockfrost.follow import update_follow
-                update_follow(store, provider, self.profile, target, hooks=hooks, observation=observation)
+                update_follow(store, provider, self.profile, target, hooks=hooks, observation=observation, relevance_enabled=self.options['relevance_enabled'])
             else:
-                self.update_fn(store, provider, self.profile, target, hooks=hooks)
+                if self.update_fn is update:
+                    self.update_fn(store, provider, self.profile, target, hooks=hooks, relevance_enabled=self.options['relevance_enabled'])
+                else:
+                    self.update_fn(store, provider, self.profile, target, hooks=hooks)
                 if getattr(store, 'supports_incremental', False) and self.update_fn is update:
                     store.certify_ready_full()
         except Refusal as error:
             if not (error.code == 'interrupted' and stop_event.is_set()):
                 provider.record_failure(error)
             if error.code in COMPLETION_ERRORS:
+                raise LifecycleFailure(error.code) from None
+            if error.code in {'relevance_parent_unsupported', 'relevance_mode_mismatch', 'relevance_coverage_invalid',
+                              'relevance_parent_changed', 'relevance_inventory_invalid', 'relevance_output_unqualified',
+                              'relevance_profile_address_invalid', 'relevance_work_unit_limit'}:
                 raise LifecycleFailure(error.code) from None
             if error.code == 'interrupted' and stop_event.is_set():
                 return
