@@ -317,7 +317,7 @@ def trust_history(store,profile):
     if state['revoked'] or state['migration_state']!='ready':raise Refusal('relevance_parent_changed')
     if g['manifest'].get('relevance_coverage') is not None:raise Refusal('relevance_trust_already_initialized')
     def unused():
-        if store.db.execute("SELECT 1 FROM chain.checkpoints WHERE phase='relevance' AND unit='anchor' AND (generation=%s OR receipt->>'origin'='trusted-history') LIMIT 1",(g['id'],)).fetchone():raise Refusal('relevance_trust_already_initialized')
+        if store.db.execute("SELECT 1 FROM chain.checkpoints WHERE phase='relevance' AND unit='anchor' AND (generation=%s) LIMIT 1",(g['id'],)).fetchone():raise Refusal('relevance_trust_already_initialized')
     unused()
     store.certify_ready_full()
     receipt=_anchor_receipt(store,g,'trusted-history','trusted-history')

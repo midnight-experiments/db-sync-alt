@@ -1,99 +1,105 @@
 # Provider relevance filtering
 
-Relevance filtering is an optional, coverage-gated optimization for incremental
-following. It requires complete certified SQL-root coverage; enabling it does not
-establish live request, latency or node acceptance.
+Relevance filtering can skip UTxO and transaction-detail requests for unrelated
+transactions while keeping the same matching facts. It is **off by default on
+every network**. Ambiguous transactions still use the full request path or refuse;
+filtering must never turn missing information into evidence that nothing matches.
 
-Filtering defaults **off on every network**, including Mainnet, Preprod and
-Preview. Enable it only for a compatible certified dataset; a network name does
-not grant a coverage capability. The example
-[mainnet-relevance-sync.json](../deploy/mainnet-relevance-sync.json) selects
-three confirmed blocks per publication with a 60-second maximum wait. These
-batching settings require measured live processing latency and request headroom.
-Keep the configured polling, confirmation depth, node margin and serving-lag
-guards; changing them is not a remedy for slow processing.
+## Before enabling
 
-## Upgrade from 0.3.0
+Use a dataset with complete supported SQL-root coverage and certified provider
+updates, or an explicitly trusted non-Mainnet history as described below. An
+upgrade alone does not make arbitrary full-scan history eligible. An unsupported
+history refuses with `relevance_parent_unsupported` before provider requests.
 
-This feature keeps fact format 1, compact schema 4, backup format 3 and the
-packaged node query/profile identities. An existing schema-4 database needs no
-schema migration for relevance filtering. Install a reader implementing both
-the prerequisite-receipt and relevance-proof protocols before enabling the
-option; keep that reader with any subsequent database or backup containing
-optimized history.
+The schema version remains 4; fact format 1, backup v3 and the packaged
+query/profile identities remain. Filtered history requires a reader that checks
+relevance proofs. Keep that compatible package and profile with the database and
+its backups, even after switching filtering off.
 
-1. Stop the writer at a completed publication, preserve its database, matching
-   package/profile and request-accounting history, and take a backup v3.
-2. Install the prerequisite-window and relevance features, then verify the
-   database. Enabling requires complete supported SQL-root coverage and
-   relevance-certified provider transitions; an arbitrary full-scan lineage
-   does not gain a certificate merely by upgrading.
-3. Leave the option off to retain full-scan behavior, or select the strict
-   boolean `sync.relevance_enabled` only after the coverage checks succeed.
-4. Restart the single writer with the same database and accounting, and check
-   the requested/effective mode and fresh `/health` and `/status` observations.
-
-If an update is pending, finish it in its original mode before changing modes.
-Disabling filtering does not disable verification of already stored optimized
-history. Preserve the original backup/package for recovery rather than deleting
-coverage rows or editing immutable manifests.
+Before changing modes, stop the writer after a completed publication, check that
+the database is unrevoked with no pending update, and take a verified backup.
+Preserve the database, package/profile and request-accounting files. A pending
+update must finish in its original mode; see [recovery below](#if-a-pending-update-cannot-finish).
 
 ## Enable and observe
 
-Set a strict JSON boolean in the service configuration:
+For the configuration-file service, set a JSON boolean:
 
 ```json
 {"sync": {"relevance_enabled": true}}
 ```
 
-Missing `relevance_enabled` means `false`. Strings such as `"false"`, numbers and null are rejected. The foreground launcher and Compose initializer accept `--relevance` and `--no-relevance`; a one-shot Blockfrost update uses the same flags:
+A missing option means `false`. Strings, numbers and null are rejected. A new
+foreground `run` or Compose deployment accepts `--relevance`; `--no-relevance`
+selects full scan. An existing native `run` state binds its original mode: use
+[the completed-boundary procedure](#change-mode-at-a-completed-publication-boundary)
+to change it instead of editing its launch receipts.
 
-```bash
+A one-shot Blockfrost update also accepts the option:
+
+```sh
 db-sync-alt acquire --source blockfrost --network preprod \
   --destination-service db_sync_alt --target-height HEIGHT --relevance
 ```
 
-Use an actual confirmed target above the current publication, within the existing maximum batch bound. SQL bootstrap itself does not use this filter and does not accept `--relevance`.
+Use your actual private service name and a confirmed target within the existing
+batch bound. Filtering applies to Blockfrost following, not SQL bootstrap.
 
-Both HTTP status endpoints expose, for example:
+Check fresh `/health` and `/status` responses. When filtering is active,
+`relevance.requested` and `relevance.effective` are both `relevance`; the reason is
+`verified` for certified history or `trusted-history` for explicitly trusted
+history. With filtering off, the requested and effective modes are `full`.
+Also check that health is ready, chain progress advances and request usage keeps
+its existing history. A refusal reason such as `relevance_coverage_invalid` or
+`relevance_mode_mismatch` requires diagnosis, not deleting rows or resetting usage.
 
-```json
-{"relevance": {"requested": "relevance", "effective": "relevance", "reason": "verified"}}
-```
+The separate `db-sync-alt status --service NAME` command reports stored provenance
+in `relevance.history`. This is not the current filtering mode or a fresh
+verification result. It can still say `trusted-history` after a full-scan update;
+use the HTTP mode fields to check what the running service is doing.
 
-Disabled mode reports `full/full/disabled`. An enabled unsupported parent reports `relevance/full/relevance_parent_unsupported` and is unready. Corrupt coverage and a conflicting pending mode report `relevance_coverage_invalid` and `relevance_mode_mismatch`. `relevance_parent_changed` means the requested profile no longer matches the certified parent. Do not retry by deleting pending rows or resetting request accounting.
+## Existing non-Mainnet full-scan history
 
-A new pending generation and its coverage row commit together before event acquisition. On resume, the selected mode must match the pending manifest. For an older pending generation that declares a valid certificate but lacks its coverage row, the writer rechecks the exact certified parent, profile, target and current pending manifest, then inserts just the missing row transactionally before provider work. A forged certificate or conflicting row refuses; existing facts, budgets and committed history are preserved. Certificate versions, root generation identifiers and both range bounds must be strict integers; JSON booleans and floating-point substitutes are rejected even when their numeric values compare equal. Resume with the original mode. The native launcher also binds this option in its durable launch identity; changing it in an existing launch state refuses.
-
-Certification binds each manifest through the store's profile-digest API. Both embedded-profile v1 transitions and digest-bound v2 transitions are supported. A fresh writer at an integrity checkpoint still obtains the core VerifiedParent capability and separately checks the retained relevance certificates back to the complete SQL root. The checkpoint alone never proves relevance coverage; a full-scan transition without coverage remains unsupported for enabling the filter.
-
-Certification reuse is scoped to the exact live VerifiedParent capability, profile, database revision and integrity-checkpoint binding, with an integrity-reference check when inheriting a certified ancestor. Revocation, a different writer session or incompatible profile cannot reuse it. Moving the checkpoint invalidates the cached prefix and requires a new relevance proof walk. One cache entry per live writer retains the latest certified prefix; a cold walk retains a single expected root rather than every historical certificate. Core parent-integrity validation still runs. This avoids repeated additional relevance proof walks, not the store's mandatory checks or a fresh writer's initial history validation. Measure the cold lineage walk and steady-state publications separately on the deployed dataset.
+Existing non-Mainnet full-scan history can be marked trusted through the hidden
+`_trust-relevance-history --destination-service NAME --network NETWORK` command,
+with its writer stopped and no pending update. Mainnet refuses this command.
+Preserve the matching package and verified backup before this explicit trust
+decision; start the service with filtering on immediately after running it.
+A later full-scan publication may be explicitly trusted again at its new ready
+generation; repeating the command on the same ready generation refuses.
+The history and its certified descendants remain labeled `trusted-history`,
+including after checkpoint and restart, rather than independently verified history.
 
 ## Change mode at a completed publication boundary
 
-The `service` interface can select a different mode at a completed publication boundary. The compatible PostgreSQL server must already be running against the original database. The `service` command does not launch PostgreSQL; if your supervisor stops it with the old service, first bring back that same server/data using your established database lifecycle procedure. Do not initialize another database.
+1. Stop the old writer. Run `db-sync-alt status --service NAME` with its original
+   private connection files: require a ready, unrevoked database and no pending
+   generation. If an update is pending, complete it in its original mode first.
+2. Keep PostgreSQL running against that same database and data directory. The
+   `service` command does not start PostgreSQL; if the old supervisor stopped it,
+   use your established database lifecycle procedure to restart the original
+   server. Do not initialize replacement data.
+3. Keep the same provider adapter and accounting paths. Shared deployments must
+   retain `DBSYNC_PROVIDER_ADAPTER=shared`, `DBSYNC_SHARED_ROOT` and
+   `DBSYNC_SHARED_PROFILE`; portable deployments must reuse their original ledger.
+   Do not clear counters, rotate credentials to evade limits or run two writers.
+4. For a configuration-file service, change only `sync.relevance_enabled` while
+   stopped. For a native `run` deployment, leave its launch state untouched and
+   copy its service configuration into a new private configuration directory.
+   The following example changes only the mode; choose your actual paths:
 
-Cleanly stop the old writer after a completed publication, and confirm that its PostgreSQL database is unrevoked with no pending generation. If shutdown leaves a pending update, resume and complete it in its original mode before changing modes. Enabling still requires the supported certified lineage described below: this route does not create missing coverage, and an intervening full-scan publication without a relevance certificate makes the current lineage unsupported for re-enabling. A completed boundary alone is insufficient. Keep all original native launch state and receipts unchanged. Use a separate private service configuration to select the new mode; do not present it to `run` as an altered native launch state.
-
-The following illustrates changing from the native wrapper to the public configuration-file service. Supply your actual existing state directory and a new private configuration path. Preserve your provider adapter choice: shared deployments must retain the same `DBSYNC_PROVIDER_ADAPTER=shared`, `DBSYNC_SHARED_ROOT` and `DBSYNC_SHARED_PROFILE`; portable deployments must retain their original accounting directory. Do not run both writers.
-
-```bash
-set -euo pipefail
+```sh
+set -eu
 umask 077
 relevance_old_state="$HOME/.local/share/db-sync-alt/native"
 relevance_new_dir="$HOME/.config/db-sync-alt/relevance-service"
 mkdir -p -m 700 "$(dirname -- "$relevance_new_dir")"
-mkdir -m 700 "$relevance_new_dir"  # Must be a new private directory.
+mkdir -m 700 "$relevance_new_dir"  # Must be new.
 export PGSERVICEFILE="$relevance_old_state/pg_service.conf"
 export PGPASSFILE="$relevance_old_state/pgpass"
 export DBSYNC_PROVIDER_KEY_FILE="$relevance_old_state/provider.key"
 export DBSYNC_PROVIDER_STATE="$relevance_old_state/accounting"
-
-# Read-only check after the old writer has stopped. PostgreSQL must be running.
-relevance_ready=$(psql 'service=db_sync_alt_owner' -X -v ON_ERROR_STOP=1 -Atc \
-  "SELECT NOT revoked AND canonical_ready IS NOT NULL AND NOT EXISTS (SELECT 1 FROM chain.generations WHERE status='pending') FROM chain.service_state WHERE id=1")
-[ "$relevance_ready" = t ] || { echo 'Refusing: database is not at a ready publication boundary.' >&2; exit 1; }
-
 python3 - "$relevance_old_state/service.json" "$relevance_new_dir/service.json" <<'PYCONFIG'
 import json, os, sys
 from pathlib import Path
@@ -104,53 +110,39 @@ with os.fdopen(fd, 'w') as out:
     json.dump(value, out, indent=2)
     out.write('\n')
 PYCONFIG
-
 db-sync-alt service --config "$relevance_new_dir/service.json"
 ```
 
-Check `/health` and `/status` for the requested/effective mode, startup verification, fresh chain progress and unchanged request usage history. The writer lock prevents concurrent owners, and a pending mode mismatch still refuses before provider work. Existing database jobs, original portable ledger or shared ledger are reused; no usage counter is reset. Future starts of this configuration-file service must reuse these same paths. Starting the old native `run` again selects its original bound mode, so manage that deployment choice explicitly.
+5. Check the fresh HTTP mode, health, progress and request usage. Reuse these same
+   private paths on later starts. Starting the old native `run` again selects its
+   original bound mode, so manage that deployment choice explicitly.
 
-## Coverage and discovery
+To switch off, use `false` or `--no-relevance` at the same completed boundary.
+Stored filtered history still needs its proof-capable reader. A later full-scan
+publication can make filtering unsupported until valid coverage is re-established;
+non-Mainnet history may use the explicit trust procedure above.
 
-Negative filtering requires a session-certified, immutable parent with a sealed direct-SQL acquisition that independently covered every required matching pre-start prerequisite and every event window. Every intervening optimized provider generation must carry matching coverage, completion and independent inventory receipts. With the option off, compatible roots use the accounted full scan without new relevance certificate or lineage work. With the option on, an unsupported root or missing/incompatible/corrupt lineage refuses before provider requests; it never silently falls back. Stored optimized generations still undergo their existing proof validation even when the next update uses full scan. Changing this option does not change the existing dataset's fact contract, profile, reference source, security parameter or confirmation semantics. Both supported SQL acquisition receipt versions are checked under their own complete-coverage rules; a version-2 root requires the prerequisite-window reader.
+## If a pending update cannot finish
 
-All transaction CBOR is still decoded and body-hash checked. Exact supported Shelley addresses, native assets/mints and ordinary input outpoints determine relevance. Profile addresses are checksum/network validated. Unknown forms, unsupported address/reference-script encodings and malformed discovery details never become negative evidence: they retain the full provider path or refuse. Relevant invalid transactions, including relevant collateral returns/spends, refuse.
+Resume with the original mode, profile and accounting. If it continues to refuse,
+for example because a selected output cannot be parsed or a work unit exceeds its
+bound, stop and keep the failed database and logs. The supported recovery is to
+restore the last verified backup into a **new, empty database** using the
+[backup and recovery procedure](recovery.md#restore-into-a-new-empty-database).
+A database with a pending generation cannot be backed up, so use a backup made
+before that update. Retain its matching package/profile and accounting history.
+Do not delete pending facts or coverage, edit manifests/launch receipts, reset
+usage or use the trust command to bypass a pending refusal.
 
-Acquisition and verification independently enumerate fresh provider block inventories and independently discover newly relevant outputs. The second pass fetches fresh selected UTxO/detail/datum responses; it does not consume acquisition-produced cached JSON or candidate-selected transaction lists. Exact supported CBOR output values are compared with the provider response, preventing a provider omission from changing relevance. Ordinary/collateral/reference role and ledger ordinal checks remain in place. Certified parent rows and already independently discovered earlier work units may be reused as immutable prerequisites.
+## Checkpoints and operating limits
 
-Independent natural-key/hash inventories are checked against persisted facts before publication; missing, changed or extra candidate facts refuse. An interrupted pending generation replays completed blocks through fresh inventories to rebuild both discovery streams. Candidate row presence alone is never evidence that an absent input origin was irrelevant. Memory and receipt bounds fail closed on excessively dense work units.
+Integrity checkpoints retain a relevance anchor after successful qualification,
+so later relevance checks walk only the new updates. Constant-size anchor checks
+still run, and ordinary integrity verification still checks stored facts.
+A checkpoint taken while an update is pending defers the new relevance anchor.
 
-## Cost and latency qualification
-
-Request models must include both fresh inventory passes, selected UTxO/detail responses, polls, metrics, origins/datums, unknown-form fallbacks, forks, retries, cold handoff and epochs. A NIGHT-only activity proxy is incomplete. Synthetic wall time measures database work but does not prove network latency or live API usage. Respect the shared daily limit and cooldowns; do not reset counters or rotate credentials to evade them.
-
-Measure complete acquisition, independent verification and publication latency
-under live load. With an average block interval of 20 seconds and batch size B,
-the prior publication's approximate peak lag is
-`B + ceil(job_seconds / 20)` blocks; final witness lag is approximately
-`ceil(job_seconds / 20)`. This model does not bound bursts or provider RTT.
-Preserve the profile's actual lag and node-margin guards and require advancing
-near-tip acceptance.
-
-The request model includes the following synthetic scenario expectations;
-polling, cold handoff, epochs, retries and unknown-form fallbacks are excluded:
-
-| Blocks per publication | All irrelevant | One relevant transaction per publication | Four relevant transactions per block |
-| ---: | ---: | ---: | ---: |
-| 1 | 8 | 12 | 24 |
-| 3 | 12 | 16 | 60 |
-| 6 | 18 | 22 | 114 |
-
-These scenarios account for six fixed job requests, two fresh CBOR inventory
-passes per nonempty block and two UTxO plus two transaction-detail reads per
-selected transaction. Pagination and other activity can add calls. They are
-request-path examples, not a measured daily allowance or latency guarantee.
-
-The global source selector, cold lineage walk, both inventory passes and
-selected transaction reads can dominate cost. Their time and request use must
-fit the actual service policy before deployment. Synthetic fixtures are useful
-for exact request-path checks, but do not establish live throughput or a daily
-quota envelope. Epoch acquisition remains part of the full update path and its
-cost must fit the same live resource and accounting budget.
-
-Integrity checkpoints retain a bound relevance anchor, so later checks walk only new generations. Existing non-Mainnet full-scan history can be initialized once through the hidden `_trust-relevance-history --destination-service NAME --network NETWORK` maintenance command, with its writer stopped and no pending update; Mainnet refuses this command. Such history and its descendants are explicitly reported as `trusted-history`, including after checkpoints and restart, rather than independently verified history. Preserve the matching package and backup before this one-time trust decision.
+Filtering still reads transaction CBOR and performs independent provider checks.
+Polls, selected responses, retries and epochs still consume requests. Preserve
+confirmation depth, polling, serving-lag/node-margin guards, quotas and cooldowns.
+Synthetic tests and checkpoint anchors do not establish live request cost or
+Mainnet throughput.

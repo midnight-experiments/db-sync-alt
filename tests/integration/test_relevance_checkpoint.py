@@ -223,6 +223,34 @@ class RelevanceAnchorTests(unittest.TestCase):
             self.assertEqual(restarted.status()['relevance']['history'],'trusted-history')
             f.SQLFixture.follow(reference,full_routes,f.T+3,relevance_enabled=False)
             self.assertEqual(restarted.digests(3),reference.digests(2))
+    def test_later_fullscan_ready_can_be_trusted_again_and_filtering_qualifies(self):
+        from db_sync_alt.service.health import HealthState
+        from db_sync_alt.sources.blockfrost.sync import SyncDriver
+        from types import SimpleNamespace
+        transaction=f.make_tx(620,relevant=False)
+        rows=[[],[],[transaction]]
+        store,routes=f.SQLFixture.prepare(rows,reuse_root=True);self.addCleanup(store.close)
+        reference,full_routes=f.SQLFixture.prepare(rows,reuse_root=True);self.addCleanup(reference.close)
+        f.SQLFixture.follow(store,routes,f.T+1,relevance_enabled=False)
+        relevance.trust_history(store,f.PROFILE);first=copy.deepcopy(self.anchor(store,1)[0]['receipt'])
+        f.SQLFixture.follow(store,routes,f.T+2,relevance_enabled=False)
+        self.assertIsNone(relevance.qualified_parent(store,f.PROFILE))
+        # Stored provenance is intentionally unchanged by a later full scan.
+        self.assertEqual(store.status()['relevance']['history'],'trusted-history')
+        self.assertEqual(relevance.trust_history(store,f.PROFILE),{'generation':2,'relevance':'trusted-history'})
+        self.assertEqual(self.anchor(store,1)[0]['receipt'],first)
+        self.assertEqual(self.anchor(store,2)[0]['receipt']['origin'],'trusted-history')
+        with self.assertRaisesRegex(Refusal,'relevance_trust_already_initialized'):relevance.trust_history(store,f.PROFILE)
+        self.assertEqual(relevance.qualified_parent(store,f.PROFILE)['root']['generation'],2)
+        _,calls=f.SQLFixture.follow(store,routes,f.T+3)
+        self.assertNotIn('/txs/'+transaction['tx_hash']+'/utxos',calls)
+        self.assertEqual(store.generation()['manifest']['relevance_coverage']['origin'],'trusted-history')
+        health=HealthState(service_version='0.3.0',schema_version=4,network='preprod',profile='synthetic')
+        SyncDriver(SimpleNamespace(sync={'relevance_enabled':True}),profile=f.PROFILE)._check_relevance(store,health,store.generation(),None)
+        self.assertEqual(health.snapshot()['relevance']['reason'],'trusted-history')
+        self.assertEqual(store.status()['relevance']['history'],'trusted-history')
+        f.SQLFixture.follow(reference,full_routes,f.T+3,relevance_enabled=False)
+        self.assertEqual(store.digests(3),reference.digests(1));verify_store(store)
     def test_ready_anchor_is_validated_before_hot_cache_and_before_older_base(self):
         store,_=self.prepare();relevance.trust_history(store,f.PROFILE)
         original=store.generation;reads=[]
