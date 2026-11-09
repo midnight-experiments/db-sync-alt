@@ -15,6 +15,11 @@
   remain unchanged. An incomplete pair returns exit code 2 with the JSON code
   `source_attestation_pair_required`; unreadable or invalid JSON attestation
   files return `schema_upgrade_failed` without a traceback.
+- Full metadata verification, run at startup and by `verify`, `backup` and
+  `upgrade`, materializes the generation's lineage membership before joining it
+  to the block headers. On a long history the inlined query could take seconds
+  just to plan and exceed the 30-second statement timeout, so the service could
+  not start. Delta verification of a new update is unchanged.
 
 ## 0.2.0
 
