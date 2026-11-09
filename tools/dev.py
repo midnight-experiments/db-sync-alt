@@ -96,7 +96,8 @@ def restart_controller(pg, control, stop):
 
 def lint():
     docker('run', '--rm', '--name', 'db-sync-alt-lint-' + uuid.uuid4().hex[:12], *LIMITS, '-v', str(ROOT) + ':/src:ro', '-w', '/src', PYTHON_IMAGE,
-           'sh', '-c', 'pip install --quiet --disable-pip-version-check --root-user-action=ignore ' + RUFF + ' && ruff check --no-cache .')
+           'sh', '-c', 'python .github/scripts/check_integration_shards.py --root /src && '
+           'pip install --quiet --disable-pip-version-check --root-user-action=ignore ' + RUFF + ' && ruff check --no-cache .')
 
 
 def unit(image):

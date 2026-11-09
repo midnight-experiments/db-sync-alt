@@ -19,7 +19,6 @@ COPY tools ./tools
 COPY deploy ./deploy
 COPY docs/operations.md ./docs/operations.md
 COPY docs/licenses ./docs/licenses
-COPY .github/workflows/ci.yml ./.github/workflows/ci.yml
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 USER 65532:65532
 CMD ["db-sync-alt", "--help"]

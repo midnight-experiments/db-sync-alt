@@ -100,11 +100,3 @@ class IntegrationShardTests(unittest.TestCase):
                 self.assertEqual(len(flat), len(set(flat)))
                 if count > 1:
                     self.assertEqual(shards[-1], ['integration.test_prerequisites'])
-
-    def test_ci_matrix_matches_eight_way_assignment(self):
-        workflow = (ROOT/'.github/workflows/ci.yml').read_text()
-        self.assertIn('shard: [1, 2, 3, 4, 5, 6, 7, 8]', workflow)
-        self.assertIn('--shard ${{ matrix.shard }}/8', workflow)
-        self.assertEqual(dev.shard_modules('8/8'), ['integration.test_prerequisites'])
-        self.assertEqual(set(p.stem for p in (ROOT/'tests/integration').glob('test_*.py')),
-                         set(dev.WEIGHTS))
