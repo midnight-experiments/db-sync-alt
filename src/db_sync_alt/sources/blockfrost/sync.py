@@ -683,19 +683,21 @@ class SyncDriver:
     def _check_relevance(self, store, health, ready, pending):
         enabled = self.options['relevance_enabled']
         effective = 'relevance' if pending and pending['manifest'].get('relevance_coverage') is not None else 'full'
+        coverage=ready['manifest'].get('relevance_coverage')
         try:
             if enabled or effective == 'relevance':
                 from db_sync_alt.sources.blockfrost.relevance import requested_coverage
                 if not getattr(store, 'supports_incremental', False):
                     raise Refusal('relevance_parent_unsupported')
-                requested_coverage(store, self.profile, pending['target_height'] if pending else ready['target_height'] + 1, pending, enabled)
+                coverage=requested_coverage(store, self.profile, pending['target_height'] if pending else ready['target_height'] + 1, pending, enabled)
         except Refusal as error:
             code = error.code if error.code in ('relevance_parent_unsupported', 'relevance_mode_mismatch', 'relevance_coverage_invalid', 'relevance_parent_changed') else 'relevance_coverage_invalid'
             if hasattr(health, 'relevance_mode'):
                 health.relevance_mode(enabled, effective=effective, reason=code)
             raise LifecycleFailure(code) from None
         if hasattr(health, 'relevance_mode'):
-            health.relevance_mode(enabled, effective='relevance' if enabled else 'full', reason='verified' if enabled else 'disabled')
+            reason='trusted-history' if coverage is not None and coverage.get('origin')=='trusted-history' else 'verified' if enabled else 'disabled'
+            health.relevance_mode(enabled, effective='relevance' if enabled else 'full', reason=reason)
 
     def _run_once(self, store, health, stop_event):
         if stop_event.is_set():

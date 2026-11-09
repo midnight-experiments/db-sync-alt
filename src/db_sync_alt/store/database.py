@@ -356,6 +356,32 @@ class PgStore:
     def checkpoint(self,generation,phase,unit,receipt):
         self.require_pending(generation)
         self.db.execute('INSERT INTO chain.checkpoints VALUES(%s,%s,%s,%s)',(generation,phase,str(unit),Jsonb(receipt)))
+    def insert_relevance_anchor(self,receipt):
+        """Exact ready metadata gate; caller holds one existing exclusive transaction.
+
+        No startup DDL and no trigger disabling. Unknown guard definitions refuse.
+        The only installed change is a pinned INSERT-only anchor branch.
+        """
+        from db_sync_alt.store.incremental import _session
+        from db_sync_alt.sources.blockfrost.relevance import validate_anchor
+        _session(self)
+        if self.db.info.transaction_status!=psycopg.pq.TransactionStatus.INTRANS:raise Refusal('relevance_anchor_transaction_required')
+        state=self.state();g=self.generation()
+        if state['schema_version']!=4 or state['migration_state']!='ready' or state['revoked'] or self.pending() is not None:raise Refusal('relevance_parent_changed')
+        validate_anchor(self,g,[{'receipt':receipt}])
+        if self.completed(g['id'],'relevance','anchor'):raise Refusal('relevance_trust_already_initialized')
+        old=Path(__file__).with_name('schema_v2.sql').read_text()
+        old=old[old.index('CREATE FUNCTION chain.guard_immutable()'):].split('END $$;',1)[0].split('AS $$',1)[1]
+        replacement=Path(__file__).with_name('relevance_anchor.sql').read_text()
+        successor=replacement.split('AS $$',1)[1].split('END $$;',1)[0]
+        actual=self.db.execute("SELECT prosrc FROM pg_proc WHERE oid='chain.guard_immutable()'::regprocedure").fetchone()[0]
+        if actual not in (old+'END ',successor+'END '):raise Refusal('relevance_anchor_guard_mismatch')
+        if actual!=successor+'END ':self.db.execute(replacement)
+        self.db.execute('SELECT set_config(%s,%s,true)',('db_sync_alt.relevance_anchor_write',canonical(receipt)))
+        try:self.db.execute("INSERT INTO chain.checkpoints VALUES(%s,'relevance','anchor',%s)",(g['id'],Jsonb(receipt)))
+        finally:
+            if self.db.info.transaction_status==psycopg.pq.TransactionStatus.INTRANS:
+                self.db.execute('SELECT set_config(%s,%s,true)',('db_sync_alt.relevance_anchor_write','null'))
     def finalize_pending(self,generation,manifest,receipt,computed_digests):
         from db_sync_alt.verify.completion import prepare_finalization
         self.require_pending(generation)
@@ -473,7 +499,11 @@ class PgStore:
         state=self.state();generations=[]
         if self.db.execute('SELECT id FROM chain.generations ORDER BY id LIMIT 1').fetchone() is not None:
             generations=[dict(zip(GENERATION_SUMMARY,r)) for r in self.db.execute('SELECT '+','.join(GENERATION_SUMMARY)+' FROM chain.generations ORDER BY id')]
-        return {'format':FORMAT,**state,'generations':generations,'bytes':self.database_bytes(),'checkpoints':self.db.execute('SELECT count(*) FROM chain.checkpoints').fetchone()[0]}
+        result={'format':FORMAT,**state,'generations':generations,'bytes':self.database_bytes(),'checkpoints':self.db.execute('SELECT count(*) FROM chain.checkpoints').fetchone()[0]}
+        if state['schema_version']==4 and state['canonical_ready'] is not None:
+            from db_sync_alt.sources.blockfrost.relevance import history_status
+            result['relevance']={'history':history_status(self)}
+        return result
     def database_bytes(self):return self.db.execute('SELECT pg_database_size(current_database())').fetchone()[0]
     def sync_job(self,job_id):
         row=self.db.execute('SELECT body FROM chain.sync_jobs WHERE id=%s',(job_id,)).fetchone()

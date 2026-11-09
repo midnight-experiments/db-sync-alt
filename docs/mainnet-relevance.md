@@ -152,3 +152,5 @@ fit the actual service policy before deployment. Synthetic fixtures are useful
 for exact request-path checks, but do not establish live throughput or a daily
 quota envelope. Epoch acquisition remains part of the full update path and its
 cost must fit the same live resource and accounting budget.
+
+Integrity checkpoints retain a bound relevance anchor, so later checks walk only new generations. Existing non-Mainnet full-scan history can be initialized once through the hidden `_trust-relevance-history --destination-service NAME --network NETWORK` maintenance command, with its writer stopped and no pending update; Mainnet refuses this command. Such history and its descendants are explicitly reported as `trusted-history`, including after checkpoints and restart, rather than independently verified history. Preserve the matching package and backup before this one-time trust decision.

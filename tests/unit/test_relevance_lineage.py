@@ -31,7 +31,7 @@ class Capability:
 class LineageStore:
     def __init__(self,profile):
         self.profile=profile;self.rev=0;self.revoked=False;self.supports_checkpoints=True
-        self.base=0;self.checkpoint=None;self.coverage_reads=[];self.ready=0
+        self.base=0;self.checkpoint=None;self.coverage_reads=[];self.anchor_reads=[];self.anchors={};self.ready=0
         facts={name:{'count':0,'sha256':h(0)} for name in TABLES}
         self.generations={0:{'id':0,'parent':None,'status':'ready',
             'source':'cardano-db-sync-postgresql','target_height':profile.start[0],
@@ -43,7 +43,11 @@ class LineageStore:
     def current_verified_parent(self):
         if self.revoked:raise Refusal('incremental_parent_uncertified')
         return self.cap
+    def meta(self,key):return self.profile.identity if key=='profile' else None
     def checkpoint_rows(self,*,generation,phase,unit):
+        if unit=='anchor':
+            self.anchor_reads.append(generation)
+            return [] if generation not in self.anchors else [{'receipt':copy.deepcopy(self.anchors[generation])}]
         self.coverage_reads.append((generation,phase,unit))
         cert=self.generations[generation]['manifest'].get('relevance_coverage')
         return [] if cert is None else [{'receipt':copy.deepcopy(cert)}]
@@ -172,3 +176,29 @@ class RelevanceLineageTests(unittest.TestCase):
             with self.assertRaisesRegex(Refusal,'relevance_coverage_invalid'):
                 relevance.requested_coverage(store,store.profile,1,copy.deepcopy(pending),True)
             write.assert_not_called()
+
+    def test_ready_anchor_wins_without_loading_or_validating_older_base(self):
+        store=self.store(5);g=store.generation()
+        store.anchors[5]={'version':1,'kind':'certified','generation':5,'integrity_ref':integrity_reference(g),
+                          'profile':digest(self.profile.identity),'origin':'certified'}
+        original=store.generation;visited=[]
+        def generation(value=None):
+            result=original(value);visited.append(result['id']);return result
+        with patch.object(store,'generation',generation):
+            for _ in range(3):
+                value=relevance.qualified_parent(store,self.profile)
+                self.assertEqual(value['root']['generation'],5)
+        self.assertEqual(set(visited),{5});self.assertEqual(store.coverage_reads,[])
+        self.assertGreaterEqual(store.anchor_reads.count(5),3)
+        store.anchors[5]['integrity_ref']['sha256']=h(99)
+        with self.assertRaisesRegex(Refusal,'relevance_coverage_invalid'):relevance.qualified_parent(store,self.profile)
+    def test_certified_anchor_cannot_launder_trusted_origin(self):
+        store=self.store(1);g=store.generations[1]
+        g['manifest']['relevance_coverage']={'kind':relevance.KIND,'version':2,'root':{'generation':0,'anchor_sha256':h(88)},
+            'profile':digest(self.profile.identity),'parent_ref':integrity_reference(store.generations[0]),'range':[g['target_height'],g['target_height']],'origin':'trusted-history'}
+        store.cap=Capability(store)
+        store.anchors[1]={'version':1,'kind':'certified','generation':1,'integrity_ref':integrity_reference(g),
+                          'profile':digest(self.profile.identity),'origin':'trusted-history'}
+        self.assertEqual(relevance.qualified_parent(store,self.profile)['origin'],'trusted-history')
+        store.anchors[1]['origin']='certified'
+        with self.assertRaisesRegex(Refusal,'relevance_coverage_invalid'):relevance.qualified_parent(store,self.profile)

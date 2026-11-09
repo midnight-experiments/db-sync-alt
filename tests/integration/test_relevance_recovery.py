@@ -110,8 +110,17 @@ class RelevanceRecoveryTests(unittest.TestCase):
         self.assertGreater(sum('/utxos' in p for p in calls),0);self.assertNotIn('relevance_coverage',store.generation()['manifest']);verify_store(store)
     def test_hot_cache_avoids_lineage_reads_but_revision_profile_and_revocation_fence(self):
         store,routes=self.prepare();relevance.qualified_parent(store,f.PROFILE)
-        with patch.object(store,'checkpoint_rows',side_effect=AssertionError('hot lineage walk')):
+        anchor={'generation':store.generation()['id'],'phase':'relevance','unit':'anchor'}
+        reads=[];checkpoint_rows=store.checkpoint_rows
+        def current_anchor_only(**kw):
+            # Anchor validation remains mandatory on cache hits. Every historical
+            # coverage/lineage read is still forbidden by this exact binding.
+            self.assertEqual(kw,anchor)
+            reads.append(kw)
+            return checkpoint_rows(**kw)
+        with patch.object(store,'checkpoint_rows',current_anchor_only):
             self.assertIsNotNone(relevance.qualified_parent(store,f.PROFILE))
+        self.assertEqual(reads,[anchor])
         self.leave_pending(store,routes)  # Legitimate mutations advance the revision through guarded triggers.
         with patch('db_sync_alt.verify.completion.validate_completion',wraps=__import__('db_sync_alt.verify.completion',fromlist=['validate_completion']).validate_completion) as validation:
             self.assertIsNotNone(relevance.qualified_parent(store,f.PROFILE));self.assertGreater(validation.call_count,0)

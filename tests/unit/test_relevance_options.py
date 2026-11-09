@@ -67,3 +67,21 @@ class RelevanceOptionTests(unittest.TestCase):
                     driver.start_polling(store,status,threading.Event(),lambda error:None)
             self.assertIsNone(driver._client);self.assertIsNone(driver._poller)
             self.assertEqual(status.snapshot()['relevance']['reason'],'relevance_coverage_invalid')
+    def test_trusted_history_is_explicit_reported_provenance_not_a_health_error(self):
+        profile=Profile(profile_dir('preprod'));store=Store();store.supports_incremental=True;status=health()
+        driver=SyncDriver(SimpleNamespace(sync={'relevance_enabled':True}),profile=profile)
+        with patch('db_sync_alt.sources.blockfrost.relevance.requested_coverage',return_value={'version':2,'origin':'trusted-history'}):
+            driver._check_relevance(store,status,store.generation(),None)
+        snapshot=status.snapshot()
+        self.assertEqual(snapshot['relevance'],{'requested':'relevance','effective':'relevance','reason':'trusted-history'})
+        self.assertNotIn('trusted-history',snapshot['reason_codes']);self.assertNotIn('internal_error',snapshot['reason_codes'])
+    def test_trust_command_hidden_and_mainnet_refuses_before_database_open(self):
+        from db_sync_alt import cli
+        from db_sync_alt.cli import relevance_history
+        self.assertNotIn('_trust-relevance-history',cli.COMMANDS)
+        self.assertNotIn('_trust-relevance-history',cli.usage())
+        with patch.object(relevance_history,'PgStore',side_effect=AssertionError('Mainnet database opened')) as opened,patch('sys.stderr'):
+            self.assertEqual(cli.main(['_trust-relevance-history','--destination-service','unused','--network','mainnet']),1)
+            opened.assert_not_called()
+        for module in (acquire,run):
+            self.assertNotIn('trust-history',module.parser().format_help())

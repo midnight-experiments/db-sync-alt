@@ -59,24 +59,93 @@ def _encode_address(raw,network):
     check=_polymod(_expand(hrp)+data+[0]*6)^1
     return hrp+'1'+''.join(ALPHABET[x] for x in data+[check>>(5*(5-i))&31 for i in range(6)])
 
+def _hashed(value):return isinstance(value,str) and re.fullmatch('[0-9a-f]{64}',value) is not None
+
+def _reference(value):
+    return (isinstance(value,dict) and set(value)=={'kind','sha256'}
+            and value['kind'] in ('full-digests-v1','parent-delta-v2') and _hashed(value['sha256']))
+
 def _coverage_bytes(value):
-    """Validate the exact persisted certificate shape without JSON numeric coercion."""
-    fields={'kind','version','root','profile','parent_ref','range'}
-    if (not isinstance(value,dict) or set(value)!=fields or value.get('kind')!=KIND
-            or type(value.get('version')) is not int or value['version']!=1):
-        raise Refusal('relevance_coverage_invalid')
-    root=value['root'];bounds=value['range'];parent=value['parent_ref']
-    def hashed(item):return isinstance(item,str) and re.fullmatch('[0-9a-f]{64}',item) is not None
-    if (not isinstance(root,dict) or set(root)!={'generation','completion'}
-            or type(root['generation']) is not int or root['generation']<0 or not hashed(root['completion'])
-            or not hashed(value['profile']) or not isinstance(bounds,list) or len(bounds)!=2
-            or any(type(n) is not int or n<0 for n in bounds)
-            or not isinstance(parent,dict) or set(parent)!={'kind','sha256'}
-            or parent['kind'] not in ('full-digests-v1','parent-delta-v2') or not hashed(parent['sha256'])):
-        raise Refusal('relevance_coverage_invalid')
+    """Legacy SQL-root and anchor-bound certificates retain strict distinct wire forms."""
+    if not isinstance(value,dict) or type(value.get('version')) is not int or value['version'] not in (1,2):raise Refusal('relevance_coverage_invalid')
+    version=value['version'];fields={'kind','version','root','profile','parent_ref','range'}
+    if version==2:fields.add('origin')
+    if set(value)!=fields or value.get('kind')!=KIND:raise Refusal('relevance_coverage_invalid')
+    root=value['root'];bounds=value['range']
+    if (not isinstance(root,dict) or set(root)!=({'generation','completion'} if version==1 else {'generation','anchor_sha256'})
+            or type(root['generation']) is not int or root['generation']<0
+            or not _hashed(root['completion' if version==1 else 'anchor_sha256'])
+            or not _hashed(value['profile']) or not _reference(value['parent_ref'])
+            or not isinstance(bounds,list) or len(bounds)!=2 or any(type(n) is not int or n<0 for n in bounds)
+            or version==2 and value['origin'] not in ('certified','trusted-history')):raise Refusal('relevance_coverage_invalid')
     encoded=canonical(value)
     if len(encoded.encode())>MAX_PROOF:raise Refusal('relevance_coverage_invalid')
     return encoded
+
+def _origin(value):return 'certified' if value['version']==1 else value['origin']
+
+def validate_anchor(store,g,rows=None,*,profile_hash=None):
+    """Validate this exact independently guarded metadata; never use a malformed row as absence."""
+    from db_sync_alt.store.incremental import integrity_reference,profile_digest
+    rows=store.checkpoint_rows(generation=g['id'],phase='relevance',unit='anchor') if rows is None else rows
+    if not rows:return None
+    if len(rows)!=1:raise Refusal('relevance_coverage_invalid')
+    a=rows[0]['receipt'];expected=profile_hash if profile_hash is not None else digest(store.meta('profile'))
+    if (not isinstance(a,dict) or set(a)!={'version','kind','generation','integrity_ref','profile','origin'}
+            or type(a.get('version')) is not int or a['version']!=1
+            or a['kind'] not in ('certified','trusted-history') or a['origin'] not in ('certified','trusted-history')
+            or type(a['generation']) is not int or a['generation']!=g['id'] or a['generation']<0
+            or not _reference(a['integrity_ref']) or a['integrity_ref']!=integrity_reference(g)
+            or not _hashed(a['profile']) or a['profile']!=expected or profile_digest(g)!=expected
+            or g['status']!='ready' or a['kind']=='certified' and 'completion' not in g['manifest']):raise Refusal('relevance_coverage_invalid')
+    cert=g['manifest'].get('relevance_coverage')
+    if a['origin']=='trusted-history' and (store.meta('profile').get('network')=='mainnet' or getattr(getattr(store,'network',None),'network',None)=='mainnet'):raise Refusal('relevance_coverage_invalid')
+    if a['kind']=='trusted-history':
+        identity=store.meta('profile')
+        if a['origin']!='trusted-history' or identity.get('network')=='mainnet' or cert is not None:raise Refusal('relevance_coverage_invalid')
+    elif cert is not None:
+        _coverage_bytes(cert)
+        if a['origin']!=_origin(cert):raise Refusal('relevance_coverage_invalid')
+    else:
+        from db_sync_alt.verify.completion import SQL_ADAPTER,SQL_VALIDATION
+        if (a['origin']!='certified' or g['source']!='cardano-db-sync-postgresql'
+                or g['manifest'].get('source_identity',{}).get('adapter')!=SQL_ADAPTER
+                or g['manifest'].get('validation',{}).get('kind')!=SQL_VALIDATION):raise Refusal('relevance_coverage_invalid')
+    return copy.deepcopy(a)
+
+def _anchor_value(anchor,ready):
+    from db_sync_alt.store.incremental import integrity_reference
+    return {'kind':KIND,'version':2,'root':{'generation':anchor['generation'],'anchor_sha256':digest(anchor)},
+            'profile':anchor['profile'],'parent_ref':integrity_reference(ready),'origin':anchor['origin']}
+
+def _validate_root(store,cert,parent):
+    """Check the referenced point and only its descendant suffix, without replaying anchor history."""
+    _coverage_bytes(cert)
+    from db_sync_alt.store.incremental import profile_digest,integrity_base
+    cutoff=None
+    if getattr(store,'supports_checkpoints',False):
+        base,_=integrity_base(store)
+        if cert['root']['generation']<base<=parent['id']:
+            candidate=store.generation(base);a=validate_anchor(store,candidate,profile_hash=cert['profile'])
+            covered=candidate['manifest'].get('relevance_coverage')
+            if a is not None and covered is not None and cert['root']==covered['root'] and _origin(cert)==a['origin']:cutoff=candidate
+    root=cutoff if cutoff is not None else store.generation(cert['root']['generation'])
+    if cutoff is not None:
+        found=store.db.execute('WITH RECURSIVE lineage(id,parent) AS (SELECT id,parent FROM chain.generations WHERE id=%s UNION ALL SELECT g.id,g.parent FROM lineage l JOIN chain.generations g ON g.id=l.parent WHERE l.id<>%s) SELECT 1 FROM lineage WHERE id=%s',(parent['id'],root['id'],root['id'])).fetchone()
+        if not found:raise Refusal('relevance_coverage_invalid')
+        return
+    if profile_digest(root)!=cert['profile']:raise Refusal('relevance_coverage_invalid')
+    if cert['version']==2:
+        a=validate_anchor(store,root,profile_hash=cert['profile'])
+        if a is None or digest(a)!=cert['root']['anchor_sha256'] or a['origin']!=cert['origin']:raise Refusal('relevance_coverage_invalid')
+    else:
+        from db_sync_alt.verify.completion import SQL_ADAPTER,SQL_VALIDATION
+        if (root['source']!='cardano-db-sync-postgresql' or root['parent'] is not None or root['status']!='ready'
+                or root['manifest'].get('source_identity',{}).get('adapter')!=SQL_ADAPTER
+                or root['manifest'].get('validation',{}).get('kind')!=SQL_VALIDATION
+                or root['manifest'].get('completion',{}).get('sha256')!=cert['root']['completion']):raise Refusal('relevance_coverage_invalid')
+    found=store.db.execute('WITH RECURSIVE lineage(id,parent) AS (SELECT id,parent FROM chain.generations WHERE id=%s UNION ALL SELECT g.id,g.parent FROM lineage l JOIN chain.generations g ON g.id=l.parent WHERE l.id<>%s) SELECT 1 FROM lineage WHERE id=%s',(parent['id'],root['id'],root['id'])).fetchone()
+    if not found:raise Refusal('relevance_coverage_invalid')
 
 
 def _checkpoint_binding(store):
@@ -93,65 +162,81 @@ def _checkpoint_binding(store):
 
 
 def qualified_parent(store,profile):
-    """Certify complete SQL-root coverage, including mixed deltas across an integrity checkpoint.
-
-    Checkpoints retain the old manifests and receipts. The core capability verifies
-    facts from its integrity base; this independent walk still proves the original
-    SQL prerequisite closure and every relevance transition. Only one certified
-    prefix is cached per writer; a cold walk does not retain the whole lineage.
-    """
+    """Qualify only the suffix after the newest valid anchor; always validate the anchor itself."""
     from db_sync_alt.store.incremental import integrity_reference,profile_digest,revision
     from db_sync_alt.verify.completion import validate_completion,SQL_ADAPTER,SQL_VALIDATION
     try:cap=store.current_verified_parent()
     except (AttributeError,Refusal):return None
     profile_hash=digest(profile.identity);current_revision=revision(store)
-    checkpoint=_checkpoint_binding(store);cached=_QUALIFIED.get(store)
-    if cached and cached[3]==profile_hash and cached[5]==checkpoint:
-        if cached[0]() is cap and cached[4]==current_revision:return copy.deepcopy(cached[1])
-    else:cached=None
     ready=store.generation();descriptor=cap.descriptor
     if (digest(descriptor['manifest'])!=digest(ready['manifest'])
-            or digest(descriptor['profile'])!=profile_hash or profile_digest(ready)!=profile_hash):
-        raise Refusal('relevance_parent_changed')
-    current=ready;lineage_root=None
-    while current['source']=='blockfrost-cardano':
+            or digest(descriptor['profile'])!=profile_hash or profile_digest(ready)!=profile_hash):raise Refusal('relevance_parent_changed')
+    # These constant-size bindings are checked even on a hot cache hit. The
+    # current point can acquire a post-ready anchor without changing its manifest.
+    ready_anchor=validate_anchor(store,ready,profile_hash=profile_hash)
+    checkpoint=_checkpoint_binding(store);cached=_QUALIFIED.get(store)
+    if ready_anchor is not None:
+        value=_anchor_value(ready_anchor,ready)
+        _QUALIFIED[store]=(weakref.ref(cap),copy.deepcopy(value),descriptor,profile_hash,current_revision,checkpoint)
+        return value
+    known_root=ready['manifest'].get('relevance_coverage',{}).get('root',{}).get('generation',-1)
+    if type(known_root) is not int:known_root=-1
+    if checkpoint is not None and known_root<checkpoint[0]<ready['id']:
+        validate_anchor(store,store.generation(checkpoint[0]),profile_hash=profile_hash)
+    if cached and cached[3]==profile_hash and cached[5]==checkpoint:
+        if cached[1]['version']==2:
+            a=validate_anchor(store,store.generation(cached[1]['root']['generation']),profile_hash=profile_hash)
+            if a is None or digest(a)!=cached[1]['root']['anchor_sha256'] or a['origin']!=cached[1]['origin']:raise Refusal('relevance_coverage_invalid')
+        if cached[0]() is cap and cached[4]==current_revision:return copy.deepcopy(cached[1])
+    else:cached=None
+    current=ready;lineage_root=None;lineage_origin=None
+    while True:
         if profile_digest(current)!=profile_hash:raise Refusal('relevance_parent_changed')
+        anchor=validate_anchor(store,current,profile_hash=profile_hash) if current['id']!=ready['id'] else None
+        if anchor is not None:
+            if lineage_root is not None:
+                if lineage_origin!=anchor['origin']:raise Refusal('relevance_coverage_invalid')
+                # A pending certificate can retain its older root across a later
+                # checkpoint. Validate that exact root; never rewrite the pending mode.
+                covered=current['manifest'].get('relevance_coverage')
+                allowed=[{'generation':anchor['generation'],'anchor_sha256':digest(anchor)}]
+                if covered is not None:allowed.append(covered['root'])
+                if lineage_root not in allowed:raise Refusal('relevance_coverage_invalid')
+            value=_anchor_value(anchor,ready);break
+        if current['source']!='blockfrost-cardano':break
         certificate=current['manifest'].get('relevance_coverage')
         proofs=store.checkpoint_rows(generation=current['id'],phase='relevance',unit='coverage')
         if certificate is None:return None
         encoded=_coverage_bytes(certificate)
-        if len(proofs)!=1 or _coverage_bytes(proofs[0]['receipt'])!=encoded:
-            raise Refusal('relevance_coverage_invalid')
-        root=certificate['root']
-        if lineage_root is not None and root!=lineage_root:raise Refusal('relevance_coverage_invalid')
-        lineage_root=root
+        if len(proofs)!=1 or _coverage_bytes(proofs[0]['receipt'])!=encoded:raise Refusal('relevance_coverage_invalid')
+        root=certificate['root'];origin=_origin(certificate)
+        if lineage_root is not None and (root!=lineage_root or origin!=lineage_origin):raise Refusal('relevance_coverage_invalid')
+        lineage_root=root;lineage_origin=origin
         from db_sync_alt.store.incremental import validate_completion_v2
         validate_completion_v2(store,current,require_seal=True)
         if current['parent'] is None:return None
         parent=store.generation(current['parent'])
         if (profile_digest(parent)!=profile_hash or certificate['profile']!=profile_hash
                 or certificate['parent_ref']!=integrity_reference(parent)
-                or certificate['range']!=[parent['target_height']+1,current['target_height']]):
-            raise Refusal('relevance_coverage_invalid')
+                or certificate['range']!=[parent['target_height']+1,current['target_height']]):raise Refusal('relevance_coverage_invalid')
         current=parent
         if cached and current['id']==cached[2]['generation'] and integrity_reference(current)==cached[2]['integrity_ref']:
-            root=cached[1]['root']
-            if lineage_root!=root:raise Refusal('relevance_coverage_invalid')
-            value={'kind':KIND,'version':1,'root':root,'profile':profile_hash,'parent_ref':integrity_reference(ready)}
-            _QUALIFIED[store]=(weakref.ref(cap),copy.deepcopy(value),descriptor,profile_hash,current_revision,checkpoint)
-            return value
-    if (current['source']!='cardano-db-sync-postgresql'
-            or current['manifest'].get('source_identity',{}).get('adapter')!=SQL_ADAPTER
-            or current['manifest'].get('validation',{}).get('kind')!=SQL_VALIDATION):return None
-    while True:
-        if profile_digest(current)!=profile_hash:raise Refusal('relevance_parent_changed')
-        if validate_completion(store,current,require_seal=True) is None:return None
-        if current['parent'] is None:break
-        current=store.generation(current['parent'])
-        if current['source']!='cardano-db-sync-postgresql':return None
-    root={'generation':current['id'],'completion':current['manifest']['completion']['sha256']}
-    if lineage_root is not None and lineage_root!=root:raise Refusal('relevance_coverage_invalid')
-    value={'kind':KIND,'version':1,'root':root,'profile':profile_hash,'parent_ref':integrity_reference(ready)}
+            if lineage_root!=cached[1]['root'] or lineage_origin!=_origin(cached[1]):raise Refusal('relevance_coverage_invalid')
+            value={**cached[1],'parent_ref':integrity_reference(ready)};break
+    else:raise AssertionError('unreachable')
+    if current['source']!='blockfrost-cardano' and anchor is None:
+        if (current['source']!='cardano-db-sync-postgresql'
+                or current['manifest'].get('source_identity',{}).get('adapter')!=SQL_ADAPTER
+                or current['manifest'].get('validation',{}).get('kind')!=SQL_VALIDATION):return None
+        while True:
+            if profile_digest(current)!=profile_hash:raise Refusal('relevance_parent_changed')
+            if validate_completion(store,current,require_seal=True) is None:return None
+            if current['parent'] is None:break
+            current=store.generation(current['parent'])
+            if current['source']!='cardano-db-sync-postgresql':return None
+        root={'generation':current['id'],'completion':current['manifest']['completion']['sha256']}
+        if lineage_root is not None and (lineage_root!=root or lineage_origin!='certified'):raise Refusal('relevance_coverage_invalid')
+        value={'kind':KIND,'version':1,'root':root,'profile':profile_hash,'parent_ref':integrity_reference(ready)}
     _QUALIFIED[store]=(weakref.ref(cap),copy.deepcopy(value),descriptor,profile_hash,current_revision,checkpoint)
     return value
 
@@ -192,6 +277,89 @@ def requested_coverage(store,profile,target,pending,enabled):
 def pending_certificate(store,profile,generation):
     g=store.generation(generation)
     return requested_coverage(store,profile,g['target_height'],g,True)
+
+def _anchor_receipt(store,g,kind,origin):
+    from db_sync_alt.store.incremental import integrity_reference
+    value={'version':1,'kind':kind,'generation':g['id'],'integrity_ref':integrity_reference(g),
+           'profile':digest(store.meta('profile')),'origin':origin}
+    validate_anchor(store,g,[{'receipt':value}])
+    return value
+
+def checkpoint_anchor(store,cap):
+    """An integrity capability can certify the parent without repeating its full audit.
+
+    Anchor-free full-scan checkpoints do no relevance lineage work. A pending
+    certificate keeps its original root: defer anchor creation until a checkpoint
+    with no pending generation, leaving the ordinary integrity checkpoint intact.
+    """
+    from db_sync_alt.store.incremental import _require_checkpoint_capability,VerifiedParent,_descriptor,_session
+    _require_checkpoint_capability(store,cap)
+    g=store.generation(cap.generation)
+    existing=validate_anchor(store,g)
+    if existing is not None or store.pending() is not None or g['manifest'].get('relevance_coverage') is None:return None
+    if store.generation()['id']!=g['id']:raise Refusal('checkpoint_uncertified')
+    store._verified_parent=VerifiedParent(store,_session(store),_descriptor(store,g))
+    from types import SimpleNamespace
+    qualification=qualified_parent(store,SimpleNamespace(identity=store.meta('profile')))
+    if qualification is None:raise Refusal('relevance_parent_unsupported')
+    return _anchor_receipt(store,g,'certified',_origin(qualification))
+
+def trust_history(store,profile):
+    """One explicit non-Mainnet initialization under the existing exclusive writer lock."""
+    from db_sync_alt.store.database import SERVING_LOCK,PROJECTION_WRITE
+    from db_sync_alt.store.incremental import _session,integrity_reference
+    _session(store)
+    if profile.network.network=='mainnet' or store.network.network=='mainnet':raise Refusal('relevance_trust_mainnet_refused')
+    if digest(profile.identity)!=digest(store.meta('profile')):raise Refusal('relevance_parent_changed')
+    if not store.supports_checkpoints:raise Refusal('checkpoint_schema_required')
+    if store.pending() is not None:raise Refusal('relevance_trust_pending')
+    state=store.state();g=store.generation()
+    if state['revoked'] or state['migration_state']!='ready':raise Refusal('relevance_parent_changed')
+    if g['manifest'].get('relevance_coverage') is not None:raise Refusal('relevance_trust_already_initialized')
+    def unused():
+        if store.db.execute("SELECT 1 FROM chain.checkpoints WHERE phase='relevance' AND unit='anchor' AND (generation=%s OR receipt->>'origin'='trusted-history') LIMIT 1",(g['id'],)).fetchone():raise Refusal('relevance_trust_already_initialized')
+    unused()
+    store.certify_ready_full()
+    receipt=_anchor_receipt(store,g,'trusted-history','trusted-history')
+    with store.atomic():
+        store.db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
+        store.db.execute('SELECT set_config(%s,%s,true)',(PROJECTION_WRITE,'on'))
+        if store.state()!=state or store.pending() is not None or store.generation()!=g or integrity_reference(store.generation())!=receipt['integrity_ref']:raise Refusal('relevance_parent_changed')
+        unused();store.insert_relevance_anchor(receipt)
+    _QUALIFIED.pop(store,None)
+    return {'generation':g['id'],'relevance':'trusted-history'}
+
+def history_status(store):
+    """Observe stored provenance using summary columns/receipts, never full manifests.
+
+    Like the rest of status, this is not a fresh integrity verification. The
+    verifier/filter independently validate the selected anchor's exact reference.
+    """
+    ready=store.state()['canonical_ready'];profile=digest(store.meta('profile'))
+    rows=store.db.execute("""WITH RECURSIVE lineage(id,parent,status) AS (
+      SELECT id,parent,status FROM chain.generations WHERE id=%s
+      UNION ALL SELECT g.id,g.parent,g.status FROM lineage l JOIN chain.generations g ON g.id=l.parent
+      WHERE NOT EXISTS(SELECT 1 FROM chain.checkpoints c WHERE c.generation=l.id AND c.phase='relevance' AND c.unit='anchor'))
+      SELECT l.id,l.status,c.receipt FROM lineage l JOIN chain.checkpoints c ON c.generation=l.id
+      WHERE c.phase='relevance' AND c.unit='anchor'""",(ready,)).fetchall()
+    if rows:
+        if len(rows)!=1:raise Refusal('relevance_coverage_invalid')
+        generation,status,a=rows[0]
+        if (not isinstance(a,dict) or set(a)!={'version','kind','generation','integrity_ref','profile','origin'}
+                or type(a.get('version')) is not int or a['version']!=1
+                or a['kind'] not in ('certified','trusted-history') or a['origin'] not in ('certified','trusted-history')
+                or a['kind']=='trusted-history' and a['origin']!='trusted-history'
+                or type(a['generation']) is not int or a['generation']!=generation or generation<0 or status!='ready'
+                or not _reference(a['integrity_ref']) or not _hashed(a['profile']) or a['profile']!=profile
+                or a['origin']=='trusted-history' and store.network.network=='mainnet'):raise Refusal('relevance_coverage_invalid')
+        return a['origin']
+    records=store.checkpoint_rows(generation=ready,phase='relevance',unit='coverage')
+    if not records:return 'not-certified'
+    if len(records)!=1:raise Refusal('relevance_coverage_invalid')
+    cert=records[0]['receipt'];_coverage_bytes(cert)
+    if cert['profile']!=profile:raise Refusal('relevance_coverage_invalid')
+    return _origin(cert)
+
 
 class Discovery:
     def __init__(self,store,profile,parent,*,independent=False):
@@ -305,8 +473,7 @@ def verify_generation(store,generation):
     from db_sync_alt.store.incremental import profile_digest
     expected_profile=digest(store.meta('profile'))
     if profile_digest(g)!=expected_profile or cert['profile']!=expected_profile or cert['parent_ref']!=integrity_reference(parent) or cert['range']!=[parent['target_height']+1,g['target_height']]:raise Refusal('relevance_coverage_invalid')
-    root=store.generation(0)
-    if root['source']!='cardano-db-sync-postgresql' or root['parent'] is not None or cert['root']!={'generation':0,'completion':root['manifest'].get('completion',{}).get('sha256')}:raise Refusal('relevance_coverage_invalid')
+    if validate_anchor(store,g) is None:_validate_root(store,cert,parent)
     known={table:set() for table in TABLES}
     for checkpoint in store.checkpoint_rows(generation=generation,phase='events'):
         proof=checkpoint['receipt'].get('relevance')
