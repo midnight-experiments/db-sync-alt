@@ -131,6 +131,33 @@ class IncrementalTests(SyncFixture):
             self.assertEqual(verify_store(restored)['digests'],expected['digests'])
             restored.certify_ready_full()
 
+    def test_full_metadata_verification_plans_materialized_membership(self):
+        """Full verification scans the lineage membership as a materialized CTE before joining
+        chain.blocks; the delta verification query keeps its text and arguments."""
+        executed=[];execute=psycopg.ServerCursor.execute
+        def recording(cursor,query,params=None,**kwargs):
+            if cursor.name=='verify_metadata':executed.append((query,params))
+            return execute(cursor,query,params,**kwargs)
+        def cte_scans(node):
+            own=[node['CTE Name']] if node['Node Type']=='CTE Scan' else []
+            return own+[name for child in node.get('Plans',[]) for name in cte_scans(child)]
+        dsn=self.make(transition=True)
+        with PgStore(conninfo=dsn) as store,patch.object(psycopg.ServerCursor,'execute',recording):
+            upgrade_store(store);store.certify_ready_full()
+            gen,expected,receipt=self.prepared_transition(store,transition=True)
+            executed.clear();ticket=store.verify_pending_incremental(gen)
+            membership,args=store.membership_sql(gen)
+            reuse=store.db.execute('SELECT through_height FROM chain.generation_reuse WHERE generation=%s',(gen,)).fetchone()[0]
+            self.assertEqual(executed,[('SELECT m.height,b.hash,b.parent_hash,b.height FROM ('+membership+') m LEFT JOIN chain.blocks b ON b.hash=m.hash WHERE m.height BETWEEN %s AND %s ORDER BY m.height',
+                                        (*args,reuse+1,store.generation(gen)['witness_height']))])
+            store.finalize_pending_incremental(gen,store.generation(gen)['manifest'],receipt,ticket);store.publish_incremental(gen,ticket)
+            executed.clear();self.assertEqual(verify_store(store)['digests'],expected['digests'])
+            # Startup verifies the published generation and its integrity base on the full path.
+            self.assertEqual(sorted(params[0] for _,params in executed),[0,gen])
+            for query,params in executed:
+                plan=store.db.execute('EXPLAIN (FORMAT JSON) '+query,params).fetchone()[0][0]['Plan']
+                self.assertIn('m',cte_scans(plan))
+
     def test_ticket_raw_delta_change_sealed_resume_and_publication_rollback(self):
         from dataclasses import replace
         dsn=self.make()
