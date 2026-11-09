@@ -200,7 +200,7 @@ publication waits for it and `sync` reads `checkpointing`.
 
 ## Status and roadmap
 
-db-sync-alt **0.2.0** is experimental. It serves the SQL queries of **Midnight
+db-sync-alt **0.3.0** is experimental. It serves the SQL queries of **Midnight
 node 1.0.400**.
 
 - **Networks** (`--network`): **Preprod** is supported and tested end to end.
