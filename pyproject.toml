@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "db-sync-alt"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cardano data for Midnight's main-chain follower, kept in PostgreSQL without a full Cardano node and db-sync stack."
 readme = "README.md"
 license = "Apache-2.0"

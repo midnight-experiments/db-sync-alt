@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - Read pending generation status without loading its manifest, while preserving
   fresh ownership, status and revocation checks.
