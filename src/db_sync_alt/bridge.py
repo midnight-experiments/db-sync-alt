@@ -57,28 +57,30 @@ def verify_lineage(store, g):
         raise Refusal('bridge_metadata_coverage_gap')
 
 
-def _outside(alias):
-    return ("encode({a}.policy,'hex')||encode({a}.name,'hex')<>ALL(%(units)s::text[]) AND encode({a}.policy,'hex')<>ALL(%(governance)s::text[])").format(a=alias)
-
-
 def verify_assets(store, g, units, governance, identity, *, delta=False):
     """Every stored asset is a profile unit, except at an ICS or reserve output stored by a covered
-    generation, which keeps every asset it holds. Mints are profile units only."""
+    generation, which keeps every asset it holds. Mints are profile units only.
+
+    Assets outside the profile are few (the assets table is small): they are found first and only
+    their rows are checked, through the (policy, name) indexes."""
     gen, db, scope = g['id'], store.db, '=' if delta else '<='
+    outside = db.execute("SELECT policy,name,first_generation FROM chain.assets WHERE first_generation<=%s"
+                         " AND encode(policy,'hex')||encode(name,'hex')<>ALL(%s::text[]) AND encode(policy,'hex')<>ALL(%s::text[])",
+                         (gen, sorted(units), sorted(governance))).fetchall()
+    if not outside:
+        return
     configs = identity['configs']
-    params = {'g': gen, 'units': sorted(units), 'governance': sorted(governance),
-              'bridge': [configs['ics-config']['illiquid_circulation_supply_validator_address'],
-                         configs['reserve-config']['reserve_validator_address']],
-              'covered': covered_generations(store, gen, delta=delta) if stored(store) else []}
-    checks = (
-        'SELECT 1 FROM chain.assets a WHERE a.first_generation' + scope + '%(g)s AND ' + _outside('a') + ' AND a.first_generation<>ALL(%(covered)s::bigint[]) LIMIT 1',
-        'SELECT 1 FROM chain.mints a WHERE a.first_generation' + scope + '%(g)s AND ' + _outside('a') + ' LIMIT 1',
-        'SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index'
-        ' WHERE a.first_generation' + scope + '%(g)s AND ' + _outside('a') +
-        ' AND NOT (o.address=ANY(%(bridge)s::text[]) AND o.first_generation=a.first_generation AND a.first_generation=ANY(%(covered)s::bigint[])) LIMIT 1',
-    )
-    for query in checks:
-        if db.execute(query, params).fetchone():
+    bridge = [configs['ics-config']['illiquid_circulation_supply_validator_address'], configs['reserve-config']['reserve_validator_address']]
+    covered_ids = covered_generations(store, gen) if stored(store) else []
+    for policy, name, first in outside:
+        if (not delta or first == gen) and first not in covered_ids:
+            raise Refusal('selected_asset_outside_profile')
+        if db.execute('SELECT 1 FROM chain.mints WHERE policy=%s AND name=%s AND first_generation' + scope + '%s LIMIT 1', (policy, name, gen)).fetchone():
+            raise Refusal('selected_asset_outside_profile')
+        if db.execute('SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index'
+                      ' WHERE a.policy=%s AND a.name=%s AND a.first_generation' + scope + '%s AND NOT (o.address=ANY(%s::text[])'
+                      ' AND o.first_generation=a.first_generation AND a.first_generation=ANY(%s::bigint[])) LIMIT 1',
+                      (policy, name, gen, bridge, covered_ids)).fetchone():
             raise Refusal('selected_asset_outside_profile')
 
 
