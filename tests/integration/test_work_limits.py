@@ -282,8 +282,7 @@ class RelevanceModeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import fixtures.relevance as rf
-        cls.rf, cls.future = rf, rf.FUTURE
-        rf.FUTURE = 110  # headers through 100 blocks past the root's witness
+        cls.rf = rf
         rf.configure('mainnet')
         rf.SQLFixture.setup()
         cls.decoded = {}
@@ -291,7 +290,6 @@ class RelevanceModeTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.rf.SQLFixture.teardown()
-        cls.rf.FUTURE = cls.future
 
     @contextlib.contextmanager
     def decoded_once(self):
@@ -324,20 +322,24 @@ class RelevanceModeTests(unittest.TestCase):
             update_follow(reference, self.rf.Provider(50000, Fake(routes)), self.rf.PROFILE, target, hooks=FixtureHooks(), relevance_enabled=False)
         return reference.digests(reference.generation()['id'])
 
-    def test_one_hundred_blocks_of_1100_relevant_outputs_complete_in_relevance_mode(self):
+    def test_blocks_of_1100_relevant_outputs_past_the_key_limit_complete_in_relevance_mode(self):
         rf = self.rf
-        # 11 transactions of 100 cNIGHT outputs per block: about 2,200 known fact keys per block, 220,000 in all.
-        transactions = [[self.relevant_outputs(1000 + 11 * b + i) for i in range(11)] for b in range(100)]
+        from db_sync_alt.sources.blockfrost import relevance
+        # 11 transactions of 100 cNIGHT outputs per block: about 2,200 known fact keys per block. The scenario of
+        # 100 such blocks against the 200,000-key limit is scaled by 1/10 to fit the CI job time: 10 blocks
+        # (about 22,000 keys) against a 20,000-key limit. One update of all 10 blocks passes the limit; the
+        # driver's relevance cap (MAX_BLOCKS, derived from the real limits in the unit tests) keeps it out of reach.
+        transactions = [[self.relevant_outputs(1000 + 11 * b + i) for i in range(11)] for b in range(10)]
         store, routes = self.prepare(transactions)
-        pauses = drive(store, real.AccountedFake(routes), rf.PROFILE, rf.T + 100, sync_options={'relevance_enabled': True})
+        with patch.object(relevance, 'MAX_KEYS', 20000):
+            pauses = drive(store, real.AccountedFake(routes), rf.PROFILE, rf.T + 10, sync_options={'relevance_enabled': True})
+            verify_store(store)
         self.assertEqual(pauses, [])
-        targets = [t - rf.T for t, _ in generations(store)[1:]]
-        self.assertEqual(targets, list(range(6, 100, 6)) + [100])
-        self.assertEqual(store.generation()['manifest']['relevance_coverage']['range'], [rf.T + 97, rf.T + 100])
-        verify_store(store)
+        self.assertEqual([t - rf.T for t, _ in generations(store)[1:]], [6, 10])
+        self.assertEqual(store.generation()['manifest']['relevance_coverage']['range'], [rf.T + 7, rf.T + 10])
         digests = store.digests(store.generation()['id'])
-        self.assertGreaterEqual(digests['outputs']['count'], 110000)
-        self.assertEqual(digests, self.full_follow(transactions, rf.T + 100, routes))
+        self.assertGreaterEqual(digests['outputs']['count'], 11000)
+        self.assertEqual(digests, self.full_follow(transactions, rf.T + 10, routes))
 
     def test_a_resume_after_a_wait_does_not_read_the_committed_blocks_again(self):
         rf = self.rf
@@ -380,6 +382,89 @@ class RelevanceModeTests(unittest.TestCase):
                 self.assertEqual([len(pages(client.calls, b)) for b in (3, 4)], [2, 2])
                 verify_store(store)
                 self.assertEqual(store.digests(store.generation()['id']), self.full_follow(transactions, rf.T + 4, routes))
+
+    def spend_in_block(self):
+        """Block 1: a relevant transaction. Block 2: a transaction creating a relevant output and one spending it,
+        whose selection depends on the discovery state the first one leaves."""
+        rf = self.rf
+        first = rf.make_tx(7001, relevant=True)
+        created = rf.make_tx(7002, relevant=True)
+        spender = rf.make_tx(7003, inputs=[(bytes.fromhex(created['tx_hash']), 0)])
+        return [[first], [created, spender]], created, spender
+
+    def test_a_transient_failure_inside_a_block_rolls_that_block_back_and_reads_it_again(self):
+        rf = self.rf
+        from db_sync_alt.sources.blockfrost import follow
+        transactions, created, spender = self.spend_in_block()
+        store, routes = self.prepare(transactions)
+        failing = '/txs/' + spender['tx_hash'] + '/utxos'
+
+        class Client(real.AccountedFake):
+            """A 503 the first time the spending transaction's /utxos is read, after the block's first transaction."""
+            failed_at = None
+            def get(self, path, **kw):
+                if path == failing and self.failed_at is None:
+                    self.calls.append(path)
+                    self.failed_at = len(self.calls)
+                    raise RuntimeError('HTTP 503; request counted, no automatic retry')
+                return super().get(path, **kw)
+        reused, original = [], follow._relevance_source
+
+        def observe(store, *args, **kwargs):
+            entry = original(store, *args, **kwargs)
+            reused.append((entry['through'], set(entry['source'].discovery.created), set(entry['source'].auditor.discovery.created)))
+            return entry
+        client = Client(copy.deepcopy(routes))
+        with patch.object(follow, '_relevance_source', observe):
+            pauses = drive(store, client, rf.PROFILE, rf.T + 2, sync_options={'relevance_enabled': True})
+        self.assertEqual([code for code, _ in pauses], ['provider_unavailable'])
+        # The resumed pass reuses the state through block 1, without block 2's partial additions.
+        key = (bytes.fromhex(created['tx_hash']), 0)
+        self.assertEqual(len(reused), 2)
+        through, main, independent = reused[1]
+        self.assertEqual(through, rf.T + 1)
+        self.assertNotIn(key, main)
+        self.assertNotIn(key, independent)
+        after = client.calls[client.failed_at:]
+        page = lambda b: sum(c.startswith('/blocks/' + rf.H(rf.T + b).hex() + '/txs/cbor') for c in after)
+        self.assertEqual((page(1), page(2)), (0, 2))
+        # Each pass reads both answers; the spent output is not stored yet, so each pass also reads the creating
+        # transaction's answer as the spent output's origin, as an uninterrupted run does.
+        self.assertEqual([after.count('/txs/' + t['tx_hash'] + '/utxos') for t in (created, spender)], [4, 2])
+        uninterrupted, _ = self.prepare(transactions)
+        reads = Fake(copy.deepcopy(routes))
+        update_follow(uninterrupted, rf.Provider(50000, reads), rf.PROFILE, rf.T + 2, hooks=FixtureHooks(), relevance_enabled=True)
+        block = lambda calls: sorted(c for c in calls if c.startswith('/blocks/' + rf.H(rf.T + 2).hex() + '/txs/cbor')
+                                     or c in ('/txs/' + created['tx_hash'] + '/utxos', '/txs/' + spender['tx_hash'] + '/utxos'))
+        self.assertEqual(block(after), block(reads.calls))
+        verify_store(store)
+        self.assertEqual(store.digests(store.generation()['id']), self.full_follow(transactions, rf.T + 2, routes))
+
+    def test_a_failure_after_the_block_keys_were_recorded_drops_the_state_and_reads_everything_again(self):
+        rf = self.rf
+        from db_sync_alt.sources.blockfrost import follow
+        transactions, created, spender = self.spend_in_block()
+        store, routes = self.prepare(transactions)
+        original, failed = store.checkpoint, []
+
+        def checkpoint(generation, phase, unit, receipt):
+            # The block-2 commit fails once, after its work added its keys to `known`.
+            if phase == 'events' and str(unit) == str(rf.T + 2) and not failed:
+                failed.append(unit)
+                raise RuntimeError('commit failed')
+            return original(generation, phase, unit, receipt)
+        with patch.object(store, 'checkpoint', side_effect=checkpoint):
+            with self.assertRaisesRegex(RuntimeError, 'commit failed'):
+                update_follow(store, rf.Provider(50000, Fake(copy.deepcopy(routes))), rf.PROFILE, rf.T + 2, hooks=FixtureHooks(), relevance_enabled=True)
+        self.assertNotIn(store, follow._REBUILT)
+        self.assertTrue(store.completed(store.pending()['id'], 'events', rf.T + 1))
+        self.assertFalse(store.completed(store.pending()['id'], 'events', rf.T + 2))
+        client = Fake(copy.deepcopy(routes))
+        update_follow(store, rf.Provider(50000, client), rf.PROFILE, rf.T + 2, hooks=FixtureHooks(), relevance_enabled=True)
+        page = lambda b: sum(c.startswith('/blocks/' + rf.H(rf.T + b).hex() + '/txs/cbor') for c in client.calls)
+        self.assertEqual((page(1), page(2)), (2, 2))
+        verify_store(store)
+        self.assertEqual(store.digests(store.generation()['id']), self.full_follow(transactions, rf.T + 2, routes))
 
     def test_an_oversized_utxos_answer_beside_a_relevant_transaction_ingests_on_both_adapters(self):
         rf = self.rf

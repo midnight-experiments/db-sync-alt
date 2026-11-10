@@ -23,8 +23,11 @@ def _relevance_source(store, provider, profile, gen, parent_capability, *, hooks
 
     A relevance resume re-reads every committed block from the provider: the stored candidate is never its
     own coverage proof. Within one writer session the state re-derived so far is kept, so a resume after a
-    wait (request budget, quota, provider backoff) continues instead of reading those blocks again. A new
-    process, another parent or another pending generation starts over.
+    wait (request budget, quota, provider backoff) continues instead of reading those blocks again. That is
+    sound by provenance in this process: every block through `through` was derived here by both independent
+    traversals, or re-derived from fresh reads and compared with its receipt; a block that stopped midway is
+    rolled back (`_unit`), and a stop after its keys were recorded drops the entry. A new process, another
+    parent or another pending generation starts over.
     """
     entry = _REBUILT.get(store)
     if (entry is not None and entry['generation'] == gen and entry['capability']() is parent_capability
