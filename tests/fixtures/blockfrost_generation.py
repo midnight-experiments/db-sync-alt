@@ -31,16 +31,23 @@ PRE_ORIGIN=tx({0:[],1:[[b'p',100]],2:3});PRE_SPEND=tx({0:[[bytes.fromhex(PRE_ORI
 # tagged auxiliary-data map whose label-674 metadatum is an indefinite-length map with a repeated key.
 HOSTILE_AUXILIARY=(b'\xa1\x19\x02\xa2'+b'\x81'*1000+b'\x00',b'\xd9\x01\x03\xa1\x00\xa1\x19\x02\xa2\xbf\x61k\x01\x61k\x02\xff')
 CLEAN_AUXILIARY=(b'\xf6',b'\xf6')
+# Witness sets that anyone can put on chain: a supplemental datum nested 1000 levels deep, a datum (in a
+# tagged set) that is an indefinite-length map with a repeated key, and a redeemer whose data is 1000
+# nested constructors.
+HOSTILE_WITNESSES=(b'\xa1\x04\x81'+b'\x81'*1000+b'\x00',b'\xa1\x04\xd9\x01\x02\x81\xbf\x01\x00\x01\x00\xff',
+                   b'\xa1\x05\xa1\x82\x00\x00\x82'+b'\xd8\x79\x81'*1000+b'\xd8\x79\x80\x82\x01\x01')
+CLEAN_WITNESSES=(b'\xa0',)*3
 
-def unrelated_tx(index,auxiliary):
-    """An unrelated transaction (no inputs or outputs) carrying `auxiliary`, hash-bound by body key 7 when present."""
+def unrelated_tx(index,auxiliary=b'\xf6',witness=b'\xa0'):
+    """An unrelated transaction (no inputs or outputs) carrying `witness` and `auxiliary`; body key 7 binds non-null auxiliary data."""
     body={0:[],1:[],2:100+index}
     if auxiliary!=b'\xf6':body[7]=hashlib.blake2b(auxiliary,digest_size=32).digest()
-    return tx(body,auxiliary=auxiliary)
+    return tx(body,auxiliary=auxiliary,witness=witness)
 
-def fixtures(fork=0,transition=False,auxiliary=()):
-    """Provider routes; each `auxiliary` entry adds one unrelated transaction after the relevant one in block h=12."""
-    at=lambda h:block(h,fork,transition,len(auxiliary))
+def fixtures(fork=0,transition=False,auxiliary=(),witnesses=()):
+    """Provider routes; each `auxiliary` or `witnesses` entry adds one unrelated transaction carrying it after the relevant one in block h=12."""
+    unrelated=[unrelated_tx(i,auxiliary=a) for i,a in enumerate(auxiliary,1)]+[unrelated_tx(i,witness=w) for i,w in enumerate(witnesses,len(auxiliary)+1)]
+    at=lambda h:block(h,fork,transition,len(unrelated))
     original=tx({0:[],1:[[b'a',100]],2:3});spend=tx({0:[[bytes.fromhex(original[1]),0]],1:[],2:3});mint=tx({0:[],1:[],2:3,9:{b'q'*28:{b'other':22},POLICY:{NAME:9,b'incidental':33}}})
     route={'/metrics':[],'/genesis':{'network_magic':1},'/blocks/latest':at(2172)}
     for h in range(8,2173):
@@ -52,8 +59,7 @@ def fixtures(fork=0,transition=False,auxiliary=()):
         route['/txs/'+th]={'hash':th,'block':b['hash'],'block_height':OFFSET+h,'index':4 if h==10 else 0,'valid_contract':True}
         inp=[dict(out(),tx_hash=original[1],reference=False,collateral=False)] if h==11 else []
         route['/txs/'+th+'/utxos']={'hash':th,'inputs':inp,'outputs':[out()] if h==10 else []}
-    for index,data in enumerate(auxiliary,1):
-        raw,th=unrelated_tx(index,data)
+    for raw,th in unrelated:
         route['/blocks/'+at(12)['hash']+'/txs/cbor?count=100&page=1&order=asc'].append({'tx_hash':th,'cbor':raw})
         route['/txs/'+th+'/utxos']={'hash':th,'inputs':[],'outputs':[]}
     b=at(10)

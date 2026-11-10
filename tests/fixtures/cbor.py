@@ -22,8 +22,8 @@ def enc(x):
     if isinstance(x,Tag):return head(6,x.number)+enc(x.value)
     raise TypeError(x)
 
-def tx(body,valid=True,auxiliary=b'\xf6'):
-    """(hex transaction, body hash); `auxiliary` is the encoded auxiliary data, null by default."""
-    raw=enc(body);return (b'\x84'+raw+enc({})+enc(valid)+auxiliary).hex(),hashlib.blake2b(raw,digest_size=32).hexdigest()
+def tx(body,valid=True,auxiliary=b'\xf6',witness=b'\xa0'):
+    """(hex transaction, body hash); `witness` and `auxiliary` are encoded, an empty map and null by default."""
+    raw=enc(body);return (b'\x84'+raw+witness+enc(valid)+auxiliary).hex(),hashlib.blake2b(raw,digest_size=32).hexdigest()
 
 def body():return {0:[[b'a'*32,0]],1:[],2:3}
