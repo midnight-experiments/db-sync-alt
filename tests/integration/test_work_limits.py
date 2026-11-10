@@ -293,29 +293,29 @@ class RelevanceModeTests(unittest.TestCase):
         cls.rf.SQLFixture.teardown()
         cls.rf.FUTURE = cls.future
 
-    def output(self, transaction, index=0):
-        """`fixtures.relevance.output` with each transaction decoded once."""
-        from db_sync_alt.sources.blockfrost.cbor import decode_transaction
-        from db_sync_alt.sources.blockfrost.relevance import address_text
-        d = self.decoded.get(transaction['tx_hash'])
-        if d is None:
-            d = self.decoded[transaction['tx_hash']] = decode_transaction(transaction['cbor'], transaction['tx_hash'])
-        value = (list(d['outputs']) + [d['collateral_output']])[index]
-        return {'output_index': index, 'address': address_text(value['address'], self.rf.PROFILE.network.network),
-                'amount': [{'unit': 'lovelace', 'quantity': value['value']}] + [{'unit': p.hex() + n.hex(), 'quantity': str(q)} for p, n, q in value['assets']],
-                'data_hash': None, **({'collateral': True} if index == d['output_count'] else {})}
+    @contextlib.contextmanager
+    def decoded_once(self):
+        """The fixture renders each output by decoding its whole transaction: decode each one once."""
+        from db_sync_alt.sources.blockfrost import cbor
+        original = cbor.decode_transaction
+
+        def decode(raw, expected):
+            key = (raw, expected)
+            if key not in self.decoded:
+                self.decoded[key] = original(raw, expected)
+            return self.decoded[key]
+        with patch.object(cbor, 'decode_transaction', decode):
+            yield
 
     def prepare(self, transactions, *, reuse_root=True):
-        with patch.object(self.rf, 'output', self.output):
+        with self.decoded_once():
             store, routes = self.rf.SQLFixture.prepare(transactions, reuse_root=reuse_root)
         self.addCleanup(store.close)
         return store, routes
 
     def relevant_outputs(self, fee, count=100):
         rf = self.rf
-        body = {0: [], 1: [[rf.ADDRESS, [100, {rf.P: {rf.N: 3}}]] for _ in range(count)], 2: fee}
-        raw, h = tx(body)
-        return {'cbor': raw, 'tx_hash': h, 'body': body, 'valid': True}
+        return rf.make_tx(fee, outputs=[[rf.ADDRESS, [100, {rf.P: {rf.N: 3}}]] for _ in range(count)])
 
     def full_follow(self, transactions, target, routes):
         """Digests of the full follow (relevance off, one generation, whole provider answers) of the same chain."""
@@ -394,12 +394,13 @@ class RelevanceModeTests(unittest.TestCase):
         big = {'cbor': raw, 'tx_hash': th, 'body': {0: [], 1: [script], 2: 777777}, 'valid': True}
         transactions = [[rf.make_tx(300, relevant=True), big]]
         store, routes = self.prepare(transactions)
-        address = self.output(big)['address']
+        rendered = self.rf.output(big)
+        address = rendered['address']
         fat = [{'unit': 'lovelace', 'quantity': '23000000'}] + [{'unit': (JUNK + n).hex(), 'quantity': '1'} for n in NAMES]
         row = lambda h, reference: {'address': address, 'amount': fat if reference else fat[:1], 'tx_hash': h.hex(), 'output_index': 0,
                                     'data_hash': None, 'inline_datum': None, 'reference_script_hash': None,
                                     'collateral': False, 'reference': reference}
-        answer = {'hash': th, 'inputs': [row(spent, False)] + [row(h, True) for h, _ in refs], 'outputs': [self.output(big)]}
+        answer = {'hash': th, 'inputs': [row(spent, False)] + [row(h, True) for h, _ in refs], 'outputs': [dict(rendered, collateral=False)]}
         body = json.dumps(answer).encode()
         del answer
         self.assertGreater(len(body), provider.MAX_BYTES)

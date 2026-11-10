@@ -622,7 +622,7 @@ class PgStore:
     def transaction_mints(self,tx_hash,generation):return self._facts_where('mints','tx_hash=%s AND first_generation<=%s',(tx_hash,generation))
     def recent_transactions(self,generation,limit=8):
         g=self.generation(generation)
-        return [dict(zip(('hash','block_hash','tx_index'),r)) for r in self.db.execute('SELECT t.hash,t.block_hash,t.tx_index FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash WHERE t.first_generation<=%s AND b.height<=%s ORDER BY b.height DESC,t.tx_index DESC LIMIT %s',(generation,g['target_height'],limit))]
+        return [dict(zip(('hash','block_hash','tx_index','valid'),r)) for r in self.db.execute('SELECT t.hash,t.block_hash,t.tx_index,t.valid FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash WHERE t.first_generation<=%s AND b.height<=%s ORDER BY b.height DESC,t.tx_index DESC LIMIT %s',(generation,g['target_height'],limit))]
     def epoch_nonce(self,epoch,generation):
         rows=self._facts_where('epoch_nonces','epoch=%s AND first_generation<=%s',(epoch,generation));return rows[0] if rows else None
     def epoch_stake_total(self,epoch,generation):return int(self.db.execute('SELECT COALESCE(sum(amount),0) FROM chain.epoch_stakes WHERE epoch=%s AND first_generation<=%s',(epoch,generation)).fetchone()[0])

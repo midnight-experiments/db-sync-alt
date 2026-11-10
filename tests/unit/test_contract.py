@@ -21,6 +21,12 @@ class ContractTests(unittest.TestCase):
         for value in ('01','-0','+1',' 1','1.0','1e3'):
             with self.assertRaises(Refusal):validate_numeric('mints',{'quantity':value})
 
+    def test_phase_two_invalid_transactions_belong_to_the_current_format_only(self):
+        # cardano-db-sync's valid_contract: 0 for a phase-2-invalid transaction. Nonce-only facts hold valid ones only.
+        validate_numeric('transactions',{'tx_index':0,'valid':0})
+        validate_numeric('transactions',{'tx_index':0,'valid':1},legacy=True)
+        with self.assertRaisesRegex(Refusal,'invalid_numeric_domain'):validate_numeric('transactions',{'tx_index':0,'valid':0},legacy=True)
+
     def test_epoch_size_is_strict_inclusive_and_never_defaulted(self):
         for value in (0,12000,24000,2**31-1):
             self.assertEqual(epoch_size(value),value)

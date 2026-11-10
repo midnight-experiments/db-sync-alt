@@ -73,6 +73,50 @@ class RelevanceTests(unittest.TestCase):
             elif field=='quantity':bad['amount'][0]['quantity']='99'
             else:bad['data_hash']='ff'*32
             with self.assertRaisesRegex(Refusal,'output_cbor_mismatch'):compare_outputs(decoded,[bad],'mainnet')
+    def test_pointer_addresses_compare_in_the_ledger_canonical_form(self):
+        """Issue 00032 (S10): from protocol version 9 the ledger accepts redundant leading zero groups in a pointer
+        and keeps it re-serialised minimally, which cardano-db-sync renders."""
+        from db_sync_alt.sources.blockfrost.relevance import _encode_address
+        head=b'\x41'+b'p'*28
+        decoded=self.decode([[head+b'\x80\x81\x00\x80\x02\x03',[100,{self.policy:{self.name:3}}]]])
+        row=dict(self.row(self.profile.night),address=_encode_address(head+b'\x81\x00\x02\x03','mainnet'));compare_outputs(decoded,[row],'mainnet')
+        row['address']=_encode_address(head+b'\x80\x81\x00\x80\x02\x03','mainnet')
+        with self.assertRaisesRegex(Refusal,'output_cbor_mismatch'):compare_outputs(decoded,[row],'mainnet')
+        from db_sync_alt.sources.blockfrost.relevance import canonical_address
+        for suffix,canonical in ((b'\x01\x02\x03',b'\x01\x02\x03'),(b'\x80\x81\x00\x80\x02\x03',b'\x81\x00\x02\x03'),
+                                 (b'\x80\x80\x80\x80\x01\x80\x80\x00\x80\x80\x07',b'\x01\x00\x07'),(b'\x8f\xff\xff\xff\x7f\x83\xff\x7f\x00',b'\x8f\xff\xff\xff\x7f\x83\xff\x7f\x00')):
+            self.assertEqual(canonical_address(head+suffix),head+canonical)
+        # Not a pointer the ledger accepts (slot or index too wide, too many groups, truncated, trailing bytes): unchanged.
+        for suffix in (b'\x90\x80\x80\x80\x00\x00\x00',b'\x00\x84\x80\x00\x00',b'\x80\x80\x80\x80\x80\x01\x00\x00',b'\x01\x02',b'\x01\x02\x03\x04'):
+            self.assertEqual(canonical_address(head+suffix),head+suffix)
+        for raw in (self.raw,b'\x61'+b'a'*28,b'\x82\x00'):self.assertEqual(canonical_address(raw),raw)
+    def test_collateral_return_assets_are_not_listed_by_blockfrost(self):
+        """Issue 00032 (S9), with a real Preprod answer (transaction 6fa3def7…): a valid transaction's collateral
+        return is a `collateral` row with lovelace only. Its CBOR (rebuilt from the answer) returns the tokens of
+        the collateral input."""
+        from fixtures.cbor import F
+        answer=json.loads((F/'collateral-return-assets-utxos.json').read_text())
+        def value(amount):
+            assets={}
+            for a in amount[1:]:assets.setdefault(bytes.fromhex(a['unit'][:56]),{})[bytes.fromhex(a['unit'][56:])]=int(a['quantity'])
+            return [int(amount[0]['quantity']),assets] if assets else int(amount[0]['quantity'])
+        ordinary=next(r for r in answer['inputs'] if not r['collateral']);outpoint=[bytes.fromhex(ordinary['tx_hash']),ordinary['output_index']]
+        address=lambda row:address_bytes(row['address'],'preprod',require_supported=False)
+        body={0:[outpoint],1:[[address(r),value(r['amount'])] for r in answer['outputs'][:3]],2:281110,13:[outpoint],
+              16:[address(answer['outputs'][3]),[int(answer['outputs'][3]['amount'][0]['quantity']),value(ordinary['amount'])[1]]]}
+        decoded=decode_transaction(*tx(body))
+        self.assertTrue(decoded['collateral_output']['assets'])
+        compare_outputs(decoded,answer['outputs'],'preprod')
+        # Listing the return's tokens would still be the same output; other values are not.
+        listed=copy.deepcopy(answer['outputs']);listed[3]['amount']=[listed[3]['amount'][0]]+copy.deepcopy(ordinary['amount'][1:]);compare_outputs(decoded,listed,'preprod')
+        from db_sync_alt.sources.blockfrost.adapter import ledger_effects
+        spent,created,_=ledger_effects(answer,decoded,lambda h,index:ordinary)
+        self.assertEqual((set(spent),[r['output_index'] for r in created]),({tuple(outpoint)},[0,1,2]))
+        for change in ('lovelace','asset'):
+            bad=copy.deepcopy(answer['outputs'])
+            if change=='lovelace':bad[3]['amount'][0]['quantity']='1'
+            else:bad[3]['amount'].append(dict(ordinary['amount'][1],quantity='1'))
+            with self.assertRaisesRegex(Refusal,'output_cbor_mismatch'):compare_outputs(decoded,bad,'preprod')
     def test_bounded_new_stream_state(self):
         discovery=self.discovery()
         with patch('db_sync_alt.sources.blockfrost.relevance.MAX_KEYS',1):
