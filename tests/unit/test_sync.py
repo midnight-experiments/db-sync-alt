@@ -91,6 +91,37 @@ class SyncTests(unittest.TestCase):
         self.clock.now=next_day(self.clock.now)+1
         with self.assertRaisesRegex(LifecycleFailure,'request_budget_exhausted'):self.run_once()
         self.assertEqual(self.store.jobs['provider-active'],job);self.assertEqual(len(self.client.calls),calls)
+    def test_job_is_sized_to_the_transactions_of_its_blocks(self):
+        # A block of 300 transactions costs 3 inventory pages and 300 /utxos: 24 blocks fit 3/4 of 10,000.
+        self.client.confirmed=1000;self.store.tx_counts.update({h:300 for h in range(101,1101)})
+        self.run_once()
+        self.assertEqual(self.update.calls,[(101,124)])
+        self.assertEqual((self.store.jobs['provider-active']['target'],self.store.jobs['provider-active']['budget']),(124,10000))
+        self.run_once()
+        self.assertEqual(self.update.calls[-1],(125,148))
+    def test_one_block_heavier_than_the_budget_is_a_job_of_its_own(self):
+        self.config.sync={'acquisition_request_budget':100};self.client.confirmed=1000;self.store.tx_counts[101]=500
+        self.run_once()
+        self.assertEqual(self.update.calls,[(101,101)])
+    def test_sizing_counts_both_relevance_passes_and_caps_relevance_generations(self):
+        from db_sync_alt.sources.blockfrost.sync import job_target
+        ready=self.store.generation();top=ready['target_height']
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+100)
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+6)
+        self.store.tx_counts.update({h:1000 for h in range(top+1,top+101)})
+        # 2 x (10 pages + 1,000 /utxos) per block: three blocks fit 7,500.
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+3)
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+7)
+    def test_sizing_ends_at_the_stored_witness(self):
+        from db_sync_alt.sources.blockfrost.sync import job_target
+        store=Store(security=3);ready=store.generation()
+        self.assertEqual(job_target(store,ready,ready['target_height']+100,10000,relevance=False),ready['target_height']+3)
+    def test_fixed_relevance_target_beyond_six_blocks_is_refused_before_any_request(self):
+        self.config.sync={'relevance_enabled':True}
+        driver=SyncDriver(self.config,client=self.client,profile=PREPROD_PROFILE,clock=self.clock,update_fn=self.update,fixed_target=107)
+        driver._check_relevance=lambda *a:None
+        with self.assertRaisesRegex(LifecycleFailure,'invalid_sync_configuration'):driver.run_once(self.store,self.health,self.stop)
+        self.assertEqual(self.client.calls,[])
     def test_daily_poll_exhaustion_pauses_until_new_utc_day_with_new_budget(self):
         self.config.sync={'daily_poll_request_budget':2}
         with self.assertRaises(TransientSyncFailure) as error:self.run_once()

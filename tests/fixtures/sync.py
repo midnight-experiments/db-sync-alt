@@ -17,11 +17,15 @@ def health():
 class Store:
     def __init__(self,security=2160):
         self.jobs={};self.target=100;self.gid=0;self._pending=None;self.revoked=False;self.saved=[];self.security=security
+        self.tx_counts={}
     def generation(self):
         return {'id':self.gid,'target_height':self.target,'witness_height':self.target+self.security,
                 'manifest':{'anchors':{'target':{'height':self.target,'hash':block(self.target)['hash']}}}}
     def pending(self):return ({'id':self.gid+1,'source':'blockfrost-cardano','status':'pending','manifest':{},**self._pending} if self._pending else None)
     def checkpoint_rows(self,**filters):return []
+    def block_at(self,generation,height):
+        # Provisional headers through the ready witness; `tx_counts` sets a block's transaction count (default 0).
+        return {**block(height),'tx_count':self.tx_counts.get(height,0)} if height<=self.target+self.security else None
     def sync_job(self,key):return copy.deepcopy(self.jobs.get(key))
     def save_sync_job(self,key,body):
         old=self.jobs.get(key)

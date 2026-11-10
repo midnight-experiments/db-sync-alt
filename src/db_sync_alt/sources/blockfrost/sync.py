@@ -306,6 +306,32 @@ def local_usage(client):
         raise LifecycleFailure('provider_accounting_unavailable') from None
 
 
+def job_target(store, ready, limit, budget, *, relevance):
+    """The highest target <= `limit` whose blocks' estimated requests fit 3/4 of `budget`, at least one block.
+
+    The ready generation stores its provisional headers through its witness, so each candidate block's
+    transaction count is known without a request: full mode reads one inventory page per 100 transactions and
+    one `/utxos` per transaction; relevance mode reads both twice (acquisition and independent pass) and may
+    select every transaction. Relevance generations hold at most `relevance.MAX_BLOCKS` blocks, so their known
+    fact keys can never pass the limit. The estimate only sizes the job; an exhausted job waits and continues.
+    """
+    first = ready['target_height'] + 1
+    if relevance:
+        from db_sync_alt.sources.blockfrost.relevance import MAX_BLOCKS
+        limit = min(limit, ready['target_height'] + MAX_BLOCKS)
+    target, spent = first, 0
+    for height in range(first, min(limit, ready['witness_height']) + 1):
+        row = store.block_at(ready['id'], height)
+        if row is None:
+            break
+        count = row['tx_count']
+        spent += ((count + 99) // 100 + count) * (2 if relevance else 1)
+        if spent > budget * 3 // 4 and height > first:
+            break
+        target = height
+    return target
+
+
 def validate_job(job, *, kind=None, security=None):
     """Fail closed on corrupted counters; never normalize a spent budget.
 
@@ -731,6 +757,11 @@ class SyncDriver:
                         or active['witness'] != pending.get('witness_height')
                         or active['parent'] != pending.get('parent')):
             raise LifecycleFailure('pending_job_missing')
+        if self.fixed_target is not None and self.options['relevance_enabled'] and (not active or active['state'] == 'completed'):
+            from db_sync_alt.sources.blockfrost.relevance import MAX_BLOCKS
+            # A relevance generation of more blocks could pass the key limit and never publish.
+            if self.fixed_target - ready['target_height'] > MAX_BLOCKS:
+                raise LifecycleFailure('invalid_sync_configuration')
         if active and active['state'] == 'exhausted':
             raise LifecycleFailure('request_budget_exhausted')
         if active and active['state'] != 'completed' and active.get('retry_at', 0) > self.clock():
@@ -806,7 +837,11 @@ class SyncDriver:
                         and self.clock() - self._eligible_at < self.options['follow_max_wait_seconds']):
                     return
             self._eligible_at = None
-            target = self.fixed_target if self.fixed_target is not None else min(confirmed_height, ready['target_height'] + self.options['max_batch_blocks'])
+            if self.fixed_target is not None:
+                target = self.fixed_target
+            else:
+                target = job_target(store, ready, min(confirmed_height, ready['target_height'] + self.options['max_batch_blocks']),
+                                    self.options['acquisition_request_budget'], relevance=self.options['relevance_enabled'])
             active = dict(job_id=uuid.uuid4().hex, attempts=0,
                           budget=self.options['acquisition_request_budget'], state='active', kind='acquire',
                           parent=ready['id'], target=target, witness=target + self.profile.security,
