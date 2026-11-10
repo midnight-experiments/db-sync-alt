@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Acquire complete SQL prerequisite history in bounded, atomic windows with
+  resumable contiguous coverage and independent source verification. Existing
+  source-query deadlines, identity caps and confirmation rules are unchanged.
+- Refuse a conservatively oversized completion receipt before generation or fact
+  work. Resume uses the immutable stored window; a CLI override cannot change it.
+- **BREAKING reader requirement:** SQL acquisition receipt version 2 requires
+  the updated reader/service; the 0.3.0 reader cannot admit it. It is separate from
+  schema 4, incremental manifest version 2 and backup format version 3. Supported
+  five-field version 1 receipts retain their validation; other adapter-versioned
+  receipt field sets refuse.
+
 ## 0.3.0
 
 - Read pending generation status without loading its manifest, while preserving

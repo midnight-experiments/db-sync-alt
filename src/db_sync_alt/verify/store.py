@@ -143,7 +143,8 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
             position=hi+1
         if position!=end+1:raise Refusal('checkpoint_incomplete')
     # A start cursor at block 0 leaves no history before it to acquire.
-    if g['parent'] is None and g['start_height']>0 and not store.completed(gen,'prerequisites','complete'):raise Refusal('prerequisites_incomplete')
+    from db_sync_alt.verify.prerequisites import prerequisite_coverage
+    prerequisite_coverage(store,g)
     for epoch in m['required_epochs']:
         # Every completed required epoch has its end block: the node's latest block of an epoch
         # it reads must be exact, never an older block.

@@ -31,13 +31,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Integration tests with PostgreSQL 17 (shard ${{ matrix.shard }} of 3)
-        run: python3 tools/dev.py integration --shard ${{ matrix.shard }}/3
+      - name: Integration tests with PostgreSQL 17 (shard ${{ matrix.shard }} of 8; density isolated)
+        run: python3 tools/dev.py integration --shard ${{ matrix.shard }}/8
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20
