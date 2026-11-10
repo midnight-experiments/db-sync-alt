@@ -102,6 +102,9 @@ def main(argv=None):
             else:
                 report=blockfrost_once(store,profile,target_height=args.target_height,
                     request_budget=args.request_budget,stop_event=stop,relevance_enabled=args.relevance_enabled)
+            for warning in report.get('warnings', []):
+                # Said on stderr as well: the operator acts on it now, not when reading the report.
+                print(canonical({'warning':warning,**report.get('bridge_coverage_ended',{})}),file=sys.stderr)
             print(canonical(report));return 0
     except TransientSyncFailure as error:
         print(canonical({'error_code':error.code,'retry_at':error.retry_at}),file=sys.stderr);return 75

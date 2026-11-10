@@ -14,6 +14,8 @@ its chain position:
 Every field is range-checked by the tables' constraints (overflow is refused, never wrapped).
 From schema 5, epoch_param also holds each epoch's max_tx_size (midnight-node 2.1.101 reads
 MAX(epoch_param.max_tx_size) of the cursor block's epoch); below schema 5 it has nonces only.
+From schema 5, tx_metadata holds the bridge metadatum (key 6500973) of each covered transaction that
+has one, with the transaction's ID (tx_metadata.id = tx_metadata.tx_id = tx.id).
 multi_asset, datum, pool_hash and epoch_stake keep the stable IDs of the stored facts. The tables
 are written in ID order (chain order) when built and grow by appends at each publication, inside
 the publication transaction.
@@ -23,7 +25,9 @@ from db_sync_alt.contract import Refusal
 HEIGHT_LIMIT = 1 << 27
 FIELD = 4096
 TABLES = ('block', 'tx', 'tx_out', 'tx_in', 'ma_tx_out', 'multi_asset', 'datum', 'epoch_param', 'pool_hash', 'epoch_stake')
-KEYS = {name: ('epoch_no' if name == 'epoch_param' else 'id') for name in TABLES}
+# Served from schema 5 on.
+BRIDGE = 'tx_metadata'
+KEYS = {name: ('epoch_no' if name == 'epoch_param' else 'id') for name in (*TABLES, BRIDGE)}
 # The index names midnight-node checks in pg_indexes; each must resolve to exactly one row.
 NODE_INDEXES = ('idx_multi_asset_policy_name_hex', 'idx_ma_tx_out_ident', 'idx_tx_out_address', 'idx_ma_tx_out_id_ident',
                 'idx_multi_asset_policy_name', 'idx_block_block_no', 'idx_tx_block_id', 'idx_tx_out_tx_id',
@@ -52,6 +56,9 @@ EXPECTED = {
                  ' WHERE s.pool_hash=p.pool_hash AND s.first_generation{scope}%(g)s)',
     'epoch_stake': 'SELECT s.id,p.id AS pool_id,s.amount,s.epoch AS epoch_no FROM chain.epoch_stakes s JOIN chain.pools p USING(pool_hash)'
                    ' WHERE s.first_generation{scope}%(g)s',
+    'tx_metadata': 'SELECT ' + TX + ' AS id,6500973::public.word64type AS key,' + TX + ' AS tx_id,m.json FROM chain.tx_metadata m'
+                   ' JOIN chain.transactions t ON t.hash=m.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash'
+                   ' WHERE m.present=1 AND m.first_generation{scope}%(g)s',
 }
 COLUMNS = {
     'block': ('id', 'hash', 'epoch_no', 'slot_no', 'block_no', 'time', 'tx_count'),
@@ -64,6 +71,7 @@ COLUMNS = {
     'epoch_param': ('epoch_no', 'nonce', 'max_tx_size'),
     'pool_hash': ('id', 'hash_raw'),
     'epoch_stake': ('id', 'pool_id', 'amount', 'epoch_no'),
+    'tx_metadata': ('id', 'key', 'tx_id', 'json'),
 }
 BLOCKS = ('SELECT m.height::bigint AS id,b.hash,b.epoch AS epoch_no,b.slot AS slot_no,b.height AS block_no,b.time,b.tx_count'
           ' FROM ({source}) m JOIN chain.blocks b ON b.hash=m.hash')
@@ -80,6 +88,11 @@ SIZES_SCHEMA = 5
 def sizes(db):
     """Whether the served epoch_param carries max_tx_size (schema 5 and later)."""
     return db.execute('SELECT schema_version FROM chain.service_state WHERE id=1').fetchone()[0] >= SIZES_SCHEMA
+
+
+def tables(db):
+    """The served tables of the database's schema: tx_metadata is served from schema 5."""
+    return (*TABLES, BRIDGE) if sizes(db) else TABLES
 
 
 def columns(db, table):
@@ -105,7 +118,7 @@ def _insert(db, table, query, params):
 def build(db, generation):
     """Fill the empty served tables for `generation` (the current projection), in chain order."""
     counts = {}
-    for table in TABLES:
+    for table in tables(db):
         query, params = expected(table, generation, db=db)
         counts[table] = _insert(db, table, query, params)
     _mark(db, generation)
@@ -121,7 +134,7 @@ def advance(db, generation, *, cutoff, bindings, bindings_args):
     """
     counts = {'block_removed': db.execute('DELETE FROM serve.block WHERE id>%s', (cutoff,)).rowcount}
     counts['block'] = _insert(db, 'block', BLOCKS.format(source=bindings), bindings_args)
-    for table in TABLES[1:]:
+    for table in tables(db)[1:]:
         query, params = expected(table, generation, only_new=True, db=db)
         if table == 'pool_hash':
             query = query + ' AND NOT EXISTS(SELECT 1 FROM serve.pool_hash x WHERE x.id=p.id)'
@@ -148,7 +161,7 @@ def verify(store, generation):
     row = db.execute('SELECT projection_generation,serve_generation FROM chain.integrity_state WHERE id=1').fetchone()
     if row != (generation, generation):
         raise Refusal('serve_projection_mismatch')
-    for table in TABLES:
+    for table in tables(db):
         if table == 'block':
             mismatch = _blocks_differ(db)
         else:

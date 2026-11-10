@@ -3,8 +3,8 @@
 The operator creates the reader login and sets its defaults; db-sync-alt never creates or alters a
 role. It grants the reader what midnight-node reads, verifies that the reader can do nothing more
 (no internal schema, no TEMP or CREATE, no write, no role membership) and reports the reader's
-settings. `tx_metadata` (bridge data, not served) and every internal table stay unreadable. Only the
-owner and the granted roles may connect, so a reader cannot see the database while it is empty,
+settings. `tx_metadata` holds the bridge metadata the node's bridge query reads; every internal table
+stays unreadable. Only the owner and the granted roles may connect, so a reader cannot see the database while it is empty,
 importing or restoring. A restore drops all privileges: grant again afterwards (`db-sync-alt restore
 --reader-role` and the service do it once the database is ready).
 """
@@ -12,12 +12,13 @@ from psycopg import sql
 from db_sync_alt.contract import Refusal
 from db_sync_alt.store.database import SCHEMA_VERSION
 
-NODE_RELATIONS = ('block', 'tx', 'tx_out', 'tx_in', 'ma_tx_out', 'multi_asset', 'datum', 'epoch_param', 'epoch_stake', 'pool_hash')
-UNGRANTED = ('tx_metadata',)
+NODE_RELATIONS = ('block', 'tx', 'tx_out', 'tx_in', 'ma_tx_out', 'multi_asset', 'datum', 'epoch_param', 'epoch_stake', 'pool_hash', 'tx_metadata')
 GATE = 'chain.gate()'
 # Role defaults the reader should carry (ALTER ROLE ... SET, by the operator).
 SETTINGS = ('statement_timeout', 'idle_in_transaction_session_timeout', 'search_path', 'default_transaction_read_only')
-# midnight-node's cardano-db-sync connection pool, plus one connection for the service's own serving check.
+# Connections midnight-node opens to cardano-db-sync, with margin: node 2.1.101 runs six pools of at most
+# 32 connections (candidates 5, sidechain 5, main chain hash 5, cNIGHT observation 10, federated authority
+# 5, bridge 2), so 35 leaves 3 spare. The reader also needs one connection for the service's serving check.
 NODE_CONNECTIONS = 35
 READER_CONNECTIONS = NODE_CONNECTIONS + 1
 SYSTEM_SCHEMAS = "n.nspname NOT LIKE 'pg\\_%%' AND n.nspname<>'information_schema'"
@@ -50,8 +51,6 @@ def grant_reader(db, role):
         db.execute(sql.SQL('GRANT USAGE ON SCHEMA public TO {}').format(ident))
         db.execute(sql.SQL('GRANT SELECT ON {} TO {}').format(
             sql.SQL(',').join(sql.Identifier('public', name) for name in NODE_RELATIONS), ident))
-        for name in UNGRANTED:
-            db.execute(sql.SQL('REVOKE ALL ON {} FROM {}').format(sql.Identifier('public', name), ident))
         db.execute(sql.SQL('GRANT EXECUTE ON FUNCTION chain.gate() TO {}').format(ident))
     return {'reader': role, 'connect': True, 'relations': ['public.' + name for name in NODE_RELATIONS], 'functions': [GATE]}
 

@@ -5,7 +5,7 @@ not a signature. Store adapters own its atomic persistence and publication fence
 """
 import copy
 import re
-from db_sync_alt.contract import TABLES, Refusal, canonical, digest, generation_capabilities
+from db_sync_alt.contract import Refusal, canonical, digest
 from db_sync_alt.networks import for_identity
 
 COMPLETION_ERRORS = frozenset({'completion_recovery_required', 'completion_invalid', 'completion_mismatch'})
@@ -101,7 +101,7 @@ def validate_sql_receipt(store, generation, manifest, receipt):
         epochs=independent['epochs']
         if not isinstance(epochs,list) or any(type(e) is not int for e in epochs) or epochs!=expected_epochs:_invalid()
         inventory=independent['inventory']
-        if not isinstance(inventory,dict) or set(inventory)!=set(TABLES):_invalid()
+        if not isinstance(inventory,dict) or set(inventory)!=set(store.sealed_tables(generation['id'])):_invalid()
         for value in inventory.values():
             if not isinstance(value,dict) or set(value)!={'count','sha256'} or type(value['count']) is not int or value['count']<0 or not _hash(value['sha256']):_invalid()
         if inventory['blocks']['count']<generation['witness_height']-start+1:_invalid()
@@ -137,7 +137,7 @@ def _identity(store, generation, computed):
         if (digest(m['identity']) != digest(store.meta('profile')) or network is None
                 or m['contracts'] != digest(network.legacy_contract if legacy else network.contract)):
             raise Refusal('completion_mismatch')
-        if not isinstance(computed, dict) or set(computed) != set(TABLES):
+        if not isinstance(computed, dict) or set(computed) != set(store.sealed_tables(generation['id'])):
             _invalid()
         for value in computed.values():
             if not isinstance(value, dict) or set(value) != {'count', 'sha256'} or type(value['count']) is not int or value['count'] < 0 or not _hash(value['sha256']):
@@ -154,7 +154,8 @@ def _identity(store, generation, computed):
                     _invalid()
         if not isinstance(m['required_epochs'], list) or any(type(e) is not int or e < 0 for e in m['required_epochs']):
             _invalid()
-        if m['capabilities'] != generation_capabilities(legacy=legacy) or any(type(v) is not bool for v in m['capabilities'].values()):
+        from db_sync_alt.verify.store import expected_capabilities
+        if m['capabilities'] != expected_capabilities(store, generation) or any(type(v) is not bool for v in m['capabilities'].values()):
             _invalid()
         return copy.deepcopy({'generation': generation['id'], 'parent': generation['parent'],
             'source': generation['source'], 'source_identity': m['source_identity'],

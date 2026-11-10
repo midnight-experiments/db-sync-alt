@@ -329,9 +329,14 @@ class ConfigTests(unittest.TestCase):
             (node_dir / 'cnight-config.json').unlink()
             self.assertEqual(node_requirement_warnings(config(node={'configuration_dir': str(node_dir)})), ['node_configuration_mismatch'])
         self.assertEqual(node_requirement_warnings(config()), ['node_requirements_unchecked'])
-        for node in ({}, {'security_parameter': '2160'}, {'security_parameter': 0}, {'configuration_dir': 'relative/res'}, {'k': 2160}, []):
+        for node in ({}, {'security_parameter': '2160'}, {'security_parameter': 0}, {'configuration_dir': 'relative/res'}, {'k': 2160}, [],
+                     {'bridge_checkpoint': 'Block(1)'}, {'bridge_checkpoint': 1}, {'bridge_checkpoint': 'tx:AB'}):
             with self.subTest(node=node), self.assertRaises(ValueError):
                 config(node=node)
+        # The on-chain bridge checkpoint is a stated node value; it is reported against the metadata coverage.
+        for checkpoint in ('block:4500300', 'tx:' + 'ab' * 32):
+            self.assertEqual(config(node={'bridge_checkpoint': checkpoint}).node, {'bridge_checkpoint': checkpoint})
+        self.assertEqual(node_requirement_warnings(config(node={'security_parameter': 2160, 'bridge_checkpoint': 'block:1'})), [])
 
     def test_reader_configuration_is_not_in_repr(self):
         self.assertNotIn('private_reader_service', repr(ServiceConfig('test', {'role': 'node_reader', 'pg_service': 'private_reader_service'}, network='preprod')))

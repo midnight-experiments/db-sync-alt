@@ -16,6 +16,7 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
 from db_sync_alt.backup import backup, restore
+from db_sync_alt.bridge import parse_checkpoint
 from db_sync_alt.contract import LEGACY_FORMAT, FORMAT, Refusal, digest
 from db_sync_alt.networks import network_profile
 from db_sync_alt.node_queries import named
@@ -159,6 +160,9 @@ class EpochUpgradeTests(CheckpointFixture):
                                                       'provider_requests': 8, 'verification': 'offline-integrity'})
         # Two complete passes, one request per stored epoch each, nothing else (no /metrics).
         self.assertEqual(client.calls, ['/epochs/%d/parameters' % e for e in range(4)] * 2)
+        # Bridge metadata coverage starts after the upgraded generation (target OFFSET + 12); nothing older is fetched.
+        self.assertEqual(result['bridge'], {'metadata_key': 6500973, 'coverage_start': OFFSET + 13, 'checkpoint': None,
+                                            'checkpoint_supported': None, 'reason': None})
         with PgStore(conninfo=dsn) as store:
             self.assertFalse(store.legacy_format)
             self.assertEqual(store.meta('contract'), json.loads(json.dumps(store.network.contract)))
@@ -187,6 +191,11 @@ class EpochUpgradeTests(CheckpointFixture):
         g = store.generation()
         self.assertEqual((g['id'], g['manifest']['capabilities']['epoch_max_tx_size_v1'], g['manifest']['contracts']),
                          (2, True, digest(store.network.contract)))
+        # The first update after the upgrade is covered; the coverage start stays where the upgrade put it.
+        self.assertIs(g['manifest']['capabilities']['bridge_metadata_v1'], True)
+        self.assertEqual(store.status()['bridge']['coverage_start'], OFFSET + 13)
+        self.assertEqual({n: store.status(parse_checkpoint('block:%d' % n))['bridge']['checkpoint_supported'] for n in (OFFSET + 11, OFFSET + 12)},
+                         {OFFSET + 11: False, OFFSET + 12: True})
         store, _ = self.startup(dsn, store)
         self.assertEqual(verify_store(store)['format'], FORMAT)
         self.assertEqual(store.integrity()['base'], 2)

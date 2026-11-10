@@ -1,7 +1,7 @@
 """Explicit, fenced schema upgrades (1 -> 2 -> 3 -> 4 -> 5); never run as an implicit live startup step."""
 from pathlib import Path
 from psycopg import sql
-from db_sync_alt.contract import TABLES,Refusal
+from db_sync_alt.contract import Refusal
 
 LATEST=5
 
@@ -20,14 +20,16 @@ def _upgrade_v2(store,state):
         # Bulk validation preserves the exact final FK without 859k individual
         # trigger lookups during initial projection construction.
         store.db.execute('ALTER TABLE chain.current_membership ADD CONSTRAINT current_membership_hash_fkey FOREIGN KEY(hash) REFERENCES chain.blocks(hash)')
-        for table in TABLES:
+        # The fact families this store has: a store written before bridge metadata has no tx_metadata yet.
+        families=tuple(store.physical_tables)
+        for table in families:
             store.db.execute(sql.SQL('CREATE INDEX {} ON chain.{}(first_generation)').format(sql.Identifier('delta_'+table),sql.Identifier(table)))
-        for table in (*TABLES,'generations','generation_blocks','checkpoints','provenance','metadata','generation_reuse','membership_delta','pools'):
+        for table in (*families,'generations','generation_blocks','checkpoints','provenance','metadata','generation_reuse','membership_delta','pools'):
             store.db.execute(sql.SQL('CREATE TRIGGER immutable_guard BEFORE INSERT OR UPDATE OR DELETE ON chain.{} FOR EACH ROW EXECUTE FUNCTION chain.guard_immutable()').format(sql.Identifier(table)))
         store.db.execute('UPDATE chain.service_state SET schema_version=2 WHERE id=1')
         for table in ('current_membership','integrity_state','service_state'):
             store.db.execute(sql.SQL('CREATE TRIGGER projection_guard BEFORE INSERT OR UPDATE OR DELETE ON chain.{} FOR EACH ROW EXECUTE FUNCTION chain.guard_projection()').format(sql.Identifier(table)))
-        for table in (*TABLES,'generations','generation_blocks','checkpoints','provenance','metadata','generation_reuse','membership_delta','pools','current_membership','integrity_state','service_state'):
+        for table in (*families,'generations','generation_blocks','checkpoints','provenance','metadata','generation_reuse','membership_delta','pools','current_membership','integrity_state','service_state'):
             store.db.execute(sql.SQL('CREATE TRIGGER no_truncate BEFORE TRUNCATE ON chain.{} EXECUTE FUNCTION chain.guard_truncate()').format(sql.Identifier(table)))
         apply_privileges(store.db)
 
@@ -201,8 +203,10 @@ def upgrade_store(store,ordinal_source=None,epoch_source=None):
     else:
         written=_upgrade_v5(store,state,checkpoint) or written
     from db_sync_alt.store import serve
+    from db_sync_alt.bridge import report as bridge_report
     serve.verify(store,store.state()['canonical_ready'])
-    result={'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served}
+    # Bridge metadata coverage starts after the upgraded generation: the next Blockfrost generation is the first covered.
+    result={'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served,'bridge':bridge_report(store)}
     if epochs is not None:result['epoch_parameters']=epochs
     if ordinal_source is not None and any(served.get('ordinals_from_source',{}).values()):
         identity=getattr(ordinal_source,'validated_identity',None)

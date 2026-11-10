@@ -46,7 +46,7 @@ WEIGHTS = {
     'test_checkpoint_backup': 240, 'test_integrity_checkpoints': 300,
     'test_manifest_kinds': 180, 'test_status_summaries': 120,
     'test_relevance': 600, 'test_relevance_checkpoint': 900, 'test_relevance_recovery': 120,
-    'test_epoch_upgrade': 150,
+    'test_epoch_upgrade': 150, 'test_bridge_metadata': 120,
 }
 
 

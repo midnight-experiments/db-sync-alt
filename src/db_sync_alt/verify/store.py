@@ -65,6 +65,12 @@ def selected_asset_units(identity):
     return units,governance
 
 
+def expected_capabilities(store,g):
+    """The capabilities a generation is sealed with: those of its format, with bridge metadata exactly
+    for a Blockfrost acquisition (cardano-db-sync acquisitions never read tx_metadata)."""
+    return generation_capabilities(legacy=store.legacy_generation(g['id']),bridge_metadata=g['source']=='blockfrost-cardano')
+
+
 def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     gen=g['id'];m=g['manifest'];db=store.db
     delta=delta_parent is not None
@@ -74,15 +80,14 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     # The profile must be the packaged profile of the database's own network.
     if network is None or network!=store.network:raise Refusal('untrusted_profile_identity')
     units,governance=selected_asset_units(identity)
-    from db_sync_alt.store.incremental import delta_rows,integrity_reference,profile_digest
-    for asset in (delta_rows(store,'assets',gen) if delta else store.rows('assets',gen)):
-        policy=asset['policy'].hex();unit=policy+asset['name'].hex()
-        if unit not in units and policy not in governance:raise Refusal('selected_asset_outside_profile')
+    from db_sync_alt.store.incremental import integrity_reference,profile_digest
+    from db_sync_alt import bridge
     # Generations sealed in the nonce-only format keep its contract and capabilities.
     legacy=store.legacy_generation(gen)
     if m.get('contracts')!=digest(network.legacy_contract if legacy else network.contract) or profile_digest(g)!=digest(identity):raise Refusal('manifest_contract_mismatch')
     if any(type(v) is not bool for v in m.get('capabilities',{}).values()):raise Refusal('unsupported_capabilities')
-    if m.get('capabilities')!=generation_capabilities(legacy=legacy):raise Refusal('unsupported_capabilities')
+    if m.get('capabilities')!=expected_capabilities(store,g):raise Refusal('unsupported_capabilities')
+    bridge.verify_assets(store,g,units,governance,identity,delta=delta)
     if g['witness_height']!=g['target_height']+network.security:raise Refusal('invalid_witness')
     if (g['start_height'],g['start_index'])!=network.start or g['target_height']<g['start_height']:raise Refusal('invalid_start_cursor')
     anchors=m.get('anchors',{});expected_anchors={'start':g['start_height'],'target':g['target_height'],'witness':g['witness_height']}
@@ -180,6 +185,7 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
             if type(epoch) is not int or checkpoint['unit']!=str(epoch) or not isinstance(anchor,dict) or type(anchor.get('height')) is not int or anchor['height']>g['target_height']:raise Refusal('epoch_anchor_mismatch')
             row=store.block_at(gen,anchor['height'])
             if row is None or row['epoch']!=epoch or row['hash'].hex()!=anchor.get('hash'):raise Refusal('epoch_anchor_mismatch')
+    bridge.verify_family(store,g,identity,delta=delta)
     store.progress('verify_structure_complete',generation=gen)
     if g['manifest'].get('relevance_coverage') is not None:
         from db_sync_alt.sources.blockfrost.relevance import verify_generation
@@ -292,13 +298,13 @@ def validate_prior_answers(store,generation):
 def physical_inventory(store):
     """Hash all durable rows/IDs, including obsolete witness facts and receipts."""
     import hashlib
-    from db_sync_alt.contract import TABLES, KEYS, canonical
-    order={**{table:','.join(KEYS[table]) for table in TABLES},'metadata':'key','generations':'id','generation_blocks':'generation,height','checkpoints':'generation,phase,unit','provenance':'generation,kind,key','pools':'pool_hash','sync_jobs':'id'}
+    from db_sync_alt.contract import KEYS, canonical
+    order={**{table:','.join(KEYS[table]) for table in store.physical_tables},'metadata':'key','generations':'id','generation_blocks':'generation,height','checkpoints':'generation,phase,unit','provenance':'generation,kind,key','pools':'pool_hash','sync_jobs':'id'}
     if store.supports_incremental:order.update(integrity_state='id',current_membership='height',generation_reuse='generation',membership_delta='generation,height')
     if store.supports_checkpoints:order.update(integrity_checkpoints='generation')
     if store.serves_directly:
         from db_sync_alt.store import serve
-        order.update({'serve.'+table:key for table,key in serve.KEYS.items()})
+        order.update({'serve.'+table:serve.KEYS[table] for table in serve.tables(store.db)})
     result={}
     for table,key in order.items():
         hasher=hashlib.sha256();count=0

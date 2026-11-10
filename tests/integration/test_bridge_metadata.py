@@ -1,0 +1,455 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Bridge readiness for midnight-node 2.1.101 against PostgreSQL, with no live provider.
+
+The transfer scenario (`fixtures.bridge`) is acquired from fake Blockfrost routes; node 2.1.101's
+six-bind bridge query, exactly as its builder formats it, runs through the restricted reader and
+is compared with the same query on a cardano-db-sync-shaped reference built from the same chain,
+in both tx_in modes. Also: request accounting, the coverage start, the checkpoint report, and the
+refusals that keep coverage complete.
+"""
+import contextlib
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import threading
+import time
+import unittest
+import uuid
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
+
+from db_sync_alt.bridge import parse_checkpoint, recipient
+from db_sync_alt.contract import Refusal
+from db_sync_alt.errors import LifecycleFailure
+from db_sync_alt.sources.blockfrost import adapter, metadata, provider
+from db_sync_alt.sources.blockfrost.poller import HeadPoller, PollBudgetStore, owner_binding
+from db_sync_alt.sources.blockfrost.sync import SyncDriver
+from db_sync_alt.store.reader import grant_reader
+from db_sync_alt.store.upgrade import upgrade_store
+from db_sync_alt.verify.store import verify_store
+from fixtures import bridge
+from fixtures.blockfrost import CountingProvider, Fake, FixtureHooks
+import fixtures.database as real
+from fixtures.networks import PREPROD
+
+from conformance import supplement
+from conformance.client import QueryError, TypedClient
+
+TYPES = ['text', 'text', 'bytea', 'bytea', 'int8', 'int4']
+SCHEMA = Path(__file__).resolve().parents[1] / 'fixtures' / 'data' / 'dbsync_schema.sql'
+OFFSET, TARGET = bridge.OFFSET, bridge.TARGET
+START = OFFSET + 11  # coverage start: the block after generation 0's target
+PROVIDER_KEY = 'preprod' + 'synthetic0000000000000000'
+
+
+def shared_root(routes, directory):
+    """An external accounting client (tests/fixtures/shared_client) in `directory`, answering `routes`."""
+    root = Path(directory)
+    shutil.copy(Path(__file__).resolve().parents[1] / 'fixtures' / 'shared_client' / 'client.py', root / 'client.py')
+    (root / 'profiles.json').write_text(json.dumps({'preprod': {'base_url': PREPROD.blockfrost_base}}))
+    (root / 'answers').mkdir()
+    for path, value in routes.items():
+        (root / 'answers' / hashlib.sha256(path.encode()).hexdigest()).write_bytes(value if isinstance(value, bytes) else json.dumps(value).encode())
+    return root
+
+
+class RawBlockfrost:
+    """HTTP transport of db-sync-alt's own client: every route answered as raw JSON bytes (bytes routes as given)."""
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def __call__(self, path):
+        self.calls.append(path)
+        if path not in self.routes:
+            return 404, {}, b'{"status_code":404}'
+        value = self.routes[path]
+        return 200, {}, value if isinstance(value, bytes) else json.dumps(value).encode()
+
+
+def metadata_calls(calls):
+    return [c for c in calls if c.startswith('/txs/') and c.endswith('/metadata')]
+
+
+class BridgeMetadataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.admin = psycopg.connect(os.environ['DB_SYNC_ALT_TEST_DSN'], autocommit=True)
+        cls.chain = bridge.scenario()
+        cls.routes = bridge.routes(cls.chain)
+        cls.txs = [t for h in sorted(cls.chain) for t in cls.chain[h]]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.admin.close()
+
+    def setUp(self):
+        self.names, self.roles, self.clients = [], [], []
+
+    def tearDown(self):
+        for client in self.clients:
+            client.close()
+        for name in self.names:
+            self.admin.execute(sql.SQL('DROP DATABASE {} WITH (FORCE)').format(sql.Identifier(name)))
+        for role in self.roles:
+            self.admin.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(sql.Identifier(role)))
+
+    def database(self):
+        name = 'db_sync_alt_test_' + uuid.uuid4().hex[:12]
+        self.names.append(name)
+        self.admin.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
+        return make_conninfo(os.environ['DB_SYNC_ALT_TEST_DSN'], dbname=name)
+
+    def client(self, dsn, role=None):
+        client = TypedClient(make_conninfo(dsn, user=role) if role else dsn, timeout=20).connect()
+        self.clients.append(client)
+        return client
+
+    def ready(self):
+        """Generation 0 at schema 5, before any bridge-covered update; returns (dsn, open store)."""
+        dsn = self.database()
+        store = bridge.baseline(dsn)
+        self.addCleanup(store.close)
+        upgrade_store(store)
+        return dsn, store
+
+    def acquired(self, fetch=None):
+        """The scenario acquired by the full Blockfrost update; returns (dsn, store, provider calls)."""
+        dsn, store = self.ready()
+        fake = Fake(self.routes)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            if fetch is not None:
+                stack.enter_context(patch.object(metadata, 'fetch', fetch))
+            adapter.update(store, CountingProvider(500, fake), bridge.PROFILE, TARGET, hooks=FixtureHooks())
+        self.assertEqual(store.generation()['target_height'], TARGET)
+        return dsn, store, fake.calls
+
+    def reference(self):
+        """The same chain in a cardano-db-sync-shaped database (db-sync 13.8's metadata rendering)."""
+        dsn = self.database()
+        with psycopg.connect(dsn, autocommit=True) as db:
+            db.execute(SCHEMA.read_text())
+            bridge.load_reference(db, bridge.db_sync_rows(self.chain))
+        return dsn
+
+    def bridge_rows(self, client, mode='Enabled', asset=None):
+        values = supplement.bridge_values(bridge.PROFILE, TARGET)
+        if asset is not None:
+            values[2:4] = list(asset)
+        return client.query(supplement.bridge_query(mode, checkpoint=START), TYPES, values).rows
+
+    def test_bridge_query_through_the_reader_equals_the_db_sync_reference(self):
+        dsn, store, _ = self.acquired()
+        verify_store(store)
+        role = 'node_reader_' + uuid.uuid4().hex[:12]
+        self.roles.append(role)
+        self.admin.execute(sql.SQL('CREATE ROLE {} LOGIN NOINHERIT').format(sql.Identifier(role)))
+        grant_reader(store.db, role)
+        node = self.client(dsn, role)
+        reference = self.client(self.reference())
+
+        # Stored facts: one row per transaction with an output at the ICS address, nothing else.
+        ics = {t.hash for t in self.txs if t.ics_producing}
+        facts = {bytes(h): (present, value) for h, present, value in store.db.execute('SELECT tx_hash,present,json FROM chain.tx_metadata')}
+        self.assertEqual(set(facts), ics)
+        t11, t12 = self.chain[11], self.chain[12]
+        self.assertEqual(facts[t11[3].hash], (0, None))
+        self.assertEqual(facts[t11[4].hash], (1, None))
+        self.assertEqual(facts[t12[0].hash], (1, 1152921504606847000))
+        self.assertEqual(facts[t12[1].hash], (1, None))
+        self.assertEqual(facts[t12[2].hash], (0, None))
+        self.assertEqual(store.db.execute('SELECT count(*) FROM serve.tx_metadata').fetchone()[0], sum(p for p, _ in facts.values()))
+        # Every asset of an ICS output stored by a covered generation, the one outside the profile too.
+        self.assertEqual(store.db.execute('SELECT count(*) FROM chain.output_assets WHERE policy=%s AND name=%s', bridge.OTHER).fetchone()[0], 1)
+
+        for asset in (None, bridge.OTHER):
+            with self.subTest(asset=asset):
+                served = self.bridge_rows(node, asset=asset)
+                expected = self.bridge_rows(reference, asset=asset)
+                # The node selects tx_in mode on both; db-sync answers the same in consumed mode.
+                self.assertEqual(self.bridge_rows(reference, 'Consumed', asset), expected)
+                self.assertEqual([r['tx_hash'] for r in served], [r['tx_hash'] for r in expected])
+                self.assertTrue(served)
+                for got, want in zip(served, expected):
+                    h = bytes(got['tx_hash'])
+                    same = {k: v for k, v in got.items() if k != 'c2m_metadata'}
+                    self.assertEqual(same, {k: v for k, v in want.items() if k != 'c2m_metadata'}, h.hex())
+                    # The node reads only the recipient: identical everywhere.
+                    self.assertEqual(recipient(got['c2m_metadata']), recipient(want['c2m_metadata']), h.hex())
+                    if h in (t12[0].hash, t12[1].hash):
+                        # Blockfrost's rendering (Q1): 2^60 rounded, a control character NULL.
+                        self.assertNotEqual(got['c2m_metadata'], want['c2m_metadata'])
+                    else:
+                        self.assertEqual(got['c2m_metadata'], want['c2m_metadata'], h.hex())
+        rows = {bytes(r['tx_hash']): r for r in self.bridge_rows(node)}
+        self.assertEqual(recipient(rows[t11[0].hash]['c2m_metadata']), bridge.RECIPIENTS[0])
+        self.assertEqual(recipient(rows[t11[1].hash]['c2m_metadata']), bridge.RECIPIENTS[1][:20])
+        self.assertEqual({k: int(rows[t12[3].hash][k]) for k in ('bridge_in', 'bridge_out')}, {'bridge_in': 100, 'bridge_out': 120})
+        self.assertEqual({k: int(rows[t12[2].hash][k]) for k in ('bridge_out', 'reserve_in', 'reserve_out')},
+                         {'bridge_out': 100, 'reserve_in': 1000, 'reserve_out': 900})
+        self.assertNotIn(t11[5].hash, rows)
+
+        # The reader reads tx_metadata and still nothing internal; the node's tx_in probes are unchanged.
+        self.assertEqual(len(node.query('SELECT id, key, tx_id, json FROM tx_metadata', [], []).rows), sum(p for p, _ in facts.values()))
+        self.assertEqual(node.query("select count(*) from information_schema.tables where table_name = 'tx_in'", [], []).rows, [{'count': 1}])
+        self.assertEqual(node.query('SELECT EXISTS (SELECT 1 FROM tx_in)', [], []).rows, [{'exists': True}])
+        for denied in ('SELECT * FROM chain.tx_metadata', 'SELECT * FROM serve.tx_metadata', 'SELECT * FROM chain.generations'):
+            with self.subTest(denied=denied), self.assertRaises(QueryError) as caught:
+                node.query(denied, [], [])
+            self.assertEqual(caught.exception.sqlstate, '42501')
+        # Like every node-facing relation, the bridge query refuses while the database does not serve.
+        with psycopg.connect(dsn, autocommit=True) as db:
+            db.execute('SET session_replication_role = replica')
+            db.execute('UPDATE chain.service_state SET revoked=true WHERE id=1')
+        with self.assertRaises(QueryError) as caught:
+            self.bridge_rows(node)
+        self.assertEqual(caught.exception.sqlstate, '55000')
+
+    def test_one_metadata_request_per_transaction_with_an_ics_output(self):
+        _, store, calls = self.acquired()
+        ics = [t for t in self.txs if t.ics_producing]
+        self.assertEqual(len(ics), 10)
+        self.assertEqual(sorted(metadata_calls(calls)), sorted('/txs/' + t.hash.hex() + '/metadata' for t in ics))
+        # The same acquisition with the metadata supplied without a request: every other request is unchanged.
+        def offline(provider, decoded):
+            present, value = metadata.provider_metadatum(self.routes['/txs/' + decoded['hash'].hex() + '/metadata'])
+            metadata.cross_check(decoded, present, value)
+            return metadata.fact(decoded['hash'], present, value)
+        _, other, baseline_calls = self.acquired(fetch=offline)
+        self.assertEqual(metadata_calls(baseline_calls), [])
+        self.assertEqual([c for c in calls if c not in metadata_calls(calls)], baseline_calls)
+        self.assertEqual(len(calls), len(baseline_calls) + len(ics))
+        self.assertEqual(other.digests(other.generation()['id']), store.digests(store.generation()['id']))
+
+    def test_follow_stores_the_same_bridge_facts_as_the_full_update(self):
+        _, reference, _ = self.acquired()
+        dsn, store = self.ready()
+        store.certify_ready_full()
+        health = real.SyncFixture.state(self); stop = threading.Event(); client = real.AccountedFake(self.routes)
+        pollstore = PollBudgetStore(None, owner_binding(store), conninfo=dsn)
+        try:
+            poller = HeadPoller(lambda: pollstore, lambda: client, health, stop, network=PREPROD)
+            poller.tick(pollstore, client)
+            driver = SyncDriver(SimpleNamespace(sync={}), client=client, profile=bridge.PROFILE)
+            driver._poller = poller
+            driver.run_once(store, health, stop)
+        finally:
+            pollstore.close()
+        g = store.generation()
+        self.assertEqual((g['target_height'], g['manifest']['capabilities']['bridge_metadata_v1']), (TARGET, True))
+        self.assertEqual(store.digests(g['id']), reference.digests(reference.generation()['id']))
+        self.assertEqual(len(metadata_calls(client.calls)), 10)
+        verify_store(store)
+
+    def test_coverage_start_and_checkpoint_report(self):
+        dsn, store = self.ready()
+        none = {'metadata_key': 6500973, 'coverage_start': START, 'checkpoint': None, 'checkpoint_supported': None, 'reason': None}
+        # A store bootstrapped from cardano-db-sync has no metadata: coverage starts after its ready target.
+        self.assertEqual(store.status()['bridge'], none)
+        dsn, store, _ = self.acquired()
+        self.assertEqual(store.status()['bridge'], none)
+        t11 = self.chain[11]
+        original = bytes.fromhex(bridge.base.fixtures()[1][1])
+        cases = [('block:%d' % (START - 1), True, None), ('block:%d' % START, True, None), ('block:%d' % (START - 2), False, 'before_coverage'),
+                 ('tx:' + t11[0].hash.hex(), True, None), ('tx:' + original.hex(), False, 'before_coverage'),
+                 ('tx:' + 'ab' * 32, False, 'transaction_not_served')]
+        for text, supported, reason in cases:
+            with self.subTest(checkpoint=text):
+                self.assertEqual(store.status(parse_checkpoint(text))['bridge'],
+                                 dict(none, checkpoint=parse_checkpoint(text), checkpoint_supported=supported, reason=reason))
+        # The status command takes the checkpoint as text.
+        from db_sync_alt.bridge import report
+        self.assertEqual(report(store, 'block:%d' % (START - 2))['reason'], 'before_coverage')
+
+    def test_covered_generations_stay_complete(self):
+        dsn, store, _ = self.acquired()
+        g = store.generation()
+        t11 = self.chain[11]
+        # Missing or extra bridge metadata is found by verification.
+        with psycopg.connect(dsn, autocommit=True) as db:
+            db.execute('SET session_replication_role = replica')
+            row = db.execute('DELETE FROM chain.tx_metadata WHERE tx_hash=%s RETURNING *', (t11[3].hash,)).fetchone()
+        with self.assertRaisesRegex(Refusal, 'bridge_metadata_incomplete'):
+            verify_store(store)
+        with psycopg.connect(dsn, autocommit=True) as db:
+            db.execute('SET session_replication_role = replica')
+            db.execute('INSERT INTO chain.tx_metadata VALUES(%s,%s,%s,%s)', row)
+            db.execute('INSERT INTO chain.tx_metadata VALUES(%s,0,NULL,%s)', (t11[5].hash, g['id']))
+        with self.assertRaisesRegex(Refusal, 'bridge_metadata_unexpected'):
+            verify_store(store)
+        with psycopg.connect(dsn, autocommit=True) as db:
+            db.execute('SET session_replication_role = replica')
+            db.execute('DELETE FROM chain.tx_metadata WHERE tx_hash=%s', (t11[5].hash,))
+            # An asset outside the profile is kept only at an ICS or reserve output.
+            db.execute('INSERT INTO chain.output_assets(tx_hash,output_index,policy,name,quantity,first_generation,ordinal) VALUES(%s,1,%s,%s,1,%s,0)',
+                       (t11[0].hash, *bridge.OTHER, g['id']))
+            db.execute("INSERT INTO chain.outputs(tx_hash,output_index,address,value,first_generation) VALUES(%s,1,'addr_test1change',1000000,%s)",
+                       (t11[0].hash, g['id']))
+        with self.assertRaisesRegex(Refusal, 'selected_asset_outside_profile'):
+            verify_store(store)
+
+    def portable(self, routes):
+        """db-sync-alt's own accounted client over `routes`, with a private ledger and a simulated clock."""
+        ledger = tempfile.TemporaryDirectory()
+        self.addCleanup(ledger.cleanup)
+        now, transport = [time.time()], RawBlockfrost(routes)
+        client = provider.PortableClient(PROVIDER_KEY, Path(ledger.name) / 'accounting', network=PREPROD, transport=transport,
+                                         clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        return client, transport
+
+    def test_hostile_nesting_never_stops_acquisition_or_follow(self):
+        chain = bridge.scenario(hostile_transfer=True)
+        routes = bridge.routes(chain)
+        target = chain[12][1]
+        path = '/txs/' + target.hash.hex() + '/metadata'
+        # The same parse path serves every endpoint: the transfer's details carry an equally deep extra field.
+        deep = b'[' * bridge.HOSTILE_DEPTH + b']' * bridge.HOSTILE_DEPTH
+        details = '/txs/' + target.hash.hex()
+        routes[details] = json.dumps(routes[details])[:-1].encode() + b',"note":' + deep + b'}'
+        # Positive control: decoded without a bound, the answer fails the counted request.
+        client, _ = self.portable(routes)
+        with patch.object(provider, 'loads', json.loads), self.assertRaisesRegex(provider.ProviderError, 'provider_request_failed_counted'):
+            client.get(path)
+        stored = lambda store: store.db.execute('SELECT present,json FROM chain.tx_metadata WHERE tx_hash=%s', (target.hash,)).fetchone()
+        # Acquisition: the full Blockfrost update.
+        _, store = self.ready()
+        client, transport = self.portable(routes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            adapter.update(store, CountingProvider(500, client), bridge.PROFILE, TARGET, hooks=FixtureHooks())
+        self.assertEqual(store.generation()['target_height'], TARGET)
+        self.assertEqual(stored(store), (1, None))
+        self.assertEqual((transport.calls.count(path), transport.calls.count(details)), (1, 1))
+        verify_store(store)
+        # Follow: the service's sync driver.
+        dsn, follower = self.ready()
+        follower.certify_ready_full()
+        client, transport = self.portable(routes)
+        health, stop = real.SyncFixture.state(self), threading.Event()
+        pollstore = PollBudgetStore(None, owner_binding(follower), conninfo=dsn)
+        try:
+            poller = HeadPoller(lambda: pollstore, lambda: client, health, stop, network=PREPROD)
+            poller.tick(pollstore, client)
+            driver = SyncDriver(SimpleNamespace(sync={}), client=client, profile=bridge.PROFILE)
+            driver._poller = poller
+            driver.run_once(follower, health, stop)
+        finally:
+            pollstore.close()
+        self.assertEqual(follower.generation()['target_height'], TARGET)
+        self.assertEqual(stored(follower), (1, None))
+        self.assertEqual(transport.calls.count(path), 1)
+        verify_store(follower)
+        self.assertEqual(follower.digests(follower.generation()['id']), store.digests(store.generation()['id']))
+
+    def hostile_routes(self):
+        chain = bridge.scenario(hostile_transfer=True)
+        routes = bridge.routes(chain)
+        target = chain[12][1]
+        deep = b'[' * bridge.HOSTILE_DEPTH + b']' * bridge.HOSTILE_DEPTH
+        details = '/txs/' + target.hash.hex()
+        routes[details] = json.dumps(routes[details])[:-1].encode() + b',"note":' + deep + b'}'
+        return routes, target
+
+    def follow(self, dsn, store, client):
+        health, stop = real.SyncFixture.state(self), threading.Event()
+        pollstore = PollBudgetStore(None, owner_binding(store), conninfo=dsn)
+        try:
+            poller = HeadPoller(lambda: pollstore, lambda: client, health, stop, network=PREPROD)
+            poller.tick(pollstore, client)
+            driver = SyncDriver(SimpleNamespace(sync={}), client=client, profile=bridge.PROFILE)
+            driver._poller = poller
+            driver.run_once(store, health, stop)
+        finally:
+            pollstore.close()
+
+    def test_hostile_nesting_never_stops_the_shared_adapter(self):
+        """DBSYNC_PROVIDER_ADAPTER=shared: the external client decodes answers with `json.loads`; its private
+        instance gets the bounded decoder, so the same hostile transfer is stored and ingest goes on."""
+        routes, target = self.hostile_routes()
+        stored = lambda store: store.db.execute('SELECT present,json FROM chain.tx_metadata WHERE tx_hash=%s', (target.hash,)).fetchone()
+        shared = lambda: provider.SharedClient(str(shared_root(routes, self.enterContext(tempfile.TemporaryDirectory()))), 'preprod', network=PREPROD)
+        # Positive control: with the standard decoder the external client fails the counted request and follow stops.
+        dsn, store = self.ready()
+        store.certify_ready_full()
+        with patch.object(provider, 'bounded_json', lambda: json), self.assertRaises(LifecycleFailure) as stopped:
+            self.follow(dsn, store, shared())
+        self.assertEqual((stopped.exception.code, store.generation()['target_height']), ('provider_request_rejected', OFFSET + 10))
+        # The service's follow path through the shared adapter.
+        dsn, store = self.ready()
+        store.certify_ready_full()
+        client = shared()
+        self.follow(dsn, store, client)
+        self.assertEqual((store.generation()['target_height'], stored(store)), (TARGET, (1, None)))
+        verify_store(store)
+        # Acquisition through the shared adapter stores the same facts.
+        _, acquired = self.ready()
+        with contextlib.redirect_stdout(io.StringIO()):
+            adapter.update(acquired, CountingProvider(500, shared()), bridge.PROFILE, TARGET, hooks=FixtureHooks())
+        self.assertEqual(stored(acquired), (1, None))
+        self.assertEqual(acquired.digests(acquired.generation()['id']), store.digests(store.generation()['id']))
+
+    def test_the_provider_must_agree_with_the_transaction_cbor(self):
+        t = self.chain[11][0]
+        for name, answer in (('other recipient', [{'label': '6500973', 'json_metadata': ['0x' + 'cd' * 32]}]),
+                             ('label missing', []), ('malformed', {'label': '6500973'})):
+            with self.subTest(case=name):
+                routes = dict(self.routes)
+                routes['/txs/' + t.hash.hex() + '/metadata'] = answer
+                dsn, store = self.ready()
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(Refusal, 'provider_metadata_conflict|provider_bad_metadata'):
+                    adapter.update(store, CountingProvider(500, Fake(routes)), bridge.PROFILE, TARGET, hooks=FixtureHooks())
+                self.assertEqual(store.generation()['id'], 0)
+                self.assertFalse(store.db.execute('SELECT 1 FROM chain.tx_metadata').fetchone())
+
+
+class BridgeRelevanceTests(unittest.TestCase):
+    """Relevance filtering (the Mainnet setting): the acquisition and its independent pass each fetch the
+    metadata once, and the stored fact is part of the certified inventory."""
+    @classmethod
+    def setUpClass(cls):
+        import fixtures.relevance as rf
+        cls.rf = rf
+        rf.configure('mainnet')
+        rf.SQLFixture.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.rf.SQLFixture.teardown()
+
+    def test_relevance_mode_fetches_once_per_pass_and_certifies_the_metadata(self):
+        import hashlib
+        from db_sync_alt.sources.blockfrost.cbor import Tag
+        from db_sync_alt.sources.blockfrost.relevance import address_bytes
+        from fixtures.cbor import enc
+        rf = self.rf
+        recipient_bytes = hashlib.sha256(b'mainnet-recipient').digest()
+        aux = enc(Tag(259, {0: {6500973: [recipient_bytes]}}))
+        body = {0: [], 1: [[address_bytes(rf.PROFILE.ics, 'mainnet'), [2000000, {rf.P: {rf.N: 5}}]]], 2: 7,
+                7: hashlib.blake2b(aux, digest_size=32).digest()}
+        raw = enc(body)
+        h = hashlib.blake2b(raw, digest_size=32).hexdigest()
+        transfer = {'cbor': (b'\x84' + raw + enc({}) + enc(True) + aux).hex(), 'tx_hash': h, 'body': body, 'valid': True}
+        store, routes = rf.SQLFixture.prepare([[transfer]])
+        self.addCleanup(store.close)
+        routes['/txs/' + h + '/metadata'] = [{'label': '6500973', 'json_metadata': ['0x' + recipient_bytes.hex()]}]
+        _, calls = rf.SQLFixture.follow(store, routes, rf.T + 1)
+        self.assertEqual(calls.count('/txs/' + h + '/metadata'), 2)
+        g = store.generation()
+        self.assertEqual((g['target_height'], g['manifest']['capabilities']['bridge_metadata_v1']), (rf.T + 1, True))
+        self.assertIsNotNone(g['manifest'].get('relevance_coverage'))
+        self.assertEqual(store.fact('tx_metadata', (bytes.fromhex(h),)),
+                         {'tx_hash': bytes.fromhex(h), 'present': 1, 'json': '["0x' + recipient_bytes.hex() + '"]'})
+        proofs = [c['receipt']['relevance']['inventory']['tx_metadata'] for c in store.checkpoint_rows(generation=g['id'], phase='events')]
+        self.assertEqual(sum(p['count'] for p in proofs), 1)
+        verify_store(store)
+
+
+if __name__ == '__main__':
+    unittest.main()

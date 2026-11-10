@@ -85,8 +85,12 @@ def run_supplement(endpoint, profile, corpus, verified):
         record['guard'] = list(case.guard)
         results.append(record)
         by_label[case.label] = record
+    # A guard holds when it passes, or when it is an observed case whose own guards hold.
+    def holds(label):
+        record = by_label.get(label, {})
+        return record.get('verdict') == 'pass' or (record.get('verdict') == 'observed' and record.get('guard_verdict') == 'pass')
     for record in results:
-        if any(by_label.get(g, {}).get('verdict') != 'pass' for g in record['guard']):
+        if not all(holds(g) for g in record['guard']):
             record['guard_verdict'] = 'fail'
         elif record['guard']:
             record['guard_verdict'] = 'pass'

@@ -35,7 +35,7 @@ class ProviderTests(unittest.TestCase):
         import db_sync_alt.sources.blockfrost.adapter as module
         decoded=[{'hash':i.to_bytes(32,'big'),'ordinary':set(),'collateral':set(),'reference':set(),'valid':True,'mints':[],'output_count':0,'collateral_return':False} for i in range(51)]
         routes={'/txs/'+d['hash'].hex()+'/utxos':{'hash':d['hash'].hex(),'inputs':[],'outputs':[]} for d in decoded}
-        source=module.BlockfrostSource(Fake(routes),SimpleNamespace(),SimpleNamespace(generation=lambda _: {'target_height':100}),1,lambda:False)
+        source=module.BlockfrostSource(Fake(routes),SimpleNamespace(),SimpleNamespace(generation=lambda _: {'target_height':100,'manifest':{}}),1,lambda:False)
         with patch.object(module,'inventory',return_value=decoded),patch('builtins.print',side_effect=AssertionError('worker stdout write')):
             facts,stats=source.block_facts({'height':99})
         self.assertEqual(facts,[]);self.assertEqual(stats['transactions_scanned'],51)
@@ -128,11 +128,15 @@ class LedgerOrdinalTests(unittest.TestCase):
         from db_sync_alt.resources import profile_dir
         from db_sync_alt.sources.blockfrost.adapter import BlockfrostSource
         profile = Profile(profile_dir('preprod'))
-        source = BlockfrostSource.__new__(BlockfrostSource)
-        source.facts, source.profile = [], profile
         units = ['00' * 28 + '01', profile.night, 'ff' * 28]
-        row = {'output_index': 3, 'address': 'addr_test1fixture', 'data_hash': None,
-               'amount': [{'unit': 'lovelace', 'quantity': '5'}] + [{'unit': u, 'quantity': '1'} for u in reversed(units)]}
-        source.output(b'\x01' * 32, row)
-        stored = [r for t, r in source.facts if t == 'output_assets']
-        self.assertEqual([(r['policy'].hex() + r['name'].hex(), r['ordinal']) for r in stored], [(profile.night, sorted(units).index(profile.night))])
+        for address, bridge, kept in (('addr_test1fixture', True, [profile.night]), (profile.ics, False, [profile.night]),
+                                      (profile.ics, True, sorted(units))):
+            source = BlockfrostSource.__new__(BlockfrostSource)
+            source.facts, source.profile, source.bridge = [], profile, bridge
+            row = {'output_index': 3, 'address': address, 'data_hash': None,
+                   'amount': [{'unit': 'lovelace', 'quantity': '5'}] + [{'unit': u, 'quantity': '1'} for u in reversed(units)]}
+            source.output(b'\x01' * 32, row)
+            stored = sorted((r['policy'].hex() + r['name'].hex(), r['ordinal']) for t, r in source.facts if t == 'output_assets')
+            # A bridge-covered generation keeps every asset of an ICS (or reserve) output; positions are among all assets.
+            with self.subTest(address=address, bridge=bridge):
+                self.assertEqual(stored, [(u, sorted(units).index(u)) for u in kept])

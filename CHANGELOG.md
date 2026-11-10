@@ -6,10 +6,35 @@
   carries the epoch's maximum transaction size, served as
   `epoch_param.max_tx_size`. midnight-node 2.1.101 reads
   `MAX(epoch_param.max_tx_size)` of the cursor block's epoch on its cost-based
-  cNIGHT observation path and stops cNIGHT observations without it. The
-  packaged node query sources and all network profiles now pin node 2.1.101
+  cNIGHT observation path and stops cNIGHT observations without it. The same
+  format holds the token bridge's metadata (below). The packaged node query
+  sources and all network profiles now pin node 2.1.101
   (`86774edf8cc76345a5c3a4221f3fe80c094b1c33`); profile configurations and
   genesis are unchanged.
+- Serve the token bridge's data for midnight-node 2.1.101, forward only. Once
+  governance sets the bridge's checkpoint, the node runs its bridge query on
+  every block import and stops when the answer differs from the block author's;
+  before this version, the reader could not read `tx_metadata` at all. Every
+  update from Blockfrost now stores the `tx_metadata` of key 6500973 of each
+  transaction with an output at the ICS address (one request per such
+  transaction, checked against the transaction's own CBOR), keeps every asset
+  of the ICS and reserve outputs, and serves them as `tx_metadata` and
+  `ma_tx_out` to the reader. Coverage starts with the first update from
+  Blockfrost: after the upgraded update for a database of 0.3.x, after the
+  bootstrap for a database built from cardano-db-sync (which stores no
+  metadata). Nothing older is fetched. `db-sync-alt status`, `/status` and the
+  upgrade report `bridge.coverage_start`. State the bridge's on-chain checkpoint
+  (`status --bridge-checkpoint`, `run --node-bridge-checkpoint` or
+  `node.bridge_checkpoint`) to have it checked: an unsupported checkpoint is
+  reported, and `/health` answers 503 `bridge_checkpoint_unsupported`. An
+  update from cardano-db-sync holds no metadata: coverage starts again after
+  it, and `acquire` reports the coverage it ended and warns
+  (`bridge_metadata_coverage_restarted`). Blockfrost's integers beyond 2^53 are stored as Blockfrost rounds them;
+  the node reads the same recipient. Answers nested deeper than 4,000 levels
+  are cut instead of failing the request, by db-sync-alt's Blockfrost client
+  and by the external accounting client of `DBSYNC_PROVIDER_ADAPTER=shared`
+  (db-sync-alt gives that client's `json.loads` the same bound): metadata that
+  deep, which anyone can put on chain, is stored as NULL and ingest goes on.
 - Upgrade an existing database in place, with the service and the node stopped:
   `db-sync-alt upgrade --service <name>`. A database written by 0.3.x or
   earlier holds each epoch's nonce but not its size: the upgrade reads every

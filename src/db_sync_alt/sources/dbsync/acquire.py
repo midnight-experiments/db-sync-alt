@@ -405,7 +405,19 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
         'independent':independent},report['digests'])
     if progress:progress('sealed',generation=generation)
     _anchors(source,store,generation); _stop(stop_event)
+    # A cardano-db-sync update stores no bridge metadata: covered blocks before it stay, coverage restarts
+    # after it. The ready generation is still the parent here.
+    from db_sync_alt import bridge
+    coverage = bridge.coverage(store)
     result = store.publish(generation,final)
-    return {**result,'source':'db-sync','queries':getattr(source,'queries',None),
-            'query_count_scope':'logical one/stream statements; excludes snapshot controls, identity queries and cursor fetches',
-            'source_rows':getattr(source,'rows_read',None),'target':g['target_height'],'witness':g['witness_height']}
+    out = {**result,'source':'db-sync','queries':getattr(source,'queries',None),
+           'query_count_scope':'logical one/stream statements; excludes snapshot controls, identity queries and cursor fetches',
+           'source_rows':getattr(source,'rows_read',None),'target':g['target_height'],'witness':g['witness_height']}
+    after = bridge.coverage(store)
+    if after is not None:
+        out['bridge'] = after
+    gap = bridge.ended(coverage, ready, after) if ready else None
+    if gap is not None:
+        out['bridge_coverage_ended'] = gap
+        out['warnings'] = ['bridge_metadata_coverage_restarted']
+    return out

@@ -11,6 +11,8 @@ import logging
 import re
 from urllib.parse import urlencode
 from db_sync_alt.sources.blockfrost.cbor import decode_transaction, decode_datum
+from db_sync_alt.sources.blockfrost import metadata
+from db_sync_alt.bridge import covered as bridge_covered
 from db_sync_alt.contract import TABLES, Refusal, canonical, digest, jsonable, required_epochs, epoch_size, generation_capabilities
 
 OPENAPI='1d4d5d8bac8f0c641eea5c6f7b1f3fbbed8d1505'
@@ -226,7 +228,10 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
 
 class BlockfrostSource:
     def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False):
-        self.provider=provider;self.profile=profile;self.store=store;self.stop_requested=stop_requested;self.gen=generation;self.target=store.generation(generation)['target_height']
+        self.provider=provider;self.profile=profile;self.store=store;self.stop_requested=stop_requested;self.gen=generation
+        g=store.generation(generation);self.target=g['target_height']
+        # A covered generation stores bridge metadata and every asset of its ICS and reserve outputs.
+        self.bridge=bridge_covered(g['manifest'])
         self.cache={};self.facts=[]
         from db_sync_alt.sources.blockfrost.relevance import pending_certificate,Discovery,CertifiedReadView
         self.coverage=coverage if relevance_enabled and coverage is not None else (pending_certificate(store,profile,generation) if relevance_enabled else None)
@@ -266,16 +271,17 @@ class BlockfrostSource:
         if val['datum_hash'] is not None:self.datum(val['datum_hash'],row.get('inline_datum'))
         self.add('outputs',{'tx_hash':h,'output_index':idx,**val})
         ordinals=ledger_ordinals(assets)
-        for (p,n),q in assets.items():
-            if self.profile.required(p,n):
-                self.add('assets',{'policy':p,'name':n});self.add('output_assets',{'tx_hash':h,'output_index':idx,'policy':p,'name':n,'quantity':str(q),'ordinal':ordinals[(p,n)]})
+        for (p,n),q in self.profile.kept_assets(val['address'],assets,covered=self.bridge).items():
+            self.add('assets',{'policy':p,'name':n});self.add('output_assets',{'tx_hash':h,'output_index':idx,'policy':p,'name':n,'quantity':str(q),'ordinal':ordinals[(p,n)]})
     def origin(self,h,index,observed):
         old=self.store.fact('outputs',(h,index))
         if old:
             val,assets=output_value(observed)
             if any(old[k]!=v for k,v in val.items()):raise Refusal('provider_origin_conflict')
             expected={(bytes(r['policy']),bytes(r['name'])):int(r['quantity']) for r in self.store.output_assets(h,index)}
-            if expected!={k:v for k,v in assets.items() if self.profile.required(*k)}:raise Refusal('provider_origin_asset_conflict')
+            # A stored output is compared under the rule of the generation that stored it.
+            covered=self.store.bridge_covered(self.store.output_generation(h,index))
+            if expected!=self.profile.kept_assets(old['address'],assets,covered=covered):raise Refusal('provider_origin_asset_conflict')
             return
         self.transaction(h)
         response=self.provider.get('/txs/'+h.hex()+'/utxos')
@@ -316,6 +322,9 @@ class BlockfrostSource:
                 self.origin(origin,oi,x);self.add('inputs',{'tx_hash':h,'origin_hash':origin,'origin_index':oi,'ordinal':ordinals[(origin,oi)]})
             for p,n,q in mints:
                 self.add('assets',{'policy':p,'name':n});self.add('mints',{'tx_hash':h,'policy':p,'name':n,'quantity':str(q)})
+            # The bridge query reads the metadata of transactions with an output at the ICS address.
+            if self.bridge and any(output_value(x)[0]['address']==self.profile.ics for x in relevant_out):
+                self.add('tx_metadata',metadata.fetch(self.provider,decoded))
         return self.facts,{'transactions_scanned':len(txs),'facts':len(self.facts)},txs
     def block_facts(self,block):
         facts,stats,txs=self._collect(block)
@@ -371,19 +380,21 @@ def handoff_overlap(provider,store,profile,parent):
         u=provider.get('/txs/'+h.hex()+'/utxos')
         if u.get('hash')!=h.hex() or not decoded['valid']:raise Refusal('provider_handoff_fact_conflict')
         ordinary=classify_inputs(u.get('inputs'),decoded,lambda origin,index:fetch_original_output(provider,origin,index))
-        seen={}
-        for out in ordinary_outputs(u.get('outputs'),decoded):
-            val,assets=output_value(out)
-            if profile.relevant(val['address'],assets):seen[integer(out['output_index'])]=(val,{k:v for k,v in assets.items() if profile.required(*k)})
-        expected={}
+        expected={};covered={}
         for out in store.transaction_outputs(h,parent['id']):
             assets={(bytes(r['policy']),bytes(r['name'])):int(r['quantity']) for r in store.output_assets(h,out['output_index'],parent['id'])}
             expected[out['output_index']]=({k:out[k] for k in ('address','value','datum_hash')},assets)
+            covered[out['output_index']]=store.bridge_covered(store.output_generation(h,out['output_index']))
+        seen={}
+        for out in ordinary_outputs(u.get('outputs'),decoded):
+            val,assets=output_value(out);index=integer(out['output_index'])
+            if profile.relevant(val['address'],assets):seen[index]=(val,profile.kept_assets(val['address'],assets,covered=covered.get(index,False)))
         ins={k for k,v in ordinary.items() if profile.relevant(output_value(v)[0]['address'],output_value(v)[1])}
         expected_ins={(bytes(r['origin_hash']),r['origin_index']) for r in store.transaction_inputs(h,parent['id'])}
         mint={ (p,n):q for p,n,q in decoded['mints'] if profile.required(p,n)}
         expected_mint={(bytes(r['policy']),bytes(r['name'])):int(r['quantity']) for r in store.transaction_mints(h,parent['id'])}
-        if seen!=expected or ins!=expected_ins or mint!=expected_mint:raise Refusal('provider_handoff_fact_conflict')
+        stored=store.fact('tx_metadata',(h,)) if 'tx_metadata' in store.physical_tables else None
+        if seen!=expected or ins!=expected_ins or mint!=expected_mint or (stored is not None and not metadata.stored_agrees(decoded,stored)):raise Refusal('provider_handoff_fact_conflict')
         checked+=1
     if not checked:raise Refusal('provider_nonempty_handoff_unqualified')
     return checked
@@ -427,7 +438,7 @@ def update(store,provider,profile,end_height=None,*,hooks,relevance_enabled=Fals
         startepoch=store.block_at(ready['id'],ready['start_height'])['epoch']
         manifest={'identity':profile.identity,'contracts':digest(profile.contract),'source_identity':profile.network.source_identity,
                   'anchors':{'start':ready['manifest']['anchors']['start'],'target':{'height':target,'hash':targetrow['hash'].hex()},'witness':{'height':target+k,'hash':witnessrow['hash'].hex()}},
-                  'required_epochs':required_epochs(startepoch,targetrow['epoch']),'capabilities':generation_capabilities(),'parent_digest':digest(ready['manifest']['digests'])}
+                  'required_epochs':required_epochs(startepoch,targetrow['epoch']),'capabilities':generation_capabilities(bridge_metadata=True),'parent_digest':digest(ready['manifest']['digests'])}
         with store.atomic():
             gen=store.begin_generation(source='blockfrost-cardano',start=profile.start,target=target,witness=target+k,manifest=manifest,parent=ready['id'])
             store.checkpoint(gen,'metadata','inherited',{'lo':ready['start_height'],'hi':ready['target_height'],'parent':ready['id'],'parent_digest':manifest['parent_digest'],'source_kind':'generation-inheritance','inherited_source_kind':ready['source']})
@@ -476,7 +487,7 @@ def update(store,provider,profile,end_height=None,*,hooks,relevance_enabled=Fals
         try:
             facts,stats=source.block_facts(block)
             # Fact order is dependency ordered at commit, with outputs before spends.
-            order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs']
+            order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs','tx_metadata']
             diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'])
             with store.atomic():
                 for table in order:

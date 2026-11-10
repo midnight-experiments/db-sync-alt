@@ -209,7 +209,74 @@ def decode_transaction(raw_hex,expected_hash):
     return {'hash':bytes.fromhex(actual),'valid':valid,'ordinary':inputs(body[0]),'collateral':inputs(body.get(13,[])),
             'reference':inputs(body.get(18,[])),'mints':tuple(sorted(facts)),'output_count':len(body[1]),'collateral_return':16 in body,'body_bytes':end-start,
             'outputs':tuple(output_details(o) for o in body[1]),'collateral_output':output_details(returned) if supported_return else None,
-            'auxiliary_data_span':auxiliary}
+            'auxiliary_data_span':auxiliary,'auxiliary_data':None if raw[auxiliary[0]:auxiliary[1]]==b'\xf6' else raw[auxiliary[0]:auxiliary[1]],
+            'auxiliary_data_hash':body.get(7)}
+
+
+# What `bridge_metadatum` finds for one metadata label: no such label, the label's metadatum (with the
+# recipient bytes the node would read from its JSON rendering, or None), or nothing certain.
+ABSENT='absent'
+PRESENT='present'
+UNKNOWN='unknown'
+# A one-element array of one (possibly chunked) string: the deepest shape that can be a recipient.
+RECIPIENT_DEPTH=2
+
+
+def bridge_metadatum(aux,label):
+    """(ABSENT|PRESENT|UNKNOWN, recipient) for metadata `label` in auxiliary data bytes `aux`.
+
+    Only that label's value is decoded, with an explicit depth bound: an over-deep or undecodable
+    value, or any shape but a one-element array holding bytes or a `0x`-hexadecimal text, is a
+    metadatum without a recipient, never a refusal. cardano-db-sync renders bytes as `0x` + hex,
+    which the node decodes back to the same bytes. Other labels and the scripts are only skipped.
+    A structure this reader does not recognise, a repeated label with different readings or a
+    malformed item gives UNKNOWN: anyone can put such data on chain."""
+    if aux is None:return ABSENT,None
+    try:
+        d=Decoder(aux,max_bytes=len(aux)+1,max_items=len(aux)+1)
+        m,n=d.head()
+        if m==6 and n==259:
+            m,n=d.head()
+            if m!=5:return UNKNOWN,None
+            found=False;i=0
+            while n is None or i<n:
+                if n is None and d.data[d.pos:d.pos+1]==b'\xff':d.pos+=1;break
+                key=d.item(1);i+=1
+                if key==0 and not found:found=True;break
+                d.skip()
+            if not found:return ABSENT,None
+            m,n=d.head()
+        elif m==4:
+            if n is not None and n<1:return UNKNOWN,None
+            m,n=d.head()
+        elif m!=5:return UNKNOWN,None
+        if m!=5:return UNKNOWN,None
+        readings=set();i=0
+        while n is None or i<n:
+            if n is None and d.data[d.pos:d.pos+1]==b'\xff':break
+            key=d.item(1);i+=1
+            if type(key) is not int:return UNKNOWN,None
+            value_start,value_end=d.skip()
+            if key==label:readings.add(_recipient(aux[value_start:value_end]))
+    except Refusal:
+        return UNKNOWN,None
+    if not readings:return ABSENT,None
+    if len(readings)!=1:return UNKNOWN,None
+    return PRESENT,readings.pop()
+
+
+def _recipient(raw):
+    """The recipient bytes of one metadatum's CBOR, or None when it cannot be one."""
+    try:
+        d=Decoder(raw,max_bytes=len(raw)+1,max_depth=RECIPIENT_DEPTH,max_items=len(raw)+1)
+        value=d.item()
+    except Refusal:
+        return None
+    if not isinstance(value,list) or len(value)!=1:return None
+    element=value[0]
+    if isinstance(element,bytes):return element
+    if isinstance(element,str) and element.startswith('0x') and re.fullmatch('(?:[0-9a-fA-F]{2})*',element[2:]):return bytes.fromhex(element[2:])
+    return None
 
 
 def decode_datum(raw):
