@@ -127,10 +127,9 @@ Administrative commands (`acquire`, `upgrade`, `backup`, `restore`, `verify`,
 | `resume_namespace_mismatch` | An unfinished build is resumed against a different db-sync database than the one it started from |
 | `source_equals_destination` | The db-sync source and the destination are the same database |
 | `explicit_blockfrost_target_required` | `acquire --source blockfrost` needs `--target-height` within 1,000 blocks above the ready target |
-| `bridge_metadata_source_missing` (`acquire --source dbsync`) | The database's bridge metadata coverage has started (an update from Blockfrost is published) and cardano-db-sync acquisition stores no bridge metadata; coverage never ends, so continue with Blockfrost |
 | `invalid_bridge_checkpoint` (`status`, `run`, service configuration) | The bridge checkpoint is not `block:<n>` (0 to 2,147,483,647, no leading zero) or `tx:<64 lowercase hex>` |
 | `provider_metadata_conflict`, `provider_bad_metadata` (service: `invalid_coverage`) | Blockfrost's `/txs/{hash}/metadata` answer for a transaction with an output at the ICS address is malformed, or disagrees with the transaction's own CBOR on whether it carries key 6500973 or on the recipient it names. Nothing is published; check the provider and restart |
-| `bridge_metadata_incomplete`, `bridge_metadata_unexpected`, `bridge_metadata_coverage_gap` (verification; `invalid_coverage` in the service) | A covered update lacks the bridge metadata of a transaction with an output at the ICS address, holds metadata it should not, or an update without metadata follows a covered one; keep the database for diagnosis and restore a verified backup |
+| `bridge_metadata_incomplete`, `bridge_metadata_unexpected` (verification; `invalid_coverage` in the service) | An update from Blockfrost lacks the bridge metadata of a transaction with an output at the ICS address, or holds metadata it should not; keep the database for diagnosis and restore a verified backup |
 
 ### Relevance filtering refusals
 

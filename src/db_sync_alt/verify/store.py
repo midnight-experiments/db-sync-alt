@@ -87,7 +87,6 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     if m.get('contracts')!=digest(network.legacy_contract if legacy else network.contract) or profile_digest(g)!=digest(identity):raise Refusal('manifest_contract_mismatch')
     if any(type(v) is not bool for v in m.get('capabilities',{}).values()):raise Refusal('unsupported_capabilities')
     if m.get('capabilities')!=expected_capabilities(store,g):raise Refusal('unsupported_capabilities')
-    bridge.verify_lineage(store,g)
     bridge.verify_assets(store,g,units,governance,identity,delta=delta)
     if g['witness_height']!=g['target_height']+network.security:raise Refusal('invalid_witness')
     if (g['start_height'],g['start_index'])!=network.start or g['target_height']<g['start_height']:raise Refusal('invalid_start_cursor')

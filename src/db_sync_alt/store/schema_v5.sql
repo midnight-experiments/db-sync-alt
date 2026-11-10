@@ -27,8 +27,7 @@ REVOKE ALL ON serve.tx_metadata FROM PUBLIC;
 CREATE TRIGGER projection_guard BEFORE INSERT OR UPDATE OR DELETE ON serve.tx_metadata FOR EACH STATEMENT EXECUTE FUNCTION chain.guard_projection();
 CREATE TRIGGER no_truncate BEFORE TRUNCATE ON serve.tx_metadata EXECUTE FUNCTION chain.guard_truncate();
 CREATE OR REPLACE VIEW public.tx_metadata AS SELECT id,key,tx_id,json FROM serve.tx_metadata WHERE chain.gate();
--- The generations acquired with bridge metadata: the coverage start is found from the first of them
--- without reading every manifest.
+-- The generations acquired with bridge metadata: verification finds them without reading every manifest.
 CREATE INDEX generations_bridge_metadata ON chain.generations(id) WHERE (manifest->'capabilities'->'bridge_metadata_v1')='true'::jsonb;
 CREATE OR REPLACE FUNCTION chain.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path=pg_catalog,chain AS $$

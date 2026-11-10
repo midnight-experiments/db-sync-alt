@@ -61,8 +61,9 @@ from the profile gets empty answers outside it
 The Cardano blocks from which the database holds everything midnight-node's
 token bridge query reads: the `tx_metadata` (key 6500973) of every transaction
 with an output at the ICS address, and every asset of the ICS and reserve
-outputs. It starts with the first update acquired from Blockfrost and never ends;
-`status` reports its first block as `bridge.coverage_start`
+outputs. It starts with the first update acquired from Blockfrost after the
+newest update without metadata (from cardano-db-sync, or before an upgrade from
+0.3.x); `status` reports its first block as `bridge.coverage_start`
 ([bridge readiness](connect-a-node.md#bridge-readiness)).
 
 ## Schemas 1 to 5

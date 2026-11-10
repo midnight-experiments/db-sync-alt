@@ -44,9 +44,7 @@ ANCHOR_REFUSALS = frozenset({'pending_target_changed', 'pending_suffix_base_chan
 FAILURE_CODES = frozenset({
     'anchor_bounds_mismatch',
     'anchor_mismatch',
-    'bridge_metadata_coverage_gap',
     'bridge_metadata_incomplete',
-    'bridge_metadata_source_missing',
     'bridge_metadata_unexpected',
     'canonical_block_conflict',
     'canonical_conflict',

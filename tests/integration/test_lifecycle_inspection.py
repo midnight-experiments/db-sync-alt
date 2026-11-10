@@ -131,7 +131,7 @@ class InspectionTests(unittest.TestCase):
                 self.assertEqual(current[0],'ok' if allowed else 'InsufficientPrivilege')
     def test_native_configure_state_gate_uses_bounded_lookup(self):
         dsn,service=self.database();params=dict(psycopg.conninfo.conninfo_to_dict(dsn),password='')
-        args=SimpleNamespace(network='preprod',http_port=18099,node_security_parameter=None,node_configuration_dir=None)
+        args=SimpleNamespace(network='preprod',http_port=18099,node_security_parameter=None,node_configuration_dir=None,node_bridge_checkpoint=None)
         class GatePassed(Exception):pass
         with psycopg.connect(dsn,autocommit=True) as db:
             db.execute('UPDATE chain.service_state SET schema_version=5')

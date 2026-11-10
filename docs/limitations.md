@@ -19,8 +19,9 @@
   transactions are not covered; a database that would need them is refused
   (`unsupported_capability`).
 - **Bridge data from the coverage start only.** The token bridge's metadata is
-  stored forward only, from the first update acquired from Blockfrost after a
-  cardano-db-sync bootstrap or an upgrade from 0.3.x; nothing older is fetched.
+  stored forward only, from the first update acquired from Blockfrost after the
+  newest update without it (a cardano-db-sync bootstrap or catch-up, or an
+  upgrade from 0.3.x); nothing older is fetched.
   A bridge checkpoint older than the coverage start, or a checkpoint transaction
   outside the profile's addresses and assets, is reported as unsupported
   ([bridge readiness](connect-a-node.md#bridge-readiness)). Large integers in

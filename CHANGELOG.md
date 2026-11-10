@@ -26,9 +26,9 @@
   upgrade report `bridge.coverage_start`. State the bridge's on-chain checkpoint
   (`status --bridge-checkpoint`, `run --node-bridge-checkpoint` or
   `node.bridge_checkpoint`) to have it checked: an unsupported checkpoint is
-  reported, and `/health` answers 503 `bridge_checkpoint_unsupported`. Once
-  coverage has started, `acquire` from cardano-db-sync refuses
-  (`bridge_metadata_source_missing`). Blockfrost's integers beyond 2^53 are
+  reported, and `/health` answers 503 `bridge_checkpoint_unsupported`. An
+  update from cardano-db-sync holds no metadata: coverage starts again after
+  it. Blockfrost's integers beyond 2^53 are
   stored as Blockfrost rounds them; the node reads the same recipient.
 - Upgrade an existing database in place, with the service stopped:
   `db-sync-alt upgrade --service <name>`. A database written by 0.3.x or

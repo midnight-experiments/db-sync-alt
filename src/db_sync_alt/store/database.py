@@ -218,8 +218,6 @@ class PgStore:
         latest=self.db.execute('SELECT max(id) FROM chain.generations').fetchone()[0]
         if parent!=latest:raise Refusal('nonlinear_lineage')
         if parent is not None and (self.generation(parent)['status']!='ready' or target<=self.generation(parent)['target_height']):raise Refusal('invalid_parent')
-        # Bridge coverage never ends: a source without bridge metadata cannot extend a covered lineage.
-        if parent is not None and source!='blockfrost-cardano' and self.bridge_covered(parent):raise Refusal('bridge_metadata_source_missing')
         if witness!=target+self.network.security or target<start[0]:raise Refusal('invalid_bounds')
         gen=0 if latest is None else latest+1
         if source=='cardano-db-sync-postgresql':

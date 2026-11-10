@@ -6,11 +6,10 @@ reserve token flows and `tx_metadata.json` of key 6500973 (the transfer's recipi
 stores that metadata forward only: every generation acquired from Blockfrost carries the
 `bridge_metadata_v1` capability and stores one `tx_metadata` fact per transaction with an output at
 the ICS address in its event range (`present` 0 when the transaction has no such metadatum). A
-cardano-db-sync acquisition never reads metadata, and coverage never ends once it has begun.
+cardano-db-sync acquisition never reads metadata: coverage restarts with the next Blockfrost update.
 
 The coverage start C is the first Cardano block from which the facts are complete for the bridge
-query: the block after the parent of the first covered generation of the ready lineage, or the
-block after the ready generation while it is not covered. A checkpoint `Block(n)` is supported when
+query: the block after the newest generation of the ready lineage without bridge metadata. A checkpoint `Block(n)` is supported when
 n + 1 >= C (the node reads the blocks after n); `Tx(h)` and `TxReserveTransfer(h)` when the
 transaction h is served in a block >= C. Nothing below C is backfilled or guessed.
 """
@@ -47,14 +46,6 @@ def covered_generations(store, generation, *, delta=False):
     if delta:
         return [generation] if store.bridge_covered(generation) else []
     return [row[0] for row in store.db.execute('SELECT id FROM chain.generations WHERE id<=%s AND ' + COVERED + ' ORDER BY id', (generation,))]
-
-
-def verify_lineage(store, g):
-    """Coverage never ends: a generation after a covered one is covered."""
-    if g['parent'] is None or store.legacy_generation(g['id']) or store.legacy_generation(g['parent']):
-        return
-    if store.bridge_covered(g['parent']) and not covered(g['manifest']):
-        raise Refusal('bridge_metadata_coverage_gap')
 
 
 def verify_assets(store, g, units, governance, identity, *, delta=False):
@@ -111,18 +102,22 @@ def verify_family(store, g, identity, *, delta=False):
 
 
 def coverage_start(store):
-    """C, the first Cardano block from which the ready lineage holds complete bridge facts (None: no ready generation)."""
+    """C, the first Cardano block from which the ready lineage holds complete bridge facts (None: no
+    ready generation): the block after the newest generation without bridge metadata.
+
+    Read from the generations' summary columns only, never a manifest (status runs with summary-only
+    access): verification admits a generation of the current format only when its bridge capability is
+    exactly "acquired from Blockfrost"; generations up to an epoch parameter upgrade have none."""
     ready = store.state()['canonical_ready']
     if ready is None:
         return None
-    g = store.generation(ready)
-    if store.legacy_generation(ready) or not covered(g['manifest']):
-        return g['target_height'] + 1
-    first = store.db.execute('SELECT min(id) FROM chain.generations WHERE id<=%s AND ' + COVERED, (ready,)).fetchone()[0]
-    root = store.generation(first)
-    if root['parent'] is None:
-        return root['start_height'] + (1 if root['start_index'] > 0 else 0)
-    return store.generation(root['parent'])['target_height'] + 1
+    boundary = -1 if store.epoch_upgrade is None else store.epoch_upgrade['generation']
+    newest = store.db.execute("SELECT max(id) FROM chain.generations WHERE id<=%s AND (source<>'blockfrost-cardano' OR id<=%s)",
+                              (ready, boundary)).fetchone()[0]
+    if newest is None:
+        root = store.db.execute('SELECT start_height,start_index FROM chain.generations WHERE parent IS NULL').fetchone()
+        return root[0] + (1 if root[1] > 0 else 0)
+    return store.db.execute('SELECT target_height FROM chain.generations WHERE id=%s', (newest,)).fetchone()[0] + 1
 
 
 def parse_checkpoint(text):

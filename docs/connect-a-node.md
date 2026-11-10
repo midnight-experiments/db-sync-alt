@@ -92,9 +92,11 @@ db-sync-alt serves that data forward only, from its **coverage start**:
   with the first update from Blockfrost after it. A database upgraded from 0.3.x
   starts coverage after its upgraded update. Nothing before the coverage start is
   fetched or guessed.
-- Once coverage has started, an update without metadata cannot extend the
-  database: `acquire` from cardano-db-sync refuses with
-  `bridge_metadata_source_missing`.
+- An update from cardano-db-sync (`acquire --source dbsync`, for example to
+  catch up after a provider outage) holds no metadata either: coverage then
+  starts again with the next update from Blockfrost, and `coverage_start` moves
+  past it. Once the bridge is active, keep following from Blockfrost and state
+  the checkpoint (below), so that such a gap shows as an unsupported checkpoint.
 
 `db-sync-alt status` and the service's `/status` report it under `bridge`:
 

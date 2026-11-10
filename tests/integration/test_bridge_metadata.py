@@ -238,14 +238,9 @@ class BridgeMetadataTests(unittest.TestCase):
         from db_sync_alt.bridge import report
         self.assertEqual(report(store, 'block:%d' % (START - 2))['reason'], 'before_coverage')
 
-    def test_coverage_never_ends_and_stays_complete(self):
+    def test_covered_generations_stay_complete(self):
         dsn, store, _ = self.acquired()
         g = store.generation()
-        # A cardano-db-sync acquisition cannot extend a covered lineage.
-        manifest = {'source_identity': {'adapter': 'db-sync-direct-pg-v1'}}
-        with self.assertRaisesRegex(Refusal, 'bridge_metadata_source_missing'):
-            store.begin_generation(source='cardano-db-sync-postgresql', start=bridge.PROFILE.start, target=TARGET + 1,
-                                   witness=TARGET + 1 + bridge.PROFILE.security, manifest=manifest, parent=g['id'])
         t11 = self.chain[11]
         # Missing or extra bridge metadata is found by verification.
         with psycopg.connect(dsn, autocommit=True) as db:
