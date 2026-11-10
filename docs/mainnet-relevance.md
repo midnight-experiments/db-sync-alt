@@ -43,8 +43,11 @@ db-sync-alt acquire --source blockfrost --network preprod \
   --destination-service db_sync_alt --target-height HEIGHT --relevance
 ```
 
-Use your actual private service name and a confirmed target within the existing
-batch bound. Filtering applies to Blockfrost following, not SQL bootstrap.
+Use your actual private service name and a confirmed target at most six blocks
+after the ready one (a further target is refused before any request with
+`invalid_sync_configuration`). An update with filtering holds at most six blocks:
+one block's proof is at most 2 MiB, so six blocks can never pass the update's
+200,000-key limit. Filtering applies to Blockfrost following, not SQL bootstrap.
 
 Check fresh `/health` and `/status` responses. When filtering is active,
 `relevance.requested` and `relevance.effective` are both `relevance`; the reason is

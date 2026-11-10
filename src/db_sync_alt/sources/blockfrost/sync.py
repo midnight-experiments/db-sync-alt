@@ -313,8 +313,8 @@ def job_target(store, ready, limit, budget, *, relevance):
     """The highest target <= `limit` whose blocks' estimated requests fit 3/4 of `budget`, at least one block.
 
     The ready generation stores its provisional headers through its witness, so each candidate block's
-    transaction count is known without a request: full mode reads one inventory page per 100 transactions and
-    one `/utxos` per transaction; relevance mode reads both twice (acquisition and independent pass) and may
+    transaction count is known without a request: full mode reads `n // 100 + 1` inventory pages of a block of
+    n > 0 transactions (the last one short) and one `/utxos` per transaction; relevance mode reads both twice (acquisition and independent pass) and may
     select every transaction. Relevance generations hold at most `relevance.MAX_BLOCKS` blocks, so their known
     fact keys can never pass the limit. The estimate only sizes the job; an exhausted job waits and continues.
     """
@@ -328,7 +328,7 @@ def job_target(store, ready, limit, budget, *, relevance):
         if row is None:
             break
         count = row['tx_count']
-        spent += ((count + 99) // 100 + count) * (2 if relevance else 1)
+        spent += ((count // 100 + 1 if count else 0) + count) * (2 if relevance else 1)
         if spent > budget * 3 // 4 and height > first:
             break
         target = height

@@ -95,6 +95,33 @@
   nested deeper than about 60 levels or with a repeated map key. Anyone can
   submit such a transaction. The witness set must still be a map; its content
   is now read past without being decoded.
+- Fix Blockfrost following stopping for good once one update had spent its
+  request budget (10,000 requests by default; `request_budget_exhausted`).
+  Anyone can fill an update's blocks with cheap transactions: full mode reads
+  one `/txs/{h}/utxos` answer per transaction, relevance filtering two per
+  selected one. Each new update is now sized to the transaction counts of its
+  blocks: as many blocks as fit three quarters of its budget, at least one.
+  With relevance filtering it counts both reads and holds at most six blocks,
+  so its 200,000-key limit can no longer be reached
+  (`relevance_work_unit_limit`). An update that still spends its budget waits
+  for the next UTC day (`quota_wait`) and then continues where it stopped
+  under a new job record that carries the earlier count; the exhausted record
+  is kept. Every request is still counted before it is sent, no count is
+  reset, and the daily request ceiling is unchanged. A filtered update resumed
+  in the same process no longer reads its committed blocks again. A one-shot
+  `acquire --relevance` target more than six blocks ahead is refused before
+  any request (`invalid_sync_configuration`).
+- Fix Blockfrost acquisition and following stopping at a transaction whose
+  `/txs/{h}/utxos` answer passes 32 MiB (`provider_request_rejected` with
+  db-sync-alt's client, `invalid_coverage` with the shared adapter). Anyone can
+  cause it: the answer lists every input with all assets of the output it
+  spends, and about 300 reference inputs to outputs of 1,300 assets each
+  suffice. Such an answer is now read with each input row's assets cut to the
+  profile's (all assets at the ICS and reserve addresses), which is all a
+  stored fact depends on; outputs stay whole. db-sync-alt's client reads it
+  one row at a time, up to 128 MiB; with the shared adapter the external
+  client still reads it whole before db-sync-alt cuts it. Answers up to
+  32 MiB are unchanged.
 
 ## 0.3.0
 

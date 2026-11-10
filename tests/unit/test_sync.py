@@ -142,7 +142,7 @@ class SyncTests(unittest.TestCase):
         store.save_sync_job('provider-acquire-a',old);store.save_sync_job('provider-active',new)
         self.assertEqual(store.jobs['provider-active'],new)
     def test_job_is_sized_to_the_transactions_of_its_blocks(self):
-        # A block of 300 transactions costs 3 inventory pages and 300 /utxos: 24 blocks fit 3/4 of 10,000.
+        # A block of 300 transactions costs 4 inventory pages (the last one empty) and 300 /utxos: 24 blocks fit 3/4 of 10,000.
         self.client.confirmed=1000;self.store.tx_counts.update({h:300 for h in range(101,1101)})
         self.run_once()
         self.assertEqual(self.update.calls,[(101,124)])
@@ -159,7 +159,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+100)
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+6)
         self.store.tx_counts.update({h:1000 for h in range(top+1,top+101)})
-        # 2 x (10 pages + 1,000 /utxos) per block: three blocks fit 7,500.
+        # 2 x (11 pages + 1,000 /utxos) per block: three blocks fit 7,500.
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+3)
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+7)
     def test_sizing_ends_at_the_stored_witness(self):
