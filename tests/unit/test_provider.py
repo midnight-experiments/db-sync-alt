@@ -52,7 +52,8 @@ class ProviderTests(unittest.TestCase):
         exact='['*p.RESPONSE_DEPTH+']'*p.RESPONSE_DEPTH
         self.assertEqual(json.dumps(p.loads(exact.encode()),separators=(',',':')),exact)
     def test_shared_adapter_decodes_with_the_bound(self):
-        import hashlib,shutil
+        import hashlib
+        import shutil
         root=self.root/'shared';(root/'answers').mkdir(parents=True)
         shutil.copy(Path(__file__).resolve().parents[1]/'fixtures'/'shared_client'/'client.py',root/'client.py')
         (root/'profiles.json').write_text(json.dumps({'preprod':{'base_url':PREPROD.blockfrost_base}}))
