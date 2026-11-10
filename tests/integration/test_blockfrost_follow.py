@@ -170,6 +170,14 @@ class FollowSourcePGTests(unittest.TestCase):
             try:self.assertEqual(poll.sync_job(key),before)
             finally:poll.close()
 
+    def test_hostile_auxiliary_data_beside_a_relevant_transaction_follows_like_the_clean_block(self):
+        # Block h=12 gains two unrelated transactions, so it is not generation 0's provisional block (fork=1).
+        dsn,store,_=self.prepare();routes,_=gen_fixture.fixtures(fork=1,auxiliary=gen_fixture.HOSTILE_AUXILIARY)
+        self.run_follow(store,dsn,routes)
+        self.assertEqual(store.generation()['target_height'],gen_fixture.OFFSET+12)
+        self.assertEqual(verify_store(store)['digests'],store.digests(store.generation()['id']))
+        self.compare_reference(gen_fixture.fixtures(fork=1,auxiliary=gen_fixture.CLEAN_AUXILIARY)[0],store)
+
     def test_epoch_transition_equals_full_update(self):
         dsn,store,routes=self.prepare(transition=True)
         self.run_follow(store,dsn,routes)

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import random
 import unittest
 from db_sync_alt.sources.blockfrost.cbor import Decoder, Tag, decode_datum, decode_transaction
 from db_sync_alt.contract import Refusal
@@ -41,5 +42,64 @@ class DecoderTests(unittest.TestCase):
         self.assertEqual(decode_datum(enc({b'a':3})),{'map':[{'k':{'bytes':'61'},'v':{'int':3}}]})
         self.assertEqual(decode_datum(enc(Tag(3,b'\x01\x00'))),{'int':-257})
         with self.assertRaises(Refusal):decode_datum(enc('bad'))
+
+class AuxiliaryDataTests(unittest.TestCase):
+    """Anyone can put well-formed auxiliary data of any shape on chain; only malformed bytes refuse."""
+    def test_any_nesting_and_repeated_keys_are_skipped(self):
+        label=b'\xa1\x19\x02\xa2'  # {674: ...}
+        cases={'1000 nested arrays':label+b'\x81'*1000+b'\x00','1000 nested maps':label+b'\xa1\x00'*1000+b'\x00',
+               '1000 nested indefinite arrays':label+b'\x9f'*1000+b'\x00'+b'\xff'*1000,'repeated key':label+b'\xa2\x61k\x01\x61k\x02',
+               'tagged map, indefinite repeated key, native script':b'\xd9\x01\x03\xa2\x00'+label+b'\xbf\x61k\x01\x61k\x02\xff\x01\x81\x82\x00\x58\x1c'+b's'*28,
+               'indefinite strings':label+b'\x82\x5f\x41a\x41b\xff\x7f\x61a\x61b\xff'}
+        for name,auxiliary in cases.items():
+            with self.subTest(name):
+                b={**body(),7:hashlib.blake2b(auxiliary,digest_size=32).digest()}
+                raw,h=tx(b,auxiliary=auxiliary);d=decode_transaction(raw,h);start,end=d.pop('auxiliary_data_span')
+                self.assertEqual(bytes.fromhex(raw)[start:end],auxiliary)
+                plain=decode_transaction(*tx(b));plain.pop('auxiliary_data_span')
+                self.assertEqual(d,plain)
+    def test_malformed_auxiliary_data_refuses_with_existing_codes(self):
+        for auxiliary,code in [(b'\x82\x00','cbor_truncated'),(b'\x9f\x00','cbor_truncated'),(b'\x5b'+b'\xff'*8,'cbor_truncated'),
+                               (b'\x9b\x00\x00\x00\x01\x00\x00\x00\x00','cbor_item_limit'),(b'\x1c','cbor_reserved_encoding'),
+                               (b'\xff','cbor_unsupported_simple'),(b'\xbf\x00\xff','cbor_unsupported_simple'),(b'\xfb'+b'\x00'*8,'cbor_unsupported_simple'),
+                               (b'\x3f','cbor_invalid_integer'),(b'\x5f\x61a\xff','cbor_invalid_chunks'),(b'\x61\xff','cbor_invalid_utf8'),
+                               (b'\xdf\x00','cbor_invalid_tag'),(b'\xf6\x00','cbor_trailing_bytes')]:
+            with self.subTest(code=code,auxiliary=auxiliary.hex()):
+                with self.assertRaisesRegex(Refusal,'^'+code+'$'):decode_transaction(*tx(body(),auxiliary=auxiliary))
+    def test_body_limits_unchanged(self):
+        deep=0
+        for _ in range(100):deep=[deep]
+        with self.assertRaisesRegex(Refusal,'^cbor_depth_limit$'):decode_transaction(*tx({**body(),1:deep}))
+        repeated=b'\xa4'+enc(0)+enc([[b'a'*32,0]])+enc(1)+enc([])+enc(2)+enc(3)+enc(2)+enc(3)
+        with self.assertRaisesRegex(Refusal,'^cbor_duplicate_map_key$'):decode_transaction((b'\x84'+repeated+b'\xa0\xf5\xf6').hex(),'00'*32)
+    def test_skip_reads_exactly_what_item_reads(self):
+        """Same bytes, item budget and reason codes as `item`, except nesting depth and map keys."""
+        rng=random.Random(19)
+        def gen(depth=0):
+            kind=rng.randrange(9 if depth<5 else 5);n=rng.randrange(4)
+            items=lambda count:b''.join(gen(depth+1) for _ in range(count))
+            if kind==0:return bytes([rng.randrange(24)])
+            if kind==1:return b'\x38'+bytes([rng.randrange(256)])
+            if kind==2:return b'\x43abc'
+            if kind==3:return b'\x7f\x61a\x61b\xff'
+            if kind==4:return bytes([rng.choice((0xf4,0xf5,0xf6))])
+            if kind==5:return bytes([0x80+n])+items(n)
+            if kind==6:return bytes([0xa0+n])+items(2*n)
+            if kind==7:return (b'\x9f'+items(n) if rng.random()<.5 else b'\xbf'+items(2*n))+b'\xff'
+            return b'\xd8\x79'+gen(depth+1)
+        for _ in range(3000):
+            data=bytearray(gen())
+            if rng.random()<.5:
+                at=rng.randrange(len(data));op=rng.randrange(3)
+                if op==0:data[at]=rng.randrange(256)
+                elif op==1:del data[at:]
+                else:data.insert(at,rng.randrange(256))
+            limits={'max_depth':rng.choice((64,2)),'max_items':rng.choice((200000,6))};outcomes=[]
+            for read in (Decoder.item,Decoder.skip):
+                d=Decoder(bytes(data),**limits)
+                try:read(d);outcomes.append((d.pos,d.remaining))
+                except Refusal as e:outcomes.append(str(e))
+            if outcomes[0] not in ('cbor_depth_limit','cbor_duplicate_map_key','cbor_unsupported_map_key'):
+                self.assertEqual(outcomes[1],outcomes[0],bytes(data).hex())
 
 if __name__=='__main__':unittest.main()
