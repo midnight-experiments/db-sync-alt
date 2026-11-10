@@ -435,16 +435,17 @@ class ServedTablesTests(unittest.TestCase):
         backup(archive, manifest, conninfo=dsn)
         body = json.loads(manifest.read_text())
         self.assertEqual((body['format'], body['schema_version']), ('db-sync-alt-postgresql-backup-v4', 5))
-        self.assertEqual(set(k for k in body['physical_inventory'] if k.startswith('serve.')), {'serve.' + t for t in serve.TABLES})
+        served = (*serve.TABLES, serve.BRIDGE)
+        self.assertEqual(set(k for k in body['physical_inventory'] if k.startswith('serve.')), {'serve.' + t for t in served})
         role = self.reader()
         restored = self.database()
         result = restore(archive, manifest, conninfo=restored, reader_role=role)
         self.assertEqual(result['reader']['relations'], ['public.' + n for n in NODE_RELATIONS])
         with psycopg.connect(restored) as db:
             # Planner statistics are gathered before the restored database serves.
-            self.assertEqual(db.execute("SELECT count(*) FROM pg_stat_user_tables WHERE schemaname='serve' AND last_analyze IS NOT NULL").fetchone()[0], len(serve.TABLES))
+            self.assertEqual(db.execute("SELECT count(*) FROM pg_stat_user_tables WHERE schemaname='serve' AND last_analyze IS NOT NULL").fetchone()[0], len(served))
         with psycopg.connect(dsn) as a, psycopg.connect(restored) as b:
-            for table in serve.TABLES:
+            for table in served:
                 query = 'SELECT * FROM serve.%s ORDER BY %s' % (table, serve.KEYS[table])
                 self.assertEqual(a.execute(query).fetchall(), b.execute(query).fetchall(), table)
         client = TypedClient(make_conninfo(restored, user=role), timeout=20).connect()

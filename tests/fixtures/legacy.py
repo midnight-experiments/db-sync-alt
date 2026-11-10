@@ -1,8 +1,8 @@
 """Stores of the nonce-only fact format, as releases before epoch parameters wrote them (test support only).
 
 Inside `nonce_only()` the service code runs with that release's fact format: the
-`midnight-compact-cardano-v1` contract, epoch facts `(epoch, nonce)`, generations without the
-`epoch_max_tx_size_v1` capability, schema 4 as the current schema (its serving gate and its
+`midnight-compact-cardano-v1` contract, epoch facts `(epoch, nonce)`, no tx_metadata family,
+generations without the `epoch_max_tx_size_v1` and `bridge_metadata_v1` capabilities, schema 4 as the current schema (its serving gate and its
 relevance-anchor guard) and no stored `max_tx_size` column. Everything else is the same code, so a
 store built here has the shape a nonce-only release gives it: generations, receipts, seals,
 integrity checkpoints and relevance anchors. Leaving the context, the same store is what this
@@ -16,8 +16,10 @@ from db_sync_alt.sources.blockfrost import adapter, follow
 from db_sync_alt.store import database, reader, upgrade
 from db_sync_alt.verify import store as verification
 
-# The nonce-only release created chain.epoch_nonces without max_tx_size and its schema-1 view over it.
-NONCE_ONLY_DDL = """DROP VIEW public.epoch_param;
+# The nonce-only release created chain.epoch_nonces without max_tx_size, its schema-1 view over it and
+# no bridge metadata family.
+NONCE_ONLY_DDL = """DROP TABLE chain.tx_metadata;
+DROP VIEW public.epoch_param;
 ALTER TABLE chain.epoch_nonces DROP COLUMN max_tx_size;
 CREATE VIEW public.epoch_param AS SELECT epoch AS epoch_no,nonce FROM chain.epoch_nonces WHERE first_generation<=(SELECT id FROM chain.ready_generation);"""
 
@@ -53,7 +55,7 @@ def nonce_only():
     with contextlib.ExitStack() as stack:
         for module in (contract, database, verification):
             stack.enter_context(patch.object(module, 'FORMAT', contract.LEGACY_FORMAT))
-        stack.enter_context(patch.dict(contract.TABLES, {'epoch_nonces': contract.LEGACY_TABLES['epoch_nonces']}))
+        stack.enter_context(patch.dict(contract.TABLES, contract.LEGACY_TABLES, clear=True))
         stack.enter_context(patch.dict(contract.NUMERIC_FIELDS, {'epoch_nonces': contract.LEGACY_NUMERIC_FIELDS['epoch_nonces']}))
         stack.enter_context(patch.object(contract, 'CAPABILITIES', dict(contract.LEGACY_CAPABILITIES)))
         stack.enter_context(patch.object(contract, 'contract_for', contract_for))

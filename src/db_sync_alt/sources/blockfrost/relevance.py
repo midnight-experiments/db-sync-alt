@@ -423,8 +423,9 @@ def compare_outputs(decoded,rows,network):
         # they cannot alias any of the checksum-validated Shelley profile addresses.
         if actual['value']!=expected['value'] or expected.get('datum_known',True) and actual['datum_hash']!=expected['datum_hash'] or assets!={(p,n):q for p,n,q in expected['assets']}:raise Refusal('provider_output_cbor_mismatch')
 
-def inventory(facts):
-    families={table:{} for table in TABLES}
+def inventory(facts,tables=TABLES):
+    """Key/hash inventory of facts, one entry per family of `tables` (a generation's sealed families)."""
+    families={table:{} for table in tables}
     for table,row in facts:
         value={k:jsonable(row[k]) for k in TABLES[table]}
         if table in ('inputs','output_assets'):value['ordinal']=row['ordinal']
@@ -446,8 +447,9 @@ class CertifiedReadView:
         return self.store.fact(table,key)
 
 def verify_inventory(store,generation,expected):
-    if not isinstance(expected,dict) or set(expected)!=set(TABLES):raise Refusal('relevance_inventory_invalid')
-    actual=[];known={table:set() for table in TABLES};count=0
+    families=store.sealed_tables(generation)
+    if not isinstance(expected,dict) or set(expected)!=set(families):raise Refusal('relevance_inventory_invalid')
+    actual=[];known={table:set() for table in families};count=0
     for table,entry in expected.items():
         if not isinstance(entry,dict) or set(entry)!={'keys','count','sha256'} or type(entry['count']) is not int or not isinstance(entry['keys'],list) or len(entry['keys'])!=entry['count']:raise Refusal('relevance_inventory_invalid')
         for rawkey in entry['keys']:
@@ -458,7 +460,7 @@ def verify_inventory(store,generation,expected):
             if row is None:raise Refusal('independent_provider_mismatch')
             if table in ('inputs','output_assets'):row={**row,'ordinal':store.ordinal(table,key)}
             actual.append((table,row));known[table].add(canonical(rawkey))
-    if inventory(actual)!=expected:raise Refusal('independent_provider_mismatch')
+    if inventory(actual,families)!=expected:raise Refusal('independent_provider_mismatch')
     return known
 
 def verify_generation(store,generation):
@@ -486,7 +488,7 @@ def verify_generation(store,generation):
         for table,keys in checked.items():known[table].update(keys)
     if sum(map(len,known.values()))>MAX_KEYS:raise Refusal('relevance_work_unit_limit')
     from db_sync_alt.store.incremental import delta_rows
-    for table in TABLES:
+    for table in store.sealed_tables(generation):
         for row in delta_rows(store,table,generation):
             if table in ('blocks','epoch_nonces','epoch_stakes'):continue  # Separate complete metadata/epoch checks.
             if canonical(jsonable([row[k] for k in KEYS[table]])) not in known[table]:raise Refusal('independent_provider_extra_fact')

@@ -198,7 +198,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
                              'target':{'height':target,'hash':targetrow['hash'].hex()},
                              'witness':{'height':witness,'hash':witnessrow['hash'].hex()}},
                   'required_epochs':required_epochs(startepoch,targetrow['epoch']),
-                  'capabilities':generation_capabilities(),
+                  'capabilities':generation_capabilities(bridge_metadata=True),
                   'parent_ref':integrity_reference(ready)}
         if coverage is not None:manifest['relevance_coverage']=coverage
         with store.atomic():

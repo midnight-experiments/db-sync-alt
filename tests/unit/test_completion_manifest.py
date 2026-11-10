@@ -21,6 +21,9 @@ class RetainedManifestTests(unittest.TestCase):
             def checkpoint_rows(self,**kw):return []
             # Recorded by a release before epoch parameters: sealed in the nonce-only format.
             def legacy_generation(self,n):return True
+            def sealed_tables(self,n):
+                from db_sync_alt.contract import LEGACY_TABLES
+                return LEGACY_TABLES
         final,latest=prepare_finalization(Store(),3,original,{'fixture':True},original['digests'])
         self.assertIsNone(latest);self.assertEqual(final['completion']['semantic']['anchors'],original['anchors'])
         self.assertEqual({k:v for k,v in final.items() if k!='completion'},original)

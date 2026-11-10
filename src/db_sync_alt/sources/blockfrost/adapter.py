@@ -427,7 +427,7 @@ def update(store,provider,profile,end_height=None,*,hooks,relevance_enabled=Fals
         startepoch=store.block_at(ready['id'],ready['start_height'])['epoch']
         manifest={'identity':profile.identity,'contracts':digest(profile.contract),'source_identity':profile.network.source_identity,
                   'anchors':{'start':ready['manifest']['anchors']['start'],'target':{'height':target,'hash':targetrow['hash'].hex()},'witness':{'height':target+k,'hash':witnessrow['hash'].hex()}},
-                  'required_epochs':required_epochs(startepoch,targetrow['epoch']),'capabilities':generation_capabilities(),'parent_digest':digest(ready['manifest']['digests'])}
+                  'required_epochs':required_epochs(startepoch,targetrow['epoch']),'capabilities':generation_capabilities(bridge_metadata=True),'parent_digest':digest(ready['manifest']['digests'])}
         with store.atomic():
             gen=store.begin_generation(source='blockfrost-cardano',start=profile.start,target=target,witness=target+k,manifest=manifest,parent=ready['id'])
             store.checkpoint(gen,'metadata','inherited',{'lo':ready['start_height'],'hi':ready['target_height'],'parent':ready['id'],'parent_digest':manifest['parent_digest'],'source_kind':'generation-inheritance','inherited_source_kind':ready['source']})

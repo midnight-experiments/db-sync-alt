@@ -11,7 +11,7 @@ import unittest
 from fixtures.service import READER
 
 from db_sync_alt import networks
-from db_sync_alt.contract import Profile, Refusal, digest
+from db_sync_alt.contract import TABLES, Profile, Refusal, digest
 from db_sync_alt.resources import data_dir, profile_dir
 
 
@@ -284,13 +284,14 @@ class StartAtBlockZeroTests(unittest.TestCase):
                           'target_height': target, 'witness_height': target + 432}
             independent = {'version': 1, 'scope': 'independent-new-facts-and-membership-with-certified-parent',
                            'parent_digest': None, 'ranges': ranges, 'epochs': [],
-                           'inventory': {t: {'count': 0, 'sha256': '0' * 64} for t in ('blocks', 'transactions', 'outputs', 'inputs', 'assets', 'output_assets', 'mints', 'datums', 'epoch_nonces', 'epoch_stakes')}}
+                           'inventory': {t: {'count': 0, 'sha256': '0' * 64} for t in TABLES}}
             independent['inventory']['blocks']['count'] = target + 433 - start
             manifest = {'parent_digest': None, 'required_epochs': [], 'digests': {},
                         'acquisition': {'version': 1, 'window_blocks': 1000},
                         'validation': {'independent': independent, 'digests': {}}}
             class Store:
                 def checkpoint_rows(self, **kw): return []
+                def sealed_tables(self, generation): return TABLES
             return Store(), generation, manifest, {'independent': independent}
         ranges = [['metadata', 0, 435], ['events', 0, 3]]
         validate_sql_receipt(*receipt(0, 3, ranges))

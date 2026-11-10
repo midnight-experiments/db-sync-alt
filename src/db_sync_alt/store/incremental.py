@@ -3,7 +3,7 @@ import copy
 import hashlib
 from dataclasses import dataclass,field
 from psycopg.types.json import Jsonb
-from db_sync_alt.contract import TABLES,KEYS,Refusal,canonical,digest,jsonable,validate_numeric
+from db_sync_alt.contract import KEYS,Refusal,canonical,digest,jsonable,validate_numeric
 
 VERSION=2
 KIND_V1='certified-parent-delta-v1'
@@ -261,14 +261,16 @@ def _membership_inventory(store,gen,*,removed=False):
 def compute_proof(store,g):
     gen=g['id'];m=g['manifest'];parent=store.generation(g['parent']);reuse=store.db.execute('SELECT through_height,receipt FROM chain.generation_reuse WHERE generation=%s',(gen,)).fetchone()
     if not reuse:raise Refusal('metadata_reuse_missing')
-    facts={};legacy=store.legacy_generation(gen)
-    for table in TABLES:
+    facts={};legacy=store.legacy_generation(gen);families=store.sealed_tables(gen)
+    for table in families:
         def validated():
             for row in delta_rows(store,table,gen):validate_numeric(table,row,legacy=legacy);yield row
         facts[table]=inventory(validated());store.progress('delta_family_complete',generation=gen,family=table,rows=facts[table]['count'])
     added=_membership_inventory(store,gen);removed=_membership_inventory(store,gen,removed=True)
     oldcounts=parent['manifest']['integrity']['semantic']['counts'] if incremental(parent) else {k:v['count'] for k,v in parent['manifest']['digests'].items()}
-    counts={k:oldcounts[k]+facts[k]['count'] for k in TABLES};counts['blocks']=oldcounts['blocks']-removed['count']+added['count']
+    # A family the parent was not sealed over (bridge metadata after a nonce-only parent) starts at zero.
+    inherited=store.sealed_tables(parent['id'])
+    counts={k:(oldcounts[k] if k in inherited else 0)+facts[k]['count'] for k in families};counts['blocks']=oldcounts['blocks']-removed['count']+added['count']
     checkpoints=[]
     for row in store.checkpoint_rows(generation=gen):
         if row['phase'] in ('final-anchors','completion-revalidation'):continue
@@ -324,7 +326,8 @@ def _validate_completion_v2(store,g,*,proof=None,require_seal=False,manifest=Non
     from db_sync_alt.verify.completion import _hash
     if not isinstance(semantic,dict) or set(semantic)!=expected_keys or 'digests' in m:raise Refusal('completion_invalid')
     if kind==KIND_V2 and not _hash(m[key]):raise Refusal('completion_invalid')
-    if set(semantic.get('facts',{}))!=set(TABLES) or set(semantic.get('counts',{}))!=set(TABLES):raise Refusal('completion_invalid')
+    families=set(store.sealed_tables(g['id']))
+    if set(semantic.get('facts',{}))!=families or set(semantic.get('counts',{}))!=families:raise Refusal('completion_invalid')
     for value in semantic['facts'].values():
         if not isinstance(value,dict) or set(value)!={'count','sha256'} or type(value['count']) is not int or value['count']<0 or not _hash(value['sha256']):raise Refusal('completion_invalid')
     if any(type(n) is not int or n<0 for n in semantic['counts'].values()) or not _hash(semantic['checkpoints_sha256']):raise Refusal('completion_invalid')

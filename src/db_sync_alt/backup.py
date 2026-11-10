@@ -171,8 +171,8 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
         if str(ready) not in body['generations']:raise Refusal('invalid_backup_canonical')
         if store.serves_directly:
             # A restore carries no planner statistics: gather them before the node is served.
-            from db_sync_alt.store.serve import TABLES as SERVED
-            db.execute('ANALYZE '+','.join('serve.'+t for t in SERVED))
+            from db_sync_alt.store.serve import tables as served
+            db.execute('ANALYZE '+','.join('serve.'+t for t in served(db)))
         with db.transaction():
             db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
             # Observations are runtime state; startup must refresh before healthy.
