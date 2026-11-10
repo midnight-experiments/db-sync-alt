@@ -395,7 +395,7 @@ class Discovery:
         refs=decoded['ordinary']|(decoded['collateral'] if not decoded['valid'] else frozenset())
         return any(self.contains(key) for key in refs) or any(self.profile.required(p,n) for p,n,_ in decoded['mints'])
     def advance(self,decoded,outputs):
-        if not decoded['valid']:return
+        """Record the relevant outputs the transaction created (a phase-2-invalid one: its collateral return)."""
         from db_sync_alt.sources.blockfrost.adapter import output_value
         for row in outputs:
             value,assets=output_value(row)
