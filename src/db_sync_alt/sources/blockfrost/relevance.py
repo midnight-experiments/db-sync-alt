@@ -59,6 +59,31 @@ def _encode_address(raw,network):
     check=_polymod(_expand(hrp)+data+[0]*6)^1
     return hrp+'1'+''.join(ALPHABET[x] for x in data+[check>>(5*(5-i))&31 for i in range(6)])
 
+def _varint(value):
+    groups=[value&127];value>>=7
+    while value:groups.append(value&127|128);value>>=7
+    return bytes(reversed(groups))
+
+def canonical_address(raw):
+    """The address bytes the ledger keeps and cardano-db-sync renders. A pointer address (header 4 or 5)
+    holds its slot (at most 32 bits) and transaction and certificate indexes (at most 16 bits) as
+    big-endian 7-bit groups; from protocol version 9 the ledger accepts redundant leading zero groups
+    and re-serialises them minimally. Any other address, or one that is not a well-formed pointer, is
+    returned unchanged."""
+    if not isinstance(raw,bytes) or len(raw)<30 or raw[0]>>4 not in (4,5):return raw
+    position=29;values=[]
+    for width,bits in ((5,32),(3,16),(3,16)):
+        value=0
+        for _ in range(width):
+            if position>=len(raw):return raw
+            byte=raw[position];position+=1;value=value<<7|byte&127
+            if not byte&128:break
+        else:return raw
+        if value>>bits:return raw
+        values.append(value)
+    if position!=len(raw):return raw
+    return raw[:29]+b''.join(_varint(v) for v in values)
+
 def _hashed(value):return isinstance(value,str) and re.fullmatch('[0-9a-f]{64}',value) is not None
 
 def _reference(value):
@@ -404,7 +429,10 @@ class Discovery:
         if len(self.created)>MAX_KEYS:raise Refusal('relevance_work_unit_limit')
 
 def compare_outputs(decoded,rows,network):
-    """Hash-bound CBOR values must equal the selected full provider response."""
+    """Hash-bound CBOR values must equal the selected full provider response, as cardano-db-sync renders
+    them: a pointer address in its canonical form, and a valid transaction's collateral return (the row
+    marked collateral, from cardano-db-sync's collateral_tx_out) with its lovelace, whose assets Blockfrost
+    does not list. That output is never created, so it is never stored."""
     from db_sync_alt.sources.blockfrost.adapter import output_value
     values=list(decoded.get('outputs',()))
     if decoded.get('collateral_return'):values.append(decoded.get('collateral_output'))
@@ -418,10 +446,12 @@ def compare_outputs(decoded,rows,network):
         if address is not None:
             if actual['address']!=address:raise Refusal('provider_output_cbor_mismatch')
         elif actual['address'].startswith(('addr1','addr_test1')):
-            if address_bytes(actual['address'],network,require_supported=False)!=expected['address']:raise Refusal('provider_output_cbor_mismatch')
+            if address_bytes(actual['address'],network,require_supported=False)!=canonical_address(expected['address']):raise Refusal('provider_output_cbor_mismatch')
         # Opaque legacy encodings still use the original trusted provider path;
         # they cannot alias any of the checksum-validated Shelley profile addresses.
-        if actual['value']!=expected['value'] or expected.get('datum_known',True) and actual['datum_hash']!=expected['datum_hash'] or assets!={(p,n):q for p,n,q in expected['assets']}:raise Refusal('provider_output_cbor_mismatch')
+        expected_assets={(p,n):q for p,n,q in expected['assets']}
+        listed=(expected_assets,{}) if row.get('collateral') is True else (expected_assets,)
+        if actual['value']!=expected['value'] or expected.get('datum_known',True) and actual['datum_hash']!=expected['datum_hash'] or assets not in listed:raise Refusal('provider_output_cbor_mismatch')
 
 def inventory(facts,tables=TABLES):
     """Key/hash inventory of facts, one entry per family of `tables` (a generation's sealed families)."""
