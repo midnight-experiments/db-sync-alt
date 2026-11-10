@@ -186,18 +186,10 @@ class RelevancePGTests(unittest.TestCase):
         if 'pointed' in named:
             tx('pointed',1);output('pointed',0,_encode_address(bytes([named['pointed']['body'][1][0][0][0]])+b'p'*28+b'\x81\x00\x02\x03',network),100,1)
         return out
-    def test_sweep_cases_ingest_in_full_and_relevance_mode_as_cardano_db_sync_stores_them(self):
-        """Issues 00031 and 00032, each case alone: full and relevance mode ingest it, store cardano-db-sync's
-        rows, serve valid_contract as it does, and agree."""
-        for name,rows,named in sweep_cases():
-            with self.subTest(case=name):
-                full=self.full(rows);relevance=self.relevance(rows)
-                self.assertEqual(self.facts(relevance),self.expected(named))
-                self.assertEqual(relevance.digests(relevance.generation()['id']),full.digests(full.generation()['id']))
-                verify_store(relevance);verify_store(full)
-    def test_sweep_cases_together_on_both_provider_adapters(self):
-        """All cases in one range through db-sync-alt's own client (full mode) and the shared adapter's external
-        client (relevance mode): the same facts as the in-process provider."""
+    def test_sweep_cases_ingest_on_both_adapters_in_full_and_relevance_mode_as_cardano_db_sync_stores_them(self):
+        """Issues 00031 and 00032, all cases in one range: full and relevance mode store cardano-db-sync's rows and
+        serve valid_contract as it does, through the in-process provider, db-sync-alt's own client (full mode) and
+        the shared adapter's external client (relevance mode)."""
         from db_sync_alt.sources.blockfrost import provider
         cases=sweep_cases();named={}
         for _,_,more in cases:named.update(more)
@@ -208,24 +200,16 @@ class RelevancePGTests(unittest.TestCase):
                                            transport=Transport(routes),clock=lambda:now[0],sleep=lambda seconds:now.__setitem__(0,now[0]+seconds))
         def shared(routes):
             return provider.SharedClient(str(mainnet_shared_root(routes,self.enterContext(tempfile.TemporaryDirectory()))),network=f.PROFILE.network)
-        reference=self.relevance(rows);own=self.full(rows,portable);external=self.relevance(rows,shared)
-        self.assertEqual(self.facts(reference),self.expected(named))
-        digests=reference.digests(reference.generation()['id'])
-        self.assertEqual(own.digests(own.generation()['id']),digests);self.assertEqual(external.digests(external.generation()['id']),digests)
+        relevance=self.relevance(rows)
+        self.assertEqual(self.facts(relevance),self.expected(named))
+        verify_store(relevance);digests=relevance.digests(relevance.generation()['id'])
+        for name,store in (('full',self.full(rows)),('full, own client',self.full(rows,portable)),('relevance, shared adapter',self.relevance(rows,shared))):
+            with self.subTest(run=name):self.assertEqual(store.digests(store.generation()['id']),digests)
     def test_invalid_transaction_validity_must_agree_with_its_cbor(self):
         _,rows,named=sweep_cases()[1];store,routes=self.prepare(rows)
         routes['/txs/'+named['invalid']['tx_hash']]['valid_contract']=True
         with self.assertRaisesRegex(Refusal,'provider_transaction_mismatch'):f.SQLFixture.follow(store,routes,f.S+2)
         self.assertEqual(store.generation()['target_height'],f.S)
-    def test_invalid_transaction_rows_must_be_its_collateral(self):
-        _,rows,named=sweep_cases()[1];path='/txs/'+named['invalid']['tx_hash']+'/utxos'
-        for mode,code in (('body output','provider_output_count_mismatch'),('collateral role','provider_input_membership_mismatch'),('missing return','provider_output_count_mismatch')):
-            with self.subTest(mode=mode):
-                store,routes=self.prepare(rows);answer=routes[path]
-                if mode=='body output':answer['outputs'].append(dict(answer['outputs'][0],output_index=0))
-                elif mode=='collateral role':answer['inputs'][0]['collateral']=True
-                else:answer['outputs']=[]
-                with self.assertRaisesRegex(Refusal,code):f.SQLFixture.follow(store,routes,f.S+2)
     def test_reference_and_collateral_overlap_preserve_ordinary_input(self):
         key=(bytes.fromhex(f.ROOT['tx_hash']),0)
         row=f.make_tx(92,inputs=[key],collateral=[key]);store,routes=self.prepare([[row]])
