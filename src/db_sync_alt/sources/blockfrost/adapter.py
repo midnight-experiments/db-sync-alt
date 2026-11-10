@@ -231,8 +231,94 @@ def inventory(provider,block):
     if len(txs)!=block['tx_count']:raise Refusal('provider_transaction_count_mismatch')
     return txs
 
+# Retired pools can still hold stake in an epoch: its distribution is the snapshot taken one epoch earlier,
+# before that boundary reaps retiring pools. Pools retired at E - 2 or later are read for epoch E.
+RETIRED_WINDOW = 2
+MAX_POOLS = 100000
+
+
+def _pool_rows(rows):
+    if not isinstance(rows, list) or len(rows) > 100:raise Refusal('provider_bad_page')
+    return rows
+
+
+def retired_pools(provider, epoch):
+    """Pool IDs retired at epoch `epoch - RETIRED_WINDOW` or later, newest first."""
+    out = []
+    for page in range(1, 10001):
+        rows = _pool_rows(provider.get('/pools/retired?' + urlencode({'count': 100, 'page': page, 'order': 'desc'})))
+        for r in rows:
+            if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
+            if integer(r.get('epoch')) < epoch - RETIRED_WINDOW:return out
+            pool_hash(r.get('pool_id'));out.append(r['pool_id'])
+        if len(rows) < 100:return out
+    raise Refusal('provider_page_limit')
+
+
+def _add(pools, pool_id, amount):
+    key = pool_hash(pool_id)
+    if key in pools:raise Refusal('provider_duplicate_or_invalid_stake')
+    pools[key] = (pool_id, amount)
+    if len(pools) > MAX_POOLS:raise Refusal('provider_epoch_size_limit')
+
+
+def current_pool_stakes(provider, epoch, *, stake_prefix):
+    """Per-pool stake of the current epoch: `/pools/extended` and the retired window through `/pools/{id}`, each
+    the sum of the epoch's epoch_stake rows of that pool. A pool with sum 0 holds rows only if the epoch's per-address
+    listing of that pool is non-empty."""
+    pools = {}
+    for rows in provider.pages('/pools/extended'):
+        for r in rows:
+            if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
+            _add(pools, r.get('pool_id'), integer(r.get('active_stake')))
+    for pool_id in retired_pools(provider, epoch):
+        if pool_hash(pool_id) in pools:continue  # retired, then registered again
+        r = provider.get('/pools/' + pool_id)
+        if not isinstance(r, dict) or r.get('pool_id') != pool_id:raise Refusal('provider_duplicate_or_invalid_stake')
+        _add(pools, pool_id, integer(r.get('active_stake')))
+    out = {}
+    for key, (pool_id, amount) in pools.items():
+        if amount == 0:
+            rows = _pool_rows(provider.get('/epochs/' + str(epoch) + '/stakes/' + pool_id + '?count=1&page=1'))
+            if not rows:continue
+            if not isinstance(rows[0], dict) or not isinstance(rows[0].get('stake_address'), str) or not rows[0]['stake_address'].startswith(stake_prefix):
+                raise Refusal('provider_duplicate_or_invalid_stake')
+        out[key] = amount
+    return out
+
+
+def historical_pool_stakes(provider, epoch):
+    """Per-pool stake of a completed epoch: every registered pool and the retired window, from each pool's history
+    (a row exists exactly where the pool has epoch_stake rows in that epoch)."""
+    candidates = {}
+    for rows in provider.pages('/pools'):
+        for pool_id in rows:
+            _add(candidates, pool_id, None)
+    for pool_id in retired_pools(provider, epoch):
+        if pool_hash(pool_id) not in candidates:_add(candidates, pool_id, None)
+    out = {}
+    for key, (pool_id, _) in sorted(candidates.items()):
+        for page in range(1, 10001):
+            rows = _pool_rows(provider.get('/pools/' + pool_id + '/history?' + urlencode({'count': 100, 'page': page, 'order': 'desc'})))
+            done = len(rows) < 100
+            for r in rows:
+                if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
+                row_epoch = integer(r.get('epoch'))
+                if row_epoch == epoch:
+                    if integer(r.get('delegators_count')) < 1:raise Refusal('provider_duplicate_or_invalid_stake')
+                    out[key] = integer(r.get('active_stake'))
+                if row_epoch <= epoch:done = True;break
+            if done:break
+        else:raise Refusal('provider_page_limit')
+    return out
+
+
 def epoch_facts(provider,epoch,target=None,*,stake_prefix):
-    """Two complete unique-address reads, total/nonce/max_tx_size/end-anchor equality."""
+    """Two complete per-pool reads of an epoch's stake distribution, with total/nonce/max_tx_size/end-anchor equality.
+
+    The facts are the SQL path's per-pool sums. Requests grow with the number of pools, never with the number of
+    delegated addresses: the current epoch (the latest block's) through `/pools/extended`, a completed one through each
+    pool's history."""
     def header():
         summary=provider.get('/epochs/'+str(epoch));params=provider.get('/epochs/'+str(epoch)+'/parameters')
         if summary.get('epoch')!=epoch or params.get('epoch')!=epoch or summary.get('active_stake') is None or params.get('nonce') is None:raise Refusal('provider_epoch_not_ready')
@@ -249,21 +335,23 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
         if target is not None and anchor['height']>target:
             anchor=block_row(provider.get('/blocks/'+str(target)))
             if anchor['height']!=target or anchor['epoch']!=epoch:raise Refusal('provider_epoch_anchor_mismatch')
-        return total,{'epoch':epoch,'nonce':nonce,'max_tx_size':size},anchor,completed
+        # The pool endpoints' "current epoch" is the latest block's epoch: read it the same way.
+        current=block_row(provider.get('/blocks/latest'))['epoch']
+        if current<epoch:raise Refusal('provider_epoch_not_ready')
+        return total,{'epoch':epoch,'nonce':nonce,'max_tx_size':size},anchor,completed,current
     first=header();reads=[]
+    source='pools-current' if first[4]==epoch else 'pools-history'
     for _ in range(2):
-        seen={};pools={};total=0
-        for rows in provider.pages('/epochs/'+str(epoch)+'/stakes'):
-            for r in rows:
-                address=r.get('stake_address')
-                if not isinstance(address,str) or not address.startswith(stake_prefix) or address in seen:raise Refusal('provider_duplicate_or_invalid_stake')
-                pool=pool_hash(r.get('pool_id'));amount=integer(r.get('amount'));seen[address]=(pool.hex(),str(amount));pools[pool]=pools.get(pool,0)+amount;total+=amount
-                if len(seen)>1000000:raise Refusal('provider_epoch_size_limit')
-        if not seen or total!=first[0]:raise Refusal('provider_epoch_total_mismatch')
-        reads.append((digest(seen),pools,len(seen)))
+        reads.append(current_pool_stakes(provider,epoch,stake_prefix=stake_prefix) if source=='pools-current' else historical_pool_stakes(provider,epoch))
+    # A boundary crossed during the reads moves the latest block's epoch: that is a wait (then the completed
+    # epoch is read from the pools' histories), checked before the sums, which such a read cannot match.
     last=header()
-    if first!=last or reads[0]!=reads[1]:raise Refusal('provider_epoch_changed')
-    return first[1],[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(reads[0][1].items())],first[2],{'max_tx_size':first[1]['max_tx_size'],'stake_addresses':reads[0][2],'stake_digest':reads[0][0],'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
+    if first!=last:raise Refusal('provider_epoch_changed')
+    for pools in reads:
+        if not pools or sum(pools.values())!=first[0]:raise Refusal('provider_epoch_total_mismatch')
+    if reads[0]!=reads[1]:raise Refusal('provider_epoch_changed')
+    pools=reads[0]
+    return first[1],[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(pools.items())],first[2],{'max_tx_size':first[1]['max_tx_size'],'stake_source':source,'stake_pools':len(pools),'stake_digest':digest({k.hex():str(v) for k,v in pools.items()}),'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
 
 class BlockfrostSource:
     def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False):
