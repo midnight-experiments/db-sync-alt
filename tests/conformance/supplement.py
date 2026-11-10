@@ -15,7 +15,10 @@ Expectations:
 
 The catalogue and the dynamic bridge builder come from the pinned midnight-node 2.1.101 reference.
 Literal presence does not prove the features or runtime paths of a native artifact.
-Bridge remains unqualified; these cases test its required refusal, not native compatibility.
+The bridge query (six binds, tx_in mode) must execute through the reader: tx_metadata is served from
+the metadata coverage start on. The corpus holds no bridge answer, so its rows are compared with a
+cardano-db-sync-shaped reference in the integration tests (tests/integration/test_bridge_metadata.py);
+whether a checkpoint lies in coverage is the operator's status report, which a reader cannot see.
 """
 import hashlib
 import re
@@ -50,9 +53,11 @@ REACH = {
     'get_utxos_for_address_tx_in_consumed': 'Off the run path: used only with TxInConfiguration::Consumed, which the node '
                                             'selects only when tx_in is missing or empty; the from_connection cases prove '
                                             'Enabled.',
-    'get_bridge_txs': 'The six catalogue entries are non-emitted bridge/reserve input/output components. The pinned '
-                      'builder assembles them into a six-bind query reading tx_metadata. Components are inventoried '
-                      'without execution and linked to final-query refusal cases. Bridge remains unqualified.',
+    'get_bridge_txs': 'On the run path once governance sets the bridge checkpoint: the six catalogue entries are '
+                      'non-emitted bridge/reserve input/output components the pinned builder assembles into a six-bind '
+                      'query reading tx_metadata. The tx_in-mode query must execute through the reader; the consumed-mode '
+                      'query is off the run path (the from_connection cases prove tx_in mode). Components are inventoried '
+                      'without execution and linked to the final queries.',
     'get_block_info_for_tx_hash': 'Bridge data source only (resolving a transaction checkpoint). The bridge capability is '
                                   'not supported: the endpoint may refuse, or answer exactly what db-sync answers.',
     'get_token_utxo_for_epoch#partner-chains': 'Not called by the node: it belongs to the partner-chains candidate data '
@@ -62,15 +67,18 @@ REACH = {
 }
 
 
-def bridge_query(configuration='Enabled'):
-    """Exact released builder, block checkpoint/no row limit, in either tx_in mode."""
+def bridge_query(configuration='Enabled', checkpoint=4500197):
+    """Exact released builder, block checkpoint/no row limit, in either tx_in mode: the query the node's
+    cached bridge source sends for checkpoint `Block(checkpoint)` (it reads the blocks from that one on)."""
     source = (data_dir('reference') / BRIDGE_SOURCE).read_bytes()
     if hashlib.sha256(source).hexdigest() != 'a016a1a87356905083c5f817fd8d4ac1b79e639ddd315b792689c51b223a813d':
         raise ValueError('unclassified bridge builder source')
     if configuration not in ('Enabled', 'Consumed'):
         raise ValueError('unknown bridge tx_in configuration')
     body = source.decode().split('pub(crate) async fn get_bridge_txs(', 1)[1]
-    substitutions = {'checkpoint_limit': 'block.block_no > 4500196', 'max_rows': 'null'}
+    if type(checkpoint) is not int or not 0 < checkpoint < 2**31:
+        raise ValueError('bridge checkpoint block')
+    substitutions = {'checkpoint_limit': 'block.block_no > ' + str(checkpoint - 1), 'max_rows': 'null'}
     for name in ('bridge_inputs_subquery', 'reserve_inputs_subquery'):
         block = re.search(r'let ' + name + r' = match tx_in_configuration \{([\s\S]*?)\n\t\};', body).group(1)
         substitutions[name] = re.search(r'TxInConfiguration::' + configuration + r' => \{\s*"([\s\S]*?)"', block).group(1)
@@ -139,7 +147,8 @@ def cases(profile, header, corpus_cases):
                     values=[profile.candidate, target], guard=['from_connection:tx_in-relation', 'from_connection:tx_in-populated']))
     queries = {mode: bridge_query(mode) for mode in ('Enabled', 'Consumed')}
     for mode, query in queries.items():
-        out.append(Case('get_bridge_txs:formatted-' + mode, None, 'error', sql=query,
+        expect, guard = ('complete', ()) if mode == 'Enabled' else ('observed', ('from_connection:tx_in-relation', 'from_connection:tx_in-populated'))
+        out.append(Case('get_bridge_txs:formatted-' + mode, None, expect, sql=query, guard=guard,
                         types=['text', 'text', 'bytea', 'bytea', 'int8', 'int4'], values=bridge_values(profile, target)))
     for entry in sorted(_all('get_bridge_txs'), key=lambda e: sha(e['sql'])):
         if not bridge_fragment(entry):

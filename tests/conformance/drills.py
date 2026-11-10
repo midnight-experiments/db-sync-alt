@@ -254,13 +254,30 @@ class Runner:
                  ('resolve_ident:night', ('statement', by_name('resolve_ident'), [bytes.fromhex(self.profile.night[:56]), bytes.fromhex(self.profile.night[56:])]), 1)]
         return self.outside_domain(queries, 'the node queries only the addresses and assets of its configuration, which the profile must equal (documented operator requirement)', edges)
 
+    def bridge_probe(self, mode):
+        return ('formatted', supplement.bridge_query(mode), ['text', 'text', 'bytea', 'bytea', 'int8', 'int4'],
+                supplement.bridge_values(self.profile, self.corpus.header['target']))
+
     def drill_bridge(self):
-        queries = [('bridge:formatted-' + mode, ('formatted', supplement.bridge_query(mode),
-                    ['text', 'text', 'bytea', 'bytea', 'int8', 'int4'],
-                    supplement.bridge_values(self.profile, self.corpus.header['target'])))
-                   for mode in ('Enabled', 'Consumed')]
-        queries.append(('bridge:tx_metadata', ('formatted', 'SELECT id, key, tx_id, json FROM tx_metadata LIMIT 1', [], [])))
-        return self.must_fail(queries)
+        """The node's bridge query (tx_in mode) and tx_metadata answer through the reader; the consumed-mode
+        query is outside the node's request domain (tx_in is populated). Whether the node's checkpoint lies
+        in the metadata coverage is the operator's status report (`bridge.checkpoint_supported`)."""
+        answered = [('bridge:formatted-Enabled', self.bridge_probe('Enabled')),
+                    ('bridge:tx_metadata', ('formatted', 'SELECT id, key, tx_id, json FROM tx_metadata LIMIT 1', [], []))]
+        results = []
+        for label, probe in answered:
+            answer = self.execute(probe)
+            results.append({'probe': label, 'answer': answer, 'verdict': 'error' if 'error' in answer else 'answered'})
+        consumed = self.execute(self.bridge_probe('Consumed'))
+        results.append({'probe': 'bridge:formatted-Consumed', 'answer': consumed, 'verdict': 'error' if 'error' in consumed else 'unreachable'})
+        exists = sorted((e for e in self.known.values() if e['name'] == 'from_connection'), key=lambda e: e['sql'].startswith('SELECT'))[1]
+        try:
+            populated = [dict(row) for row in self.endpoint.run(exists, []).rows]
+        except QueryError as error:
+            populated = error.summary()
+        ok = all(r['verdict'] == 'answered' for r in results[:2]) and populated == [{'exists': True}]
+        return ok, {'probes': results, 'tx_in_populated': populated,
+                    'coverage': 'db-sync-alt status --bridge-checkpoint block:<n>|tx:<hash> reports checkpoint_supported'}
 
     def watch(self, until_ready, limit, interval=1.0):
         """Probe repeatedly while the deployment changes state; stop after the first fully ready round."""

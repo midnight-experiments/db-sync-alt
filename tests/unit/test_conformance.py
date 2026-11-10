@@ -198,6 +198,10 @@ class SupplementTests(unittest.TestCase):
                     self.assertTrue(all(g.startswith('get_bridge_txs:formatted-') for g in case.guard))
                 elif case.statement is not None and not case.simple:
                     self.assertEqual(len(supplement.statement_types(case)), placeholders(case.sql or case.statement['sql']))
+        bridge = {c.label: c for c in cases if c.label.startswith('get_bridge_txs:formatted-')}
+        self.assertEqual({label: case.expect for label, case in bridge.items()},
+                         {'get_bridge_txs:formatted-Enabled': 'complete', 'get_bridge_txs:formatted-Consumed': 'observed'})
+        self.assertEqual(bridge['get_bridge_txs:formatted-Consumed'].guard, ('from_connection:tx_in-relation', 'from_connection:tx_in-populated'))
 
     def test_bridge_query_is_formatted_from_the_reference_source(self):
         for mode in ('Enabled', 'Consumed'):
@@ -214,6 +218,11 @@ class SupplementTests(unittest.TestCase):
                     self.assertIn('tx_out.consumed_by_tx_id IS NOT NULL', query)
         with self.assertRaisesRegex(ValueError, 'unknown bridge'):
             supplement.bridge_query('unknown')
+        # The node's cached source reads the blocks from the checkpoint block on.
+        self.assertIn('AND block.block_no > 4500196) AS bridge_tx_totals', supplement.bridge_query())
+        self.assertIn('AND block.block_no > 4500299) AS bridge_tx_totals', supplement.bridge_query(checkpoint=4500300))
+        with self.assertRaisesRegex(ValueError, 'bridge checkpoint'):
+            supplement.bridge_query(checkpoint=0)
 
     def test_bridge_values_follow_public_ICS_reserve_and_native_token_configuration(self):
         profile = Profile(profile_dir('preprod'))
@@ -224,26 +233,49 @@ class SupplementTests(unittest.TestCase):
                                  supplement.TOKEN_TRANSFER_METADATUM_KEY, 4500300])
         self.assertNotEqual(values[0], profile.mapping)
 
-    def test_components_are_not_executed_and_need_final_query_refusal(self):
+    def test_components_are_not_executed_and_need_their_final_query(self):
+        Case, types = supplement.Case, ['text', 'text', 'bytea', 'bytea', 'int8', 'int4']
         entry = statements()[min(BRIDGE_FRAGMENT_SHA256)]
-        component = supplement.Case('get_bridge_txs:component-test', entry, 'component',
-                                    guard=['get_bridge_txs:formatted-Enabled'])
-        final = supplement.Case('get_bridge_txs:formatted-Enabled', None, 'error', sql=supplement.bridge_query(),
-                                types=['text', 'text', 'bytea', 'bytea', 'int8', 'int4'], values=['ics', 'reserve', b'p', b'n', 1, 2])
+        component = Case('get_bridge_txs:component-test', entry, 'component', guard=['get_bridge_txs:formatted-Enabled'])
+        final = Case('get_bridge_txs:formatted-Enabled', None, 'complete', sql=supplement.bridge_query(),
+                     types=types, values=['ics', 'reserve', b'p', b'n', 1, 2])
         endpoint = mock.Mock()
         endpoint.calls = {'formatted': 0}
-        endpoint.client.query.side_effect = QueryError('statement', '42501')
+        endpoint.client.query.return_value = mock.Mock(rows=[], command='SELECT 0')
         corpus = mock.Mock(header={}, cases=[])
         with mock.patch.object(supplement, 'cases', return_value=[component, final]):
             results = run_supplement(endpoint, None, corpus, {})
         self.assertEqual(endpoint.client.query.call_count, 1)
         self.assertEqual(results[0]['outcome'], {'executed': False, 'kind': 'non_emitted_component'})
-        self.assertEqual((results[0]['verdict'], results[0]['guard_verdict']), ('component', 'pass'))
+        self.assertEqual((results[0]['verdict'], results[0]['guard_verdict'], results[1]['verdict']), ('component', 'pass', 'pass'))
+        # The reader refuses the bridge query: the final query and every component it holds fail.
+        endpoint.client.query.side_effect = QueryError('statement', '42501')
+        with mock.patch.object(supplement, 'cases', return_value=[component, final]):
+            results = run_supplement(endpoint, None, corpus, {})
+        self.assertEqual((results[1]['verdict'], results[0]['guard_verdict']), ('fail', 'fail'))
         endpoint.client.query.reset_mock()
         with mock.patch.object(supplement, 'cases', return_value=[component]):
             results = run_supplement(endpoint, None, corpus, {})
         endpoint.client.query.assert_not_called()
         self.assertEqual(results[0]['guard_verdict'], 'fail')
+
+    def test_an_observed_guard_holds_through_its_own_guards(self):
+        Case = supplement.Case
+        entry = statements()[min(BRIDGE_FRAGMENT_SHA256)]
+        reach = Case('from_connection:tx_in-populated', None, ('rows', [{'exists': True}]), sql='SELECT true AS exists', types=[])
+        consumed = Case('get_bridge_txs:formatted-Consumed', None, 'observed', sql=supplement.bridge_query('Consumed'),
+                        types=['text', 'text', 'bytea', 'bytea', 'int8', 'int4'], values=['ics', 'reserve', b'p', b'n', 1, 2],
+                        guard=['from_connection:tx_in-populated'])
+        component = Case('get_bridge_txs:component-test', entry, 'component', guard=['get_bridge_txs:formatted-Consumed'])
+        corpus = mock.Mock(header={}, cases=[])
+        for exists, verdict in ((True, 'pass'), (False, 'fail')):
+            endpoint = mock.Mock()
+            endpoint.calls = {'formatted': 0}
+            endpoint.client.query.side_effect = lambda sql, types, values, exists=exists: mock.Mock(
+                rows=[{'exists': exists}] if sql == 'SELECT true AS exists' else [], command='SELECT')
+            with self.subTest(exists=exists), mock.patch.object(supplement, 'cases', return_value=[reach, consumed, component]):
+                results = run_supplement(endpoint, None, corpus, {})
+                self.assertEqual((results[1]['verdict'], results[1]['guard_verdict'], results[2]['guard_verdict']), ('observed', verdict, verdict))
 
     def test_expectations_judge_refusals_and_answers(self):
         Case = supplement.Case
