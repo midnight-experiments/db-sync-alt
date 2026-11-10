@@ -83,6 +83,7 @@ def fixtures(fork=0,transition=False,auxiliary=(),witnesses=(),payments=(),spend
         page=route['/blocks/'+at(h)['hash']+'/txs/cbor?count=100&page=1&order=asc'];page.append({'tx_hash':th,'cbor':raw})
         route['/txs/'+th]={'hash':th,'block':at(h)['hash'],'block_height':OFFSET+h,'index':len(page)-1,'valid_contract':True}
         route['/txs/'+th+'/cbor']={'cbor':raw};route['/txs/'+th+'/utxos']={'hash':th,'inputs':inputs,'outputs':outputs}
+        route['/txs/'+th+'/metadata']=[]  # no metadata: read for a transaction with an output at the ICS address
     for payment,(raw,th) in zip(payments,paid):
         place(payment.height,raw,th,[],[payment_output(payment)])
         if not payment.inline:route['/scripts/datum/'+payment.hash.hex()+'/cbor']={'cbor':payment.datum.hex()} if payment.on_chain else NOT_FOUND
