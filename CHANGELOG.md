@@ -95,6 +95,13 @@
   nested deeper than about 60 levels or with a repeated map key. Anyone can
   submit such a transaction. The witness set must still be a map; its content
   is now read past without being decoded.
+- Fix Blockfrost following stopping for good at an epoch whose stake
+  distribution has more than about 499,000 delegated stake addresses
+  (Mainnet has more; anyone can register more). The epoch's stake is now read
+  per pool, the same per-pool sums cardano-db-sync acquisition stores: the
+  current epoch from the pool list, a completed epoch from each pool's history.
+  Requests grow with the number of pools (about 1,300 per new Mainnet epoch,
+  6,100 when catching up a completed one), never with delegated addresses.
 - Fix every update stopping at a payment to the registered-candidates address.
   Anyone can make one. Blockfrost acquisition and follow refused the block
   (`unsupported_nonempty_candidates`), verification refused a database holding
