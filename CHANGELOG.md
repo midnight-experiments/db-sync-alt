@@ -95,6 +95,23 @@
   nested deeper than about 60 levels or with a repeated map key. Anyone can
   submit such a transaction. The witness set must still be a map; its content
   is now read past without being decoded.
+- Fix every update stopping at a payment to the registered-candidates address.
+  Anyone can make one. Blockfrost acquisition and follow refused the block
+  (`unsupported_nonempty_candidates`), verification refused a database holding
+  such an output (`unsupported_candidate_activity`) and a cardano-db-sync
+  bootstrap refused a source holding one (`candidates_unsupported`); none of
+  them refuses now. The address is no longer one of the profile's addresses: an
+  output there is kept only when it carries one of the profile's assets, as at
+  any other address. midnight-node 2.1.101 selects committees without
+  registrations, and a test fails if the packaged node sources query them
+  again. The node's registration RPCs and subcommands
+  (`sidechain_getRegistrations`, `sidechain_getAriadneParameters`,
+  `systemParameters_getAriadneParameters`, `registration-status`,
+  `ariadne-parameters`) return no registrations, and fail when an output there
+  carries a profile asset and its transaction spends no output db-sync-alt
+  holds. Serving registrations is future work (midnight-node#1761). Updates of
+  the current format carry the capability `registered_candidates_unserved`;
+  updates sealed in the nonce-only format keep `candidates_empty`.
 
 ## 0.3.0
 

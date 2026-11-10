@@ -36,7 +36,7 @@ from a valid one:
   for; a node with a smaller k treats younger blocks as stable and asks for
   events db-sync-alt has not published yet. A larger k is harmless.
 - **Addresses and policies.** The node's Cardano addresses and policies (cNIGHT
-  mapping validator and asset, governance bodies, candidates, reserve and ICS)
+  mapping validator and asset, governance bodies, reserve and ICS)
   must be the profile's ([networks](networks.md)). They come from the node's
   network configuration, and Midnight governance can change some of them on
   chain; when that happens, update db-sync-alt's profile before the change takes
@@ -68,6 +68,26 @@ is.
 The reader cannot connect at all until db-sync-alt has restored or verified the
 database and granted it access: a node connected to an empty database would
 find no `tx_in` relation and remember that until it restarts.
+
+## Registered candidates
+
+db-sync-alt serves no candidate registrations. The registered-candidates
+address is not one of the profile's addresses: an output there is kept only when
+it carries one of the profile's assets, as at any other address, and a payment
+there never stops an update. midnight-node 2.1.101 selects committees without
+registrations (its committee selection passes an empty list), so no committee
+depends on them; db-sync-alt's tests check this in the packaged node sources.
+
+Only the node's queries for operators read registrations: the RPC methods
+`sidechain_getRegistrations`, `sidechain_getAriadneParameters` and
+`systemParameters_getAriadneParameters`, and the `registration-status` and
+`ariadne-parameters` subcommands. Against db-sync-alt they return no
+registrations. When an output at the address carries one of the profile's
+assets and its transaction spends no output db-sync-alt holds, they fail
+instead: the node cannot read that output's transaction inputs. Serving
+registrations as cardano-db-sync does is future work, for a node release that
+reads them again
+([midnight-node#1761](https://github.com/midnightntwrk/midnight-node/issues/1761)).
 
 ## Bridge readiness
 

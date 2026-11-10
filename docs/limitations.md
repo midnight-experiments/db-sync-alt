@@ -15,9 +15,19 @@
 - **Not a db-sync replacement.** db-sync-alt keeps only the Cardano data the
   profile selects in the relations the pinned Midnight queries read. Other
   assets or addresses and ranges outside the [coverage](glossary.md#coverage)
-  are not held; the reader login can read nothing else. Candidate registrations and invalid
-  transactions are not covered; a database that would need them is refused
+  are not held; the reader login can read nothing else. Invalid transactions
+  are not covered; a database that would need them is refused
   (`unsupported_capability`).
+- **No candidate registrations.** The node's registration queries for
+  operators, the RPC methods `sidechain_getRegistrations`,
+  `sidechain_getAriadneParameters` and `systemParameters_getAriadneParameters`
+  and the `registration-status` and `ariadne-parameters` subcommands, return no
+  registrations. They fail instead when an output at the registered-candidates
+  address carries one of the profile's assets and its transaction spends no
+  output db-sync-alt holds. Committee selection in midnight-node 2.1.101 does
+  not read registrations
+  ([registered candidates](connect-a-node.md#registered-candidates)). Serving
+  them as cardano-db-sync does is future work.
 - **Bridge data from the coverage start only.** The token bridge's metadata is
   stored forward only, from the first update acquired from Blockfrost after the
   newest update without it (a cardano-db-sync bootstrap or catch-up, or an
