@@ -31,12 +31,13 @@
   profile's assets: the bridge token of every packaged profile is one of them,
   but if governance named a token outside the profile, a covered spend of such
   an older output would be counted without it.
-- **Deeply nested provider answers.** db-sync-alt's own Blockfrost client cuts
-  arrays and objects nested deeper than 4,000 levels from an answer instead of
-  failing the request; bridge metadata that deep is stored as NULL, as
-  cardano-db-sync stores nesting beyond 2,000. An external accounting client
-  (`DBSYNC_PROVIDER_ADAPTER=shared`) decodes answers itself and keeps its own
-  limits.
+- **Deeply nested provider answers.** Arrays and objects nested deeper than
+  4,000 levels are cut from a Blockfrost answer instead of failing the request:
+  by db-sync-alt's own client, and by the external accounting client of
+  `DBSYNC_PROVIDER_ADAPTER=shared`, whose `json.loads` db-sync-alt replaces with
+  the same bounded decoder. Bridge metadata that deep is stored as NULL, as
+  cardano-db-sync stores nesting beyond 2,000. An external client that decodes
+  answers without the standard `json` module's `loads` keeps its own limits.
 - **PostgreSQL 17 only**, server and client tools.
 - **Initial data is required.** An empty database is filled from a snapshot or
   backup, or from your own db-sync; a Blockfrost key alone cannot fill it.

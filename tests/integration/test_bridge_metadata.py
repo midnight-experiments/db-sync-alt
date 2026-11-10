@@ -8,10 +8,12 @@ in both tx_in modes. Also: request accounting, the coverage start, the checkpoin
 refusals that keep coverage complete.
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import time
@@ -26,6 +28,7 @@ from psycopg.conninfo import make_conninfo
 
 from db_sync_alt.bridge import parse_checkpoint, recipient
 from db_sync_alt.contract import Refusal
+from db_sync_alt.errors import LifecycleFailure
 from db_sync_alt.sources.blockfrost import adapter, metadata, provider
 from db_sync_alt.sources.blockfrost.poller import HeadPoller, PollBudgetStore, owner_binding
 from db_sync_alt.sources.blockfrost.sync import SyncDriver
@@ -45,6 +48,17 @@ SCHEMA = Path(__file__).resolve().parents[1] / 'fixtures' / 'data' / 'dbsync_sch
 OFFSET, TARGET = bridge.OFFSET, bridge.TARGET
 START = OFFSET + 11  # coverage start: the block after generation 0's target
 PROVIDER_KEY = 'preprod' + 'synthetic0000000000000000'
+
+
+def shared_root(routes, directory):
+    """An external accounting client (tests/fixtures/shared_client) in `directory`, answering `routes`."""
+    root = Path(directory)
+    shutil.copy(Path(__file__).resolve().parents[1] / 'fixtures' / 'shared_client' / 'client.py', root / 'client.py')
+    (root / 'profiles.json').write_text(json.dumps({'preprod': {'base_url': PREPROD.blockfrost_base}}))
+    (root / 'answers').mkdir()
+    for path, value in routes.items():
+        (root / 'answers' / hashlib.sha256(path.encode()).hexdigest()).write_bytes(value if isinstance(value, bytes) else json.dumps(value).encode())
+    return root
 
 
 class RawBlockfrost:
@@ -333,6 +347,53 @@ class BridgeMetadataTests(unittest.TestCase):
         self.assertEqual(transport.calls.count(path), 1)
         verify_store(follower)
         self.assertEqual(follower.digests(follower.generation()['id']), store.digests(store.generation()['id']))
+
+    def hostile_routes(self):
+        chain = bridge.scenario(hostile_transfer=True)
+        routes = bridge.routes(chain)
+        target = chain[12][1]
+        deep = b'[' * bridge.HOSTILE_DEPTH + b']' * bridge.HOSTILE_DEPTH
+        details = '/txs/' + target.hash.hex()
+        routes[details] = json.dumps(routes[details])[:-1].encode() + b',"note":' + deep + b'}'
+        return routes, target
+
+    def follow(self, dsn, store, client):
+        health, stop = real.SyncFixture.state(self), threading.Event()
+        pollstore = PollBudgetStore(None, owner_binding(store), conninfo=dsn)
+        try:
+            poller = HeadPoller(lambda: pollstore, lambda: client, health, stop, network=PREPROD)
+            poller.tick(pollstore, client)
+            driver = SyncDriver(SimpleNamespace(sync={}), client=client, profile=bridge.PROFILE)
+            driver._poller = poller
+            driver.run_once(store, health, stop)
+        finally:
+            pollstore.close()
+
+    def test_hostile_nesting_never_stops_the_shared_adapter(self):
+        """DBSYNC_PROVIDER_ADAPTER=shared: the external client decodes answers with `json.loads`; its private
+        instance gets the bounded decoder, so the same hostile transfer is stored and ingest goes on."""
+        routes, target = self.hostile_routes()
+        stored = lambda store: store.db.execute('SELECT present,json FROM chain.tx_metadata WHERE tx_hash=%s', (target.hash,)).fetchone()
+        shared = lambda: provider.SharedClient(str(shared_root(routes, self.enterContext(tempfile.TemporaryDirectory()))), 'preprod', network=PREPROD)
+        # Positive control: with the standard decoder the external client fails the counted request and follow stops.
+        dsn, store = self.ready()
+        store.certify_ready_full()
+        with patch.object(provider, 'bounded_json', lambda: json), self.assertRaises(LifecycleFailure) as stopped:
+            self.follow(dsn, store, shared())
+        self.assertEqual((stopped.exception.code, store.generation()['target_height']), ('provider_request_rejected', OFFSET + 10))
+        # The service's follow path through the shared adapter.
+        dsn, store = self.ready()
+        store.certify_ready_full()
+        client = shared()
+        self.follow(dsn, store, client)
+        self.assertEqual((store.generation()['target_height'], stored(store)), (TARGET, (1, None)))
+        verify_store(store)
+        # Acquisition through the shared adapter stores the same facts.
+        _, acquired = self.ready()
+        with contextlib.redirect_stdout(io.StringIO()):
+            adapter.update(acquired, CountingProvider(500, shared()), bridge.PROFILE, TARGET, hooks=FixtureHooks())
+        self.assertEqual(stored(acquired), (1, None))
+        self.assertEqual(acquired.digests(acquired.generation()['id']), store.digests(store.generation()['id']))
 
     def test_the_provider_must_agree_with_the_transaction_cbor(self):
         t = self.chain[11][0]

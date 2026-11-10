@@ -29,10 +29,11 @@
   reported, and `/health` answers 503 `bridge_checkpoint_unsupported`. An
   update from cardano-db-sync holds no metadata: coverage starts again after
   it. Blockfrost's integers beyond 2^53 are stored as Blockfrost rounds them;
-  the node reads the same recipient. db-sync-alt's Blockfrost client cuts any
-  answer nested deeper than 4,000 levels instead of failing the request:
-  metadata that deep (anyone can put it on chain) is stored as NULL and never
-  stops ingest.
+  the node reads the same recipient. Answers nested deeper than 4,000 levels
+  are cut instead of failing the request, by db-sync-alt's Blockfrost client
+  and by the external accounting client of `DBSYNC_PROVIDER_ADAPTER=shared`
+  (db-sync-alt gives that client's `json.loads` the same bound): metadata that
+  deep, which anyone can put on chain, is stored as NULL and ingest goes on.
 - Upgrade an existing database in place, with the service and the node stopped:
   `db-sync-alt upgrade --service <name>`. A database written by 0.3.x or
   earlier holds each epoch's nonce but not its size: the upgrade reads every

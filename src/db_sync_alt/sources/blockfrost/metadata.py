@@ -9,8 +9,8 @@ JavaScript round trip; it is stored as jsonb with this normalization only:
   integer; a non-finite number is a provider error;
 - like cardano-db-sync 13.8, a value containing U+0000 (which jsonb cannot hold), text that is not
   Unicode, or arrays and objects nested deeper than 2000 is NULL (`present` 1, `json` None). That
-  includes an answer the provider client had to cut (`provider.TooDeep`, nesting beyond 4000): such
-  an answer never fails the request or stops ingest.
+  includes an answer the provider client had to cut (`provider.TooDeep`, nesting beyond 4000), with
+  db-sync-alt's own client or the shared adapter: such an answer does not fail the request.
 
 Big integers beyond 2^53 therefore keep Blockfrost's rounded value: midnight-node reads only a
 one-element array holding a `0x` string, so its decision is the same as on cardano-db-sync.

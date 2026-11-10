@@ -51,6 +51,33 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(p.loads(text.encode()),json.loads(text))
         exact='['*p.RESPONSE_DEPTH+']'*p.RESPONSE_DEPTH
         self.assertEqual(json.dumps(p.loads(exact.encode()),separators=(',',':')),exact)
+    def test_shared_adapter_decodes_with_the_bound(self):
+        import hashlib,shutil
+        root=self.root/'shared';(root/'answers').mkdir(parents=True)
+        shutil.copy(Path(__file__).resolve().parents[1]/'fixtures'/'shared_client'/'client.py',root/'client.py')
+        (root/'profiles.json').write_text(json.dumps({'preprod':{'base_url':PREPROD.blockfrost_base}}))
+        deep=b'['*20000+b']'*20000
+        answers={'/plain':b'{"a":[1,2.5,null],"b":"]["}','/deep':b'{"a":'+deep+b',"b":1}','/malformed':b'{"a":[1}'}
+        for path,body in answers.items():(root/'answers'/hashlib.sha256(path.encode()).hexdigest()).write_bytes(body)
+        c=p.SharedClient(str(root),'preprod',network=PREPROD)
+        # The module's own settings and usage files decode as before; normal answers equal the standard library's.
+        self.assertEqual(c.get('/plain'),json.loads(answers['/plain']))
+        self.assertEqual(c.status()['budget_used'],1)
+        value=c.get('/deep');inner=value['a'];above=1
+        while not isinstance(inner,p.TooDeep):inner=inner[0];above+=1
+        self.assertEqual((above,value['b']),(p.RESPONSE_DEPTH,1))
+        with self.assertRaises(p.ProviderError) as error:c.get('/malformed')
+        self.assertEqual(str(error.exception),'provider_request_failed_counted')
+        with self.assertRaises(p.ProviderError):c.get('/missing')
+        self.assertEqual(c.status()['budget_used'],4)
+        # The bounded module is the standard one except for `loads`.
+        module=p.bounded_json()
+        self.assertIs(module.dumps,json.dumps);self.assertIs(module.JSONDecodeError,json.JSONDecodeError)
+        self.assertEqual(module.loads('[1e+21]'),[1e21]);self.assertEqual(module.loads('{"a":1}',object_pairs_hook=list),[('a',1)])
+        with self.assertRaises(json.JSONDecodeError):module.loads(b'['*5000+b'}')
+        # Without the bound the external client fails the counted request on the deep answer.
+        with patch.object(p,'bounded_json',lambda:json):plain=p.SharedClient(str(root),'preprod',network=PREPROD)
+        with self.assertRaises(p.ProviderError):plain.get('/deep')
     def test_status_offline_and_failure_charged_no_retry(self):
         calls=[]
         def fail(path):calls.append(path);raise RuntimeError(KEY)
