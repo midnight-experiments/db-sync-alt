@@ -8,7 +8,7 @@ from unittest.mock import patch
 from db_sync_alt.contract import Profile,Refusal
 from db_sync_alt.resources import profile_dir
 from db_sync_alt.sources.blockfrost.cbor import decode_transaction,Tag
-from db_sync_alt.sources.blockfrost.relevance import Discovery,address_bytes,address_text,canonical_address,compare_outputs,inventory
+from db_sync_alt.sources.blockfrost.relevance import Discovery,address_bytes,address_text,compare_outputs,inventory
 from fixtures.cbor import tx
 
 class RelevanceTests(unittest.TestCase):
@@ -76,7 +76,13 @@ class RelevanceTests(unittest.TestCase):
     def test_pointer_addresses_compare_in_the_ledger_canonical_form(self):
         """Issue 00032 (S10): from protocol version 9 the ledger accepts redundant leading zero groups in a pointer
         and keeps it re-serialised minimally, which cardano-db-sync renders."""
+        from db_sync_alt.sources.blockfrost.relevance import _encode_address
         head=b'\x41'+b'p'*28
+        decoded=self.decode([[head+b'\x80\x81\x00\x80\x02\x03',[100,{self.policy:{self.name:3}}]]])
+        row=dict(self.row(self.profile.night),address=_encode_address(head+b'\x81\x00\x02\x03','mainnet'));compare_outputs(decoded,[row],'mainnet')
+        row['address']=_encode_address(head+b'\x80\x81\x00\x80\x02\x03','mainnet')
+        with self.assertRaisesRegex(Refusal,'output_cbor_mismatch'):compare_outputs(decoded,[row],'mainnet')
+        from db_sync_alt.sources.blockfrost.relevance import canonical_address
         for suffix,canonical in ((b'\x01\x02\x03',b'\x01\x02\x03'),(b'\x80\x81\x00\x80\x02\x03',b'\x81\x00\x02\x03'),
                                  (b'\x80\x80\x80\x80\x01\x80\x80\x00\x80\x80\x07',b'\x01\x00\x07'),(b'\x8f\xff\xff\xff\x7f\x83\xff\x7f\x00',b'\x8f\xff\xff\xff\x7f\x83\xff\x7f\x00')):
             self.assertEqual(canonical_address(head+suffix),head+canonical)
@@ -84,17 +90,11 @@ class RelevanceTests(unittest.TestCase):
         for suffix in (b'\x90\x80\x80\x80\x00\x00\x00',b'\x00\x84\x80\x00\x00',b'\x80\x80\x80\x80\x80\x01\x00\x00',b'\x01\x02',b'\x01\x02\x03\x04'):
             self.assertEqual(canonical_address(head+suffix),head+suffix)
         for raw in (self.raw,b'\x61'+b'a'*28,b'\x82\x00'):self.assertEqual(canonical_address(raw),raw)
-        decoded=self.decode([[head+b'\x80\x81\x00\x80\x02\x03',[100,{self.policy:{self.name:3}}]]])
-        from db_sync_alt.sources.blockfrost.relevance import _encode_address
-        row=dict(self.row(self.profile.night),address=_encode_address(head+b'\x81\x00\x02\x03','mainnet'));compare_outputs(decoded,[row],'mainnet')
-        row['address']=_encode_address(head+b'\x80\x81\x00\x80\x02\x03','mainnet')
-        with self.assertRaisesRegex(Refusal,'output_cbor_mismatch'):compare_outputs(decoded,[row],'mainnet')
     def test_collateral_return_assets_are_not_listed_by_blockfrost(self):
         """Issue 00032 (S9), with a real Preprod answer (transaction 6fa3def7…): a valid transaction's collateral
         return is a `collateral` row with lovelace only. Its CBOR (rebuilt from the answer) returns the tokens of
         the collateral input."""
         from fixtures.cbor import F
-        from db_sync_alt.sources.blockfrost.adapter import ledger_effects
         answer=json.loads((F/'collateral-return-assets-utxos.json').read_text())
         def value(amount):
             assets={}
@@ -107,10 +107,11 @@ class RelevanceTests(unittest.TestCase):
         decoded=decode_transaction(*tx(body))
         self.assertTrue(decoded['collateral_output']['assets'])
         compare_outputs(decoded,answer['outputs'],'preprod')
-        spent,created,_=ledger_effects(answer,decoded,lambda h,index:ordinary)
-        self.assertEqual((set(spent),[r['output_index'] for r in created]),({tuple(outpoint)},[0,1,2]))
         # Listing the return's tokens would still be the same output; other values are not.
         listed=copy.deepcopy(answer['outputs']);listed[3]['amount']=[listed[3]['amount'][0]]+copy.deepcopy(ordinary['amount'][1:]);compare_outputs(decoded,listed,'preprod')
+        from db_sync_alt.sources.blockfrost.adapter import ledger_effects
+        spent,created,_=ledger_effects(answer,decoded,lambda h,index:ordinary)
+        self.assertEqual((set(spent),[r['output_index'] for r in created]),({tuple(outpoint)},[0,1,2]))
         for change in ('lovelace','asset'):
             bad=copy.deepcopy(answer['outputs'])
             if change=='lovelace':bad[3]['amount'][0]['quantity']='1'

@@ -11,7 +11,7 @@ from psycopg import sql
 
 from db_sync_alt.contract import Profile
 from db_sync_alt.resources import profile_dir
-from db_sync_alt.sources.blockfrost.relevance import address_bytes,address_text,canonical_address,_encode_address
+from db_sync_alt.sources.blockfrost.relevance import address_bytes,address_text,_encode_address
 from db_sync_alt.sources.blockfrost.adapter import OPENAPI
 from db_sync_alt.sources.dbsync.acquire import CountedSQLSource,acquire
 from db_sync_alt.store.database import PgStore
@@ -44,6 +44,22 @@ def configure(network):
     ADDRESS=address_bytes(PROFILE.mapping,network);OTHER=bytes([0x61 if network=='mainnet' else 0x60])+b'o'*28
     PRE=make_tx(1,relevant=True);PRE_SPEND=make_tx(2,inputs=[(bytes.fromhex(PRE['tx_hash']),0)],relevant=True);ROOT=make_tx(3,relevant=True);BASE_SPEND=make_tx(4,inputs=[(bytes.fromhex(ROOT['tx_hash']),0)],relevant=True)
 
+def ledger_address(raw):
+    """The bytes the ledger keeps for a well-formed output address `raw` (cardano-ledger Address.hs, protocol
+    version 9 and later): a pointer address (header 4 or 5) with its three variable-length integers
+    re-serialised minimally. A test oracle, written apart from the code under test."""
+    if raw[0]>>4 not in (4,5):return raw
+    values=[];value=0
+    for byte in raw[29:]:
+        value=value<<7|byte&127
+        if not byte&128:values.append(value);value=0
+    assert len(values)==3 and not raw[-1]&128
+    def minimal(v):
+        groups=[v&127];v>>=7
+        while v:groups.insert(0,v&127|128);v>>=7
+        return bytes(groups)
+    return raw[:29]+b''.join(minimal(v) for v in values)
+
 def output(transaction,index=0):
     """Output `index` of `transaction` (its collateral return at the number of body outputs) as
     cardano-db-sync stores it in tx_out and Blockfrost renders it: the address the ledger keeps (a pointer
@@ -51,7 +67,7 @@ def output(transaction,index=0):
     from db_sync_alt.sources.blockfrost.cbor import decode_transaction
     d=decode_transaction(transaction['cbor'],transaction['tx_hash'])
     value=(list(d['outputs'])+[d['collateral_output']])[index]
-    network=PROFILE.network.network;raw=canonical_address(value['address'])
+    network=PROFILE.network.network;raw=ledger_address(value['address'])
     return {'output_index':index,'address':address_text(raw,network) or _encode_address(raw,network),
             'amount':[{'unit':'lovelace','quantity':value['value']}]+[{'unit':p.hex()+n.hex(),'quantity':str(q)} for p,n,q in value['assets']],
             'data_hash':None,'inline_datum':None,'reference_script_hash':None}
