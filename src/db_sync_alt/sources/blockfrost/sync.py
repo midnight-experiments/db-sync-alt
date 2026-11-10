@@ -3,8 +3,10 @@
 
 Only the accounted client of the profile's network sends authenticated requests. Tests
 inject a deterministic accounted client. A job reservation commits before every
-attempt, including metrics/failures; restarts and day changes cannot reset an
-acquisition budget. Polling has an explicit independent UTC-day budget.
+attempt, including metrics/failures; restarts and day changes never reset a job's count.
+An update (acquisition job) is sized to its blocks and spends at most its budget per
+UTC day: an exhausted update waits for the next UTC day and continues under a new job
+record that carries the earlier count. Polling has an explicit independent UTC-day budget.
 """
 import datetime as dt
 import hashlib
@@ -347,11 +349,14 @@ def validate_job(job, *, kind=None, security=None):
             or job.get('kind') not in {'poll', 'acquire'}
             or (kind is not None and job['kind'] != kind)):
         raise LifecycleFailure('invalid_sync_job')
-    for field in ('created_at', 'reserved_at', 'metrics_at', 'retry_at', 'completed_at'):
+    for field in ('created_at', 'reserved_at', 'metrics_at', 'retry_at', 'completed_at', 'exhausted_at'):
         if field in job and (isinstance(job[field], bool) or not isinstance(job[field], (int, float))
                              or not math.isfinite(job[field]) or job[field] < 0):
             raise LifecycleFailure('invalid_sync_job')
-    for field in ('failure_count', 'metrics_count'):
+    if 'resumes' in job and (job['kind'] != 'acquire' or not isinstance(job['resumes'], str)
+                             or re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', job['resumes']) is None):
+        raise LifecycleFailure('invalid_sync_job')
+    for field in ('failure_count', 'metrics_count', 'prior_attempts'):
         if field in job and (type(job[field]) is not int or job[field] < 0):
             raise LifecycleFailure('invalid_sync_job')
     if job.get('metrics_count', 0) > job['attempts'] or job.get('failure_count', 0) > 20:
@@ -464,13 +469,17 @@ class AccountedProvider(ProviderClient):
                 or now - last_metrics >= 600 or self.attempts - self.job.get('metrics_count', 0) >= 1000):
             self.get('/metrics')
         if self.attempts >= self.budget:
-            # This job is terminal until explicit operator action. Never mint a
-            # replacement acquisition job to evade its cumulative cap.
-            self.job.update(state='exhausted', error_code='request_budget_exhausted')
-            self.save()
+            # The job never spends more than its budget. A poll job waits for the next UTC day's
+            # job; an acquisition job waits for the next UTC day, when the driver continues its
+            # update under a new job record (`SyncDriver._continue`), never by resetting this one.
             if self.job.get('kind') == 'poll':
+                self.job.update(state='exhausted', error_code='request_budget_exhausted')
+                self.save()
                 self._wait('quota_exhausted', quota=True)
-            raise LifecycleFailure('request_budget_exhausted')
+            retry = next_day(now)
+            self.job.update(state='exhausted', exhausted_at=now, retry_at=retry, error_code='request_budget_exhausted')
+            self.save()
+            raise TransientSyncFailure('request_budget_exhausted', retry_at=retry)
         self.attempts += 1
         self.job['reserved_at'] = self.clock()
         self.save()  # durable reservation BEFORE shared request, including failure
@@ -644,6 +653,19 @@ class SyncDriver:
         else:store.save_sync_job(key, value)
         return value
 
+    def _continue(self, store, old):
+        """The next UTC day's job of an exhausted update: the same parent, target and witness under a new
+        allotment, every earlier attempt carried in `prior_attempts`. The exhausted record is kept unchanged
+        under its own key first, so a crash in between repeats both writes."""
+        from db_sync_alt.store.database import ARCHIVE
+        store.save_sync_job(ARCHIVE + old['job_id'], old)
+        new = dict(job_id=uuid.uuid4().hex, attempts=0, budget=self.options['acquisition_request_budget'], state='active',
+                   kind='acquire', parent=old['parent'], target=old['target'], witness=old['witness'],
+                   created_at=self.clock(), retry_at=0, failure_count=0, resumes=old['job_id'],
+                   prior_attempts=old.get('prior_attempts', 0) + old['attempts'])
+        store.save_sync_job('provider-active', new)
+        return new
+
     def _provider(self, store, key, job, health, stop_event):
         if self._client is None:
             self._client = shared_client(self.profile.network)
@@ -763,7 +785,11 @@ class SyncDriver:
             if self.fixed_target - ready['target_height'] > MAX_BLOCKS:
                 raise LifecycleFailure('invalid_sync_configuration')
         if active and active['state'] == 'exhausted':
-            raise LifecycleFailure('request_budget_exhausted')
+            from db_sync_alt.store.database import exhausted_at
+            resume = next_day(exhausted_at(active))
+            if self.clock() < resume:
+                raise TransientSyncFailure('request_budget_exhausted', retry_at=resume)
+            active = self._continue(store, active)
         if active and active['state'] != 'completed' and active.get('retry_at', 0) > self.clock():
             raise TransientSyncFailure(active.get('error_code', 'provider_unavailable'), retry_at=active['retry_at'])
         if not pending and self._checkpoint(store, health):
@@ -820,8 +846,6 @@ class SyncDriver:
             self._eligible_at = None
             return  # Cheap idle: never verify full history or perform handoff.
         if active and active['state'] != 'completed':
-            if active['state'] == 'exhausted':
-                raise LifecycleFailure('request_budget_exhausted')
             target = active['target']
         else:
             # Near tip use the configured spacing after durable job completion.

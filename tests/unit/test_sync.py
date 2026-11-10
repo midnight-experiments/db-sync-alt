@@ -26,6 +26,18 @@ from fixtures.networks import PREPROD, PREPROD_PROFILE
 
 
 
+class BlockUpdate(FixtureUpdate):
+    """One request per block, each block committed for good: a resumed update starts at its first uncommitted block."""
+    def __init__(self):super().__init__();self.done=0
+    def __call__(self,store,provider,profile,target,*,hooks):
+        self.calls.append((store.target+1,target))
+        store._pending={'target_height':target,'witness_height':target+self.security,'parent':store.gid}
+        while self.done<target-store.target:provider.get('/unit');self.done+=1
+        hooks.before_publish()
+        store.target=target;store.gid+=1;store._pending=None;self.done=0
+        return {'generation':store.gid}
+
+
 class SyncTests(unittest.TestCase):
     def setUp(self):
         self.clock=Clock();self.store=Store();self.client=Client(self.clock);self.health=health()
@@ -84,13 +96,51 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(new['job_id'],job['job_id']);self.assertEqual(new['target'],140)
         self.assertGreater(new['attempts'],job['attempts']);self.assertEqual(new['budget'],job['budget'])
         self.assertEqual(self.update.calls[-1],(101,140))
-    def test_budget_exhaustion_does_not_create_new_acquisition_job(self):
-        self.config.sync={'acquisition_request_budget':1};self.client.confirmed=101
-        with self.assertRaisesRegex(LifecycleFailure,'request_budget_exhausted'):self.run_once()
-        job=copy.deepcopy(self.store.jobs['provider-active']);calls=len(self.client.calls)
-        self.clock.now=next_day(self.clock.now)+1
-        with self.assertRaisesRegex(LifecycleFailure,'request_budget_exhausted'):self.run_once()
-        self.assertEqual(self.store.jobs['provider-active'],job);self.assertEqual(len(self.client.calls),calls)
+    def test_exhausted_update_waits_for_the_next_utc_day_then_continues_its_target(self):
+        # Each allotment of 3 requests holds one usage check and two committed blocks of a 5-block update.
+        self.config.sync={'acquisition_request_budget':3};self.client.confirmed=105;self.update=BlockUpdate()
+        with self.assertRaises(TransientSyncFailure) as error:self.run_once()
+        self.assertEqual((error.exception.code,error.exception.retry_at),('request_budget_exhausted',next_day(self.clock.now)))
+        first=copy.deepcopy(self.store.jobs['provider-active'])
+        self.assertEqual((first['state'],first['attempts'],first['target'],first['exhausted_at']),('exhausted',3,105,self.clock.now))
+        self.assertEqual(self.update.done,2)
+        # Later the same UTC day: no request and no change.
+        calls=len(self.client.calls);self.clock.now=next_day(self.clock.now)-1
+        with self.assertRaises(TransientSyncFailure) as error:self.run_once()
+        self.assertEqual(error.exception.code,'request_budget_exhausted')
+        self.assertEqual((len(self.client.calls),self.store.jobs['provider-active']),(calls,first))
+        # Each later UTC day continues the same target under a new record; the exhausted one is kept unchanged.
+        self.clock.now+=2
+        with self.assertRaises(TransientSyncFailure):self.run_once()
+        second=copy.deepcopy(self.store.jobs['provider-active'])
+        self.assertEqual(self.store.jobs['provider-acquire-'+first['job_id']],first)
+        self.assertEqual((second['resumes'],second['prior_attempts'],second['target'],second['witness'],second['parent']),
+                         (first['job_id'],3,105,first['witness'],first['parent']))
+        self.assertEqual((second['state'],second['attempts'],self.update.done),('exhausted',3,4))
+        self.clock.now=next_day(self.clock.now)+1;self.run_once()
+        third=self.store.jobs['provider-active']
+        self.assertEqual(self.store.jobs['provider-acquire-'+second['job_id']],second)
+        self.assertEqual((third['resumes'],third['prior_attempts'],third['state'],third['target']),(second['job_id'],6,'completed',105))
+        self.assertEqual((self.store.target,self.update.calls),(105,[(101,105)]*3))
+    def test_continuation_rule_never_resets_or_retargets(self):
+        from db_sync_alt.store.database import continues
+        old={'job_id':'a','kind':'acquire','state':'exhausted','attempts':10,'budget':10,'parent':0,'target':105,'witness':2265,
+             'prior_attempts':7,'exhausted_at':self.clock.now}
+        new={'job_id':'b','kind':'acquire','state':'active','attempts':0,'budget':10,'parent':0,'target':105,'witness':2265,
+             'resumes':'a','prior_attempts':17,'created_at':next_day(self.clock.now)}
+        self.assertTrue(continues(old,new))
+        for change in ({'created_at':next_day(self.clock.now)-1},{'prior_attempts':10},{'prior_attempts':True},{'target':106},
+                       {'witness':2266},{'parent':1},{'resumes':'c'},{'attempts':1},{'state':'exhausted'},{'kind':'poll'}):
+            with self.subTest(change=change):self.assertFalse(continues(old,{**new,**change}))
+        self.assertFalse(continues({**old,'state':'active'},new))
+        # A job of 0.3.x has no `exhausted_at`: its last reservation dates the exhaustion.
+        legacy={k:v for k,v in old.items() if k!='exhausted_at'}
+        self.assertFalse(continues(legacy,new))
+        self.assertTrue(continues({**legacy,'reserved_at':self.clock.now},new))
+        store=Store();store.jobs['provider-active']=old
+        with self.assertRaisesRegex(AssertionError,'nonterminal_rollover'):store.save_sync_job('provider-active',new)
+        store.save_sync_job('provider-acquire-a',old);store.save_sync_job('provider-active',new)
+        self.assertEqual(store.jobs['provider-active'],new)
     def test_job_is_sized_to_the_transactions_of_its_blocks(self):
         # A block of 300 transactions costs 3 inventory pages and 300 /utxos: 24 blocks fit 3/4 of 10,000.
         self.client.confirmed=1000;self.store.tx_counts.update({h:300 for h in range(101,1101)})

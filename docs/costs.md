@@ -31,11 +31,18 @@ transactions need more requests than empty ones.
 | Requests per UTC day for the key | 50,000 attempts | The request ledger, `accounting/usage.json` in the state directory |
 | Request rate | 8 per second | The same ledger |
 | One day's polling job | 10,000 attempts | The database (`chain.sync_jobs`) |
-| One update (acquisition job) | 10,000 attempts | The database |
+| One update (acquisition job) | 10,000 attempts per UTC day | The database |
 
 Every attempt is counted before it is sent, including failures and usage
 checks. Restarting the process never resets a count. When the daily ceiling is
-reached the service waits for the next UTC day (`quota_exhausted`). All
+reached the service waits for the next UTC day (`quota_exhausted`).
+
+Each update is sized to its blocks: it takes as many blocks as fit three
+quarters of its budget at one request per transaction (two with relevance
+filtering, which also holds at most six blocks per update), and at least one.
+An update that still uses up its budget waits for the next UTC day
+(`request_budget_exhausted`) and then continues where it stopped, under a new
+job record that carries the earlier count. All
 programs that use the same Blockfrost key must share one ledger; two ledgers for
 one key would each believe they have the whole allowance.
 

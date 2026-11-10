@@ -30,6 +30,31 @@ FACT_ORDER = ('blocks','transactions','datums','outputs','inputs','assets','outp
 ORDINAL_TABLES = ('inputs','output_assets')
 ORDINAL_LIMIT = 4096
 GENERATION_SUMMARY = ('id','parent','status','source','start_height','start_index','target_height','witness_height')
+# An exhausted update's job record is kept unchanged under ARCHIVE + its job ID once its continuation replaces it.
+ARCHIVE = 'provider-acquire-'
+
+
+def exhausted_at(job):
+    """When an acquisition job spent its budget (a job of 0.3.x has only its last reservation time)."""
+    return job.get('exhausted_at', job.get('reserved_at', job.get('created_at')))
+
+
+def _utc_day(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 2**40:
+        return None
+    return dt.datetime.fromtimestamp(value, dt.timezone.utc).date()
+
+
+def continues(old, body):
+    """Whether `body` continues the exhausted update `old` on a later UTC day: same parent, target and witness,
+    a fresh allotment and every earlier attempt carried in `prior_attempts`. Counts are never reset."""
+    since, day = _utc_day(exhausted_at(old)), _utc_day(body.get('created_at'))
+    return (old.get('state') == 'exhausted' and old.get('kind') == 'acquire' and body.get('kind') == 'acquire'
+            and body.get('resumes') == old.get('job_id') and body.get('state') == 'active' and body.get('attempts') == 0
+            and all(body.get(k) == old.get(k) for k in ('parent', 'target', 'witness'))
+            and type(old.get('attempts')) is int and type(body.get('prior_attempts')) is int
+            and body['prior_attempts'] == old.get('prior_attempts', 0) + old['attempts']
+            and since is not None and day is not None and day > since)
 
 
 def connect(service=None, *, conninfo='', **kwargs):
@@ -578,7 +603,9 @@ class PgStore:
         old=self.sync_job(job_id)
         if old:
             if old.get('job_id')!=body['job_id']:
-                if old.get('state')!='completed':raise Refusal('sync_job_rollover_refused')
+                # Only a completed job, or an exhausted update kept unchanged under its own key, is replaced.
+                if old.get('state')!='completed' and not (continues(old,body) and self.sync_job(ARCHIVE+old['job_id'])==old):
+                    raise Refusal('sync_job_rollover_refused')
             elif body['attempts']<old['attempts'] or body['budget']!=old['budget']:raise Refusal('sync_job_budget_reset')
             elif old.get('state') in ('completed','exhausted') and body['state']=='active':raise Refusal('sync_job_reopen_refused')
         self.db.execute('INSERT INTO chain.sync_jobs VALUES(%s,%s) ON CONFLICT(id) DO UPDATE SET body=excluded.body',(job_id,Jsonb(body)))

@@ -1,6 +1,7 @@
 """In-memory store, clock, provider client and update fakes for the sync driver."""
 import copy
 from db_sync_alt.service.health import HealthState
+from db_sync_alt.store.database import ARCHIVE, continues
 
 
 class Clock:
@@ -31,7 +32,8 @@ class Store:
         old=self.jobs.get(key)
         if old and old['job_id']==body['job_id']:
             if body['attempts']<old['attempts'] or body['budget']!=old['budget']:raise AssertionError('budget_reset')
-        elif old and old['state']!='completed':raise AssertionError('nonterminal_rollover')
+        elif old and old['state']!='completed' and not (continues(old,body) and self.jobs.get(ARCHIVE+old['job_id'])==old):
+            raise AssertionError('nonterminal_rollover')
         self.jobs[key]=copy.deepcopy(body);self.saved.append((key,copy.deepcopy(body)))
     def mark_conflict(self):self.revoked=True
 
