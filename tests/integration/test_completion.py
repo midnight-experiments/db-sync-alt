@@ -109,7 +109,7 @@ class CompletionTests(unittest.TestCase):
             final=self.verify(store)['digests'];self.assertEqual(store.generation(1)['manifest'],seal)
             self.assertEqual(store.checkpoint_rows(generation=1,phase='final-anchors'),[original])
             self.assertEqual(store.state()['publication_serial'],saved['service']['publication_serial']+1)
-            self.assertEqual(final,self.fixture.reference(self.routes,transition=True)['digests']);self.assertEqual(len(final),10)
+            self.assertEqual(final,self.fixture.reference(self.routes,transition=True)['digests']);self.assertEqual(len(final),11)
 
     def test_first_seal_and_original_receipt_roll_back_together(self):
         with self.owner() as store:
