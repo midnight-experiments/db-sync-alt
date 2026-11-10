@@ -132,11 +132,11 @@ def _upgrade_v4(store,state,checkpoint):
 def _relevance_guard_v5(db):
     """The relevance-anchor branch of the immutability guard admits anchors on the serving schema: a
     schema-4 store whose guard already has that branch gets its schema-5 successor."""
-    successor=Path(__file__).with_name('relevance_anchor.sql').read_text()
-    body=successor.split('AS $$',1)[1].split('END $$;',1)[0]
+    from db_sync_alt.store.database import relevance_anchor_sql
+    previous=relevance_anchor_sql(4).split('AS $$',1)[1].split('END $$;',1)[0]
     actual=db.execute("SELECT prosrc FROM pg_proc WHERE oid='chain.guard_immutable()'::regprocedure").fetchone()[0]
-    if actual==body.replace('schema_version=5','schema_version=4')+'END ':
-        db.execute(successor)
+    if actual==previous+'END ':
+        db.execute(relevance_anchor_sql(5))
 
 
 def _schema_v5(store):

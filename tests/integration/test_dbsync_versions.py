@@ -181,14 +181,14 @@ class SourceVersions(unittest.TestCase):
                     if initial_schema==3:upgrade._upgrade_v3(store,store.state(),None)
                     self.assertEqual(store.state()['schema_version'],initial_schema)
                     result=upgrade.upgrade_store(store,UnusedSource())
-                    self.assertEqual(result['schema_version'],4)
+                    self.assertEqual(result['schema_version'],5)
                     self.assertEqual(result['base_generation'],store.integrity()['base'])
                     self.assertIn('checkpoint_generation',result)
                     self.assertNotIn('ordinal_source_identity',result)
                     self.assertEqual(store.digests(store.generation()['id']),before)
                     self.assertEqual(store.meta('profile'),profile)
                     verify_store(store)
-                    self.assertEqual(upgrade.upgrade_store(store),{'schema_version':4,'changed':False})
+                    self.assertEqual(upgrade.upgrade_store(store),{'schema_version':5,'changed':False})
 
     def test_upgrade_cli_recovers_missing_ordinals_from_attested_13_8_source(self):
         from db_sync_alt.store import upgrade
@@ -202,7 +202,7 @@ class SourceVersions(unittest.TestCase):
         out=io.StringIO()
         with contextlib.redirect_stdout(out):
             upgrade.main(['--service',alias,'--source-service',self.templates['13.8.0.0'][1],'--source-attestation',str(att)])
-        result=json.loads(out.getvalue());self.assertEqual(result['schema_version'],4)
+        result=json.loads(out.getvalue());self.assertEqual(result['schema_version'],5)
         self.assertIn('checkpoint_generation',result)
         self.assertGreater(result['ordinals_from_source']['inputs'],0)
         self.assertEqual(result['ordinal_source_identity']['schema'],[16,52,6])

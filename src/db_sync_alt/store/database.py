@@ -56,6 +56,12 @@ def empty_destination(db):
       UNION ALL SELECT 1 FROM pg_publication LIMIT 1""").fetchone()
 
 
+def relevance_anchor_sql(schema):
+    """The immutability guard whose relevance-anchor branch admits anchors on serving schema `schema`."""
+    text=Path(__file__).with_name('relevance_anchor.sql').read_text()
+    return text.replace('schema_version=5','schema_version='+str(int(schema)))
+
+
 def apply_privileges(db):
     """Only the owner and the roles db-sync-alt grants may connect or use the database: a reader
     connected to an empty, importing or restoring database would find no tx_in relation and cache that."""
@@ -408,7 +414,7 @@ class PgStore:
         if self.completed(g['id'],'relevance','anchor'):raise Refusal('relevance_trust_already_initialized')
         old=Path(__file__).with_name('schema_v2.sql').read_text()
         old=old[old.index('CREATE FUNCTION chain.guard_immutable()'):].split('END $$;',1)[0].split('AS $$',1)[1]
-        replacement=Path(__file__).with_name('relevance_anchor.sql').read_text()
+        replacement=relevance_anchor_sql(state['schema_version'])
         successor=replacement.split('AS $$',1)[1].split('END $$;',1)[0]
         actual=self.db.execute("SELECT prosrc FROM pg_proc WHERE oid='chain.guard_immutable()'::regprocedure").fetchone()[0]
         if actual not in (old+'END ',successor+'END '):raise Refusal('relevance_anchor_guard_mismatch')

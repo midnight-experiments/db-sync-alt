@@ -43,7 +43,7 @@ class CheckpointBackupPGTests(CheckpointFixture):
             receipt = backup(archive, manifest, conninfo=dsn)
         self.assertEqual(calls, [(3,)])
         body = json.loads(manifest.read_text())
-        self.assertEqual((body['format'], body['schema_version'], body['canonical_ready']), ('db-sync-alt-postgresql-backup-v3', 4, 3))
+        self.assertEqual((body['format'], body['schema_version'], body['canonical_ready']), ('db-sync-alt-postgresql-backup-v4', 5, 3))
         self.assertEqual(list(body['generations']), ['3'])
         self.assertIn('integrity_checkpoints', body['physical_inventory'])
         self.assertEqual(body['physical_inventory']['integrity_checkpoints']['count'], 1)
@@ -88,7 +88,7 @@ class CheckpointBackupPGTests(CheckpointFixture):
         result = restore(archive, manifest, conninfo=destination, expected_manifest_sha256=file_hash(manifest)['sha256'], reader_role=role)
         self.assertEqual(result['reader']['reader'], role)
         schema, base, rows, canonical = self.state_of(destination)
-        self.assertEqual((schema, base, canonical, [row[:2] for row in rows]), (4, 2, 2, [(2, 0)]))
+        self.assertEqual((schema, base, canonical, [row[:2] for row in rows]), (5, 2, 2, [(2, 0)]))
         self.assertEqual(rows[0][3], expected['digests'])
         answer = self.node(destination, role).execute(QUERY).fetchone()
         self.assertEqual(answer[1], OFFSET + 2170 + 2)
@@ -97,7 +97,7 @@ class CheckpointBackupPGTests(CheckpointFixture):
         # Without the reader as well: a restored schema-3 backup is always upgraded.
         plain = self.database()
         restore(archive, manifest, conninfo=plain)
-        self.assertEqual(self.state_of(plain)[:2], (4, 2))
+        self.assertEqual(self.state_of(plain)[:2], (5, 2))
 
     def test_tampered_v3_backups_are_refused(self):
         dsn, store = self.history(1)

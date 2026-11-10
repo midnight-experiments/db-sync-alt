@@ -221,7 +221,7 @@ class FollowSourcePGTests(unittest.TestCase):
         service=Service(cfg,runtime=Runtime(cfg),sync_driver=driver)
         try:
             service.start();self.assertTrue(entered.wait(15),service.failure)
-            self.assertEqual(service.health.snapshot()['schema_version'],'4')
+            self.assertEqual(service.health.snapshot()['schema_version'],'5')
             before=driver._poller.latest().sequence
             deadline=time.monotonic()+3
             while driver._poller.latest().sequence<before+2 and time.monotonic()<deadline:time.sleep(.01)

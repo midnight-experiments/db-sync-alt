@@ -28,7 +28,7 @@ class RelevanceCheckpointTests(unittest.TestCase):
     def prepare(self,rows):
         store,routes=f.SQLFixture.prepare(rows,reuse_root=True)
         self.addCleanup(store.close)
-        self.assertEqual(store.state()['schema_version'],4)
+        self.assertEqual(store.state()['schema_version'],5)
         return store,routes
 
     def follow_embedded(self,store,routes,target):

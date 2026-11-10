@@ -76,7 +76,7 @@ class InterchangeTests(unittest.TestCase):
                 self.assertEqual(store.generation()['manifest']['acquisition']['window_blocks'],1000)
                 if self.incremental:
                     from db_sync_alt.store.upgrade import upgrade_store
-                    self.assertEqual(upgrade_store(store)['schema_version'],4)
+                    self.assertEqual(upgrade_store(store)['schema_version'],5)
                     self.assertTrue(store.supports_checkpoints)
                     store.certify_ready_full()
                 old_ids=store.db.execute('SELECT hash,id FROM chain.transactions ORDER BY id').fetchall();old_digest=store.digests(0)

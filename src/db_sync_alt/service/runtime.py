@@ -73,7 +73,8 @@ def failure_code(error):
         return 'unsupported_capability'
     if raw in {'reader_role_missing', 'invalid_reader_role', 'reader_privileges_not_exact'}:
         return 'invalid_reader_role'
-    if raw in {'reader_requires_current_schema', 'epoch_parameters_upgrade_required'}:
+    if raw in {'reader_requires_current_schema', 'epoch_parameters_upgrade_required', 'epoch_parameters_source_required',
+               'upgrade_required_before_backup'}:
         return 'schema_upgrade_required'
     if raw in {'invalid_epoch_max_tx_size', 'epoch_parameter_receipt_mismatch', 'epoch_parameters_upgrade_invalid'}:
         return 'invalid_coverage'
@@ -235,9 +236,12 @@ class PostgresRuntime:
     def restore(self):
         self.reserve_check()
         from db_sync_alt.backup import restore
+        from db_sync_alt.store.upgrade import epoch_source
+        # A backup written before epoch parameters is upgraded with the service's Blockfrost settings.
         restore(self.config.backup_archive, self.config.backup_manifest,
                 destination_service=self.config.pg_service, reserve_check=self.reserve_check,
-                expected_network=self.config.network, reader_role=self.config.reader['role'])
+                expected_network=self.config.network, reader_role=self.config.reader['role'],
+                epoch_source=epoch_source)
 
     def open_writer(self, health):
         from db_sync_alt.store.database import PgStore
