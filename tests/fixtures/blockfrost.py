@@ -5,8 +5,9 @@ import hashlib
 import time
 import uuid
 
-from db_sync_alt.contract import Refusal, canonical
-from db_sync_alt.sources.blockfrost.adapter import OPENAPI, ProviderClient
+from db_sync_alt.contract import Refusal
+from db_sync_alt.sources.blockfrost.adapter import OPENAPI, ProviderClient, bounded_answer, input_cut
+from db_sync_alt.sources.blockfrost.provider import UTXOS
 from fixtures.networks import PREPROD
 
 
@@ -22,11 +23,12 @@ class Fake:
 
 
 class CountingProvider(ProviderClient):
-    """Budgeted provider over a fake client: counts attempts and keeps compact receipts, like the service's accounted provider."""
-    def __init__(self,budget,client):
+    """Budgeted provider over a fake client: counts attempts and keeps compact receipts, like the service's accounted
+    provider. With `profile`, an oversized `/utxos` answer is cut as the service cuts it."""
+    def __init__(self,budget,client,profile=None):
         if type(budget) is not int or not 1<=budget<=50000:raise Refusal('invalid_request_budget')
         self.budget=budget;self.job_id=uuid.uuid4().hex;self.attempts=0;self.receipts=[];self.metrics_day=None;self.metrics_at=0;self.metrics_count=0
-        self.client=client
+        self.client=client;self.profile=profile
     def get(self,path):
         if not isinstance(path,str) or not path.startswith('/') or path.startswith('//') or any(c in path for c in ('#','\\','\n','\r')):raise Refusal('invalid_provider_path')
         day=dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -35,8 +37,7 @@ class CountingProvider(ProviderClient):
         self.attempts+=1
         try:result=self.client.get(path,purpose='fixture:'+self.job_id)
         except Exception:raise Refusal('provider_request_failed_counted') from None
-        encoded=canonical(result).encode()
-        if len(encoded)>32*1024*1024:raise Refusal('provider_response_size_limit')
+        result,encoded=bounded_answer(result,input_cut(self.profile) if self.profile is not None and UTXOS.fullmatch(path) else None)
         self.receipts.append({'endpoint':path,'sha256':hashlib.sha256(encoded).hexdigest(),'bytes':len(encoded),'attempt':self.attempts,'at':dt.datetime.now(dt.timezone.utc).isoformat()})
         if len(self.receipts)>20000:raise Refusal('provider_receipt_unit_limit')
         if path=='/metrics':self.metrics_day=day;self.metrics_at=time.monotonic();self.metrics_count=self.attempts

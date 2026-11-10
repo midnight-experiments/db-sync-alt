@@ -17,8 +17,9 @@ import time
 import uuid
 
 from db_sync_alt.resources import profile_dir
-from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, ProviderClient, block_row, update)
-from db_sync_alt.contract import Profile, Refusal, canonical
+from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, ProviderClient, block_row, bounded_answer, input_cut, update)
+from db_sync_alt.sources.blockfrost.provider import UTXOS
+from db_sync_alt.contract import Profile, Refusal
 from db_sync_alt.service.health import ChainPoint, PendingProgress, QuotaStatus
 from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure, CooperativeStop
 from db_sync_alt.verify.completion import COMPLETION_ERRORS, validate_completion
@@ -372,10 +373,12 @@ def validate_job(job, *, kind=None, security=None):
 
 
 class AccountedProvider(ProviderClient):
-    def __init__(self, store, key, job, client, health, stop_event, *, network, clock=time.time):
+    def __init__(self, store, key, job, client, health, stop_event, *, network, clock=time.time, profile=None):
         # The job row carries budget, attempts and identity; there is no per-invocation budget.
         validate_job(job, security=network.security)
         self.network = network
+        # With the acquisition profile, an oversized `/utxos` answer is cut (`adapter.input_cut`) instead of refused.
+        self.profile = profile
         self.store, self.key, self.job, self.client = store, key, dict(job), client
         self.health, self.stop_event, self.clock = health, stop_event, clock
         self.job_id, self.budget, self.attempts = job['job_id'], job['budget'], job['attempts']
@@ -485,8 +488,11 @@ class AccountedProvider(ProviderClient):
         self.save()  # durable reservation BEFORE shared request, including failure
         self.health.end_operation()
         self.health.begin_operation('provider')
+        cut = input_cut(self.profile) if self.profile is not None and UTXOS.fullmatch(path) else None
         try:
-            result = self.client.get(path, purpose='db-sync-alt:' + self.job_id)
+            # db-sync-alt's own client reads an oversized `/utxos` answer row by row; another client's parsed answer is cut below.
+            extra = {'cut': cut} if cut is not None and getattr(self.client, 'reads_by_row', False) else {}
+            result = self.client.get(path, purpose='db-sync-alt:' + self.job_id, **extra)
         except Exception as error:
             usage = self._quota()
             text = str(error)  # classify known shared machine text, never serialize it
@@ -509,9 +515,7 @@ class AccountedProvider(ProviderClient):
             self.health.end_operation()
             self.health.begin_operation('verification')
         self._quota()
-        encoded = canonical(result).encode()
-        if len(encoded) > 32 * 1024 * 1024:
-            raise Refusal('provider_response_size_limit')
+        result, encoded = bounded_answer(result, cut)
         self.receipts.append({'endpoint': path, 'sha256': hashlib.sha256(encoded).hexdigest(),
                               'bytes': len(encoded), 'attempt': self.attempts,
                               'at': dt.datetime.fromtimestamp(self.clock(), dt.timezone.utc).isoformat()})
@@ -670,7 +674,7 @@ class SyncDriver:
         if self._client is None:
             self._client = shared_client(self.profile.network)
         provider = AccountedProvider(store, key, job, self._client, health, stop_event, clock=self.clock,
-                                     network=self.profile.network)
+                                     network=self.profile.network, profile=self.profile)
         self._diagnostic_provider = provider
         return provider
 

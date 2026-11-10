@@ -23,6 +23,12 @@ import types
 from urllib.parse import unquote, urlsplit
 
 MAX_BYTES = 32 * 1024 * 1024
+# `/txs/{h}/utxos` lists every input with all assets of the output it spends; anyone can make that answer pass
+# MAX_BYTES (about 300 reference inputs to outputs of 1,304 assets each). Such an answer is read one input row at a
+# time, each row cut as it is read (`CutAnswer`), up to this many bytes: above any answer a ledger-valid
+# transaction can produce (a 16,384-byte transaction has at most about 455 inputs of at most about 114 KB each).
+UTXOS = re.compile('/txs/[0-9a-f]{64}/utxos')
+UTXOS_MAX_BYTES = 128 * 1024 * 1024
 # Arrays and objects nested deeper than this in a provider answer are cut out. Python's JSON decoder and
 # encoder recurse in C and fail between 5,000 and 10,000 levels, and anyone can put metadata that deep on
 # chain. Every value cardano-db-sync stores as JSON (nesting up to 2,000) arrives whole.
@@ -36,6 +42,58 @@ _CUT_KEY = '\x00db-sync-alt:nested-too-deep'
 
 class TooDeep(dict):
     """An array or object nested deeper than RESPONSE_DEPTH in a provider answer: cut, empty."""
+
+
+class CutAnswer(dict):
+    """A `/txs/{h}/utxos` answer above MAX_BYTES whose input rows were cut (`adapter.input_cut`)."""
+
+
+_SPACE = re.compile(r'[ \t\n\r]*')
+
+
+def cut_utxos(raw, cut):
+    """A `/txs/{h}/utxos` answer decoded one input row at a time, each row passed through `cut` as it is read,
+    so the whole answer is never held decoded. Other members are decoded as `json.loads` decodes them (a
+    repeated name keeps its last value). Malformed JSON raises ValueError."""
+    text = raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else raw
+    decoder, result = json.JSONDecoder(), CutAnswer()
+    skip = lambda i: _SPACE.match(text, i).end()
+    def expect(i, token):
+        if text[i:i + 1] != token:
+            raise ValueError('expected ' + token)
+        return skip(i + 1)
+    i = expect(skip(0), '{')
+    while text[i:i + 1] != '}':
+        if text[i:i + 1] != '"':
+            raise ValueError('member name expected')
+        name, i = decoder.raw_decode(text, i)
+        i = expect(skip(i), ':')
+        if name == 'inputs' and text[i:i + 1] == '[':
+            value, i = [], skip(i + 1)
+            while text[i:i + 1] != ']':
+                row, i = decoder.raw_decode(text, i)
+                value.append(cut(row))
+                i = skip(i)
+                if text[i:i + 1] == ',':
+                    i = skip(i + 1)
+                    if text[i:i + 1] == ']':
+                        raise ValueError('trailing comma')
+                elif text[i:i + 1] != ']':
+                    raise ValueError('expected , or ]')
+            i += 1
+        else:
+            value, i = decoder.raw_decode(text, i)
+        result[name] = value
+        i = skip(i)
+        if text[i:i + 1] == ',':
+            i = skip(i + 1)
+            if text[i:i + 1] != '"':
+                raise ValueError('member name expected')
+        elif text[i:i + 1] != '}':
+            raise ValueError('expected , or }')
+    if skip(i + 1) != len(text):
+        raise ValueError('trailing data')
+    return result
 
 
 def _object(pairs):
@@ -228,10 +286,13 @@ class PortableClient:
         conn = http.client.HTTPSConnection(self.host, timeout=60)
         try:
             conn.request('GET', '/api/v0'+path, headers={'project_id':self.key, 'Accept':'application/json'})
-            response = conn.getresponse();raw = response.read(MAX_BYTES+1)
+            limit = UTXOS_MAX_BYTES if UTXOS.fullmatch(path) else MAX_BYTES
+            response = conn.getresponse();raw = response.read(limit+1)
             return response.status, dict(response.getheaders()), raw
         finally:conn.close()
-    def get(self, path, purpose='db-sync-alt'):
+    # AccountedProvider passes `cut` for `/txs/{h}/utxos`: an answer above MAX_BYTES is read row by row (`cut_utxos`).
+    reads_by_row = True
+    def get(self, path, purpose='db-sync-alt', cut=None):
         safe_path(path)
         if self.key in unquote(path):raise ProviderError('credential_in_path')
         with self._locked():
@@ -254,8 +315,10 @@ class PortableClient:
                     if code==402:entry['days'][day] = max(entry['days'][day],entry['limit'])
                     _atomic(self.state,data)
                 if code != 200:raise ProviderError('provider_request_failed_counted',http_status=code)
-                if len(raw)>MAX_BYTES or self.key.encode() in raw:raise ProviderError('unsafe_provider_response')
-                result=loads(raw)
+                large=len(raw)>MAX_BYTES
+                if (large and (cut is None or not UTXOS.fullmatch(path) or len(raw)>UTXOS_MAX_BYTES)) or self.key.encode() in raw:
+                    raise ProviderError('unsafe_provider_response')
+                result=cut_utxos(raw,cut) if large else loads(raw)
                 if self.key in json.dumps(result,ensure_ascii=False):raise ProviderError('unsafe_provider_response')
                 if path=='/metrics':
                     if not isinstance(result,list):raise ProviderError('invalid_provider_metrics')
