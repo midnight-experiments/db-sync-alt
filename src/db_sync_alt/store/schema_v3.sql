@@ -18,7 +18,7 @@ CREATE TABLE serve.tx_in(id bigint PRIMARY KEY,tx_in_id bigint NOT NULL,tx_out_i
 CREATE TABLE serve.ma_tx_out(id bigint PRIMARY KEY,quantity public.word64type NOT NULL,tx_out_id bigint NOT NULL,ident bigint NOT NULL,
  CONSTRAINT ma_tx_out_position CHECK(tx_out_id BETWEEN 0 AND 2251799813685247 AND id-tx_out_id*4096 BETWEEN 0 AND 4095));
 CREATE TABLE serve.multi_asset(id bigint PRIMARY KEY,policy public.hash28type NOT NULL,name public.asset32type NOT NULL);
-CREATE TABLE serve.datum(id bigint PRIMARY KEY,hash public.hash32type NOT NULL,value jsonb NOT NULL);
+CREATE TABLE serve.datum(id bigint PRIMARY KEY,hash public.hash32type NOT NULL,value jsonb);
 CREATE TABLE serve.epoch_param(epoch_no public.word31type PRIMARY KEY,nonce public.hash32type NOT NULL);
 CREATE TABLE serve.pool_hash(id bigint PRIMARY KEY,hash_raw public.hash28type NOT NULL);
 CREATE TABLE serve.epoch_stake(id bigint PRIMARY KEY,pool_id bigint NOT NULL,amount public.lovelace NOT NULL,epoch_no public.word31type NOT NULL);

@@ -185,10 +185,12 @@ class SQLSource:
         for r in self.stream('SELECT t.hash,b.hash AS block_hash,t.block_index AS tx_index,t.valid_contract AS valid FROM tx t JOIN block b ON b.id=t.block_id WHERE t.id=ANY(%s::bigint[]) ORDER BY b.block_no,t.block_index',(txs,)):
             if r['valid'] is not True:raise Refusal('invalid_relevant_transaction')
             r['valid']=1;yield 'transactions',r
-        missing=self.one('SELECT count(*) AS n FROM tx_out o LEFT JOIN datum d ON d.hash=o.data_hash LEFT JOIN datum di ON di.id=o.inline_datum_id WHERE o.id=ANY(%s::bigint[]) AND ((o.data_hash IS NOT NULL AND d.id IS NULL) OR (o.inline_datum_id IS NOT NULL AND (di.id IS NULL OR di.hash IS DISTINCT FROM o.data_hash)))',(outs,))['n']
+        # A datum hash without a datum row is a preimage not on chain yet: the output keeps the hash.
+        # An inline datum is always in the source, under the output's own hash.
+        missing=self.one('SELECT count(*) AS n FROM tx_out o LEFT JOIN datum di ON di.id=o.inline_datum_id WHERE o.id=ANY(%s::bigint[]) AND o.inline_datum_id IS NOT NULL AND (di.id IS NULL OR di.hash IS DISTINCT FROM o.data_hash)',(outs,))['n']
         if missing:raise Refusal('missing_or_conflicting_datum')
         for r in self.stream('SELECT DISTINCT d.hash,d.value FROM tx_out o JOIN datum d ON d.hash=o.data_hash WHERE o.id=ANY(%s::bigint[])',(outs,)):
-            r['value']=canonical(r['value']);yield 'datums',r
+            r['value']=None if r['value'] is None else canonical(r['value']);yield 'datums',r
         for r in self.stream('SELECT t.hash AS tx_hash,o.index AS output_index,o.address,o.value::text AS value,o.data_hash AS datum_hash FROM tx_out o JOIN tx t ON t.id=o.tx_id WHERE o.id=ANY(%s::bigint[]) ORDER BY t.hash,o.index',(outs,)):yield 'outputs',r
         for r in self.stream('SELECT DISTINCT a.policy,a.name FROM multi_asset a WHERE '+self.asset_predicate()+' AND (EXISTS(SELECT 1 FROM ma_tx_out m WHERE m.ident=a.id AND m.tx_out_id=ANY(%s::bigint[])) OR EXISTS(SELECT 1 FROM ma_tx_mint m WHERE m.ident=a.id AND m.tx_id=ANY(%s::bigint[])))',(*self.asset_params(),outs,mints)):yield 'assets',r
         # Ordinals: db-sync's row order within the output / spending transaction, which is ledger order.

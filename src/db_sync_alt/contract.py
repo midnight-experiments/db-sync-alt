@@ -153,6 +153,8 @@ def contract_for(network,*,legacy=False):
               'quantities':'canonical decimal TEXT','hashes':'raw bytes','timestamps':'UTC ISO-8601 microseconds',
               'datum':'canonical semantic JSON','bridge_qualified':False,'schema_version':SCHEMA_VERSION}
     if not legacy:
+        contract['datum']=('canonical semantic JSON; NULL where cardano-db-sync 13.8 stores NULL (JSON nested deeper than 2000 levels);'
+                           ' an output datum hash without a preimage on chain has no datum')
         # The node reads MAX(max_tx_size) of the cursor block's epoch: every source row of the
         # epoch is validated and their maximum is the fact.
         contract['epoch_parameters']={'version':1,'capability':EPOCH_CAPABILITY,

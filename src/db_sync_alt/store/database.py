@@ -81,14 +81,15 @@ def logical_row(table, row):
         if isinstance(value,memoryview):out[key]=bytes(value)
     for column in ('value','quantity','amount'):
         if column in out:
-            out[column]=canonical(out[column]) if table=='datums' else str(out[column])
+            # A datum value is NULL where cardano-db-sync stores NULL (JSON nested past its limit).
+            out[column]=(None if out[column] is None else canonical(out[column])) if table=='datums' else str(out[column])
     if table=='blocks' and isinstance(out['time'],dt.datetime):out['time']=out['time'].strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     return out
 
 
 def bind_row(table,row):
     values=[row[c] for c in TABLES[table]]
-    if table=='datums':values[TABLES[table].index('value')]=Jsonb(json.loads(row['value']))
+    if table=='datums' and row['value'] is not None:values[TABLES[table].index('value')]=Jsonb(json.loads(row['value']))
     if table=='blocks':
         raw=row['time']
         parsed=dt.datetime.fromisoformat(raw.replace('Z','+00:00'))

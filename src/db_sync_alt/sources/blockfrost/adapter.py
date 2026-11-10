@@ -37,7 +37,7 @@ def integer(v,*,signed=False):
     return r
 
 class ProviderClient:
-    """Provider base: subclasses implement `get(path)` and `drain()`; `pages` walks ascending pages."""
+    """Provider base: subclasses implement `get(path)`, `get_optional(path)` (None for HTTP 404) and `drain()`; `pages` walks ascending pages."""
     def pages(self,path):
         page=1
         while True:
@@ -253,13 +253,25 @@ class BlockfrostSource:
         if integer(r.get('block_height'))!=block['height'] or index>=block['tx_count'] or (expected_block is not None and block['hash']!=expected_block) or (expected_index is not None and index!=expected_index):raise Refusal('provider_transaction_position_mismatch')
         self.add('transactions',{'hash':h,'block_hash':block['hash'],'tx_index':index,'valid':1});self.cache[h]=r;return r
     def datum(self,h,inline=None):
+        """Store datum `h` as cardano-db-sync 13.8 does; `inline` is the output's own datum CBOR.
+
+        No preimage on chain (Blockfrost 404): no datum, the output keeps its hash. A value that
+        db-sync stores as NULL (`decode_datum` gives None) is never asked for: Blockfrost serves
+        that NULL as `{}`. Any other value must equal Blockfrost's JSON.
+        """
         if self.has('datums','hash=?',(h,)) or any(t=='datums' and r['hash']==h for t,r in self.facts):return
-        data=self.provider.get('/scripts/datum/'+h.hex())
-        if 'json_value' not in data or not isinstance(data['json_value'],dict):raise Refusal('provider_missing_datum')
-        raw=hexbytes(inline) if inline is not None else hexbytes(self.provider.get('/scripts/datum/'+h.hex()+'/cbor').get('cbor'))
+        if inline is None:
+            found=self.provider.get_optional('/scripts/datum/'+h.hex()+'/cbor')
+            if found is None:return
+            inline=found.get('cbor') if isinstance(found,dict) else None
+        raw=hexbytes(inline)
         if hashlib.blake2b(raw,digest_size=32).digest()!=h:raise Refusal('provider_datum_hash_mismatch')
-        if decode_datum(raw)!=data['json_value']:raise Refusal('provider_datum_semantics_mismatch')
-        self.add('datums',{'hash':h,'value':canonical(data['json_value'])})
+        value=decode_datum(raw)
+        if value is not None:
+            data=self.provider.get('/scripts/datum/'+h.hex())
+            if 'json_value' not in data or not isinstance(data['json_value'],dict):raise Refusal('provider_missing_datum')
+            if data['json_value']!=value:raise Refusal('provider_datum_semantics_mismatch')
+        self.add('datums',{'hash':h,'value':None if value is None else canonical(value)})
     def output(self,h,row):
         val,assets=output_value(row);idx=integer(row['output_index'])
         if val['address']==self.profile.candidate:raise Refusal('unsupported_nonempty_candidates')
@@ -276,6 +288,8 @@ class BlockfrostSource:
             if any(old[k]!=v for k,v in val.items()):raise Refusal('provider_origin_conflict')
             expected={(bytes(r['policy']),bytes(r['name'])):int(r['quantity']) for r in self.store.output_assets(h,index)}
             if expected!={k:v for k,v in assets.items() if self.profile.required(*k)}:raise Refusal('provider_origin_asset_conflict')
+            # A Plutus spend of a hash-only output carries its preimage: a datum missing until now is stored here.
+            if old['datum_hash'] is not None:self.datum(old['datum_hash'],observed.get('inline_datum'))
             return
         self.transaction(h)
         response=self.provider.get('/txs/'+h.hex()+'/utxos')

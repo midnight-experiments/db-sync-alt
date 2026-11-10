@@ -20,8 +20,8 @@ class IdentityTests(unittest.TestCase):
     def test_contract_and_profile(self):
         profile = contract.Profile(profile_dir('preprod'))
         preprod = networks.network_profile('preprod')
-        self.assertEqual(contract.digest(contract.contract_for(preprod)), '54bf7fc0ea580536856c9ebfd0884bc07a4ffa80f1e1670d7d22dc170b120f36')
-        self.assertEqual(contract.digest(profile.contract), '54bf7fc0ea580536856c9ebfd0884bc07a4ffa80f1e1670d7d22dc170b120f36')
+        self.assertEqual(contract.digest(contract.contract_for(preprod)), '985d815697c6586548247a350c9e18aaea1fad63e0b9512e99016cee1998d5db')
+        self.assertEqual(contract.digest(profile.contract), '985d815697c6586548247a350c9e18aaea1fad63e0b9512e99016cee1998d5db')
         # The nonce-only contract stored by every earlier release: stores and backups that carry it
         # must still be recognised to be verified and upgraded.
         self.assertEqual(contract.digest(contract.contract_for(preprod, legacy=True)), '65da5fbe1e66529141f8ae3e8b9330e0b2110d2ed17ef3ac94899c84f6e5cbab')
