@@ -1,3 +1,4 @@
+import bisect
 import copy
 import json
 import unittest
@@ -107,6 +108,8 @@ class SyntheticEpoch:
         self.amount={p:1000000+k%13 for k,p in enumerate(staked)};self.amount[self.zero_rows]=0
         self.sums={p:self.count[p]*self.amount[p] for p in self.count}
         self.order=list(self.count);self.total=sum(self.sums.values())
+        self.first=[0]
+        for p in self.order:self.first.append(self.first[-1]+self.count[p])
         self.calls=[]
     def expected(self):
         return [{'epoch':self.E,'pool_hash':pool_hash(p),'amount':str(v)} for p,v in sorted(self.sums.items(),key=lambda kv:pool_hash(kv[0]))]
@@ -123,12 +126,11 @@ class SyntheticEpoch:
         if path=='/epochs/'+E+'/blocks?count=1&page=1&order=desc':return ['aa'*32]
         if path=='/blocks/'+'aa'*32:return block
         if base=='/epochs/'+E+'/stakes':  # the per-address listing the per-pool read never needs
-            query=dict(x.split('=') for x in path.split('?',1)[1].split('&'));start=(int(query['page'])-1)*100;rows=[];k=0
-            for p in self.order:
-                for _ in range(self.count[p]):
-                    if start<=k<start+100:rows.append({'stake_address':'stake_test1u%053d'%k,'pool_id':p,'amount':str(self.amount[p])})
-                    k+=1
-                    if k>=start+100:return rows
+            query=dict(x.split('=') for x in path.split('?',1)[1].split('&'));start=(int(query['page'])-1)*100;rows=[]
+            at=bisect.bisect_right(self.first,start)-1
+            for k in range(start,min(start+100,self.first[-1])):
+                while k>=self.first[at+1]:at+=1
+                p=self.order[at];rows.append({'stake_address':'stake_test1u%053d'%k,'pool_id':p,'amount':str(self.amount[p])})
             return rows
         if base.startswith('/epochs/'+E+'/stakes/'):
             p=base.rsplit('/',1)[1];return [{'stake_address':'stake_test1u%053d'%0,'amount':str(self.amount[p])}] if p in self.count else []
