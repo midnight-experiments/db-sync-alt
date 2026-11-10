@@ -32,6 +32,8 @@ from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure, Cooperati
 
 
 SAFE_FAILURES = frozenset({
+    'relevance_parent_unsupported', 'relevance_mode_mismatch', 'relevance_coverage_invalid', 'relevance_parent_changed',
+    'relevance_inventory_invalid', 'relevance_output_unqualified', 'relevance_profile_address_invalid', 'relevance_work_unit_limit',
     'unsupported_follow_mode', 'completion_recovery_required', 'completion_invalid', 'completion_mismatch',
     'writer_busy', 'invalid_identity', 'invalid_backup', 'incomplete_restore',
     'missing_backup', 'database_unavailable', 'database_timeout', 'invalid_coverage',

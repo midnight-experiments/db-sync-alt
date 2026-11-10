@@ -116,3 +116,14 @@ Administrative commands (`acquire`, `upgrade`, `backup`, `restore`, `verify`,
 | `resume_namespace_mismatch` | An unfinished build is resumed against a different db-sync database than the one it started from |
 | `source_equals_destination` | The db-sync source and the destination are the same database |
 | `explicit_blockfrost_target_required` | `acquire --source blockfrost` needs `--target-height` within 1,000 blocks above the ready target |
+
+### Relevance filtering refusals
+
+| Code | Action |
+|---|---|
+| `relevance_parent_unsupported` | Enable filtering only after a compatible, independently verified complete SQL bootstrap and certified continuation lineage. Full scan is available with the option off when no conflicting relevance pending update exists. |
+| `relevance_mode_mismatch` | Resume the pending update with its original relevance setting. Do not discard pending data or reset budgets. |
+| `relevance_coverage_invalid` | Preserve the database and inspect the declared and stored proofs. A valid missing legacy row is repaired automatically; conflicting or forged proof is refused. |
+| `relevance_parent_changed` | Use the exact profile matching the certified parent, and reverify after investigating any unexpected change. |
+
+`/health` and `/status` include the requested mode, effective mode and reason under `relevance`. Turning the option off does not disable validation of optimized generations already in the database.

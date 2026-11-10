@@ -17,7 +17,7 @@ from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure
 
 
 def blockfrost_once(store, profile, *, target_height=None, request_budget=None,
-                    stop_event=None, client=None):
+                    stop_event=None, client=None, relevance_enabled=False):
     from db_sync_alt.sources.blockfrost.sync import SyncDriver
     from db_sync_alt.service.health import HealthState
     stop_event = stop_event or threading.Event()
@@ -36,7 +36,7 @@ def blockfrost_once(store, profile, *, target_height=None, request_budget=None,
         if request_budget is not None and request_budget != active['budget']:raise Refusal('sync_job_budget_reset')
         request_budget = active['budget']
     options={'max_batch_blocks':target_height-ready['target_height'],
-             'publication_interval_seconds':1,'acquisition_request_budget':request_budget or 10000}
+             'publication_interval_seconds':1,'acquisition_request_budget':request_budget or 10000,'relevance_enabled':relevance_enabled}
     # Keep an existing current-day poll allowance as it is; never reset it.
     import datetime as dt
     day=dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -65,6 +65,7 @@ def parser():
     p.add_argument('--source-service')
     p.add_argument('--source-attestation',type=Path)
     p.add_argument('--request-budget',type=int)
+    p.add_argument('--relevance',action=argparse.BooleanOptionalAction,dest='relevance_enabled',default=False,help='Enable coverage-certified relevance filtering for Blockfrost following (default: off)')
     p.add_argument('--reserve',action='append',default=[],metavar='PATH:BYTES',
                    help='Free space that must stay on the volume of PATH, in bytes; repeat for each volume (default /:10737418240, 10 GiB)')
     return p
@@ -77,7 +78,7 @@ def main(argv=None):
         if stop.is_set():raise Refusal('interrupted')
         print(canonical({'phase':phase,**fields}),file=sys.stderr,flush=True)
     try:
-        if args.source=='db-sync' and (not args.source_service or not args.source_attestation or args.request_budget is not None):
+        if args.source=='db-sync' and (not args.source_service or not args.source_attestation or args.request_budget is not None or args.relevance_enabled):
             raise Refusal('invalid_source_configuration')
         if args.source=='blockfrost' and (args.create or args.source_service or args.source_attestation):
             raise Refusal('blockfrost_requires_ready_destination')
@@ -100,7 +101,7 @@ def main(argv=None):
                     window_blocks=args.window_blocks,stop_event=stop)
             else:
                 report=blockfrost_once(store,profile,target_height=args.target_height,
-                    request_budget=args.request_budget,stop_event=stop)
+                    request_budget=args.request_budget,stop_event=stop,relevance_enabled=args.relevance_enabled)
             print(canonical(report));return 0
     except TransientSyncFailure as error:
         print(canonical({'error_code':error.code,'retry_at':error.retry_at}),file=sys.stderr);return 75

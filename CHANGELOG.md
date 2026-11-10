@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+
+- Add optional filtering that can skip unnecessary UTxO and transaction-detail
+  requests for unrelated transactions while retaining matching facts. Select it
+  with `sync.relevance_enabled` or `--relevance` / `--no-relevance`; it is off by
+  default on every network, and health reports the requested/effective modes.
+- Filtered history requires a reader that verifies relevance proofs. Retain a
+  compatible package with the database and its backups, even after filtering
+  is switched off.
+- Bound relevance checks at integrity checkpoints and report stored history
+  provenance in the `status` field `relevance.history`.
 - Acquire complete SQL prerequisite history in bounded, atomic windows with
   resumable contiguous coverage and independent source verification. Existing
   source-query deadlines, identity caps and confirmation rules are unchanged.

@@ -11,7 +11,7 @@ import logging
 import re
 from urllib.parse import urlencode
 from db_sync_alt.sources.blockfrost.cbor import decode_transaction, decode_datum
-from db_sync_alt.contract import Refusal, canonical, digest, required_epochs
+from db_sync_alt.contract import TABLES, Refusal, canonical, digest, jsonable, required_epochs
 
 OPENAPI='1d4d5d8bac8f0c641eea5c6f7b1f3fbbed8d1505'
 
@@ -173,7 +173,7 @@ def inventory(provider,block):
     diagnostic_context(provider,'events.inventory',block_height=block.get('height'),block_hash=block.get('hash'))
     if block['tx_count']==0:return []
     if block['tx_count']>10000:raise Refusal('provider_block_transaction_limit')
-    txs=[];seen=set();body_bytes=0
+    txs=[];seen=set();body_bytes=0;raw_bytes=0
     for rows in provider.pages('/blocks/'+block['hash'].hex()+'/txs/cbor'):
         for row in rows:
             diagnostic_context(provider,'events.inventory',block_height=block.get('height'),block_hash=block.get('hash'),transaction_index=len(txs),transaction_hash=row.get('tx_hash') if isinstance(row,dict) else None)
@@ -182,7 +182,8 @@ def inventory(provider,block):
             except KeyError:raise Refusal('provider_bad_inventory') from None
             if d['hash'] in seen:raise Refusal('provider_duplicate_transaction')
             body_bytes+=d['body_bytes']
-            if body_bytes>16*1024*1024:raise Refusal('provider_block_decode_limit')
+            raw_bytes+=len(row['cbor'])//2
+            if body_bytes>16*1024*1024 or raw_bytes>16*1024*1024:raise Refusal('provider_block_decode_limit')
             seen.add(d['hash']);txs.append(d)
             if len(txs)>block['tx_count']:raise Refusal('provider_transaction_count_mismatch')
         diagnostic_context(provider,'events.inventory',block_height=block.get('height'),block_hash=block.get('hash'))
@@ -224,9 +225,18 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
     return {'epoch':epoch,'nonce':first[1]},[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(reads[0][1].items())],first[2],{'stake_addresses':reads[0][2],'stake_digest':reads[0][0],'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
 
 class BlockfrostSource:
-    def __init__(self,provider,profile,store,generation,stop_requested):
+    def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False):
         self.provider=provider;self.profile=profile;self.store=store;self.stop_requested=stop_requested;self.gen=generation;self.target=store.generation(generation)['target_height']
         self.cache={};self.facts=[]
+        from db_sync_alt.sources.blockfrost.relevance import pending_certificate,Discovery,CertifiedReadView
+        self.coverage=coverage if relevance_enabled and coverage is not None else (pending_certificate(store,profile,generation) if relevance_enabled else None)
+        if relevance_enabled and self.coverage is None:raise Refusal('relevance_parent_unsupported')
+        self.discovery=None;self.auditor=None
+        if self.coverage is not None:
+            parent=store.generation(generation)['parent'];known=known if known is not None else {table:set() for table in TABLES}
+            self.known=known;self.store=CertifiedReadView(store,parent,known)
+            self.discovery=Discovery(store,profile,parent,independent=audit)
+            if not audit:self.auditor=BlockfrostSource(provider,profile,store,generation,stop_requested,audit=True,coverage=self.coverage,known=known,relevance_enabled=True)
     def add(self,table,row):self.facts.append((table,row))
     def has(self,table,where,params):return self.store.fact(table,params) is not None
     def block(self,h):
@@ -273,22 +283,30 @@ class BlockfrostSource:
         matches=[x for x in response.get('outputs',[]) if x.get('output_index')==index]
         if len(matches)!=1 or output_value(matches[0])!=output_value(observed):raise Refusal('provider_origin_conflict')
         self.output(h,matches[0])
-    def block_facts(self,block):
+    def _collect(self,block):
         self.cache={};self.facts=[];txs=inventory(self.provider,block)
+        if self.discovery:self.discovery.begin()
         for index,decoded in enumerate(txs):
             if self.stop_requested():raise Refusal('interrupted')
             h=decoded['hash']
             diagnostic_context(self.provider,'events.transaction',block_height=block.get('height'),block_hash=block.get('hash'),transaction_index=index,transaction_hash=h)
+            if self.discovery and not self.discovery.select(decoded):continue
             response=self.provider.get('/txs/'+h.hex()+'/utxos')
             if response.get('hash')!=h.hex():raise Refusal('provider_utxo_hash_mismatch')
             ordinary=classify_inputs(response.get('inputs'),decoded,lambda origin,index:fetch_original_output(self.provider,origin,index))
             outputs=ordinary_outputs(response.get('outputs'),decoded)
+            if self.discovery:
+                from db_sync_alt.sources.blockfrost.relevance import compare_outputs
+                compare_outputs(decoded,response['outputs'],self.profile.network.network)
+                self.discovery.advance(decoded,outputs)
             # Unsupported relevant invalid transactions include relevant
             # collateral-return facts even though valid ones ignore that output.
             if not decoded['valid']:outputs=response['outputs']
             relevant_out=[x for x in outputs if self.profile.relevant(output_value(x)[0]['address'],output_value(x)[1])]
             relevant_in=[(k,x) for k,x in ordinary.items() if self.profile.relevant(output_value(x)[0]['address'],output_value(x)[1])]
+            if self.discovery and any(not self.discovery.contains(key) for key,_ in relevant_in):raise Refusal('relevance_parent_incomplete')
             mints=[m for m in decoded['mints'] if self.profile.required(m[0],m[1])]
+            if self.discovery and not decoded['valid'] and any(self.discovery.contains(key) for key in decoded['collateral']):raise Refusal('unsupported_relevant_invalid_transaction')
             if not (relevant_out or relevant_in or mints):continue
             if not decoded['valid']:raise Refusal('unsupported_relevant_invalid_transaction')
             self.transaction(h,block['hash'],index)
@@ -298,7 +316,24 @@ class BlockfrostSource:
                 self.origin(origin,oi,x);self.add('inputs',{'tx_hash':h,'origin_hash':origin,'origin_index':oi,'ordinal':ordinals[(origin,oi)]})
             for p,n,q in mints:
                 self.add('assets',{'policy':p,'name':n});self.add('mints',{'tx_hash':h,'policy':p,'name':n,'quantity':str(q)})
-        return self.facts,{'transactions_scanned':len(txs),'facts':len(self.facts)}
+        return self.facts,{'transactions_scanned':len(txs),'facts':len(self.facts)},txs
+    def block_facts(self,block):
+        facts,stats,txs=self._collect(block)
+        if self.auditor is not None:
+            from db_sync_alt.sources.blockfrost.relevance import inventory as fact_inventory,KIND,MAX_KEYS,MAX_PROOF
+            expected,_,independent=self.auditor._collect(block)
+            tx_hashes=[row['hash'] for row in txs]
+            if tx_hashes!=[row['hash'] for row in independent]:raise Refusal('independent_provider_inventory_changed')
+            actual=fact_inventory(facts);expected=fact_inventory(expected)
+            if actual!=expected:raise Refusal('independent_provider_mismatch')
+            proof={'kind':KIND,'version':1,'parent_ref':self.coverage['parent_ref'],'inventory':expected,
+                   'transactions':len(txs),'transaction_hashes_sha256':digest(tx_hashes),
+                   'created_outputs':jsonable(sorted(self.auditor.discovery.block_created))}
+            if len(canonical(proof).encode())>MAX_PROOF:raise Refusal('relevance_work_unit_limit')
+            for table,entry in expected.items():self.known[table].update(canonical(k) for k in entry['keys'])
+            if sum(map(len,self.known.values()))>MAX_KEYS:raise Refusal('relevance_work_unit_limit')
+            stats['relevance']=proof
+        return facts,stats
 
 def complete_inherited_epoch(provider,store,g,epoch,inherited):
     """Qualify the new completed end; already certified stake facts stay inherited."""
@@ -353,9 +388,11 @@ def handoff_overlap(provider,store,profile,parent):
     return checked
 
 
-def update(store,provider,profile,end_height=None,*,hooks):
+def update(store,provider,profile,end_height=None,*,hooks,relevance_enabled=False):
     from db_sync_alt.verify.completion import validate_completion
+    if relevance_enabled:raise Refusal('relevance_parent_unsupported')
     pending=store.pending()
+    if pending and pending['manifest'].get('relevance_coverage') is not None:raise Refusal('relevance_mode_mismatch')
     if pending:validate_completion(store,pending)
     ready=store.generation()
     diagnostic_context(provider,'verification',generation=(pending or ready)['id'])

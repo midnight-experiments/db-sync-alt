@@ -136,7 +136,7 @@ def _store_suffix(store, provider, gen, pages, *, hooks):
     return stored
 
 
-def update_follow(store, provider, profile, target, *, hooks, observation=None):
+def update_follow(store, provider, profile, target, *, hooks, observation=None, relevance_enabled=False):
     from db_sync_alt.store.incremental import integrity_reference
     parent_capability=store.current_verified_parent()
     ready=store.generation();pending=store.pending()
@@ -144,6 +144,8 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None):
     if target<=ready['target_height']:raise Refusal('no_confirmed_progress')
     if pending and (pending['target_height']!=target or pending['source']!='blockfrost-cardano'):
         raise Refusal('resume_target_mismatch')
+    from db_sync_alt.sources.blockfrost.relevance import requested_coverage
+    coverage=requested_coverage(store,profile,target,pending,relevance_enabled)
     source_identity=profile.network.source_identity
     token=_QUALIFIED.get(store)
     qualified=(token is not None and token['parent'] == ready['id']
@@ -198,8 +200,11 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None):
                   'required_epochs':required_epochs(startepoch,targetrow['epoch']),
                   'capabilities':ready['manifest']['capabilities'],
                   'parent_ref':integrity_reference(ready)}
-        gen=store.begin_continuation(source='blockfrost-cardano',start=profile.start,target=target,
-                                     witness=witness,manifest=manifest,parent_capability=parent_capability)
+        if coverage is not None:manifest['relevance_coverage']=coverage
+        with store.atomic():
+            gen=store.begin_continuation(source='blockfrost-cardano',start=profile.start,target=target,
+                                         witness=witness,manifest=manifest,parent_capability=parent_capability)
+            if coverage is not None:store.checkpoint(gen,'relevance','coverage',coverage)
         # The core owns the immutable inherited metadata receipt/proof shape.
         reuse_receipt={'source_kind':'blockfrost-cardano','parent':ready['id'],'height':cutoff,
                        'hash':base['hash'].hex(),
@@ -249,11 +254,20 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None):
                 if actual['hash']!=base['hash']:raise Refusal('pending_suffix_base_changed')
         suffix=_fetch_suffix(provider,store,base,g['witness_height'],hooks=hooks)
         processed_rows=_store_suffix(store,provider,gen,suffix,hooks=hooks)
-    source=BlockfrostSource(provider,profile,store,gen,stop_requested=hooks.stopped)
+    source=BlockfrostSource(provider,profile,store,gen,stop_requested=hooks.stopped,relevance_enabled=relevance_enabled,coverage=coverage)
     committed_events=store.last_event_height(gen)
     hooks.update(phase='events',committed=max(ready['target_height'],committed_events or ready['target_height']))
     for height in range(ready['target_height']+1,g['target_height']+1):
-        if store.completed(gen,'events',height):continue
+        if store.completed(gen,'events',height):
+            if source.coverage is not None:
+                # Rebuild both discovery streams from fresh provider inventories;
+                # an unsealed pending candidate is never its own coverage proof.
+                facts,stats=source.block_facts(store.block_at(gen,height))
+                old=store.checkpoint_rows(generation=gen,phase='events',unit=height)
+                if len(old)!=1 or old[0]['receipt'].get('relevance')!=stats.get('relevance'):raise Refusal('independent_provider_mismatch')
+                from db_sync_alt.sources.blockfrost.relevance import verify_inventory
+                verify_inventory(store,gen,stats['relevance']['inventory'])
+            continue
         if hooks.stopped():raise Refusal('interrupted')
         hooks.check_space(store)
         hooks.update(phase='events',range_start=height,range_end=height)

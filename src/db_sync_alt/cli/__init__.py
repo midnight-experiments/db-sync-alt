@@ -39,6 +39,9 @@ def main(argv=None):
     if argv[0] == '--version':
         print('db-sync-alt ' + __version__)
         return 0
+    if argv[0] == '_trust-relevance-history':
+        from db_sync_alt.cli.relevance_history import main as trust_history
+        return trust_history(argv[1:])
     command = COMMANDS.get(argv[0])
     if command is None:
         sys.stderr.write('db-sync-alt: unknown command ' + repr(argv[0]) + '\n' + usage())

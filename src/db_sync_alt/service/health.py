@@ -19,6 +19,8 @@ import time
 
 
 ERROR_CODES = frozenset({
+    'relevance_parent_unsupported', 'relevance_mode_mismatch', 'relevance_coverage_invalid', 'relevance_parent_changed',
+    'relevance_inventory_invalid', 'relevance_output_unqualified', 'relevance_profile_address_invalid', 'relevance_work_unit_limit',
     'unsupported_follow_mode', 'completion_recovery_required', 'completion_invalid', 'completion_mismatch',
     'provider_unavailable', 'provider_timeout', 'quota_exhausted',
     'database_unavailable', 'database_timeout', 'canonical_conflict',
@@ -184,6 +186,15 @@ class HealthState:
         self._reader = None
         self._node_warnings = []
         self._integrity = {'base': None, 'checkpointed_at': None}
+        self._relevance = dict(requested='full', effective='full', reason='disabled')
+
+    def relevance_mode(self, enabled, *, effective=None, reason=None):
+        if type(enabled) is not bool or effective not in ('full', 'relevance'):
+            raise ValueError('invalid relevance mode')
+        if reason not in ('disabled','verified','trusted-history','relevance_parent_unsupported','relevance_mode_mismatch','relevance_coverage_invalid','relevance_parent_changed'):
+            raise ValueError('invalid relevance reason')
+        with self._lock:
+            self._relevance = dict(requested='relevance' if enabled else 'full', effective=effective, reason=reason)
 
     def verified_schema(self, version):
         if type(version) is not int or version not in (1,2,3,4):
@@ -374,6 +385,8 @@ class HealthState:
                 'stage': self._operation[0], 'progress_at': self._operation[1],
                 'progress_age_seconds': age(self._operation[2]), 'deadline_seconds': self._operation[3]}
             reasons = []
+            if self._relevance['reason'] not in ('disabled', 'verified', 'trusted-history'):
+                reasons.append(self._relevance['reason'])
             if self._poll_error is not None:
                 reasons.append('provider_poll_' + self._poll_error)
             if self._lifecycle != 'ready':
@@ -419,7 +432,7 @@ class HealthState:
                         freshness={'provider_observation_age_seconds': observed_age},
                         last_successful_sync=self._success_at, retry_at=self._retry_at, quota=asdict(self._quota),
                         database=asdict(database), workers=workers, operation=operation, error_code=self._error_code, poll_error_code=self._poll_error,
-                        integrity=dict(self._integrity),
+                        integrity=dict(self._integrity), relevance=dict(self._relevance),
                         reader=None if self._reader is None else json.loads(json.dumps(self._reader)),
                         warnings=([] if self._reader is None else list(self._reader['warnings'])) + list(self._node_warnings),
                         policy=asdict(self.policy), healthy=not reasons, reason_codes=reasons)

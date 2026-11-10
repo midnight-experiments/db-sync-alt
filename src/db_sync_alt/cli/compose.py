@@ -59,6 +59,7 @@ def initialize(args):
                backup_archive='/run/db-sync-alt/recovery/state.dump',backup_manifest='/run/db-sync-alt/recovery/manifest.json',
                reader={'role':READER,'pg_service':READER},pg_service=OWNER)
     cfg['storage_reserves']={'/var/lib/db-sync-alt':10*1024**3}
+    cfg['sync']['relevance_enabled']=getattr(args,'relevance_enabled',False)
     write(service/'service.json',json.dumps(cfg,indent=2)+'\n')
     values={'COMPOSE_PROJECT_NAME':'db-sync-alt-'+secrets.token_hex(4),'PRIVATE_DIR':str(private),'APP_UID':str(os.getuid()),'APP_GID':str(os.getgid()),
             'HTTP_PORT':str(args.http_port),'POSTGRES_PASSWORD':passwords['superuser'],'APP_IMAGE':'db-sync-alt:local'}
@@ -95,6 +96,7 @@ def provision():
 def main(argv=None):
     p=argparse.ArgumentParser(prog='db-sync-alt compose',description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter);sub=p.add_subparsers(dest='command',required=True)
     init=sub.add_parser('init');init.add_argument('--private',required=True);init.add_argument('--archive',required=True);init.add_argument('--manifest',required=True);init.add_argument('--http-port',type=int,default=18080)
+    init.add_argument('--relevance',action=argparse.BooleanOptionalAction,dest='relevance_enabled',default=False,help='Enable coverage-certified relevance filtering (default: off)')
     sub.add_parser('provision');a=p.parse_args(argv)
     try:initialize(a) if a.command=='init' else provision()
     except Exception:p.exit(2,'Bootstrap failed; check private paths, permissions, supplied backup and database state.\n')

@@ -168,11 +168,15 @@ def write_checkpoint(store,cap):
     """One gated transaction: the checkpoint for `cap.generation` and the base move to it."""
     from db_sync_alt.store.database import SERVING_LOCK,PROJECTION_WRITE
     _require_checkpoint_capability(store,cap)
+    from db_sync_alt.sources.blockfrost.relevance import checkpoint_anchor
+    anchor=checkpoint_anchor(store,cap)
     with store.atomic():
         store.db.execute("SET LOCAL lock_timeout='5s'")
         store.db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
         store.db.execute('SELECT set_config(%s,%s,true)',(PROJECTION_WRITE,'on'))
-        return insert_checkpoint(store,cap)
+        result=insert_checkpoint(store,cap)
+        if anchor is not None:store.insert_relevance_anchor(anchor)
+        return result
 
 def begin_continuation(store,*,source,start,target,witness,manifest,parent_capability):
     cap=current_verified_parent(store)
@@ -263,7 +267,13 @@ def compute_proof(store,g):
     added=_membership_inventory(store,gen);removed=_membership_inventory(store,gen,removed=True)
     oldcounts=parent['manifest']['integrity']['semantic']['counts'] if incremental(parent) else {k:v['count'] for k,v in parent['manifest']['digests'].items()}
     counts={k:oldcounts[k]+facts[k]['count'] for k in TABLES};counts['blocks']=oldcounts['blocks']-removed['count']+added['count']
-    checkpoints=[r for r in store.checkpoint_rows(generation=gen) if r['phase'] not in ('final-anchors','completion-revalidation')]
+    checkpoints=[]
+    for row in store.checkpoint_rows(generation=gen):
+        if row['phase'] in ('final-anchors','completion-revalidation'):continue
+        if row['phase']=='relevance' and row['unit']=='anchor':
+            from db_sync_alt.sources.blockfrost.relevance import validate_anchor
+            validate_anchor(store,g,[row])
+        else:checkpoints.append(row)
     kind=form(m)
     if kind is None:raise Refusal('completion_invalid')
     key=PROFILE_FIELD[kind]

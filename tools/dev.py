@@ -45,6 +45,7 @@ WEIGHTS = {
     'test_lifecycle_inspection': 57, 'test_native_serving': 120, 'test_network_profiles': 120,
     'test_checkpoint_backup': 240, 'test_integrity_checkpoints': 300,
     'test_manifest_kinds': 180, 'test_status_summaries': 120,
+    'test_relevance': 600, 'test_relevance_checkpoint': 900, 'test_relevance_recovery': 120,
 }
 
 
