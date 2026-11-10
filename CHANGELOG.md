@@ -70,14 +70,16 @@
   nested deeper than about 60 levels or with a repeated map key. Anyone can
   submit such a transaction. The witness set must still be a map; its content
   is now read past without being decoded.
-- Fix Blockfrost acquisition and follow stopping at a payment to a profile
-  address (ICS, reserve, cNIGHT mapping, governance) whose datum is nested
-  deeper than 64 levels, repeats a map key, or has no preimage on chain. Datums
-  are now stored as cardano-db-sync 13.8 stores them: the served `datum.value` is
-  NULL when its JSON nests deeper than 2000 levels, and an output whose preimage
-  is not on chain keeps its `data_hash` without a `datum` row until a transaction
-  carrying the preimage is read. A cardano-db-sync source is accepted with such
-  outputs too. Schema 5 makes `datum.value` nullable; see
+- Fix Blockfrost acquisition and follow stopping at a relevant output (at a
+  profile address such as ICS, reserve, cNIGHT mapping or governance, or at any
+  address when it carries cNIGHT) whose datum is nested deeper than 64 levels,
+  repeats a map key, holds an integer beyond 2^53 (which Blockfrost rounds), or
+  has no preimage on chain. Datums are now stored as cardano-db-sync 13.8 stores
+  them, from the datum's own CBOR with exact integers: the served `datum.value`
+  is NULL when its JSON nests deeper than 2000 levels, and an output whose
+  preimage is not on chain keeps its `data_hash` without a `datum` row until a
+  transaction carrying the preimage is read. A cardano-db-sync source is
+  accepted with such outputs too. Schema 5 makes `datum.value` nullable; see
   [limitations](docs/limitations.md) for the datums db-sync-alt cannot see.
 
 ## 0.3.0

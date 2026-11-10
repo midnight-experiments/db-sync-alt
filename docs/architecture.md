@@ -92,9 +92,11 @@ The IDs the node bounds its event queries with are
 older fact discovered late still falls inside the node's bounds. Assets, datums
 and pools keep the stable IDs of the stored facts.
 
-Datums are stored as cardano-db-sync 13.8 stores them. `datum.value` is the
-datum's detailed-schema JSON, or NULL when that JSON nests deeper than 2000
-levels; Plutus data of any depth and with repeated map keys is accepted. An
+Datums are stored as cardano-db-sync 13.8 stores them, from the datum's CBOR
+(bound to its hash), never from a provider's JSON. `datum.value` is the
+detailed-schema JSON with exact integers, or NULL when that JSON nests deeper
+than 2000 levels; Plutus data of any depth and with repeated map keys is
+accepted. An
 output whose datum preimage is not on chain keeps its `data_hash` and has no
 `datum` row; the row is added when a transaction db-sync-alt reads carries the
 preimage, such as the spend of that output.

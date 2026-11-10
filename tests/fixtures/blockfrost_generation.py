@@ -48,10 +48,12 @@ def unrelated_tx(index,auxiliary=b'\xf6',witness=b'\xa0'):
 def payment_tx(index,payment):
     """A transaction paying to `payment.address` with its datum (fixtures.datums.Payment)."""
     option=[1,Tag(24,payment.datum)] if payment.inline else [0,payment.hash]
-    return tx({0:[],1:[{0:payment.address.encode(),1:5,2:option}],2:200+index})
+    value=[5,{POLICY:{NAME:1}}] if payment.night else 5
+    return tx({0:[],1:[{0:payment.address.encode(),1:value,2:option}],2:200+index})
 
 def payment_output(payment):
-    return {'output_index':0,'address':payment.address,'amount':[{'unit':'lovelace','quantity':'5'}],'data_hash':payment.hash.hex(),
+    amount=[{'unit':'lovelace','quantity':'5'}]+([{'unit':PROFILE.night,'quantity':'1'}] if payment.night else [])
+    return {'output_index':0,'address':payment.address,'amount':amount,'data_hash':payment.hash.hex(),
             'inline_datum':payment.datum.hex() if payment.inline else None}
 
 def fixtures(fork=0,transition=False,auxiliary=(),witnesses=(),payments=(),spends=()):
@@ -84,8 +86,8 @@ def fixtures(fork=0,transition=False,auxiliary=(),witnesses=(),payments=(),spend
     for payment,(raw,th) in zip(payments,paid):
         place(payment.height,raw,th,[],[payment_output(payment)])
         if not payment.inline:route['/scripts/datum/'+payment.hash.hex()+'/cbor']={'cbor':payment.datum.hex()} if payment.on_chain else NOT_FOUND
-        # Blockfrost serves db-sync's NULL value as {}.
-        if payment.on_chain:route['/scripts/datum/'+payment.hash.hex()]={'json_value':{} if payment.served is None else payment.served}
+        # Blockfrost serves db-sync's NULL value as {}, and numbers rounded to doubles.
+        if payment.on_chain:route['/scripts/datum/'+payment.hash.hex()]={'json_value':{} if payment.served is None else payment.answered or payment.served}
     for k,(raw,th) in zip(spends,spent):
         place(12,raw,th,[dict(payment_output(payments[k]),tx_hash=paid[k][1],reference=False,collateral=False)],[])
     b=at(10)

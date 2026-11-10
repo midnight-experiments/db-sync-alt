@@ -164,7 +164,7 @@ class DatumTests(unittest.TestCase):
         self.assertEqual(self.datums(source), {})
         self.assertEqual(self.requests(source), ['/scripts/datum/' + h.hex() + '/cbor'])
 
-    def test_value_past_the_nesting_limit_is_null_and_never_asked_for(self):
+    def test_value_past_the_nesting_limit_is_null(self):
         raw = b'\x81' * 1000 + b'\x00'
         h = hashlib.blake2b(raw, digest_size=32).digest()
         source = self.source({})
@@ -172,19 +172,20 @@ class DatumTests(unittest.TestCase):
         self.assertEqual(self.datums(source), {h: None})
         self.assertEqual(self.requests(source), [])
 
-    def test_value_below_the_limit_must_equal_blockfrost(self):
-        value = {'int': 0}
-        for _ in range(999):
-            value = {'list': [value]}
-        raw = b'\x81' * 999 + b'\x00'
-        h = hashlib.blake2b(raw, digest_size=32).digest()
-        source = self.source({'/scripts/datum/' + h.hex() + '/cbor': {'cbor': raw.hex()}, '/scripts/datum/' + h.hex(): {'json_value': value}})
-        source.datum(h)
-        self.assertEqual(self.datums(source), {h: canonical(value)})
-        # Blockfrost serves db-sync's NULL as {}: for a datum db-sync does not store as NULL, that is a disagreement.
-        source = self.source({'/scripts/datum/' + h.hex(): {'json_value': {}}})
-        with self.assertRaisesRegex(Refusal, 'provider_datum_semantics_mismatch'):
-            source.datum(h, raw.hex())
+    def test_value_comes_from_the_cbor_never_from_blockfrost_json(self):
+        """Blockfrost rounds integers beyond 2^53 and serves NULL as {}: its JSON is never asked for."""
+        cases = [(bytes.fromhex('1b0020000000000001'), {'int': 2**53 + 1}),
+                 (bytes.fromhex('d866821b002000000000000180'), {'constructor': 2**53 + 1, 'fields': []}),
+                 (b'\xc2\x4d' + (123456789012345678901234567890).to_bytes(13, 'big'), {'int': 123456789012345678901234567890}),
+                 (b'\xa2\x01\x00\x01\x00', {'map': [{'k': {'int': 1}, 'v': {'int': 0}}] * 2})]
+        for raw, value in cases:
+            with self.subTest(raw=raw.hex()):
+                h = hashlib.blake2b(raw, digest_size=32).digest()
+                lossy = json.loads(json.dumps(value).replace(str(2**53 + 1), str(2**53)))
+                source = self.source({'/scripts/datum/' + h.hex() + '/cbor': {'cbor': raw.hex()}, '/scripts/datum/' + h.hex(): {'json_value': lossy}})
+                source.datum(h)
+                self.assertEqual(self.datums(source), {h: canonical(value)})
+                self.assertEqual(self.requests(source), ['/scripts/datum/' + h.hex() + '/cbor'])
 
     def test_malformed_or_mismatched_datum_still_refuses(self):
         raw = b'\x82\x00'
@@ -198,7 +199,7 @@ class DatumTests(unittest.TestCase):
         raw = b'\xd8\x79\x80'
         h = hashlib.blake2b(raw, digest_size=32).digest()
         old = {'tx_hash': b'\x01' * 32, 'output_index': 0, 'address': 'addr_test1fixture', 'value': '5', 'datum_hash': h}
-        routes = {'/scripts/datum/' + h.hex() + '/cbor': {'cbor': raw.hex()}, '/scripts/datum/' + h.hex(): {'json_value': {'constructor': 0, 'fields': []}}}
+        routes = {'/scripts/datum/' + h.hex() + '/cbor': {'cbor': raw.hex()}}
         source = self.source(routes, {('outputs', (b'\x01' * 32, 0)): old})
         observed = {'address': 'addr_test1fixture', 'amount': [{'unit': 'lovelace', 'quantity': '5'}], 'data_hash': h.hex(), 'inline_datum': None}
         source.origin(b'\x01' * 32, 0, observed)

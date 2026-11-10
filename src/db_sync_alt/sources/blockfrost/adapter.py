@@ -253,11 +253,12 @@ class BlockfrostSource:
         if integer(r.get('block_height'))!=block['height'] or index>=block['tx_count'] or (expected_block is not None and block['hash']!=expected_block) or (expected_index is not None and index!=expected_index):raise Refusal('provider_transaction_position_mismatch')
         self.add('transactions',{'hash':h,'block_hash':block['hash'],'tx_index':index,'valid':1});self.cache[h]=r;return r
     def datum(self,h,inline=None):
-        """Store datum `h` as cardano-db-sync 13.8 does; `inline` is the output's own datum CBOR.
+        """Store datum `h` as cardano-db-sync 13.8 does, from its CBOR bound to `h`; `inline` is the
+        output's own datum CBOR.
 
-        No preimage on chain (Blockfrost 404): no datum, the output keeps its hash. A value that
-        db-sync stores as NULL (`decode_datum` gives None) is never asked for: Blockfrost serves
-        that NULL as `{}`. Any other value must equal Blockfrost's JSON.
+        No preimage on chain (Blockfrost 404): no datum, the output keeps its hash. The value is
+        `decode_datum`'s, never Blockfrost's JSON: that rounds integers beyond 2^53 and serves
+        db-sync's NULL as `{}`.
         """
         if self.has('datums','hash=?',(h,)) or any(t=='datums' and r['hash']==h for t,r in self.facts):return
         if inline is None:
@@ -267,10 +268,6 @@ class BlockfrostSource:
         raw=hexbytes(inline)
         if hashlib.blake2b(raw,digest_size=32).digest()!=h:raise Refusal('provider_datum_hash_mismatch')
         value=decode_datum(raw)
-        if value is not None:
-            data=self.provider.get('/scripts/datum/'+h.hex())
-            if 'json_value' not in data or not isinstance(data['json_value'],dict):raise Refusal('provider_missing_datum')
-            if data['json_value']!=value:raise Refusal('provider_datum_semantics_mismatch')
         self.add('datums',{'hash':h,'value':None if value is None else canonical(value)})
     def output(self,h,row):
         val,assets=output_value(row);idx=integer(row['output_index'])

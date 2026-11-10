@@ -162,6 +162,16 @@ class DatumTests(unittest.TestCase):
                     raw,reference=make(n);null=dbsync_nesting_exceeded(json.dumps(reference))
                     self.assertEqual(decode_datum(raw),None if null else reference)
                     self.assertEqual(null,n>edge)
+    def test_integers_are_exact(self):
+        huge=int.from_bytes(b'\xff'*2000,'big')  # 4817 digits, past Python's default int/text limit
+        for raw,value in [(bytes.fromhex('1b0020000000000001'),{'int':2**53+1}),(bytes.fromhex('3b0020000000000000'),{'int':-2**53-1}),
+                          (b'\xc2\x4d'+(123456789012345678901234567890).to_bytes(13,'big'),{'int':123456789012345678901234567890}),
+                          (b'\xc3\x49'+(2**64).to_bytes(9,'big'),{'int':-2**64-1}),
+                          (bytes.fromhex('d866821b002000000000000180'),{'constructor':2**53+1,'fields':[]}),
+                          (b'\xc2\x5f'+(b'\x58\x40'+b'\xff'*64)*31+b'\x50'+b'\xff'*16+b'\xff',{'int':huge})]:
+            with self.subTest(raw=raw[:12].hex()):
+                self.assertEqual(decode_datum(raw),value)
+                self.assertEqual(json.loads(json.dumps(decode_datum(raw))),value)
     def test_repeated_map_keys_keep_every_pair(self):
         self.assertEqual(decode_datum(b'\xa2\x01\x00\x01\x02'),{'map':[{'k':{'int':1},'v':{'int':0}},{'k':{'int':1},'v':{'int':2}}]})
         self.assertEqual(decode_datum(b'\xbf\x01\x00\x01\x00\xff'),{'map':[{'k':{'int':1},'v':{'int':0}},{'k':{'int':1},'v':{'int':0}}]})
