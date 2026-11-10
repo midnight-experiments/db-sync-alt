@@ -80,8 +80,8 @@ Before a generation is published the verifier also requires what the node's
 queries rely on without being able to check it: the witness is the target plus
 the network's k, headers are contiguous from the start cursor to the witness,
 events and prerequisites are complete, every required epoch has its nonce and
-`max_tx_size`, at least one stake row and (once completed) its end block, the registered-candidates
-address holds nothing, and at least one spend is served. A generation acquired
+`max_tx_size`, at least one stake row and (once completed) its end block, and
+at least one spend is served. A generation acquired
 from Blockfrost also holds the bridge metadata of every transaction with an
 output at the ICS address in its new blocks, and no other, and every asset of the
 ICS and reserve outputs it stores

@@ -121,6 +121,23 @@
   lists with lovelace only, and at an output to a pointer address encoded with
   redundant zero groups, which the ledger and cardano-db-sync re-serialise
   minimally. Anyone can submit either; full mode was not affected.
+- Fix every update stopping at a payment to the registered-candidates address.
+  Anyone can make one. Blockfrost acquisition and follow refused the block
+  (`unsupported_nonempty_candidates`), verification refused a database holding
+  such an output (`unsupported_candidate_activity`) and a cardano-db-sync
+  bootstrap refused a source holding one (`candidates_unsupported`); none of
+  them refuses now. The address is no longer one of the profile's addresses: an
+  output there is kept only when it carries one of the profile's assets, as at
+  any other address. midnight-node 2.1.101 selects committees without
+  registrations, and a test fails if the packaged node sources query them
+  again. The node's registration RPCs and subcommands
+  (`sidechain_getRegistrations`, `sidechain_getAriadneParameters`,
+  `systemParameters_getAriadneParameters`, `registration-status`,
+  `ariadne-parameters`) return no registrations, and fail when an output there
+  carries a profile asset and its transaction spends no output db-sync-alt
+  holds. Serving registrations is future work (midnight-node#1761). Updates of
+  the current format carry the capability `registered_candidates_unserved`;
+  updates sealed in the nonce-only format keep `candidates_empty`.
 
 ## 0.3.0
 

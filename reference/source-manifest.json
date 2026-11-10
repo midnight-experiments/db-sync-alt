@@ -37,6 +37,11 @@
       "source": "primitives/mainchain-follower/src/db/types.rs",
       "sha256": "333f3a8305b8bcdb7844a2b2cf70483d0f9551a5bb79e86be29110061c149673",
       "git_blob_sha1": "f048d5a8243cef1b1c7a7a2d1ac2548393cd372a"
+    },
+    "partner-chains/toolkit/committee-selection/authority-selection-inherents/src/authority_selection_inputs.rs": {
+      "source": "partner-chains/toolkit/committee-selection/authority-selection-inherents/src/authority_selection_inputs.rs",
+      "sha256": "415cc2bfc7cf8dab6316284206c42a5295aea22b2cdb21025d01d2e38d689360",
+      "git_blob_sha1": "f1ee9694dbc5173684e5e539a4f64b7117e5354f"
     }
   }
 }

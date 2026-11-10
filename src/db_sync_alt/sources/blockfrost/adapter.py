@@ -394,7 +394,6 @@ class BlockfrostSource:
         self.add('datums',{'hash':h,'value':canonical(data['json_value'])})
     def output(self,h,row):
         val,assets=output_value(row);idx=integer(row['output_index'])
-        if val['address']==self.profile.candidate:raise Refusal('unsupported_nonempty_candidates')
         if val['datum_hash'] is not None:self.datum(val['datum_hash'],row.get('inline_datum'))
         self.add('outputs',{'tx_hash':h,'output_index':idx,**val})
         ordinals=ledger_ordinals(assets)
