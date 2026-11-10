@@ -58,7 +58,14 @@ unknown until the first poll.
 
 Restore refuses a database that is not empty. An interrupted restore leaves the
 database owned but not ready (`incomplete_restore`): keep it for diagnosis and
-restore into another empty database. There is no in-place overwrite and no
+restore into another empty database.
+
+If the upgrade step of a restore refuses (for example `epoch_parameters_changed`
+or a failed source request), the backup is already restored and verified: the
+database is ready but still of the earlier format, and the reader has not been
+granted. Do not restore again: fix the cause, run `db-sync-alt upgrade` on that
+database, then `db-sync-alt grant-reader` (or start the service, which grants
+the reader). The service reports this state as `schema_upgrade_required`. There is no in-place overwrite and no
 automatic clean-up.
 
 ## Upgrade to schema 5
@@ -107,10 +114,20 @@ epoch, carry the stored nonce and a size from 0 to 2,147,483,647, and both
 passes must agree; otherwise the upgrade refuses (`epoch_parameters_changed`,
 `epoch_parameters_nonce_mismatch`, `invalid_epoch_max_tx_size`). Answers are
 kept as they arrive: an interrupted upgrade continues where it stopped, and once
-both passes are kept a rerun sends no request. The sizes, the new fact contract,
-a record of the sizes and their source, and schema 5 are committed in one
-transaction that also verifies the result; any refusal leaves the database as
-it was, still served by the release that wrote it. Earlier generations, their
+both passes are kept a rerun sends no request, unless the attempt spent its own
+request budget (4 per stored epoch) on failing requests: then its answers are
+discarded and a rerun reads again (`request_budget_exhausted`). The sizes, the
+new fact contract, a record of the sizes and their source, and schema 5 are
+committed in one transaction that also verifies the result; any refusal leaves
+the database as it was, still served by the release that wrote it.
+
+That transaction holds exclusive locks on the node-facing `epoch_param`, its
+served table and the epoch facts while it verifies the whole database, about as
+long as one `db-sync-alt verify`: a running node's epoch reads wait until it
+commits. Stop the node as well as the service for the upgrade. If another
+session holds a lock on those relations, the commit gives up after 5 seconds
+and `upgrade` prints `schema_upgrade_failed`; nothing is changed, the answers
+are kept and a rerun sends no request. Earlier generations, their
 receipts and integrity checkpoints are kept unchanged and verified as they were
 sealed; the record binds the sizes added to their epochs, and integrity
 checkpoints of later updates include the sizes.
@@ -120,8 +137,8 @@ The upgrade refuses while an unfinished update exists
 and stop it when `db-sync-alt status` shows no pending generation.
 
 There is no downgrade: db-sync-alt 0.3.x and earlier refuse a schema-5 database
-(`unsupported_format`), and 0.1.x refuses schema 4
-(`unsupported_database_identity`). To go back, keep a `pg_dump` of the database
+and 0.1.x refuses schema 4, both with `unsupported_database_identity`
+(`invalid_identity` in the service). To go back, keep a `pg_dump` of the database
 taken with the service stopped before the upgrade, and restore it.
 With the Compose deployment, run the same command in the image
 ([Compose](docker.md#upgrade)).

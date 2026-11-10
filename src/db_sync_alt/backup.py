@@ -140,6 +140,10 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
     if body['format'] in UPGRADED_ON_RESTORE:
         source=epoch_source(network) if epoch_source is not None else None
         if source is None:raise Refusal('epoch_parameters_source_required')
+        # The upgrade reads every stored epoch twice: the day's budget must cover it before the
+        # destination is touched (the upgrade checks it again).
+        epochs=body.get('physical_inventory',{}).get('epoch_nonces',{}).get('count') if isinstance(body.get('physical_inventory'),dict) else None
+        if source.counted and type(epochs) is int and epochs>=0:source.check_budget(2*epochs)
     if reserve_check:reserve_check()
     with connect(destination_service,conninfo=conninfo) as db:
         if not db.execute('SELECT pg_try_advisory_lock(%s,%s)',WRITER_LOCK).fetchone()[0]:raise Refusal('writer_busy')

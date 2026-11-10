@@ -78,6 +78,11 @@ def failure_code(error):
         return 'schema_upgrade_required'
     if raw in {'invalid_epoch_max_tx_size', 'epoch_parameter_receipt_mismatch', 'epoch_parameters_upgrade_invalid'}:
         return 'invalid_coverage'
+    # The upgrade step of a first-run restore refused: the backup is restored and ready but still
+    # needs `db-sync-alt upgrade`.
+    if raw in {'epoch_parameters_changed', 'epoch_parameters_nonce_mismatch', 'epoch_parameters_unavailable',
+               'epoch_parameters_source_unavailable', 'provider_budget_insufficient', 'upgrade_state_changed'}:
+        return 'schema_upgrade_required'
     if any(base.__module__.startswith('psycopg') and base.__name__ in {'OperationalError', 'InterfaceError'}
            for base in type(error).__mro__):
         return 'database_unavailable'

@@ -154,8 +154,9 @@ Blockfrost requests, in about 18 minutes for Preprod. Then run
 This version needs a schema-5 database. A database of 0.3.x or earlier holds
 each epoch's nonce but not the epoch's maximum transaction size, which
 midnight-node 2.1.101 reads. Stop the service after a publication
-(`db-sync-alt status` shows no pending generation), then run once, with the
-service's Blockfrost settings:
+(`db-sync-alt status` shows no pending generation) and stop the node (the
+upgrade's final transaction locks the node's `epoch_param` while it verifies the
+whole database), then run once, with the service's Blockfrost settings:
 
 ```sh
 db-sync-alt upgrade --service db_sync_alt
@@ -165,7 +166,7 @@ The upgrade reads every stored epoch's `max_tx_size` twice from Blockfrost (2
 requests per stored epoch; `status` shows the count) and refuses unless both
 reads agree; a cardano-db-sync of the network can be given instead with
 `--source-service` and `--source-attestation`. Then start the service with this
-version. There is no downgrade: 0.3.x refuses an upgraded database, so take a
+version, then the node. There is no downgrade: 0.3.x refuses an upgraded database, so take a
 `pg_dump` of the stopped database first if you may need to go back. See
 [upgrade to schema 5](docs/recovery.md#upgrade-to-schema-5).
 

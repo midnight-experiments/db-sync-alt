@@ -280,6 +280,10 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(failure_code(Refusal(code)), 'schema_upgrade_required')
         for code in ('invalid_epoch_max_tx_size', 'epoch_parameter_receipt_mismatch', 'epoch_parameters_upgrade_invalid'):
             self.assertEqual(failure_code(Refusal(code)), 'invalid_coverage')
+        # A first-run restore whose upgrade step refused leaves a restored database that needs `upgrade`.
+        for code in ('epoch_parameters_changed', 'epoch_parameters_nonce_mismatch', 'epoch_parameters_unavailable',
+                     'epoch_parameters_source_unavailable', 'provider_budget_insufficient', 'upgrade_state_changed'):
+            self.assertEqual(failure_code(Refusal(code)), 'schema_upgrade_required')
 
     def test_secret_exceptions_never_enter_status_or_failure_code(self):
         runtime = Runtime()

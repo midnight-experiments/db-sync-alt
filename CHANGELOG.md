@@ -10,7 +10,7 @@
   packaged node query sources and all network profiles now pin node 2.1.101
   (`86774edf8cc76345a5c3a4221f3fe80c094b1c33`); profile configurations and
   genesis are unchanged.
-- Upgrade an existing database in place, with the service stopped:
+- Upgrade an existing database in place, with the service and the node stopped:
   `db-sync-alt upgrade --service <name>`. A database written by 0.3.x or
   earlier holds each epoch's nonce but not its size: the upgrade reads every
   stored epoch's `max_tx_size` twice from Blockfrost with the service's
@@ -19,12 +19,18 @@
   cardano-db-sync given with `--source-service` and `--source-attestation` (no
   Blockfrost request). Both reads must agree and carry the stored nonce. Answers
   are kept as they arrive, so a rerun continues where it stopped without
-  repeating an answered request. The change commits in one transaction that
-  verifies the result; any refusal leaves the database as it was. Stop the
+  repeating an answered request, unless the attempt spent its own request
+  budget (4 per stored epoch) on failing requests. The change commits in one
+  transaction that verifies the whole database and, until it commits, locks the
+  node's `epoch_param`; any refusal leaves the database as it was. Stop the
   service when `status` shows no pending generation (the upgrade refuses with
   `upgrade_pending_generation` otherwise).
-- 0.3.x and earlier cannot open an upgraded database (`unsupported_format`):
-  there is no downgrade; keep a `pg_dump` of the stopped database to go back.
+- The packaged profiles' `network.json` now names the node 2.1.101 query pin. A
+  copy given with `--profile-dir` must be refreshed from this release, or every
+  command refuses it (`untrusted_network_profile`).
+- 0.3.x and earlier cannot open an upgraded database: they refuse schema 5 with
+  `unsupported_database_identity` (`invalid_identity` in the service). There is
+  no downgrade; keep a `pg_dump` of the stopped database to go back.
   Backups are written only of schema-5 databases (format v4). Restoring a v2 or
   v3 backup runs the same upgrade and needs the same source settings, which are
   checked before the destination database is touched.
