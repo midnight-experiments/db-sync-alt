@@ -107,10 +107,10 @@ class SQLEpochSource:
 
     @property
     def identity(self):
-        identity = getattr(self.source, 'validated_identity', None)
-        if identity is None:
-            raise Refusal('epoch_parameters_source_unavailable')
-        return {'kind': self.kind, **identity}
+        if getattr(self.source, 'validated_identity', None) is None:
+            with self.source.snapshot():
+                self.source.check_source()
+        return {'kind': self.kind, **self.source.validated_identity}
 
     @property
     def counted(self):
@@ -156,17 +156,23 @@ def _new_job(job_id, epochs, generation, source):
             'reads': [{'sizes': {}, 'sha256': '0' * 64}, {'sizes': {}, 'sha256': '0' * 64}]}
 
 
-def _staged(store, job_id, epochs, generation, source):
-    """The upgrade's sync job: resumed when it is this upgrade's, otherwise started afresh."""
+def _resumed(store, job_id, generation, source):
+    """This upgrade's staged job, or None when it has not started."""
     job = store.sync_job(JOB)
-    if job is not None and job.get('job_id') == job_id:
-        if job.get('state') == 'exhausted':
-            raise Refusal('request_budget_exhausted')
-        if (job.get('state') != 'active' or job.get('kind') != 'epoch-parameters' or job.get('version') != VERSION
-                or job.get('generation') != generation or job.get('source') != source.identity
-                or not isinstance(job.get('reads'), list) or len(job['reads']) != 2):
-            raise Refusal('invalid_sync_job')
-        return job
+    if job is None or job.get('job_id') != job_id:
+        return None
+    if job.get('state') == 'exhausted':
+        raise Refusal('request_budget_exhausted')
+    if (job.get('state') != 'active' or job.get('kind') != 'epoch-parameters' or job.get('version') != VERSION
+            or job.get('generation') != generation or job.get('source') != source.identity
+            or not isinstance(job.get('reads'), list) or len(job['reads']) != 2):
+        raise Refusal('invalid_sync_job')
+    return job
+
+
+def _start(store, job_id, epochs, generation, source):
+    """A new staged job; the job of an earlier attempt that never committed is closed first."""
+    job = store.sync_job(JOB)
     if job is not None and job.get('state') != 'completed':
         # A job of an earlier attempt that never committed (another ready generation or source):
         # close it, keeping its spent attempts, and start this one.
@@ -183,11 +189,14 @@ def _discard(store):
 
 def read_twice(store, epochs, generation, source):
     """Both complete passes over `epochs`, staged durably; returns {epoch: size} and the job."""
-    job = _staged(store, _job_id(store, generation, epochs, source), epochs, generation, source)
+    job_id = _job_id(store, generation, epochs, source)
+    job = _resumed(store, job_id, generation, source)
     stored = dict(epochs)
-    remaining = sum(1 for read in job['reads'] for epoch, _ in epochs if str(epoch) not in read['sizes'])
+    remaining = 2 * len(epochs) if job is None else sum(1 for read in job['reads'] for epoch, _ in epochs if str(epoch) not in read['sizes'])
     if remaining and source.counted:
         source.check_budget(remaining)
+    if job is None:
+        job = _start(store, job_id, epochs, generation, source)
     try:
         for number, read in enumerate(job['reads']):
             todo = [epoch for epoch, _ in epochs if str(epoch) not in read['sizes']]

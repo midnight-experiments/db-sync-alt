@@ -8,7 +8,7 @@ import contextlib
 import io
 from db_sync_alt.resources import profile_dir
 from db_sync_alt.sources.blockfrost.adapter import block_row, update
-from db_sync_alt.contract import Profile, digest
+from db_sync_alt.contract import Profile, digest, generation_capabilities
 from fixtures import synthetic
 from fixtures.blockfrost import CountingProvider, Fake
 from fixtures.cbor import tx
@@ -55,7 +55,7 @@ def baseline(conninfo,transition=False):
     """Write generation 0 into a new store on the empty database `conninfo`; returns the open writer store."""
     routes,original=fixtures(transition=transition);s=synthetic.create(conninfo,PROFILE.identity)
     try:
-        manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'anchors':{n:{'height':OFFSET+h,'hash':block(h,transition=transition)['hash']} for n,h in [('start',10),('target',10),('witness',2170)]},'required_epochs':[0,1,2],'capabilities':{'bridge_qualified':False,'candidates_empty':True,'epoch_max_tx_size_v1':True},'source_identity':{'fixture':'sql'}}
+        manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'anchors':{n:{'height':OFFSET+h,'hash':block(h,transition=transition)['hash']} for n,h in [('start',10),('target',10),('witness',2170)]},'required_epochs':[0,1,2],'capabilities':generation_capabilities(),'source_identity':{'fixture':'sql'}}
         g=synthetic.begin(s,start=PROFILE.start,target=OFFSET+10,witness=OFFSET+2170,manifest=manifest)
         with s.atomic():
             synthetic.add_blocks(s,g,[block_row(block(h,transition=transition)) for h in range(8,2171)])

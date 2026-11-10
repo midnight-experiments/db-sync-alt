@@ -12,6 +12,7 @@ import contextlib
 from unittest.mock import patch
 
 from db_sync_alt import contract
+from db_sync_alt.sources.blockfrost import adapter, follow
 from db_sync_alt.store import database, reader, upgrade
 from db_sync_alt.verify import store as verification
 
@@ -34,6 +35,21 @@ def nonce_only():
     def contract_for(network, *, legacy=False):
         return legacy_contract_for(network, legacy=True)
 
+    # The nonce-only release neither read nor recorded an epoch's size.
+    read_epoch, complete_epoch = adapter.epoch_facts, adapter.complete_inherited_epoch
+
+    def epoch_facts(*args, **kwargs):
+        fact, stakes, anchor, receipt = read_epoch(*args, **kwargs)
+        fact.pop('max_tx_size'); receipt.pop('max_tx_size')
+        return fact, stakes, anchor, receipt
+
+    def complete_inherited_epoch(provider, store, g, epoch, inherited):
+        stored = store.epoch_nonce
+        with patch.object(store, 'epoch_nonce', lambda e, gen: None if stored(e, gen) is None else {**stored(e, gen), 'max_tx_size': None}):
+            receipt = complete_epoch(provider, store, g, epoch, inherited)
+        receipt.pop('max_tx_size')
+        return receipt
+
     with contextlib.ExitStack() as stack:
         for module in (contract, database, verification):
             stack.enter_context(patch.object(module, 'FORMAT', contract.LEGACY_FORMAT))
@@ -44,6 +60,11 @@ def nonce_only():
         stack.enter_context(patch.object(database, 'SCHEMA_VERSION', 4))
         stack.enter_context(patch.object(reader, 'SCHEMA_VERSION', 4))
         stack.enter_context(patch.object(database.PgStore, '__init__', init))
+        for module in (adapter, verification):
+            stack.enter_context(patch.object(module, 'epoch_size', lambda value: None))
+        for module in (adapter, follow):
+            stack.enter_context(patch.object(module, 'epoch_facts', epoch_facts))
+            stack.enter_context(patch.object(module, 'complete_inherited_epoch', complete_inherited_epoch))
         # The nonce-only release's upgrade ended at schema 4.
         stack.enter_context(patch.object(upgrade, '_upgrade_v5', lambda store, state, checkpoint: None))
         yield
