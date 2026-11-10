@@ -18,9 +18,9 @@ ATTESTATION = {'dbsync_version':'13.8.0.0','tx_in_retained':True,
 
 
 class UpgradeAttestationTests(unittest.TestCase):
-    def invoke(self, extra=(), *, network='preprod'):
+    def invoke(self, extra=(), *, network='preprod', legacy=False):
         output, error = io.StringIO(), io.StringIO()
-        store = SimpleNamespace(network=network_profile(network))
+        store = SimpleNamespace(network=network_profile(network), legacy_format=legacy)
         with patch('db_sync_alt.store.database.PgStore') as opened, patch.object(upgrade, 'upgrade_store', return_value={'schema_version':4,'changed':False}) as migrate, contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
             opened.return_value.__enter__.return_value = store
             try:
@@ -57,6 +57,18 @@ class UpgradeAttestationTests(unittest.TestCase):
         self.assertEqual((code,body), (0,{'schema_version':4,'changed':False}))
         self.assertTrue(opened)
         self.assertIsNone(migrate.call_args.args[1])
+        # A store that already has epoch parameters needs no epoch source.
+        self.assertIsNone(migrate.call_args.args[2])
+
+    def test_nonce_only_store_reads_epoch_parameters_from_the_given_source(self):
+        from db_sync_alt.store.epoch_parameters import SQLEpochSource
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'source.json'; path.write_text(json.dumps(ATTESTATION))
+            code, _, _, migrate = self.invoke(['--source-service','source','--source-attestation',str(path)], legacy=True)
+        self.assertEqual(code, 0)
+        epochs = migrate.call_args.args[2]
+        self.assertIsInstance(epochs, SQLEpochSource)
+        self.assertIs(epochs.source, migrate.call_args.args[1])
 
     def test_explicit_pair_is_network_neutral_and_passes_exact_attestation(self):
         with tempfile.TemporaryDirectory() as directory:

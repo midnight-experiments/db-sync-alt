@@ -99,10 +99,10 @@ class StateTests(unittest.TestCase):
         result.update(sync='checkpointing')
         code, value = result.health()
         self.assertEqual((code, value['sync'], value['reason_codes']), (200, 'checkpointing', []))
-        result.verified_schema(4)
-        self.assertEqual(result.snapshot()['schema_version'], '4')
+        result.verified_schema(5)
+        self.assertEqual(result.snapshot()['schema_version'], '5')
         with self.assertRaises(ValueError):
-            result.verified_schema(5)
+            result.verified_schema(6)
 
     def test_every_unready_lifecycle_is_503(self):
         for lifecycle in ('starting', 'restoring', 'stopping', 'stopped', 'failed', 'halted'):
