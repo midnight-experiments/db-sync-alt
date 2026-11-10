@@ -131,16 +131,19 @@ class IncrementalTests(SyncFixture):
             self.assertEqual(verify_store(restored)['digests'],expected['digests'])
             restored.certify_ready_full()
 
-    def test_full_metadata_verification_plans_materialized_membership(self):
-        """Full verification scans the lineage membership as a materialized CTE before joining
-        chain.blocks; the delta verification query keeps its text and arguments."""
+    def test_full_metadata_verification_hash_joins_materialized_membership_and_blocks(self):
+        """Full verification materializes the lineage membership and the block headers and hash-joins the
+        two scans, with the rows of the direct join against chain.blocks; a broken parent link or a member
+        missing from chain.blocks still refuses; the delta verification query keeps its text and arguments."""
+        class Rollback(Exception):pass
         executed=[];execute=psycopg.ServerCursor.execute
         def recording(cursor,query,params=None,**kwargs):
             if cursor.name=='verify_metadata':executed.append((query,params))
             return execute(cursor,query,params,**kwargs)
-        def cte_scans(node):
-            own=[node['CTE Name']] if node['Node Type']=='CTE Scan' else []
-            return own+[name for child in node.get('Plans',[]) for name in cte_scans(child)]
+        def nodes(node,*,ctes=True):
+            return [node]+[n for child in node.get('Plans',[]) if ctes or child.get('Parent Relationship')!='InitPlan' for n in nodes(child,ctes=ctes)]
+        joins=('Hash Join','Merge Join','Nested Loop')
+        direct='WITH m AS MATERIALIZED (SELECT height,hash FROM chain.membership(%s)) SELECT m.height,b.hash,b.parent_hash,b.height FROM m LEFT JOIN chain.blocks b ON b.hash=m.hash WHERE m.height BETWEEN %s AND %s ORDER BY m.height'
         dsn=self.make(transition=True)
         with PgStore(conninfo=dsn) as store,patch.object(psycopg.ServerCursor,'execute',recording):
             upgrade_store(store);store.certify_ready_full()
@@ -154,9 +157,27 @@ class IncrementalTests(SyncFixture):
             executed.clear();self.assertEqual(verify_store(store)['digests'],expected['digests'])
             # Startup verifies the published generation and its integrity base on the full path.
             self.assertEqual(sorted(params[0] for _,params in executed),[0,gen])
-            for query,params in executed:
+            full=list(executed)
+            member=store.block_at(gen,store.generation(gen)['start_height']+1)['hash']
+            for statement in ('UPDATE chain.blocks SET parent_hash=hash WHERE hash=%s','DELETE FROM chain.blocks WHERE hash=%s'):
+                with self.assertRaises(Rollback):
+                    with store.atomic():
+                        store.db.execute("SET LOCAL session_replication_role='replica'")
+                        store.db.execute(statement,(member,))
+                        with self.assertRaisesRegex(Refusal,'metadata_gap_or_parent_conflict'):verify_store(store)
+                        raise Rollback()
+            self.assertEqual(verify_store(store)['digests'],expected['digests'])
+            store.db.execute('ANALYZE')
+            for query,params in full:
                 plan=store.db.execute('EXPLAIN (FORMAT JSON) '+query,params).fetchone()[0][0]['Plan']
-                self.assertIn('m',cte_scans(plan))
+                main=nodes(plan,ctes=False)
+                self.assertEqual([n['Node Type'] for n in main if n['Node Type'] in joins],['Hash Join'])
+                self.assertEqual(sorted(n['CTE Name'] for n in main if n['Node Type']=='CTE Scan'),['b','m'])
+                # chain.blocks is read once, by the materialized CTE; no lookup per membership row.
+                self.assertEqual([n.get('Subplan Name') for n in nodes(plan) if n.get('Relation Name')=='blocks'],['CTE b'])
+                rows=store.db.execute(query,params).fetchall()
+                self.assertEqual(len(rows),params[-1]-params[-2]+1)
+                self.assertEqual(rows,store.db.execute(direct,params).fetchall())
 
     def test_ticket_raw_delta_change_sealed_resume_and_publication_rollback(self):
         from dataclasses import replace
