@@ -51,7 +51,7 @@ class ProviderTests(unittest.TestCase):
     def epoch_routes(self):
         block={'hash':'aa'*32,'height':99,'previous_block':'bb'*32,'epoch':4,'slot':500,'time':1660000000,'tx_count':1}
         return {'/metrics':[], '/epochs/4':{'epoch':4,'active_stake':'19'},'/epochs/4/parameters':{'epoch':4,'nonce':'cc'*32,'max_tx_size':12000},'/epochs/4/blocks?count=1&page=1&order=desc':['aa'*32],'/blocks/'+'aa'*32:block,
-                '/epochs/latest':{'epoch':4},'/pools/extended?count=100&page=1&order=asc':[{'pool_id':POOL,'hex':'00'*28,'active_stake':'19'}],'/pools/retired?count=100&page=1&order=desc':[]}
+                '/blocks/latest':dict(block,hash='ab'*32,height=120),'/pools/extended?count=100&page=1&order=asc':[{'pool_id':POOL,'hex':'00'*28,'active_stake':'19'}],'/pools/retired?count=100&page=1&order=desc':[]}
     def test_epoch_complete_twice(self):
         p=ProviderClient(30,Fake(self.epoch_routes()));nonce,stakes,anchor,receipt=epoch_facts(p,4,stake_prefix='stake_test1');self.assertEqual(stakes,[{'epoch':4,'pool_hash':pool_hash(POOL),'amount':'19'}]);self.assertEqual(nonce['nonce'],b'\xcc'*32)
         self.assertEqual((receipt['stake_source'],receipt['stake_pools']),('pools-current',1))
@@ -82,7 +82,7 @@ class ProviderTests(unittest.TestCase):
             elif mutate=='duplicate':rows.append(dict(rows[0],active_stake='0'))
             elif mutate=='missing':rows.pop()
             elif mutate=='short':rows[0]['active_stake']='18'
-            elif mutate=='latest-ahead':routes['/epochs/latest']={'epoch':3}
+            elif mutate=='latest-ahead':routes['/blocks/latest']=dict(routes['/blocks/latest'],epoch=3)
             else:
                 other=pool_id(b'\x01'*28);values=[[dict(rows[0],active_stake='10'),{'pool_id':other,'active_stake':'9'}],[dict(rows[0],active_stake='9'),{'pool_id':other,'active_stake':'10'}]];routes[key]=lambda:values.pop(0)
             with self.subTest(mutate=mutate),self.assertRaises(Refusal) as caught:epoch_facts(ProviderClient(30,Fake(routes)),4,stake_prefix='stake_test1')
@@ -120,7 +120,7 @@ class SyntheticEpoch:
         self.calls.append(path);E=str(self.E);base=path.split('?')[0]
         block={'hash':'aa'*32,'height':99,'previous_block':'bb'*32,'epoch':self.E,'slot':500,'time':1660000000,'tx_count':1}
         if path=='/metrics':return []
-        if path=='/epochs/latest':return {'epoch':self.current}
+        if path=='/blocks/latest':return dict(block,hash='ab'*32,height=120,epoch=self.current)
         if path=='/epochs/'+E:return {'epoch':self.E,'active_stake':str(self.total)}
         if path=='/epochs/'+E+'/parameters':return {'epoch':self.E,'nonce':'cc'*32,'max_tx_size':16384}
         if path=='/epochs/'+E+'/blocks?count=1&page=1&order=desc':return ['aa'*32]
@@ -190,8 +190,13 @@ class StakeDistributionTests(unittest.TestCase):
         self.assertEqual((stakes,receipt['stake_source']),(model.expected(),'pools-history'))
         self.assertTrue(any('/history?count=100&page=2&order=desc' in c for c in model.calls))
     def test_an_epoch_boundary_during_the_reads_waits(self):
-        model=SyntheticEpoch(1000,30,current=500,zero=5);get=model.get;latest=[{'epoch':500},{'epoch':501}]
-        model.get=lambda path,purpose=None:latest.pop(0) if path=='/epochs/latest' else get(path,purpose)
+        # The pool list already answers for the next epoch (its sums cannot match): a wait, never a total refusal.
+        model=SyntheticEpoch(1000,30,current=500,zero=5);get=model.get;latest=[500,501]
+        def moving(path,purpose=None):
+            if path=='/blocks/latest':model.current=latest.pop(0)
+            if path.startswith('/pools/extended'):return [dict(r,active_stake=str(int(r['active_stake'])+1)) for r in get(path,purpose)]
+            return get(path,purpose)
+        model.get=moving
         with self.assertRaisesRegex(Refusal,'provider_epoch_changed'):self.read(model)
     def test_a_malformed_zero_stake_row_refuses(self):
         model=SyntheticEpoch(1000,30,current=500,zero=5);get=model.get

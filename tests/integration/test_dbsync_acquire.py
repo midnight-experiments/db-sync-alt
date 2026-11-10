@@ -316,7 +316,7 @@ raise SystemExit(pg_acquire.main(sys.argv[1:]))
                 page=lambda rows:rows[(int(query.get('page',1))-1)*int(query.get('count',100)):int(query.get('page',1))*int(query.get('count',100))]
                 block={'hash':'aa'*32,'height':99,'previous_block':'bb'*32,'epoch':E,'slot':500,'time':1660000000,'tx_count':1}
                 if path=='/metrics':return []
-                if path=='/epochs/latest':return {'epoch':self.current}
+                if path=='/blocks/latest':return dict(block,hash='ab'*32,height=120,epoch=self.current)
                 if path=='/epochs/%d'%E:return {'epoch':E,'active_stake':str(one('SELECT COALESCE(SUM(amount),0) FROM epoch_stake WHERE epoch_no=%s',(E,)))}
                 if path=='/epochs/%d/parameters'%E:return {'epoch':E,'nonce':H('nonce').hex(),'max_tx_size':16384}
                 if path=='/epochs/%d/blocks?count=1&page=1&order=desc'%E:return ['aa'*32]

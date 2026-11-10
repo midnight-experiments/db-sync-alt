@@ -278,7 +278,8 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
     """Two complete per-pool reads of an epoch's stake distribution, with total/nonce/max_tx_size/end-anchor equality.
 
     The facts are the SQL path's per-pool sums. Requests grow with the number of pools, never with the number of
-    delegated addresses: the current epoch through `/pools/extended`, a completed one through each pool's history."""
+    delegated addresses: the current epoch (the latest block's) through `/pools/extended`, a completed one through each
+    pool's history."""
     def header():
         summary=provider.get('/epochs/'+str(epoch));params=provider.get('/epochs/'+str(epoch)+'/parameters')
         if summary.get('epoch')!=epoch or params.get('epoch')!=epoch or summary.get('active_stake') is None or params.get('nonce') is None:raise Refusal('provider_epoch_not_ready')
@@ -295,19 +296,21 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
         if target is not None and anchor['height']>target:
             anchor=block_row(provider.get('/blocks/'+str(target)))
             if anchor['height']!=target or anchor['epoch']!=epoch:raise Refusal('provider_epoch_anchor_mismatch')
-        latest=provider.get('/epochs/latest')
-        current=integer(latest.get('epoch')) if isinstance(latest,dict) else None
-        if current is None or current<epoch:raise Refusal('provider_epoch_not_ready')
+        # The pool endpoints' "current epoch" is the latest block's epoch: read it the same way.
+        current=block_row(provider.get('/blocks/latest'))['epoch']
+        if current<epoch:raise Refusal('provider_epoch_not_ready')
         return total,{'epoch':epoch,'nonce':nonce,'max_tx_size':size},anchor,completed,current
     first=header();reads=[]
     source='pools-current' if first[4]==epoch else 'pools-history'
     for _ in range(2):
-        pools=current_pool_stakes(provider,epoch,stake_prefix=stake_prefix) if source=='pools-current' else historical_pool_stakes(provider,epoch)
-        if not pools or sum(pools.values())!=first[0]:raise Refusal('provider_epoch_total_mismatch')
-        reads.append(pools)
-    # A boundary crossed during the reads moves /epochs/latest: wait, then read the completed epoch.
+        reads.append(current_pool_stakes(provider,epoch,stake_prefix=stake_prefix) if source=='pools-current' else historical_pool_stakes(provider,epoch))
+    # A boundary crossed during the reads moves the latest block's epoch: that is a wait (then the completed
+    # epoch is read from the pools' histories), checked before the sums, which such a read cannot match.
     last=header()
-    if first!=last or reads[0]!=reads[1]:raise Refusal('provider_epoch_changed')
+    if first!=last:raise Refusal('provider_epoch_changed')
+    for pools in reads:
+        if not pools or sum(pools.values())!=first[0]:raise Refusal('provider_epoch_total_mismatch')
+    if reads[0]!=reads[1]:raise Refusal('provider_epoch_changed')
     pools=reads[0]
     return first[1],[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(pools.items())],first[2],{'max_tx_size':first[1]['max_tx_size'],'stake_source':source,'stake_pools':len(pools),'stake_digest':digest({k.hex():str(v) for k,v in pools.items()}),'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
 

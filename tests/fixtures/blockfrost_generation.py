@@ -71,8 +71,7 @@ def fixtures(fork=0,transition=False,auxiliary=(),witnesses=()):
         for epoch,total,nonce in [(2,'123','6e'*32),(3,'19','cc'*32)]:
             route['/epochs/'+str(epoch)]={'epoch':epoch,'active_stake':total};route['/epochs/'+str(epoch)+'/parameters']={'epoch':epoch,'nonce':nonce,'max_tx_size':12000+epoch}
             route['/epochs/'+str(epoch)+'/blocks?count=1&page=1&order=desc']=[block(11 if epoch==2 else 2172,fork,transition)['hash']]
-        # Epoch 3 is the current epoch: its stake is read per pool.
-        route['/epochs/latest']={'epoch':3}
+        # Epoch 3 is the latest block's epoch: its stake is read per pool.
         route['/pools/extended?count=100&page=1&order=asc']=[{'pool_id':POOL,'hex':'00'*28,'active_stake':'19'}]
         route['/pools/retired?count=100&page=1&order=desc']=[]
     return route,original
