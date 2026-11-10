@@ -13,6 +13,9 @@ EPOCH_CAPABILITY = 'epoch_max_tx_size_v1'
 # produce an output at the ICS address. A generation acquired with that metadata carries the capability.
 BRIDGE_METADATA_KEY = 6500973
 BRIDGE_CAPABILITY = 'bridge_metadata_v1'
+# Registered candidates are not served: the registered-candidates address is not a profile address, so the
+# node's registration RPCs read no registrations. Node 2.1.101 selects committees without registrations.
+CANDIDATES_CAPABILITY = 'registered_candidates_unserved'
 SCHEMA_VERSION = (15, 48, 6)
 PROFILE_FILES = ('cnight-config', 'federated-authority-config', 'permissioned-candidates-config',
                  'registered-candidates-addresses', 'ics-config', 'reserve-config')
@@ -89,9 +92,10 @@ def metadata_json(row):
     return value
 
 # Manifest capabilities of a generation: the nonce-only format had no epoch parameters and no bridge
-# metadata. `bridge_metadata_v1` is true exactly for a generation whose event range was acquired with
-# bridge metadata (Blockfrost); a cardano-db-sync acquisition never reads tx_metadata.
-CAPABILITIES={'candidates_empty':True,EPOCH_CAPABILITY:True,BRIDGE_CAPABILITY:False}
+# metadata, and its `candidates_empty` stated an empty registered-candidates address. `bridge_metadata_v1`
+# is true exactly for a generation whose event range was acquired with bridge metadata (Blockfrost); a
+# cardano-db-sync acquisition never reads tx_metadata.
+CAPABILITIES={CANDIDATES_CAPABILITY:True,EPOCH_CAPABILITY:True,BRIDGE_CAPABILITY:False}
 LEGACY_CAPABILITIES={'bridge_qualified':False,'candidates_empty':True}
 def generation_capabilities(*,legacy=False,bridge_metadata=False):
     out=dict(LEGACY_CAPABILITIES if legacy else CAPABILITIES)
