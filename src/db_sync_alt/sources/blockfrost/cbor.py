@@ -83,12 +83,13 @@ class Decoder:
     def skip(self):
         """Read past one item without building it; return its (start, end) byte span.
 
-        For data no fact depends on, such as transaction auxiliary data. Ledger
-        metadata may nest to any depth below the transaction size and repeat map
-        keys, so neither refuses here: an explicit stack replaces recursion, and
-        the input length and the shared item budget bound the work. Leaves go
-        through `item`, so malformed heads, truncation, string chunks, UTF-8 and
-        simple values refuse with the same reason codes as everywhere else.
+        For data no fact depends on: a transaction's witness set and auxiliary
+        data. Plutus data and metadata may nest to any depth below the
+        transaction size and repeat map keys, so neither refuses here: an
+        explicit stack replaces recursion, and the input length and the shared
+        item budget bound the work. Leaves go through `item`, so malformed
+        heads, truncation, string chunks, UTF-8 and simple values refuse with
+        the same reason codes as everywhere else.
         """
         start=self.pos;todo=[1]  # per open container: items left, or -1/-2 (array/map groups) until a break
         while todo:
@@ -173,11 +174,12 @@ def output_details(output):
 def decode_transaction(raw_hex,expected_hash):
     """Discovery facts of one transaction whose original body bytes hash to `expected_hash`.
 
-    Auxiliary data is only skipped (`Decoder.skip`); `auxiliary_data_span` is
-    its byte span in the transaction. A reader of one metadata label decodes
-    just that value from those bytes with an explicit depth bound, and treats an
-    over-deep or undecodable value as absent, never as a refusal: anyone can put
-    such metadata on chain.
+    The witness set (checked to be a map) and auxiliary data are only skipped
+    (`Decoder.skip`); `auxiliary_data_span` is the auxiliary data's byte span
+    in the transaction. A reader of one metadata label decodes just that value
+    from those bytes with an explicit depth bound, and treats an over-deep or
+    undecodable value as absent, never as a refusal: anyone can put such
+    metadata on chain.
     """
     if not isinstance(raw_hex,str) or len(raw_hex)>8*1024*1024 or len(raw_hex)%2 or re.fullmatch('[0-9a-f]+',raw_hex) is None:raise Refusal('cbor_invalid_hex')
     if not isinstance(expected_hash,str) or re.fullmatch('[0-9a-f]{64}',expected_hash) is None:raise Refusal('cbor_invalid_hash')
@@ -186,11 +188,11 @@ def decode_transaction(raw_hex,expected_hash):
     start=d.pos;body=d.item(1);end=d.pos
     actual=hashlib.blake2b(raw[start:end],digest_size=32).hexdigest()
     if actual!=expected_hash:raise Refusal('cbor_body_hash_mismatch')
-    witness=d.item(1);valid=d.item(1);auxiliary=d.skip()
+    witness_head=d.data[d.pos:d.pos+1];d.skip();valid=d.item(1);auxiliary=d.skip()
     if n is None and d.take(1)!=b'\xff':raise Refusal('cbor_envelope_arity')
     if d.pos!=len(raw):raise Refusal('cbor_trailing_bytes')
     if not isinstance(body,dict) or not {0,1,2}.issubset(body) or any(type(k) is not int or k not in set(range(23))-{10,12} for k in body):raise Refusal('cbor_unsupported_body')
-    if not isinstance(witness,dict) or type(valid) is not bool or not uint(body[2]):raise Refusal('cbor_unsupported_envelope')
+    if witness_head[0]>>5!=5 or type(valid) is not bool or not uint(body[2]):raise Refusal('cbor_unsupported_envelope')
     if not isinstance(body[1],list):raise Refusal('cbor_output_shape')
     for o in body[1]:
         if not ((isinstance(o,list) and len(o) in (2,3)) or (isinstance(o,dict) and {0,1}.issubset(o) and set(o)<={0,1,2,3})):raise Refusal('cbor_output_shape')

@@ -2,7 +2,7 @@
 import unittest
 from db_sync_alt.contract import Refusal
 from fixtures.blockfrost import FixtureHooks
-from fixtures.blockfrost_generation import CLEAN_AUXILIARY, HOSTILE_AUXILIARY, OFFSET, advance, baseline, block, fixtures
+from fixtures.blockfrost_generation import CLEAN_AUXILIARY, CLEAN_WITNESSES, HOSTILE_AUXILIARY, HOSTILE_WITNESSES, OFFSET, advance, baseline, block, fixtures
 from fixtures.database import SyncFixture
 
 
@@ -60,6 +60,13 @@ class GenerationTests(SyncFixture):
         # Block h=12 gains two unrelated transactions, so it is not generation 0's provisional block (fork=1).
         digests=lambda auxiliary:self.advance(self.store(),fixtures(fork=1,auxiliary=auxiliary)[0])['digests']
         hostile,clean,plain=digests(HOSTILE_AUXILIARY),digests(CLEAN_AUXILIARY),digests(())
+        self.assertEqual(hostile,clean)
+        self.assertEqual({k:v for k,v in hostile.items() if k!='blocks'},{k:v for k,v in plain.items() if k!='blocks'})
+        self.assertEqual(hostile['mints']['count'],1)
+    def test_hostile_witness_sets_beside_a_relevant_transaction_store_the_clean_facts(self):
+        # Block h=12 gains three unrelated transactions, so it is not generation 0's provisional block (fork=1).
+        digests=lambda witnesses:self.advance(self.store(),fixtures(fork=1,witnesses=witnesses)[0])['digests']
+        hostile,clean,plain=digests(HOSTILE_WITNESSES),digests(CLEAN_WITNESSES),digests(())
         self.assertEqual(hostile,clean)
         self.assertEqual({k:v for k,v in hostile.items() if k!='blocks'},{k:v for k,v in plain.items() if k!='blocks'})
         self.assertEqual(hostile['mints']['count'],1)
