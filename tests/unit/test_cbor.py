@@ -56,7 +56,9 @@ class AuxiliaryDataTests(unittest.TestCase):
                 b={**body(),7:hashlib.blake2b(auxiliary,digest_size=32).digest()}
                 raw,h=tx(b,auxiliary=auxiliary);d=decode_transaction(raw,h);start,end=d.pop('auxiliary_data_span')
                 self.assertEqual(bytes.fromhex(raw)[start:end],auxiliary)
-                plain=decode_transaction(*tx(b));plain.pop('auxiliary_data_span')
+                # The bridge metadata reader gets the auxiliary data bytes; no other fact depends on them.
+                self.assertEqual(d.pop('auxiliary_data'),auxiliary)
+                plain=decode_transaction(*tx(b));plain.pop('auxiliary_data_span');self.assertIsNone(plain.pop('auxiliary_data'))
                 self.assertEqual(d,plain)
     def test_malformed_auxiliary_data_refuses_with_existing_codes(self):
         for auxiliary,code in [(b'\x82\x00','cbor_truncated'),(b'\x9f\x00','cbor_truncated'),(b'\x5b'+b'\xff'*8,'cbor_truncated'),
