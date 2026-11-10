@@ -51,4 +51,4 @@ class SyncFixture(unittest.TestCase):
         """The ready generation of `store` has the same fact digests as the full update with `routes`."""
         expected=self.reference(routes,transition)
         self.assertEqual(store.digests(store.generation()['id']),expected['digests'])
-        self.assertEqual(set(expected['digests']),{'blocks','transactions','outputs','inputs','assets','output_assets','mints','datums','epoch_nonces','epoch_stakes'})
+        self.assertEqual(set(expected['digests']),{'blocks','transactions','outputs','inputs','assets','output_assets','mints','datums','epoch_nonces','epoch_stakes','tx_metadata'})

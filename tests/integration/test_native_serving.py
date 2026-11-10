@@ -69,7 +69,8 @@ def values(types, hit):
 def gated_statements():
     """Every standalone catalogue SELECT reading relations outside the PostgreSQL catalogue.
 
-    The bridge query's builder components are never sent alone (bridge data is not served).
+    The bridge query's builder components are never sent alone; the assembled query is tested on the
+    bridge transfer scenario (test_bridge_metadata).
     """
     out = []
     for entry in emitted_statements().values():
@@ -190,7 +191,9 @@ class NativeServingTests(unittest.TestCase):
             self.assertEqual(len(rows), 1, name)
         self.assertEqual(client.query("select count(*) from information_schema.tables where table_name = 'tx_in'", [], []).rows, [{'count': 1}])
         self.assertEqual(client.query('SELECT EXISTS (SELECT 1 FROM tx_in)', [], []).rows, [{'exists': True}])
-        for denied in ('SELECT id, key, tx_id, json FROM tx_metadata LIMIT 1', 'SELECT * FROM chain.outputs', 'SELECT chain.gate()',
+        # tx_metadata is a node relation (the bridge query reads it); the stored facts behind it are not.
+        self.assertEqual(client.query('SELECT id, key, tx_id, json FROM tx_metadata LIMIT 1', [], []).rows, [])
+        for denied in ('SELECT * FROM chain.tx_metadata', 'SELECT * FROM serve.tx_metadata', 'SELECT * FROM chain.outputs', 'SELECT chain.gate()',
                        'SELECT * FROM chain.service_state', "UPDATE multi_asset SET name='\\x78'::bytea"):
             with self.subTest(denied=denied):
                 with self.assertRaises(QueryError) as caught:
