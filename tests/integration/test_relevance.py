@@ -293,39 +293,42 @@ class RelevancePGTests(unittest.TestCase):
 class InvalidTransactionSQLTests(unittest.TestCase):
     """A phase-2-invalid transaction in the cardano-db-sync source, as cardano-db-sync 13.8 stores it: tx with
     valid_contract false, its collateral input as tx_in, its collateral return as tx_out at the number of body
-    outputs. It spends the relevant output of the root's PRE_SPEND and returns cNIGHT to a key address."""
+    outputs. It spends the relevant output of the root's last transaction and returns cNIGHT to a key address.
+    Preview: its start cursor at block 0 leaves no prerequisite history to acquire."""
     @classmethod
     def setUpClass(cls):
         from db_sync_alt.sources.blockfrost.relevance import address_text
-        f.configure('mainnet');f.SQLFixture.setup()
-        cls.invalid=f.make_tx(170,valid=False,collateral=[key(f.PRE_SPEND)],returned=[f.OTHER,[60,{f.P:{f.N:3}}]])
-        cls.other=address_text(f.OTHER,'mainnet')
+        f.configure('preview');f.SQLFixture.setup()
+        cls.invalid=f.make_tx(170,valid=False,collateral=[key(f.BASE_SPEND)],returned=[f.OTHER,[60,{f.P:{f.N:3}}]])
+        cls.other=address_text(f.OTHER,'preview')
         c=f.SQLFixture.source
         with c.transaction():
-            c.execute('INSERT INTO tx VALUES(10,%s,%s,2,false)',(key(cls.invalid)[0],f.S-1))
-            c.execute('INSERT INTO tx_in VALUES(10,10,2,0)')
+            c.execute('INSERT INTO tx VALUES(10,%s,%s,1,false)',(key(cls.invalid)[0],f.T))
+            c.execute('INSERT INTO tx_in VALUES(10,10,4,0)')
             c.execute('INSERT INTO tx_out(id,tx_id,index,address,value,data_hash) VALUES(10,10,1,%s,60,NULL)',(cls.other,))
             c.execute('INSERT INTO ma_tx_out VALUES(10,3,10,1)')
     @classmethod
-    def tearDownClass(cls):f.SQLFixture.teardown()
+    def tearDownClass(cls):
+        try:f.SQLFixture.teardown()
+        finally:f.configure('mainnet')
     def prepare(self,rows):
-        store,routes=f.SQLFixture.prepare(rows,history=[(f.S-1,2,self.invalid)]);self.addCleanup(store.close);return store,routes
+        store,routes=f.SQLFixture.prepare(rows,history=[(f.T,1,self.invalid)]);self.addCleanup(store.close);return store,routes
     def test_sql_source_stores_and_serves_it_and_blockfrost_continues_from_it(self):
         spend=f.make_tx(171,inputs=[key(self.invalid,1)]);invalid=key(self.invalid)[0]
         store,routes=self.prepare([[spend]])
         self.assertEqual(store.fact('transactions',(invalid,))['valid'],0)
-        self.assertEqual(store.ordinal('inputs',(invalid,*key(f.PRE_SPEND))),0)
+        self.assertEqual(store.ordinal('inputs',(invalid,*key(f.BASE_SPEND))),0)
         self.assertIsNone(store.fact('outputs',(invalid,0)))
         self.assertEqual(store.fact('outputs',(invalid,1))['address'],self.other)
         self.assertEqual([(bytes(r['policy']),bytes(r['name']),str(r['quantity'])) for r in store.output_assets(invalid,1)],[(f.P,f.N,'3')])
         self.assertEqual(store.db.execute('SELECT valid_contract FROM serve.tx WHERE hash=%s',(invalid,)).fetchone(),(False,))
         verify_store(store)
         # The hand-off check reads the stored invalid transaction back from Blockfrost; the spend of its return follows.
-        _,calls=f.SQLFixture.follow(store,routes,f.S+1)
+        _,calls=f.SQLFixture.follow(store,routes,f.T+1)
         self.assertIn('/txs/'+self.invalid['tx_hash']+'/utxos',calls)
         self.assertEqual(store.ordinal('inputs',(key(spend)[0],invalid,1)),0)
         verify_store(store)
         from db_sync_alt.sources.blockfrost.adapter import update
         from fixtures.blockfrost import Fake
-        reference,paths=self.prepare([[spend]]);update(reference,f.Provider(50000,Fake(paths)),f.PROFILE,f.S+1,hooks=FixtureHooks())
+        reference,paths=self.prepare([[spend]]);update(reference,f.Provider(50000,Fake(paths)),f.PROFILE,f.T+1,hooks=FixtureHooks())
         self.assertEqual(reference.digests(reference.generation()['id']),store.digests(store.generation()['id']))
