@@ -203,8 +203,10 @@ def upgrade_store(store,ordinal_source=None,epoch_source=None):
     else:
         written=_upgrade_v5(store,state,checkpoint) or written
     from db_sync_alt.store import serve
+    from db_sync_alt.bridge import report as bridge_report
     serve.verify(store,store.state()['canonical_ready'])
-    result={'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served}
+    # Bridge metadata coverage starts after the upgraded generation: the next Blockfrost generation is the first covered.
+    result={'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served,'bridge':bridge_report(store)}
     if epochs is not None:result['epoch_parameters']=epochs
     if ordinal_source is not None and any(served.get('ordinals_from_source',{}).values()):
         identity=getattr(ordinal_source,'validated_identity',None)

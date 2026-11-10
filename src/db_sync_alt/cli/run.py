@@ -61,6 +61,7 @@ def parser():
     p.add_argument('--relevance', action=argparse.BooleanOptionalAction, dest='relevance_enabled', default=False, help='Enable coverage-certified relevance filtering (default: off)')
     p.add_argument('--node-security-parameter', type=int, help="The Midnight node's CARDANO_SECURITY_PARAMETER, compared with the network's k (report-only)")
     p.add_argument('--node-configuration-dir', type=Path, help="The node's network configuration directory (res/<network>), compared with the profile (report-only)")
+    p.add_argument('--node-bridge-checkpoint', help="The on-chain bridge data checkpoint, block:<n> or tx:<hash>; /health is unhealthy while the bridge metadata coverage does not support it")
     return p
 
 
@@ -204,6 +205,10 @@ def node_values(args):
         out['security_parameter'] = args.node_security_parameter
     if args.node_configuration_dir is not None:
         out['configuration_dir'] = str(args.node_configuration_dir.absolute())
+    if args.node_bridge_checkpoint is not None:
+        from db_sync_alt.bridge import parse_checkpoint
+        parse_checkpoint(args.node_bridge_checkpoint)
+        out['bridge_checkpoint'] = args.node_bridge_checkpoint
     return out or None
 
 

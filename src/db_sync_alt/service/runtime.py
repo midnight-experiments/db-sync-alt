@@ -96,7 +96,8 @@ class ServiceConfig:
     # The node's login: {"role": name, "pg_service": libpq service that logs in as that role}.
     reader: dict = field(repr=False)
     # The node's own values, compared with the profile and reported (never enforced):
-    # {"security_parameter": k, "configuration_dir": the node's res/<network> directory}.
+    # {"security_parameter": k, "configuration_dir": the node's res/<network> directory,
+    #  "bridge_checkpoint": the on-chain bridge data checkpoint, "block:<n>" or "tx:<hash>"}.
     node: dict | None = field(default=None, repr=False)
     sync: dict = field(default_factory=dict)
     network: str | None = None
@@ -147,12 +148,18 @@ class ServiceConfig:
         if _label(self.reader['pg_service']) == self.pg_service:
             raise ValueError('reader_service_must_differ')
         if self.node is not None:
-            if (not isinstance(self.node, dict) or not self.node or not set(self.node) <= {'security_parameter', 'configuration_dir'}
+            if (not isinstance(self.node, dict) or not self.node or not set(self.node) <= {'security_parameter', 'configuration_dir', 'bridge_checkpoint'}
                     or ('security_parameter' in self.node and (type(self.node['security_parameter']) is not int
                                                                or not 0 < self.node['security_parameter'] < 2**31))
                     or ('configuration_dir' in self.node and (not isinstance(self.node['configuration_dir'], str)
                                                               or not Path(self.node['configuration_dir']).is_absolute()))):
                 raise ValueError('invalid_node_configuration')
+            if 'bridge_checkpoint' in self.node:
+                from db_sync_alt.bridge import parse_checkpoint
+                try:
+                    parse_checkpoint(self.node['bridge_checkpoint'])
+                except Refusal:
+                    raise ValueError('invalid_node_configuration') from None
         if bool(self.backup_archive) != bool(self.backup_manifest):
             raise ValueError('backup_pair_required')
         if (isinstance(self.shutdown_seconds, bool) or not isinstance(self.shutdown_seconds, (int, float))
@@ -204,6 +211,8 @@ class DatabaseObservation:
     witness: ChainPoint | None
     revoked: bool = False
     ready: bool = True
+    # Bridge readiness (bridge.report): coverage start and the stated checkpoint's support.
+    bridge: dict | None = None
 
 
 def _point(row):
@@ -367,9 +376,13 @@ class PostgresRuntime:
                 generation = store.generation(current['canonical_ready'])
                 committed = _point(store.block_at(generation['id'], generation['target_height']))
                 witness = _point(store.block_at(generation['id'], generation['witness_height']))
+                bridge = None
+                if 'tx_metadata' in store.physical_tables:
+                    from db_sync_alt.bridge import report
+                    bridge = report(store, (self.config.node or {}).get('bridge_checkpoint'))
                 # Pending progress belongs to the updater's durable checkpoint
                 # adapter; this reader must not overwrite its completed counts.
-                return DatabaseObservation(committed, witness)
+                return DatabaseObservation(committed, witness, bridge=bridge)
 
     def reader_check(self):
         """As the reader, in the writer's database: one gated node-facing relation answers."""
@@ -607,6 +620,7 @@ class Service:
                         self.health.set_coverage(committed=observation.committed,
                                                  served=observation.committed if observation.ready and sql_ready else None,
                                                  witness=observation.witness)
+                        self.health.bridge(observation.bridge)
                         self.health.update(serving='ready' if observation.ready and sql_ready else 'unready')
                         if sql_ready:
                             self.health.heartbeat('sql')
