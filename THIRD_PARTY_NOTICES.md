@@ -10,8 +10,9 @@ Source: [midnightntwrk/midnight-node at
 86774edf8cc76345a5c3a4221f3fe80c094b1c33](https://github.com/midnightntwrk/midnight-node/tree/86774edf8cc76345a5c3a4221f3fe80c094b1c33),
 tag `node-2.1.101`.
 
-The seven Rust files under `reference/` are unchanged copies of the corresponding
-paths at that commit. They supply the runtime SQL catalogue. Their exact hashes
+The eight Rust files under `reference/` are unchanged copies of the corresponding
+paths at that commit. They supply the runtime SQL catalogue and the
+committee-selection source a test pins. Their exact hashes
 are recorded in [`reference/source-manifest.json`](reference/source-manifest.json); do not edit them as
 ordinary application code. Midnight source files retain their Midnight
 Foundation notices. The Partner Chains db-sync model is part of the upstream
