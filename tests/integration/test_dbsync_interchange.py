@@ -97,12 +97,17 @@ class InterchangeTests(unittest.TestCase):
                     self.assertEqual(store.write_checkpoint(store.certify_checkpoint()),
                                      {'generation':1,'previous_base':0})
                     verify_store(store)
-                acquire(source(),store,fixture.profile,target_height=it.gen_fixture.OFFSET+12)
+                    # Bridge metadata coverage starts with the Blockfrost update.
+                    self.assertEqual(store.status()['bridge']['coverage_start'],it.gen_fixture.OFFSET+11)
+                caught_up=acquire(source(),store,fixture.profile,target_height=it.gen_fixture.OFFSET+12)
                 self.assertEqual(store.digests(2),expected);self.assertEqual(store.digests(0),old_digest)
                 self.assertEqual(store.db.execute('SELECT hash,id FROM chain.transactions WHERE first_generation=0 ORDER BY id').fetchall(),old_ids)
                 self.assertEqual(store.generation()['manifest']['required_epochs'],[0,1,2,3])
                 self.assertTrue(any(r['receipt'].get('epoch_end',{}).get('height')==it.gen_fixture.OFFSET+11 for r in store.checkpoint_rows(phase='epochs',unit='2') if r['receipt'].get('epoch_end')))
                 verify_store(store)
+                if not self.incremental:
+                    # Schema 1 serves no bridge metadata: nothing to report.
+                    self.assertNotIn('bridge',caught_up)
                 if self.incremental:
                     # A full SQL receipt remains full-profile-bound when it is
                     # made the schema-4 integrity base after a compact delta.
@@ -113,6 +118,15 @@ class InterchangeTests(unittest.TestCase):
                     self.assertEqual(store.db.execute('SELECT generation,previous_base FROM chain.integrity_checkpoints ORDER BY generation').fetchall(),
                                      [(1,0),(2,1)])
                     verify_store(store)
+                    # The cardano-db-sync update holds no bridge metadata: coverage starts again after it, and a
+                    # checkpoint inside it is reported unsupported.
+                    from db_sync_alt.bridge import parse_checkpoint
+                    bridge=store.status(parse_checkpoint('block:%d'%(it.gen_fixture.OFFSET+10)))['bridge']
+                    self.assertEqual((bridge['coverage_start'],bridge['checkpoint_supported'],bridge['reason']),(it.gen_fixture.OFFSET+13,False,'before_coverage'))
+                    # The catch-up says so when it publishes.
+                    self.assertEqual((caught_up['bridge']['coverage_start'],caught_up['bridge_coverage_ended'],caught_up['warnings']),
+                                     (it.gen_fixture.OFFSET+13,{'previous_coverage_start':it.gen_fixture.OFFSET+11,'coverage_start':it.gen_fixture.OFFSET+13},
+                                      ['bridge_metadata_coverage_restarted']))
                     # Both publication paths kept the served tables exact; db-sync reports the stored ordinals.
                     from db_sync_alt.store import serve
                     serve.verify(store,store.generation()['id'])

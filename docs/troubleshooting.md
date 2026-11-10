@@ -31,10 +31,12 @@ preserve a failed database for diagnosis and recover into a new empty one.
 | `serving_block_lag_exceeded`, `serving_lag_exceeded` | The served target is more blocks behind the confirmed target than the block-lag limit (the network profile's 9, one below the node's stability margin of 10), or more than 600 seconds | Usually catching up; persistent lag means requests are failing or too slow, and a node on the default margin stops verifying new blocks one block later |
 | `serving_block_lag_unknown`, `serving_lag_unknown` | Lag cannot be computed yet | Normal right after start |
 | `provider_behind_served` | Blockfrost reports a confirmed target lower than the one already served | Usually a short provider delay; persistent: check the network setting and key |
+| `bridge_checkpoint_unsupported` | The bridge checkpoint stated in the configuration (`node.bridge_checkpoint`) is older than the bridge metadata coverage start (`bridge.reason` `before_coverage`), or names a transaction the database does not serve (`transaction_not_served`) | Check the stated value against the chain ([bridge readiness](connect-a-node.md#bridge-readiness)). A correct, unsupported checkpoint means the node's bridge query reads data this database does not hold; serving continues, but the node can stop at a bridge transfer in the uncovered range |
 
 `/status` returns the same snapshot with HTTP 200, including `lag`, `quota`,
-`pending` progress, per-worker heartbeats, the verified `reader` and the
-`integrity` base. `sync` reads `checkpointing` while the service writes a
+`pending` progress, per-worker heartbeats, the verified `reader`, the
+`integrity` base and `bridge` (metadata coverage start and the stated
+checkpoint). `sync` reads `checkpointing` while the service writes a
 periodic [integrity checkpoint](operations.md#integrity-checkpoints); publication
 waits meanwhile, so the lag grows by a few blocks.
 
@@ -47,10 +49,12 @@ warning never makes `/health` fail.
 | --- | --- |
 | `reader_statement_timeout_unset`, `reader_idle_in_transaction_timeout_unset` | The reader login has no `statement_timeout` or `idle_in_transaction_session_timeout` default |
 | `reader_search_path_not_public` | The reader login's `search_path` default is not `public` |
-| `reader_connection_limit_unset`, `reader_connection_limit_below_node_pool` | The reader login has no connection limit, or one below 36 (the node's pool of 35 and the service's check) |
+| `reader_connection_limit_unset`, `reader_connection_limit_below_node_pool` | The reader login has no connection limit, or one below 36 (node 2.1.101's pools of up to 32 connections, the service's check and 3 spare) |
 | `node_requirements_unchecked` | The service configuration has no `node` section, so the node's k and configuration were not compared with the profile |
 | `node_security_parameter_mismatch` | The node's configured k differs from the profile's ([node requirements](connect-a-node.md#node-requirements)) |
 | `node_configuration_mismatch` | A Cardano address or policy file of the node's network configuration differs from the profile's, or is missing |
+
+| `bridge_metadata_coverage_restarted` (`acquire --source dbsync`) | The published update from cardano-db-sync follows blocks that held bridge metadata; it holds none, so the bridge metadata coverage now starts after it (`bridge_coverage_ended` gives the previous and the new start). Before bridge activation this needs nothing; after it, the node can stop at a transfer inside the update: follow from Blockfrost instead ([bridge readiness](connect-a-node.md#bridge-readiness)) |
 
 ## Service error codes
 
@@ -125,6 +129,9 @@ Administrative commands (`acquire`, `upgrade`, `backup`, `restore`, `verify`,
 | `resume_namespace_mismatch` | An unfinished build is resumed against a different db-sync database than the one it started from |
 | `source_equals_destination` | The db-sync source and the destination are the same database |
 | `explicit_blockfrost_target_required` | `acquire --source blockfrost` needs `--target-height` within 1,000 blocks above the ready target |
+| `invalid_bridge_checkpoint` (`status`, `run`, service configuration) | The bridge checkpoint is not `block:<n>` (0 to 2,147,483,647, no leading zero) or `tx:<64 lowercase hex>` |
+| `provider_metadata_conflict`, `provider_bad_metadata` (service: `invalid_coverage`) | Blockfrost's `/txs/{hash}/metadata` answer for a transaction with an output at the ICS address is malformed, or disagrees with the transaction's own CBOR on whether it carries key 6500973 or on the recipient it names. Nothing is published; check the provider and restart |
+| `bridge_metadata_incomplete`, `bridge_metadata_unexpected` (verification; `invalid_coverage` in the service) | An update from Blockfrost lacks the bridge metadata of a transaction with an output at the ICS address, or holds metadata it should not; keep the database for diagnosis and restore a verified backup |
 
 ### Relevance filtering refusals
 

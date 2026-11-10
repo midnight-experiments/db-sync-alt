@@ -187,6 +187,7 @@ class HealthState:
         self._node_warnings = []
         self._integrity = {'base': None, 'checkpointed_at': None}
         self._relevance = dict(requested='full', effective='full', reason='disabled')
+        self._bridge = None
 
     def relevance_mode(self, enabled, *, effective=None, reason=None):
         if type(enabled) is not bool or effective not in ('full', 'relevance'):
@@ -208,6 +209,20 @@ class HealthState:
             _number(checkpointed_at, 'checkpointed_at')
         with self._lock:
             self._integrity = {'base': base, 'checkpointed_at': checkpointed_at}
+
+    def bridge(self, report):
+        """Bridge readiness from the database: the metadata coverage start and, when the operator states
+        the node's bridge checkpoint, whether it is supported. An unsupported checkpoint is unhealthy."""
+        if report is not None:
+            if (not isinstance(report, dict) or set(report) != {'metadata_key', 'coverage_start', 'checkpoint', 'checkpoint_supported', 'reason'}
+                    or type(report['metadata_key']) is not int
+                    or not (report['coverage_start'] is None or type(report['coverage_start']) is int)
+                    or report['checkpoint_supported'] not in (None, True, False)
+                    or report['reason'] not in (None, 'before_coverage', 'transaction_not_served')):
+                raise ValueError('invalid bridge report')
+            report = json.loads(json.dumps(report))
+        with self._lock:
+            self._bridge = report
 
     def reader_verified(self, report):
         """The reader role midnight-node uses: verified privileges, its settings, what to set."""
@@ -424,6 +439,8 @@ class HealthState:
                 reasons.append('serving_lag_unknown')
             elif lag_seconds > self.policy.serving_lag_max_seconds:
                 reasons.append('serving_lag_exceeded')
+            if self._bridge is not None and self._bridge['checkpoint_supported'] is False:
+                reasons.append('bridge_checkpoint_unsupported')
             return dict(self._identity, follow_mode=self._follow_mode, poll_interval_seconds=self._poll_interval, poll_timing=None if self._poll_timing is None else dict(self._poll_timing), lifecycle=self._lifecycle, sync=self._sync, serving=self._serving,
                         provider_head=point(self._head), provider_observed_at=self._observed_at,
                         confirmed_target=point(self._confirmed), committed_target=point(self._committed),
@@ -433,6 +450,7 @@ class HealthState:
                         last_successful_sync=self._success_at, retry_at=self._retry_at, quota=asdict(self._quota),
                         database=asdict(database), workers=workers, operation=operation, error_code=self._error_code, poll_error_code=self._poll_error,
                         integrity=dict(self._integrity), relevance=dict(self._relevance),
+                        bridge=None if self._bridge is None else json.loads(json.dumps(self._bridge)),
                         reader=None if self._reader is None else json.loads(json.dumps(self._reader)),
                         warnings=([] if self._reader is None else list(self._reader['warnings'])) + list(self._node_warnings),
                         policy=asdict(self.policy), healthy=not reasons, reason_codes=reasons)

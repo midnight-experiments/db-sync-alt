@@ -19,9 +19,62 @@ import re
 import stat
 import tempfile
 import time
+import types
 from urllib.parse import unquote, urlsplit
 
 MAX_BYTES = 32 * 1024 * 1024
+# Arrays and objects nested deeper than this in a provider answer are cut out. Python's JSON decoder and
+# encoder recurse in C and fail between 5,000 and 10,000 levels, and anyone can put metadata that deep on
+# chain. Every value cardano-db-sync stores as JSON (nesting up to 2,000) arrives whole.
+RESPONSE_DEPTH = 4000
+_STRUCTURE = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}"]')
+_PAIRS = {'[': ']', '{': '}'}
+# Stands in for a cut container while the shallow rest is decoded. U+0000 never occurs in provider JSON
+# (PostgreSQL's jsonb cannot hold it).
+_CUT_KEY = '\x00db-sync-alt:nested-too-deep'
+
+
+class TooDeep(dict):
+    """An array or object nested deeper than RESPONSE_DEPTH in a provider answer: cut, empty."""
+
+
+def _object(pairs):
+    return TooDeep() if pairs == [(_CUT_KEY, True)] else dict(pairs)
+
+
+def loads(raw):
+    """A provider answer as `json.loads` decodes it, except that every array or object nested deeper
+    than RESPONSE_DEPTH is a `TooDeep`. Malformed JSON raises ValueError, as `json.loads` does; no input
+    raises RecursionError."""
+    binary = isinstance(raw, (bytes, bytearray))
+    if (raw.count(b'[') + raw.count(b'{') if binary else raw.count('[') + raw.count('{')) <= RESPONSE_DEPTH:
+        return json.loads(raw)  # cannot nest deeper: the common answer, decoded by the standard library
+    text = raw.decode('utf-8') if binary else raw
+    stack, spans, start = [], [], None
+    for token in _STRUCTURE.finditer(text):
+        value = token.group()
+        if value[0] == '"':
+            if len(value) == 1:
+                raise ValueError('unterminated string')
+        elif value in _PAIRS:
+            stack.append(value)
+            if len(stack) == RESPONSE_DEPTH + 1:
+                start = token.start()
+        else:
+            if not stack or _PAIRS[stack.pop()] != value:
+                raise ValueError('unbalanced brackets')
+            if len(stack) == RESPONSE_DEPTH and start is not None:
+                spans.append((start, token.end()));start = None
+    if stack:
+        raise ValueError('unbalanced brackets')
+    if not spans:
+        return json.loads(raw)
+    cut, pieces, position = json.dumps({_CUT_KEY: True}), [], 0
+    for first, end in spans:
+        pieces += [text[position:first], cut];position = end
+    pieces.append(text[position:])
+    return json.loads(''.join(pieces), object_pairs_hook=_object)
+
 
 class ProviderError(RuntimeError):
     def __init__(self, code, *, http_status=None, kind=None):
@@ -40,6 +93,26 @@ def safe_path(path):
         raise ProviderError('invalid_provider_path')
     return path
 
+def bounded_json():
+    """The standard `json` module with `loads` bounded like db-sync-alt's own client: equal results for
+    every answer `loads` handles, a `TooDeep` for nesting beyond RESPONSE_DEPTH, `JSONDecodeError` for
+    malformed JSON. A call with decoding options is the standard library's."""
+    module = types.ModuleType('json')
+    module.__dict__.update({name: value for name, value in vars(json).items() if not name.startswith('__')})
+
+    def bounded(document, *args, **kwargs):
+        if args or kwargs:
+            return json.loads(document, *args, **kwargs)
+        try:
+            return loads(document)
+        except json.JSONDecodeError:
+            raise
+        except ValueError as error:
+            raise json.JSONDecodeError(str(error), document if isinstance(document, str) else '', 0) from None
+    module.loads = bounded
+    return module
+
+
 def external_module(root):
     try:
         root = Path(root)
@@ -51,13 +124,17 @@ def external_module(root):
     except Exception:raise ProviderError('shared_client_unavailable') from None
 
 class SharedClient:
-    """Opt-in adapter; never copies or modifies external accounting semantics.
+    """Opt-in adapter; never copies or modifies external accounting semantics (the module's JSON decoding
+    is bounded, see `bounded_json`).
 
     `profile` names the shared client's profile (default: the network name); its
     API base must be the network's.
     """
     def __init__(self, root, profile=None, *, network):
         self.module = external_module(root)
+        # The external client decodes Blockfrost's answers with `json.loads`, which fails on nesting anyone can
+        # put on chain. Its private instance gets the bounded decoder; its own files decode as before.
+        self.module.json = bounded_json()
         self.client = self.module.Client(profile or network.network, root=Path(root))
         self.base = self.client.base
         if self.base != network.blockfrost_base:raise ProviderError('wrong_provider_network')
@@ -178,7 +255,7 @@ class PortableClient:
                     _atomic(self.state,data)
                 if code != 200:raise ProviderError('provider_request_failed_counted',http_status=code)
                 if len(raw)>MAX_BYTES or self.key.encode() in raw:raise ProviderError('unsafe_provider_response')
-                result=json.loads(raw)
+                result=loads(raw)
                 if self.key in json.dumps(result,ensure_ascii=False):raise ProviderError('unsafe_provider_response')
                 if path=='/metrics':
                     if not isinstance(result,list):raise ProviderError('invalid_provider_metrics')

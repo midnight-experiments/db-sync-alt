@@ -20,8 +20,8 @@ class IdentityTests(unittest.TestCase):
     def test_contract_and_profile(self):
         profile = contract.Profile(profile_dir('preprod'))
         preprod = networks.network_profile('preprod')
-        self.assertEqual(contract.digest(contract.contract_for(preprod)), '985d815697c6586548247a350c9e18aaea1fad63e0b9512e99016cee1998d5db')
-        self.assertEqual(contract.digest(profile.contract), '985d815697c6586548247a350c9e18aaea1fad63e0b9512e99016cee1998d5db')
+        self.assertEqual(contract.digest(contract.contract_for(preprod)), '4f49c2d3a1e48daa83e549fb187ffe2d88835bc9bd0b0483ef0d865089c03ffb')
+        self.assertEqual(contract.digest(profile.contract), '4f49c2d3a1e48daa83e549fb187ffe2d88835bc9bd0b0483ef0d865089c03ffb')
         # The nonce-only contract stored by every earlier release: stores and backups that carry it
         # must still be recognised to be verified and upgraded.
         self.assertEqual(contract.digest(contract.contract_for(preprod, legacy=True)), '65da5fbe1e66529141f8ae3e8b9330e0b2110d2ed17ef3ac94899c84f6e5cbab')
@@ -30,7 +30,12 @@ class IdentityTests(unittest.TestCase):
                          ('midnight-compact-cardano-v2', 'midnight-compact-cardano-v1', 'preprod-selective-v1', 2160, (15, 48, 6)))
         self.assertEqual(contract.TABLES['epoch_nonces'], ('epoch', 'nonce', 'max_tx_size'))
         self.assertEqual(contract.LEGACY_TABLES['epoch_nonces'], ('epoch', 'nonce'))
-        self.assertEqual(contract.generation_capabilities(), {'bridge_qualified': False, 'candidates_empty': True, 'epoch_max_tx_size_v1': True})
+        self.assertEqual(contract.TABLES['tx_metadata'], ('tx_hash', 'present', 'json'))
+        self.assertNotIn('tx_metadata', contract.LEGACY_TABLES)
+        self.assertEqual(contract.generation_capabilities(), {'candidates_empty': True, 'epoch_max_tx_size_v1': True, 'bridge_metadata_v1': False})
+        self.assertEqual(contract.generation_capabilities(bridge_metadata=True), {'candidates_empty': True, 'epoch_max_tx_size_v1': True, 'bridge_metadata_v1': True})
+        self.assertEqual(contract.contract_for(preprod)['bridge_metadata']['key'], 6500973)
+        self.assertNotIn('bridge_qualified', contract.contract_for(preprod))
         self.assertEqual(contract.generation_capabilities(legacy=True), {'bridge_qualified': False, 'candidates_empty': True})
         self.assertEqual(preprod.config_sha256, '88a096f98b01f55c0680eb523f58fa9c4c141f3546794e4f5fd1084a76e32304')
         self.assertEqual(contract.digest(profile.configs), preprod.config_sha256)

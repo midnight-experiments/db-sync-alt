@@ -1,5 +1,5 @@
--- Schema 5: epoch parameters for midnight-node 2.1.101, which reads
--- MAX(epoch_param.max_tx_size) of the cursor block's epoch.
+-- Schema 5: epoch parameters and bridge metadata for midnight-node 2.1.101, which reads
+-- MAX(epoch_param.max_tx_size) of the cursor block's epoch and tx_metadata in its bridge query.
 --
 -- chain.epoch_nonces already holds every epoch's max_tx_size: a store created with this release
 -- stores it with each epoch, and the upgrade of a nonce-only store adds it (from an authoritative
@@ -17,6 +17,25 @@ ALTER TABLE serve.epoch_param ADD COLUMN max_tx_size public.word31type;
 UPDATE serve.epoch_param s SET max_tx_size=c.max_tx_size FROM chain.epoch_nonces c WHERE c.epoch=s.epoch_no;
 ALTER TABLE serve.epoch_param ALTER COLUMN max_tx_size SET NOT NULL;
 CREATE OR REPLACE VIEW public.epoch_param AS SELECT epoch_no,nonce,max_tx_size FROM serve.epoch_param WHERE chain.gate();
+-- Bridge metadata for midnight-node 2.1.101, whose bridge query LEFT JOINs tx_metadata on key 6500973
+-- and decodes its json as jsonb. chain.tx_metadata exists before this file runs (created with the store,
+-- or by the upgrade of a nonce-only store). The served rows are those with a metadatum (present=1);
+-- their ID is the transaction's positional ID. The placeholder view is replaced in place with the same
+-- columns and types (bigint, word64type, bigint, jsonb), so a grant on it is kept.
+CREATE TABLE serve.tx_metadata(id bigint PRIMARY KEY,key public.word64type NOT NULL,tx_id bigint NOT NULL,json jsonb,
+ CONSTRAINT tx_metadata_key CHECK(key=6500973),
+ CONSTRAINT tx_metadata_position CHECK(tx_id BETWEEN 0 AND 549755813887 AND id=tx_id));
+INSERT INTO serve.tx_metadata(id,key,tx_id,json)
+ SELECT b.height::bigint*4096+t.tx_index,6500973,b.height::bigint*4096+t.tx_index,m.json FROM chain.tx_metadata m
+ JOIN chain.transactions t ON t.hash=m.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash
+ WHERE m.present=1 AND m.first_generation<=(SELECT canonical_ready FROM chain.service_state WHERE id=1) ORDER BY 1;
+CREATE INDEX serve_tx_metadata_tx_id ON serve.tx_metadata(tx_id);
+REVOKE ALL ON serve.tx_metadata FROM PUBLIC;
+CREATE TRIGGER projection_guard BEFORE INSERT OR UPDATE OR DELETE ON serve.tx_metadata FOR EACH STATEMENT EXECUTE FUNCTION chain.guard_projection();
+CREATE TRIGGER no_truncate BEFORE TRUNCATE ON serve.tx_metadata EXECUTE FUNCTION chain.guard_truncate();
+CREATE OR REPLACE VIEW public.tx_metadata AS SELECT id,key,tx_id,json FROM serve.tx_metadata WHERE chain.gate();
+-- The generations acquired with bridge metadata: verification finds them without reading every manifest.
+CREATE INDEX generations_bridge_metadata ON chain.generations(id) WHERE (manifest->'capabilities'->'bridge_metadata_v1')='true'::jsonb;
 CREATE OR REPLACE FUNCTION chain.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path=pg_catalog,chain AS $$
 DECLARE s chain.service_state%ROWTYPE;

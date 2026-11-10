@@ -83,7 +83,29 @@ class StateTests(unittest.TestCase):
             'lifecycle', 'sync', 'serving', 'provider_head', 'provider_observed_at',
             'confirmed_target', 'committed_target', 'served_target', 'witness', 'pending',
             'lag', 'freshness', 'last_successful_sync', 'retry_at', 'quota', 'database',
-            'workers', 'operation', 'error_code', 'policy', 'healthy', 'reason_codes', 'reader', 'warnings', 'integrity', 'relevance'})
+            'workers', 'operation', 'error_code', 'policy', 'healthy', 'reason_codes', 'reader', 'warnings', 'integrity', 'relevance', 'bridge'})
+
+    def test_bridge_coverage_is_reported_and_an_unsupported_checkpoint_is_unhealthy(self):
+        result, _ = healthy()
+        self.assertIsNone(result.health()[1]['bridge'])
+        report = {'metadata_key': 6500973, 'coverage_start': 4500300, 'checkpoint': None, 'checkpoint_supported': None, 'reason': None}
+        result.bridge(report)
+        code, value = result.health()
+        self.assertEqual((code, value['bridge'], value['reason_codes']), (200, report, []))
+        supported = dict(report, checkpoint={'kind': 'block', 'height': 4500299}, checkpoint_supported=True)
+        result.bridge(supported)
+        self.assertEqual(result.health()[0], 200)
+        for reason, checkpoint in (('before_coverage', {'kind': 'block', 'height': 4500298}), ('transaction_not_served', {'kind': 'tx', 'hash': 'ab' * 32})):
+            with self.subTest(reason=reason):
+                result.bridge(dict(report, checkpoint=checkpoint, checkpoint_supported=False, reason=reason))
+                code, value = result.health()
+                self.assertEqual((code, value['reason_codes']), (503, ['bridge_checkpoint_unsupported']))
+                self.assertEqual(value['bridge']['reason'], reason)
+        result.bridge(None)
+        self.assertEqual(result.health()[0], 200)
+        for bad in ({}, dict(report, reason='other'), dict(report, coverage_start='1'), dict(report, extra=1)):
+            with self.subTest(report=bad), self.assertRaises(ValueError):
+                result.bridge(bad)
 
     def test_integrity_base_and_checkpointing_are_reported(self):
         result, _ = healthy()

@@ -198,7 +198,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
                              'target':{'height':target,'hash':targetrow['hash'].hex()},
                              'witness':{'height':witness,'hash':witnessrow['hash'].hex()}},
                   'required_epochs':required_epochs(startepoch,targetrow['epoch']),
-                  'capabilities':generation_capabilities(),
+                  'capabilities':generation_capabilities(bridge_metadata=True),
                   'parent_ref':integrity_reference(ready)}
         if coverage is not None:manifest['relevance_coverage']=coverage
         with store.atomic():
@@ -277,7 +277,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
         try:
             facts,stats=source.block_facts(block)
             # Fact order is dependency ordered at commit, with outputs before spends.
-            order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs']
+            order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs','tx_metadata']
             diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'])
             with store.atomic():
                 for table in order:

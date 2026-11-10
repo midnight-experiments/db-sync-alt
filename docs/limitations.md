@@ -15,9 +15,29 @@
 - **Not a db-sync replacement.** db-sync-alt keeps only the Cardano data the
   profile selects in the relations the pinned Midnight queries read. Other
   assets or addresses and ranges outside the [coverage](glossary.md#coverage)
-  are not held; the reader login can read nothing else. Candidate registrations, invalid
-  transactions and bridge data are not covered; a database that would need them
-  is refused (`unsupported_capability`).
+  are not held; the reader login can read nothing else. Candidate registrations and invalid
+  transactions are not covered; a database that would need them is refused
+  (`unsupported_capability`).
+- **Bridge data from the coverage start only.** The token bridge's metadata is
+  stored forward only, from the first update acquired from Blockfrost after the
+  newest update without it (a cardano-db-sync bootstrap or catch-up, or an
+  upgrade from 0.3.x); nothing older is fetched.
+  A bridge checkpoint older than the coverage start, or a checkpoint transaction
+  outside the profile's addresses and assets, is reported as unsupported
+  ([bridge readiness](connect-a-node.md#bridge-readiness)). Large integers in
+  metadata are stored as Blockfrost returns them (rounded beyond 2^53), not as
+  cardano-db-sync stores them; the node's reading of a recipient is the same.
+  ICS and reserve outputs stored before the coverage start hold only the
+  profile's assets: the bridge token of every packaged profile is one of them,
+  but if governance named a token outside the profile, a covered spend of such
+  an older output would be counted without it.
+- **Deeply nested provider answers.** Arrays and objects nested deeper than
+  4,000 levels are cut from a Blockfrost answer instead of failing the request:
+  by db-sync-alt's own client, and by the external accounting client of
+  `DBSYNC_PROVIDER_ADAPTER=shared`, whose `json.loads` db-sync-alt replaces with
+  the same bounded decoder. Bridge metadata that deep is stored as NULL, as
+  cardano-db-sync stores nesting beyond 2,000. An external client that decodes
+  answers without the standard `json` module's `loads` keeps its own limits.
 - **Datums db-sync-alt cannot see.** A datum row is added when db-sync-alt reads
   a transaction that carries the preimage: the output's own transaction or a
   spend of it. cardano-db-sync also adds the row when the preimage appears only in

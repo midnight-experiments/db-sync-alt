@@ -11,7 +11,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 from db_sync_alt import networks
-from db_sync_alt.contract import TABLES, LEGACY_TABLES, KEYS, FORMAT, LEGACY_FORMAT, Refusal, canonical, digest, jsonable, validate_numeric
+from db_sync_alt.contract import TABLES, LEGACY_TABLES, KEYS, FORMAT, LEGACY_FORMAT, BRIDGE_CAPABILITY, Refusal, canonical, digest, jsonable, metadata_json, validate_numeric
 
 POSTGRES_MAJOR = 17
 SCHEMA_VERSION = 5
@@ -24,7 +24,7 @@ RESTORE_GUARD = 'db_sync_alt_restore_guard'
 PROJECTION_WRITE = 'db_sync_alt.projection_write'
 WRITER_LOCK = (36, 1)
 SERVING_LOCK = (36, 2)
-FACT_ORDER = ('blocks','transactions','datums','outputs','inputs','assets','output_assets','mints','epoch_nonces','epoch_stakes')
+FACT_ORDER = ('blocks','transactions','datums','outputs','inputs','assets','output_assets','mints','epoch_nonces','epoch_stakes','tx_metadata')
 # Facts that also store their ledger ordinal (outside the fact contract): the position of an input
 # among all ordinary inputs of its transaction, of an asset among all assets of its output.
 ORDINAL_TABLES = ('inputs','output_assets')
@@ -83,6 +83,7 @@ def logical_row(table, row):
         if column in out:
             # A datum value is NULL where cardano-db-sync stores NULL (JSON nested past its limit).
             out[column]=(None if out[column] is None else canonical(out[column])) if table=='datums' else str(out[column])
+    if table=='tx_metadata' and out.get('json') is not None:out['json']=canonical(out['json'])
     if table=='blocks' and isinstance(out['time'],dt.datetime):out['time']=out['time'].strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     return out
 
@@ -90,6 +91,7 @@ def logical_row(table, row):
 def bind_row(table,row):
     values=[row[c] for c in TABLES[table]]
     if table=='datums' and row['value'] is not None:values[TABLES[table].index('value')]=Jsonb(json.loads(row['value']))
+    if table=='tx_metadata' and row['json'] is not None:values[TABLES[table].index('json')]=Jsonb(json.loads(row['json']))
     if table=='blocks':
         raw=row['time']
         parsed=dt.datetime.fromisoformat(raw.replace('Z','+00:00'))
@@ -155,8 +157,10 @@ class PgStore:
         return found
     @property
     def physical_tables(self):
-        """Stored columns of each fact family: the nonce-only store has no max_tx_size."""
-        return LEGACY_TABLES if self.__dict__.get('legacy_format') else TABLES
+        """Stored fact families and their columns: the nonce-only store has no max_tx_size and no
+        tx_metadata."""
+        if self.__dict__.get('_network') is None:self.network
+        return LEGACY_TABLES if self.legacy_format else TABLES
     def legacy_generation(self,generation):
         """Whether `generation` was sealed in the nonce-only format: every generation of a nonce-only
         store, and those at or before the epoch parameter upgrade of an upgraded one."""
@@ -247,6 +251,7 @@ class PgStore:
         self.require_pending(generation)
         if table not in TABLES:raise Refusal('unknown_fact_table')
         validate_numeric(table,row)
+        if table=='tx_metadata':metadata_json(row)
         ordinal=()
         if table in ORDINAL_TABLES:
             value=row.get('ordinal')
@@ -511,7 +516,7 @@ class PgStore:
                 for row in cur:yield logical_row(table,dict(zip(columns,row)))
     def digests(self,generation):
         result={};legacy=self.legacy_generation(generation)
-        for table in TABLES:
+        for table in self.sealed_tables(generation):
             hasher=hashlib.sha256();count=0
             for row in self.rows(table,generation):
                 validate_numeric(table,row,legacy=legacy);hasher.update((canonical(jsonable(row))+'\n').encode());count+=1
@@ -534,8 +539,11 @@ class PgStore:
         self.db.execute('SELECT pg_database_size(current_database())').fetchone()
         self.db.execute('SELECT 1 FROM chain.checkpoints LIMIT 0')
         return state
-    def status(self):
+    def status(self,checkpoint=None):
         """Database state plus one summary row per generation; manifests stay in PostgreSQL.
+
+        `checkpoint` is the node's bridge checkpoint as the operator states it (bridge.parse_checkpoint);
+        the `bridge` section reports the metadata coverage start and whether that checkpoint is supported.
 
         Generation columns beyond id are read only when history exists, so status of an empty
         database needs only SELECT(id) on chain.generations.
@@ -552,6 +560,9 @@ class PgStore:
         if state['schema_version']>=4 and state['canonical_ready'] is not None:
             from db_sync_alt.sources.blockfrost.relevance import history_status
             result['relevance']={'history':history_status(self)}
+        if not legacy and 'tx_metadata' in self.physical_tables and state['schema_version']>=SCHEMA_VERSION and state['canonical_ready'] is not None and not state['revoked']:
+            from db_sync_alt.bridge import report
+            result['bridge']=report(self,checkpoint)
         return result
     def database_bytes(self):return self.db.execute('SELECT pg_database_size(current_database())').fetchone()[0]
     def sync_job(self,job_id):
@@ -589,6 +600,15 @@ class PgStore:
     def epoch_nonce(self,epoch,generation):
         rows=self._facts_where('epoch_nonces','epoch=%s AND first_generation<=%s',(epoch,generation));return rows[0] if rows else None
     def epoch_stake_total(self,epoch,generation):return int(self.db.execute('SELECT COALESCE(sum(amount),0) FROM chain.epoch_stakes WHERE epoch=%s AND first_generation<=%s',(epoch,generation)).fetchone()[0])
+    def bridge_covered(self,generation):
+        """Whether `generation` was acquired with bridge metadata (its sealed capability)."""
+        row=self.db.execute("SELECT (manifest->'capabilities'->%s)='true'::jsonb FROM chain.generations WHERE id=%s",(BRIDGE_CAPABILITY,generation)).fetchone()
+        if row is None:raise Refusal('generation_missing')
+        return row[0] is True
+    def output_generation(self,tx_hash,output_index):
+        """The generation that first stored an output (None if it is not stored)."""
+        row=self.db.execute('SELECT first_generation FROM chain.outputs WHERE tx_hash=%s AND output_index=%s',(tx_hash,output_index)).fetchone()
+        return None if row is None else row[0]
     def last_metadata_height(self,generation):
         if self.supports_incremental and self.db.execute('SELECT 1 FROM chain.generation_reuse WHERE generation=%s',(generation,)).fetchone():
             query,args=self.membership_sql(generation);return self.db.execute('SELECT max(height) FROM ('+query+') m',args).fetchone()[0]

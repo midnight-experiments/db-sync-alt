@@ -12,7 +12,8 @@ size of every stored epoch from an authoritative source, never a default:
    stopped; once both passes are staged a rerun makes no request. Every provider request is
    reserved in the job before it is sent and goes through the shared accounted client.
 3. One fenced transaction adds the column with the staged values, replaces the stored contract,
-   writes the immutable upgrade record, moves the store to schema 5 and verifies it in full. Any
+   writes the immutable upgrade record, creates the empty bridge metadata family (its coverage
+   starts after the upgraded generation), moves the store to schema 5 and verifies it in full. Any
    refusal rolls it back: the store stays the nonce-only schema-4 store it was.
 
 Generations sealed before the upgrade keep their seals, receipts and checkpoints; they are verified
@@ -236,6 +237,22 @@ def family_digest(store, generation):
     return {'count': count, 'sha256': hasher.hexdigest()}
 
 
+BRIDGE_METADATA_DDL = (
+    'CREATE TABLE chain.tx_metadata(tx_hash public.hash32type PRIMARY KEY REFERENCES chain.transactions(hash),present integer NOT NULL CHECK(present IN (0,1)),json jsonb,first_generation bigint NOT NULL REFERENCES chain.generations(id),CHECK(present=1 OR json IS NULL))',
+    'CREATE INDEX delta_tx_metadata ON chain.tx_metadata(first_generation)',
+    'CREATE TRIGGER immutable_guard BEFORE INSERT OR UPDATE OR DELETE ON chain.tx_metadata FOR EACH ROW EXECUTE FUNCTION chain.guard_immutable()',
+    'CREATE TRIGGER no_truncate BEFORE TRUNCATE ON chain.tx_metadata EXECUTE FUNCTION chain.guard_truncate()',
+    'REVOKE ALL ON chain.tx_metadata FROM PUBLIC',
+)
+
+
+def create_bridge_metadata(db):
+    """The bridge metadata fact family of a store written before it, with the guards every fact family
+    has from schema 2 (a store created by this release has it from its schema)."""
+    for statement in BRIDGE_METADATA_DDL:
+        db.execute(statement)
+
+
 def upgrade_epoch_parameters(store, state, source):
     """Schema 4 nonce-only store -> schema 5 with every stored epoch's max_tx_size (see module doc)."""
     from db_sync_alt import __version__
@@ -280,6 +297,8 @@ def upgrade_epoch_parameters(store, state, source):
             db.execute('INSERT INTO chain.metadata VALUES(%s,%s)', (EPOCH_UPGRADE, Jsonb(record)))
             db.execute('ALTER TABLE chain.metadata ENABLE TRIGGER immutable_guard')
             db.execute('DELETE FROM chain.sync_jobs WHERE id=%s', (JOB,))
+            # The bridge metadata family starts empty: its coverage begins after this generation.
+            create_bridge_metadata(db)
             # Any capability certified over the nonce-only contents is void.
             db.execute('UPDATE chain.integrity_state SET revision=revision+1 WHERE id=1')
             _schema_v5(store)

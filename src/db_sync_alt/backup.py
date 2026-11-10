@@ -175,8 +175,8 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
         if str(ready) not in body['generations']:raise Refusal('invalid_backup_canonical')
         if store.serves_directly:
             # A restore carries no planner statistics: gather them before the node is served.
-            from db_sync_alt.store.serve import TABLES as SERVED
-            db.execute('ANALYZE '+','.join('serve.'+t for t in SERVED))
+            from db_sync_alt.store.serve import tables as served
+            db.execute('ANALYZE '+','.join('serve.'+t for t in served(db)))
         with db.transaction():
             db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
             # Observations are runtime state; startup must refresh before healthy.
@@ -206,6 +206,8 @@ def main(argv=None):
             command.add_argument('--reader-role',help="existing login role midnight-node connects with; granted read access after the restore")
             command.add_argument('--source-service',help='read-only cardano-db-sync of the network for the epoch parameters a v2/v3 backup lacks; requires --source-attestation (default: Blockfrost, 2 requests per stored epoch)')
             command.add_argument('--source-attestation',type=Path,help='truthful version/retention JSON, as for acquire; requires --source-service')
+        if name=='status':
+            command.add_argument('--bridge-checkpoint',help="the node's on-chain bridge data checkpoint, block:<n> or tx:<hash>; the bridge section reports whether the metadata coverage supports it")
     args=parser.parse_args(argv)
     try:
         if args.command=='backup':result=backup(args.archive,args.manifest,args.service)
@@ -222,8 +224,12 @@ def main(argv=None):
                 return epoch_source(network,sql_source)
             result=restore(args.archive,args.manifest,args.service,expected_manifest_sha256=args.expected_manifest_sha256,reader_role=args.reader_role,epoch_source=epochs)
         else:
+            checkpoint=None
+            if args.command=='status' and args.bridge_checkpoint is not None:
+                from db_sync_alt.bridge import parse_checkpoint
+                checkpoint=parse_checkpoint(args.bridge_checkpoint)
             with PgStore(args.service,readonly=True,allow_incomplete=args.command=='status',allow_legacy=True) as store:
-                result=store.status() if args.command=='status' else {'generations':reports(store),'physical_inventory':physical_inventory(store)}
+                result=store.status(checkpoint) if args.command=='status' else {'generations':reports(store),'physical_inventory':physical_inventory(store)}
         print(canonical(result))
     except Refusal as error:
         body={'error':error.code}

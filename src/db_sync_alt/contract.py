@@ -9,6 +9,10 @@ FORMAT = 'midnight-compact-cardano-v2'
 # recognised and verified as it was sealed, and `db-sync-alt upgrade` moves it to FORMAT.
 LEGACY_FORMAT = 'midnight-compact-cardano-v1'
 EPOCH_CAPABILITY = 'epoch_max_tx_size_v1'
+# Bridge metadata: midnight-node 2.1.101 reads tx_metadata.json of this key for the transactions that
+# produce an output at the ICS address. A generation acquired with that metadata carries the capability.
+BRIDGE_METADATA_KEY = 6500973
+BRIDGE_CAPABILITY = 'bridge_metadata_v1'
 SCHEMA_VERSION = (15, 48, 6)
 PROFILE_FILES = ('cnight-config', 'federated-authority-config', 'permissioned-candidates-config',
                  'registered-candidates-addresses', 'ics-config', 'reserve-config')
@@ -24,12 +28,16 @@ TABLES = {
  'datums': ('hash','value'),
  'epoch_nonces': ('epoch','nonce','max_tx_size'),
  'epoch_stakes': ('epoch','pool_hash','amount'),
+ # One row per transaction with an output at the ICS address in a covered block: `present` 1 with the
+ # metadatum of BRIDGE_METADATA_KEY as canonical JSON text (or None for a source NULL), 0 without one.
+ 'tx_metadata': ('tx_hash','present','json'),
 }
 KEYS = {'blocks':('hash',),'transactions':('hash',),'outputs':('tx_hash','output_index'),
  'inputs':('tx_hash','origin_hash','origin_index'),'assets':('policy','name'),
  'output_assets':('tx_hash','output_index','policy','name'),'mints':('tx_hash','policy','name'),
- 'datums':('hash',),'epoch_nonces':('epoch',),'epoch_stakes':('epoch','pool_hash')}
-LEGACY_TABLES = {**TABLES, 'epoch_nonces': ('epoch','nonce')}
+ 'datums':('hash',),'epoch_nonces':('epoch',),'epoch_stakes':('epoch','pool_hash'),'tx_metadata':('tx_hash',)}
+LEGACY_TABLES = {**{k:v for k,v in TABLES.items() if k!='tx_metadata'}, 'epoch_nonces': ('epoch','nonce')}
+LEGACY_KEYS = {k:v for k,v in KEYS.items() if k in LEGACY_TABLES}
 
 class Refusal(Exception):
     """Safe machine-readable code, never source driver text or secrets."""
@@ -48,6 +56,7 @@ NUMERIC_FIELDS={
  'mints':{'quantity':(-(10**20-1),10**20-1)},
  'epoch_nonces':{'epoch':(0,2**31-1),'max_tx_size':(0,2**31-1)},
  'epoch_stakes':{'epoch':(0,2**31-1),'amount':(0,2**64-1)},
+ 'tx_metadata':{'present':(0,1)},
 }
 LEGACY_NUMERIC_FIELDS={**NUMERIC_FIELDS,'epoch_nonces':{'epoch':(0,2**31-1)}}
 def validate_numeric(table,row,*,legacy=False):
@@ -69,11 +78,25 @@ def epoch_size(value):
     if type(value) is not int or not 0<=value<=2**31-1:raise Refusal('invalid_epoch_max_tx_size')
     return value
 
-# Manifest capabilities of a generation: the nonce-only format had no epoch parameters.
-CAPABILITIES={'bridge_qualified':False,'candidates_empty':True,EPOCH_CAPABILITY:True}
+def metadata_json(row):
+    """A tx_metadata fact's `json`: None, or canonical JSON text; None whenever `present` is 0."""
+    value=row.get('json')
+    if value is None:return None
+    if row.get('present')!=1 or not isinstance(value,str):raise Refusal('invalid_bridge_metadata')
+    try:parsed=json.loads(value)
+    except (ValueError,RecursionError):raise Refusal('invalid_bridge_metadata') from None
+    if canonical(parsed)!=value:raise Refusal('invalid_bridge_metadata')
+    return value
+
+# Manifest capabilities of a generation: the nonce-only format had no epoch parameters and no bridge
+# metadata. `bridge_metadata_v1` is true exactly for a generation whose event range was acquired with
+# bridge metadata (Blockfrost); a cardano-db-sync acquisition never reads tx_metadata.
+CAPABILITIES={'candidates_empty':True,EPOCH_CAPABILITY:True,BRIDGE_CAPABILITY:False}
 LEGACY_CAPABILITIES={'bridge_qualified':False,'candidates_empty':True}
-def generation_capabilities(*,legacy=False):
-    return dict(LEGACY_CAPABILITIES if legacy else CAPABILITIES)
+def generation_capabilities(*,legacy=False,bridge_metadata=False):
+    out=dict(LEGACY_CAPABILITIES if legacy else CAPABILITIES)
+    if BRIDGE_CAPABILITY in out:out[BRIDGE_CAPABILITY]=bridge_metadata is True
+    return out
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -125,6 +148,9 @@ class Profile:
         self.units={self.night,self.auth,self.permissioned}|self.governance
         for key,address in [('ics-config','illiquid_circulation_supply_validator_address'),('reserve-config','reserve_validator_address')]:
             c=self.configs[key];self.addresses.add(c[address]);self.units.add(c['asset']['policy_id'].removeprefix('0x')+c['asset']['asset_name'].encode().hex())
+        # The bridge reads the ICS and reserve addresses: from bridge coverage on, their outputs keep every asset.
+        self.ics=self.configs['ics-config']['illiquid_circulation_supply_validator_address']
+        self.bridge_addresses=frozenset({self.ics,self.configs['reserve-config']['reserve_validator_address']})
         self.identity={'network':self.network.network,'config_sha256':digest(self.configs),'genesis':self.network.genesis,'configs':self.configs,'profile':info['name']}
     @property
     def security(self):
@@ -138,6 +164,11 @@ class Profile:
         return unit in self.units or unit[:56] in self.governance
     def relevant(self,address,assets):
         return address in self.addresses or any(self.required(p,n) for p,n in assets)
+    def kept_assets(self,address,assets,*,covered):
+        """The assets of an output that are stored: profile units, or every asset of an ICS or reserve
+        output stored by a bridge-covered generation. `assets` maps (policy, name) to a quantity."""
+        if covered and address in self.bridge_addresses:return dict(assets)
+        return {k:v for k,v in assets.items() if self.required(*k)}
 
 def required_epochs(start_epoch, target_epoch):
     """Epochs whose nonce, stakes and end block a generation holds: from two before the
@@ -149,14 +180,20 @@ def contract_for(network,*,legacy=False):
     """The fact contract of a network: stored when a database is created, its digest in every manifest.
     `legacy` gives the nonce-only contract of stores written before epoch parameters."""
     contract={'block_membership':'ancestor-committed-prefix-v1','format':LEGACY_FORMAT if legacy else FORMAT,'algorithm':network.algorithm,'security':network.security,
-              'tables':LEGACY_TABLES if legacy else TABLES,'keys':KEYS,
+              'tables':LEGACY_TABLES if legacy else TABLES,'keys':LEGACY_KEYS if legacy else KEYS,
               'quantities':'canonical decimal TEXT','hashes':'raw bytes','timestamps':'UTC ISO-8601 microseconds',
-              'datum':'canonical semantic JSON','bridge_qualified':False,'schema_version':SCHEMA_VERSION}
-    if not legacy:
+              'datum':'canonical semantic JSON','schema_version':SCHEMA_VERSION}
+    if legacy:contract['bridge_qualified']=False
+    else:
         contract['datum']=('canonical semantic JSON; NULL where cardano-db-sync 13.8 stores NULL (JSON nested deeper than 2000 levels);'
                            ' an output datum hash without a preimage on chain has no datum')
         # The node reads MAX(max_tx_size) of the cursor block's epoch: every source row of the
         # epoch is validated and their maximum is the fact.
         contract['epoch_parameters']={'version':1,'capability':EPOCH_CAPABILITY,
                                       'max_tx_size':'maximum of the validated per-epoch source values, integers 0..2147483647'}
+        # Forward-only bridge readiness: tx_metadata of the bridge key for every transaction with an
+        # output at the ICS address, from the first generation with the capability on.
+        contract['bridge_metadata']={'version':1,'capability':BRIDGE_CAPABILITY,'key':BRIDGE_METADATA_KEY,
+                                     'transactions':'every transaction with an output at the ICS address in a covered block',
+                                     'json':'Blockfrost json_metadata as jsonb, integral numbers as integers; NULL for a NULL, a U+0000 or a nesting deeper than 2000'}
     return contract
