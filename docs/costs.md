@@ -10,6 +10,11 @@ Measured at the Preprod chain tip:
 | Publishing new blocks, ≈ 9 requests per block | ≈ 24,700 |
 | **Total** | **≈ 33,400** |
 
+Upgrading a database of 0.3.x or earlier to this version reads each stored
+epoch's parameters twice: 2 requests per stored epoch, once
+([upgrade to schema 5](recovery.md#upgrade-to-schema-5)); `db-sync-alt status`
+shows the number before you start. With a cardano-db-sync source it needs none.
+
 Catching up after a pause costs more: every missed block needs its own requests,
 and history before the published snapshot is never fetched from Blockfrost (the
 snapshot or your own db-sync provides it). Blocks with many relevant

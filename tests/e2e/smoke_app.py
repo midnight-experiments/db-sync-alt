@@ -53,7 +53,7 @@ def check():
     if status['reader']['role']!='db_sync_alt_reader' or status['reader']['warnings']:
         raise RuntimeError('reader not verified as provisioned')
     with PgStore('db_sync_alt_owner',readonly=True) as store:
-        if store.state()['schema_version']!=4:raise RuntimeError('schema 4 was not restored')
+        if store.state()['schema_version']!=5:raise RuntimeError('schema 5 was not restored')
         if store.db.execute('SELECT rolsuper OR rolcreaterole OR rolcreatedb FROM pg_roles WHERE rolname=current_user').fetchone()[0]:
             raise RuntimeError('the service runs as a privileged role')
     print('Synthetic generated-config Compose restore as the owner, counted polling, health and reader verification passed.')
@@ -68,6 +68,10 @@ def node():
             raise RuntimeError('the node would cache tx_in as empty')
         row=db.execute(named('get_epoch_nonce','candidates_data_source').replace('$1','%s'),(psycopg.types.numeric.Int4(2),)).fetchone()
         if row is None:raise RuntimeError('the node query returned no nonce')
+        # midnight-node 2.1.101's Cost path: the size of the cursor block's epoch.
+        from fixtures.generations import START
+        size=db.execute(named('get_max_tx_size').replace('$1','%s'),(psycopg.types.numeric.Int4(START),)).fetchone()
+        if size!=(12002,):raise RuntimeError('the node query returned no epoch max_tx_size')
         try:db.execute('SELECT * FROM chain.service_state')
         except psycopg.errors.InsufficientPrivilege:pass
         else:raise RuntimeError('the reader reads internal state')

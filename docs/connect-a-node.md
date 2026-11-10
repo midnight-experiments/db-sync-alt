@@ -52,7 +52,10 @@ The reader login can connect to db-sync-alt's database, read the ten
 db-sync-shaped relations the node's queries use (`block`, `tx`, `tx_out`,
 `tx_in`, `ma_tx_out`, `multi_asset`, `datum`, `epoch_param`, `epoch_stake`,
 `pool_hash`) and run the serving check they call; nothing else. The node's SQL
-runs unchanged. Each of those relations raises SQLSTATE 55000
+runs unchanged. `epoch_param` includes each epoch's `max_tx_size`: midnight-node
+2.1.101 reads `MAX(epoch_param.max_tx_size)` of its cursor block's epoch once
+its runtime selects the cost-based cNIGHT observation, and stops cNIGHT
+observations without it. Each of those relations raises SQLSTATE 55000
 (`db_sync_alt_not_serving`) instead of answering while the database does not
 hold a verified, published update (empty, restoring, revoked, or an update not
 yet complete), so the node never accepts an empty answer from a database that is

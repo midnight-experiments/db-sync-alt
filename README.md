@@ -133,8 +133,9 @@ db-sync-alt run --network preprod \
   --manifest db-sync-alt-0.1.0-preprod-5366232.manifest.json
 ```
 
-db-sync-alt restores and verifies the snapshot, upgrades it to schema 4, then
-serves it and follows new blocks from Blockfrost; `/health` returns 200 once it has caught up. Catching up
+db-sync-alt restores and verifies the snapshot, upgrades it to schema 5 (reading
+each stored epoch's maximum transaction size from Blockfrost, 2 requests per
+stored epoch), then serves it and follows new blocks from Blockfrost; `/health` returns 200 once it has caught up. Catching up
 from the snapshot costs Blockfrost requests ([costs](docs/costs.md)). It runs in
 the foreground: Ctrl-C stops it and the same command resumes it. All options:
 `db-sync-alt run --help`.
@@ -150,14 +151,23 @@ Blockfrost requests, in about 18 minutes for Preprod. Then run
 
 ## Upgrade an existing database
 
-This version needs a schema-4 database; db-sync-alt 0.1.x serves schema 3. With
-the service stopped, run `db-sync-alt upgrade` once, then start the service with
-this version. The upgrade verifies the whole history once, as a 0.1.x start
-does, and writes the first [integrity checkpoint](docs/glossary.md#integrity-checkpoint);
-from then on a start verifies from the last checkpoint and takes about as long
-however long the history is. There is no downgrade: 0.1.x refuses a schema-4
-database, so take a `pg_dump` of the stopped database first if you may need to
-go back. See [upgrade to schema 4](docs/recovery.md#upgrade-to-schema-4).
+This version needs a schema-5 database. A database of 0.3.x or earlier holds
+each epoch's nonce but not the epoch's maximum transaction size, which
+midnight-node 2.1.101 reads. Stop the service after a publication
+(`db-sync-alt status` shows no pending generation), then run once, with the
+service's Blockfrost settings:
+
+```sh
+db-sync-alt upgrade --service db_sync_alt
+```
+
+The upgrade reads every stored epoch's `max_tx_size` twice from Blockfrost (2
+requests per stored epoch; `status` shows the count) and refuses unless both
+reads agree; a cardano-db-sync of the network can be given instead with
+`--source-service` and `--source-attestation`. Then start the service with this
+version. There is no downgrade: 0.3.x refuses an upgraded database, so take a
+`pg_dump` of the stopped database first if you may need to go back. See
+[upgrade to schema 5](docs/recovery.md#upgrade-to-schema-5).
 
 ## Connect a Midnight node
 
@@ -201,7 +211,8 @@ publication waits for it and `sync` reads `checkpointing`.
 ## Status and roadmap
 
 db-sync-alt **0.3.0** is experimental. It serves the SQL queries of **Midnight
-node 1.0.400**.
+node 2.1.101**, including the epoch `max_tx_size` its cost-based cNIGHT
+observation reads.
 
 - **Networks** (`--network`): **Preprod** is supported and tested end to end.
   The **Mainnet** and **Preview** profiles are packaged but not tested on their

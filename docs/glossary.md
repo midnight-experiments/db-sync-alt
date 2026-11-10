@@ -56,17 +56,20 @@ database cannot see a query's parameters, so a node whose k or addresses differ
 from the profile gets empty answers outside it
 ([node requirements](connect-a-node.md#node-requirements)).
 
-## Schemas 1 to 4
+## Schemas 1 to 5
 
 The layouts of a db-sync-alt database. A new database is created as schema 1;
-`db-sync-alt upgrade` turns it into schema 4, which the running service needs.
+`db-sync-alt upgrade` turns it into schema 5, which the running service needs.
 Schema 2 adds a projection of the current block membership and lets the follower
 publish small certified updates instead of re-checking all history each time.
 Schema 3 serves the node directly: every node-facing relation calls the
 [serving gate](#serving-gate), and a reader role gets read access to those
 relations only (the service, `restore --reader-role`, `db-sync-alt grant-reader`).
 Schema 4 adds [integrity checkpoints](#integrity-checkpoint), so verification
-starts at the last one instead of the first generation. Backups record their schema.
+starts at the last one instead of the first generation. Schema 5 serves each
+epoch's `max_tx_size` in `epoch_param`; a database written before it (fact
+format `midnight-compact-cardano-v1`, nonces only) gets every stored epoch's
+size from an authoritative source when it is upgraded. Backups record their schema.
 
 ## Integrity checkpoint
 

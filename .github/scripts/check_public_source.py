@@ -39,6 +39,8 @@ REDACTION_FIXTURES = {
     'tests/fixtures/service.py': {'postgres://username:secret@private-directory'},
     'tests/unit/test_health.py': {'postgres://alice:password@private.example/secret-directory',
                               'postgres://alice:secret@hostname/private-directory'},
+    # Upstream unit-test constant in the pinned (hash-checked) node source.
+    'reference/node/src/main_chain_follower.rs': {'postgres://user:pass@localhost:5432/testdb'},
 }
 
 def check(root):
