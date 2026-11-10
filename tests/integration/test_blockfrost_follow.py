@@ -20,6 +20,8 @@ from db_sync_alt.sources.blockfrost.sync import SyncDriver
 from db_sync_alt.sources.blockfrost.poller import HeadPoller, PollBudgetStore, owner_binding
 import fixtures.database as real
 import fixtures.blockfrost_generation as gen_fixture
+import fixtures.datums as datums
+from fixtures.adapters import ADAPTERS
 from fixtures.networks import PREPROD
 
 
@@ -42,8 +44,8 @@ class FollowSourcePGTests(unittest.TestCase):
         upgrade_store(store);store.certify_ready_full()
         return dsn,store,routes
 
-    def run_follow(self,store,dsn,routes,target=None):
-        health=self.state();stop=threading.Event();client=real.AccountedFake(routes)
+    def run_follow(self,store,dsn,routes,target=None,client=None):
+        health=self.state();stop=threading.Event();client=client or real.AccountedFake(routes)
         pollstore=PollBudgetStore(None,owner_binding(store),conninfo=dsn)
         self.addCleanup(pollstore.close)
         poller=HeadPoller(lambda:pollstore,lambda:client,health,stop,network=PREPROD)
@@ -185,6 +187,38 @@ class FollowSourcePGTests(unittest.TestCase):
         self.assertEqual(store.generation()['target_height'],gen_fixture.OFFSET+12)
         self.assertEqual(verify_store(store)['digests'],store.digests(store.generation()['id']))
         self.compare_reference(gen_fixture.fixtures(fork=1,witnesses=gen_fixture.CLEAN_WITNESSES)[0],store)
+
+    def test_hostile_datums_at_profile_addresses_follow_with_both_adapters(self):
+        """Every output keeps its datum hash and datum rows are what cardano-db-sync 13.8 stores, through either adapter."""
+        # Block h=12 gains eight payments, so it is not generation 0's provisional block (fork=1).
+        routes,_=gen_fixture.fixtures(fork=1,payments=datums.HOSTILE)
+        for name,make in ADAPTERS.items():
+            with self.subTest(adapter=name):
+                dsn,store,_=self.prepare()
+                self.run_follow(store,dsn,routes,client=make(routes,Path(self.tmp.name)/('follow-'+name)))
+                self.assertEqual(store.generation()['target_height'],gen_fixture.OFFSET+12)
+                self.assertEqual(verify_store(store)['digests'],store.digests(store.generation()['id']))
+                self.assertEqual(datums.served(store,datums.HOSTILE),datums.expected(datums.HOSTILE))
+                self.compare_reference(routes,store)
+
+    def test_datum_first_on_chain_with_a_later_spend_is_stored_then(self):
+        """A datum hash without a preimage is kept on its output; the spend that carries the preimage stores the datum."""
+        # A payment to the cNIGHT mapping validator in block h=11 carries only a datum hash; block h=12 spends it with the
+        # preimage. Blocks 11 and 12 gain transactions (fork=1).
+        before=datums.Payment(datums.MAPPING,*datums.REGISTRATION,inline=False,on_chain=False,height=11)
+        after=replace(before,on_chain=True)
+        dsn,store,_=self.prepare()
+        self.run_follow(store,dsn,gen_fixture.fixtures(fork=1,payments=[before],spends=[0])[0],gen_fixture.OFFSET+11)
+        first=store.generation()['id']
+        self.assertEqual(datums.served(store,[before]),datums.expected([before]))
+        routes,_=gen_fixture.fixtures(fork=1,payments=[after],spends=[0])
+        self.run_follow(store,dsn,routes,gen_fixture.OFFSET+12)
+        self.assertEqual(datums.served(store,[after]),datums.expected([after]))
+        stored=store.db.execute('SELECT d.first_generation,o.first_generation FROM chain.datums d JOIN chain.outputs o ON o.datum_hash=d.hash WHERE d.hash=%s',(after.hash,)).fetchone()
+        self.assertEqual(stored,(store.generation()['id'],first))
+        self.assertGreater(stored[0],stored[1])
+        verify_store(store)
+        self.compare_reference(routes,store)
 
     def test_epoch_transition_equals_full_update(self):
         dsn,store,routes=self.prepare(transition=True)

@@ -100,6 +100,22 @@ class SQLTests(unittest.TestCase):
             self.assertEqual(store.generation()['source'],'cardano-db-sync-postgresql');verify_store(store)
             seal=validate_completion(store,store.generation(),result['digests'],require_seal=True);self.assertIsNotNone(seal)
             self.assertLess(result['queries'],300)
+    def test_datum_without_preimage_and_null_value_are_kept_as_the_source_has_them(self):
+        """A relevant output whose datum hash has no datum row keeps the hash; a datum the source stores as NULL stays NULL."""
+        dsn,service=self.database()
+        with psycopg.connect(dsn,autocommit=True) as c:
+            self.fill(c)
+            c.execute('INSERT INTO datum VALUES(2,%s,NULL)',(H('deep'),))
+            c.execute('INSERT INTO tx_out(id,tx_id,index,address,value,data_hash,inline_datum_id) VALUES(4,6,0,%s,2000000,%s,NULL),(5,6,1,%s,2000000,%s,2)',
+                      (self.profile.mapping,H('dangling'),self.profile.mapping,H('deep')))
+        with self.owner() as store:
+            acquire(CountedSQLSource(service,self.profile,copy.deepcopy(ATTEST)),store,self.profile,target_height=T,window_blocks=10000)
+            outputs=store.db.execute('SELECT data_hash FROM public.tx_out WHERE address=%s ORDER BY data_hash',(self.profile.mapping,)).fetchall()
+            self.assertEqual(sorted(bytes(h) for h, in outputs),sorted([H('datum'),H('dangling'),H('deep')]))
+            served=dict(store.db.execute('SELECT hash,value FROM public.datum').fetchall())
+            self.assertEqual({bytes(h):v for h,v in served.items()},{H('datum'):{'int':7},H('deep'):None})
+            verify_store(store)
+
     def test_interrupted_checkpoint_and_sealed_resume_preserve_manifest(self):
         with self.owner() as store:
             stop=threading.Event()

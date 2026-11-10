@@ -1,7 +1,11 @@
 """The full Blockfrost update (`adapter.update`) on a PostgreSQL store holding the synthetic generation 0."""
+import tempfile
 import unittest
 from db_sync_alt.contract import Refusal
+from db_sync_alt.verify.store import verify_store
 from fixtures.blockfrost import FixtureHooks
+import fixtures.datums as datums
+from fixtures.adapters import ADAPTERS
 from fixtures.blockfrost_generation import CLEAN_AUXILIARY, CLEAN_WITNESSES, HOSTILE_AUXILIARY, HOSTILE_WITNESSES, OFFSET, advance, baseline, block, fixtures
 from fixtures.database import SyncFixture
 
@@ -9,7 +13,7 @@ from fixtures.database import SyncFixture
 class GenerationTests(SyncFixture):
     def store(self,transition=False):
         s=baseline(self.database(),transition=transition);self.addCleanup(s.close);return s
-    def advance(self,s,routes,budget=200,hooks=None):return advance(s,routes,budget,hooks)
+    def advance(self,s,routes,budget=200,hooks=None,client=None):return advance(s,routes,budget,hooks,client)
     def test_real_store_update_input_only_mint_only_preserves_g0(self):
         s=self.store()
         s.set_meta('archive_sealed',True)  # Unrelated metadata survives the update unchanged.
@@ -70,6 +74,17 @@ class GenerationTests(SyncFixture):
         self.assertEqual(hostile,clean)
         self.assertEqual({k:v for k,v in hostile.items() if k!='blocks'},{k:v for k,v in plain.items() if k!='blocks'})
         self.assertEqual(hostile['mints']['count'],1)
+    def test_hostile_datums_at_profile_addresses_store_what_dbsync_serves(self):
+        """Both provider adapters: every output keeps its datum hash, and datum rows are what cardano-db-sync 13.8 stores."""
+        # Block h=12 gains eight payments, so it is not generation 0's provisional block (fork=1).
+        routes,_=fixtures(fork=1,payments=datums.HOSTILE);results={}
+        for name,make in ADAPTERS.items():
+            with self.subTest(adapter=name),tempfile.TemporaryDirectory() as root:
+                s=self.store();results[name]=self.advance(s,routes,budget=400,client=make(routes,root))['digests']
+                self.assertEqual(datums.served(s,datums.HOSTILE),datums.expected(datums.HOSTILE))
+                verify_store(s)
+        self.assertEqual(results['built-in'],results['shared'])
+        self.assertEqual(results['built-in'],self.advance(self.store(),routes,budget=400)['digests'])
     def test_wrong_network_no_pending(self):
         s=self.store()
         routes,_=fixtures();routes['/genesis']['network_magic']=2

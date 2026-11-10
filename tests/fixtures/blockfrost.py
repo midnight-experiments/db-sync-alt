@@ -2,6 +2,7 @@
 import copy
 import datetime as dt
 import hashlib
+import json
 import time
 import uuid
 
@@ -21,7 +22,9 @@ class Fake:
         if p not in self.routes:raise RuntimeError('secret error must not leak')
         r=self.routes[p]
         if r is NOT_FOUND:raise ProviderError('provider_request_failed_counted',http_status=404)
-        return r() if callable(r) else copy.deepcopy(r)
+        if callable(r):return r()
+        try:return copy.deepcopy(r)
+        except RecursionError:return json.loads(json.dumps(r))  # answers nested past Python's recursion limit
 
 
 class CountingProvider(ProviderClient):

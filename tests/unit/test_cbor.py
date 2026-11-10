@@ -122,4 +122,85 @@ class WitnessSetTests(unittest.TestCase):
             with self.subTest(code=code,witness=witness.hex()):
                 with self.assertRaisesRegex(Refusal,'^'+code+'$'):decode_transaction(*tx(body(),witness=witness))
 
+def dbsync_nesting_exceeded(text):
+    """cardano-db-sync 13.8 `jsonbNestingExceeded`: more than 2000 levels, one per '{' or '[' outside strings."""
+    level=0;inside=escaped=False
+    for ch in text:
+        if inside:
+            if escaped:escaped=False
+            elif ch=='\\':escaped=True
+            elif ch=='"':inside=False
+        elif ch=='"':inside=True
+        elif ch in '{[':
+            level+=1
+            if level>2000:return True
+        elif ch in '}]':level-=1
+    return False
+
+class DatumTests(unittest.TestCase):
+    """`decode_datum` gives cardano-db-sync 13.8's `datum.value`: its JSON, or None (NULL) past 2000 nesting levels."""
+    def test_any_depth_follows_dbsync_nesting_rule(self):
+        def lists(n):
+            v={'int':0}
+            for _ in range(n):v={'list':[v]}
+            return b'\x81'*n+b'\x00',v
+        def constructors(n):
+            v={'int':0}
+            for _ in range(n):v={'constructor':0,'fields':[v]}
+            return b'\xd8\x79\x81'*n+b'\x00',v
+        def maps(n):
+            v={'int':0}
+            for _ in range(n):v={'map':[{'k':{'int':0},'v':v}]}
+            return b'\xa1\x00'*n+b'\x00',v
+        def indefinite(n):
+            v={'int':0}
+            for _ in range(n):v={'list':[v]}
+            return b'\x9f'*n+b'\x00'+b'\xff'*n,v
+        for name,make,edge in [('lists',lists,999),('constructors',constructors,999),('maps',maps,666),('indefinite lists',indefinite,999)]:
+            for n in (64,65,edge-1,edge,edge+1,edge+2,3000):
+                with self.subTest(name,levels=n):
+                    raw,reference=make(n);null=dbsync_nesting_exceeded(json.dumps(reference))
+                    self.assertEqual(decode_datum(raw),None if null else reference)
+                    self.assertEqual(null,n>edge)
+    def test_repeated_map_keys_keep_every_pair(self):
+        self.assertEqual(decode_datum(b'\xa2\x01\x00\x01\x02'),{'map':[{'k':{'int':1},'v':{'int':0}},{'k':{'int':1},'v':{'int':2}}]})
+        self.assertEqual(decode_datum(b'\xbf\x01\x00\x01\x00\xff'),{'map':[{'k':{'int':1},'v':{'int':0}},{'k':{'int':1},'v':{'int':0}}]})
+    def test_malformed_datums_refuse_with_existing_codes(self):
+        for raw,code in [(b'\x82\x00','cbor_truncated'),(b'\x1c','cbor_reserved_encoding'),(b'\x00\x00','cbor_datum_trailing_bytes'),
+                         (b'\x61a','cbor_datum_shape'),(b'\xf5','cbor_datum_shape'),(b'\xfb'+b'\x00'*8,'cbor_unsupported_simple'),
+                         (b'\xd8\x64\x80','cbor_datum_tag'),(b'\xd8\x79\x00','cbor_datum_constructor'),(b'\xdf\x80','cbor_invalid_tag'),
+                         (b'\x9b\x00\x00\x00\x01\x00\x00\x00\x00','cbor_item_limit'),(b'\xbf\x00\xff','cbor_unsupported_simple'),
+                         (b'\x81'*1000+b'\x61a','cbor_datum_shape')]:
+            with self.subTest(code=code,raw=raw[:8].hex()):
+                with self.assertRaisesRegex(Refusal,'^'+code+'$'):decode_datum(raw)
+    def test_value_builds_what_item_builds(self):
+        """`Decoder.value` gives `item`'s result (maps as pairs) and its reason codes, except nesting depth and map keys."""
+        rng=random.Random(23)
+        def gen(depth=0):
+            kind=rng.randrange(9 if depth<5 else 5);n=rng.randrange(4)
+            items=lambda count:b''.join(gen(depth+1) for _ in range(count))
+            if kind==0:return bytes([rng.randrange(24)])
+            if kind==1:return b'\x38'+bytes([rng.randrange(256)])
+            if kind==2:return b'\x43abc'
+            if kind==3:return b'\x5f\x41a\x41b\xff'
+            if kind==4:return bytes([rng.choice((0xf4,0xf5,0xf6))])
+            if kind==5:return bytes([0x80+n])+items(n)
+            if kind==6:return bytes([0xa0+n])+items(2*n)
+            if kind==7:return (b'\x9f'+items(n) if rng.random()<.5 else b'\xbf'+items(2*n))+b'\xff'
+            return b'\xd8\x79'+gen(depth+1)
+        for _ in range(3000):
+            data=bytearray(gen())
+            if rng.random()<.5:
+                at=rng.randrange(len(data));op=rng.randrange(3)
+                if op==0:data[at]=rng.randrange(256)
+                elif op==1:del data[at:]
+                else:data.insert(at,rng.randrange(256))
+            limits={'max_depth':rng.choice((64,2)),'max_items':rng.choice((200000,6))};outcomes=[]
+            for read in (lambda d:d.item(),lambda d:d.value()):
+                d=Decoder(bytes(data),maps_as_pairs=True,**limits)
+                try:outcomes.append((read(d),d.pos,d.remaining))
+                except Refusal as e:outcomes.append(str(e))
+            if outcomes[0] not in ('cbor_depth_limit','cbor_duplicate_map_key','cbor_unsupported_map_key'):
+                self.assertEqual(outcomes[1],outcomes[0],bytes(data).hex())
+
 if __name__=='__main__':unittest.main()

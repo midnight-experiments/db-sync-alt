@@ -1,10 +1,11 @@
 import copy
+import hashlib
 import json
 import unittest
 from unittest.mock import patch
 from db_sync_alt.sources.blockfrost.cbor import decode_transaction
 from db_sync_alt.sources.blockfrost.adapter import amounts, classify_inputs, epoch_facts, inventory, output_value, pool_hash, ordinary_outputs
-from db_sync_alt.contract import Refusal
+from db_sync_alt.contract import Refusal, canonical
 from fixtures.cbor import F, body, tx
 from fixtures.blockfrost import CountingProvider as ProviderClient, Fake, POOL
 
@@ -80,7 +81,6 @@ class ProviderTests(unittest.TestCase):
                 values=[routes[key],[dict(routes[key][0],stake_address='stake_test1changed'),routes[key][1]]];routes[key]=lambda:values.pop(0)
             with self.assertRaises(Refusal):epoch_facts(ProviderClient(30,Fake(routes)),4,stake_prefix='stake_test1')
 
-if __name__=='__main__':unittest.main()
 
 class CurrentEpochTests(unittest.TestCase):
     def test_current_epoch_tip_can_advance_above_target(self):
@@ -136,3 +136,77 @@ class LedgerOrdinalTests(unittest.TestCase):
         source.output(b'\x01' * 32, row)
         stored = [r for t, r in source.facts if t == 'output_assets']
         self.assertEqual([(r['policy'].hex() + r['name'].hex(), r['ordinal']) for r in stored], [(profile.night, sorted(units).index(profile.night))])
+
+
+class DatumTests(unittest.TestCase):
+    """Datums of relevant outputs are stored as cardano-db-sync 13.8 stores them; none refuses a ledger-valid block."""
+    def source(self, routes, stored=None):
+        from types import SimpleNamespace
+        from db_sync_alt.sources.blockfrost.adapter import BlockfrostSource
+        source = BlockfrostSource.__new__(BlockfrostSource)
+        stored = stored or {}
+        source.facts, source.provider = [], ProviderClient(50, Fake({'/metrics': [], **routes}))
+        source.store = SimpleNamespace(fact=lambda table, key: stored.get((table, key)), output_assets=lambda h, i: [])
+        source.profile = SimpleNamespace(required=lambda p, n: False)
+        return source
+
+    def datums(self, source):
+        return {r['hash']: r['value'] for t, r in source.facts if t == 'datums'}
+
+    def requests(self, source):
+        return [p for p in source.provider.client.calls if p != '/metrics']
+
+    def test_hash_without_preimage_on_chain_stores_nothing(self):
+        from fixtures.blockfrost import NOT_FOUND
+        h = hashlib.blake2b(b'\x43abc', digest_size=32).digest()
+        source = self.source({'/scripts/datum/' + h.hex() + '/cbor': NOT_FOUND})
+        source.datum(h)
+        self.assertEqual(self.datums(source), {})
+        self.assertEqual(self.requests(source), ['/scripts/datum/' + h.hex() + '/cbor'])
+
+    def test_value_past_the_nesting_limit_is_null_and_never_asked_for(self):
+        raw = b'\x81' * 1000 + b'\x00'
+        h = hashlib.blake2b(raw, digest_size=32).digest()
+        source = self.source({})
+        source.datum(h, raw.hex())
+        self.assertEqual(self.datums(source), {h: None})
+        self.assertEqual(self.requests(source), [])
+
+    def test_value_below_the_limit_must_equal_blockfrost(self):
+        value = {'int': 0}
+        for _ in range(999):
+            value = {'list': [value]}
+        raw = b'\x81' * 999 + b'\x00'
+        h = hashlib.blake2b(raw, digest_size=32).digest()
+        source = self.source({'/scripts/datum/' + h.hex() + '/cbor': {'cbor': raw.hex()}, '/scripts/datum/' + h.hex(): {'json_value': value}})
+        source.datum(h)
+        self.assertEqual(self.datums(source), {h: canonical(value)})
+        # Blockfrost serves db-sync's NULL as {}: for a datum db-sync does not store as NULL, that is a disagreement.
+        source = self.source({'/scripts/datum/' + h.hex(): {'json_value': {}}})
+        with self.assertRaisesRegex(Refusal, 'provider_datum_semantics_mismatch'):
+            source.datum(h, raw.hex())
+
+    def test_malformed_or_mismatched_datum_still_refuses(self):
+        raw = b'\x82\x00'
+        h = hashlib.blake2b(raw, digest_size=32).digest()
+        with self.assertRaisesRegex(Refusal, 'cbor_truncated'):
+            self.source({}).datum(h, raw.hex())
+        with self.assertRaisesRegex(Refusal, 'provider_datum_hash_mismatch'):
+            self.source({}).datum(b'\x00' * 32, raw.hex())
+
+    def test_a_spend_stores_a_datum_first_seen_with_it(self):
+        raw = b'\xd8\x79\x80'
+        h = hashlib.blake2b(raw, digest_size=32).digest()
+        old = {'tx_hash': b'\x01' * 32, 'output_index': 0, 'address': 'addr_test1fixture', 'value': '5', 'datum_hash': h}
+        routes = {'/scripts/datum/' + h.hex() + '/cbor': {'cbor': raw.hex()}, '/scripts/datum/' + h.hex(): {'json_value': {'constructor': 0, 'fields': []}}}
+        source = self.source(routes, {('outputs', (b'\x01' * 32, 0)): old})
+        observed = {'address': 'addr_test1fixture', 'amount': [{'unit': 'lovelace', 'quantity': '5'}], 'data_hash': h.hex(), 'inline_datum': None}
+        source.origin(b'\x01' * 32, 0, observed)
+        self.assertEqual(self.datums(source), {h: canonical({'constructor': 0, 'fields': []})})
+        # Already stored: no request.
+        source = self.source(routes, {('outputs', (b'\x01' * 32, 0)): old, ('datums', (h,)): {'hash': h, 'value': '{}'}})
+        source.origin(b'\x01' * 32, 0, observed)
+        self.assertEqual((self.datums(source), self.requests(source)), ({}, []))
+
+
+if __name__=='__main__':unittest.main()

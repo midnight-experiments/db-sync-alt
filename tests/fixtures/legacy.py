@@ -16,10 +16,13 @@ from db_sync_alt.sources.blockfrost import adapter, follow
 from db_sync_alt.store import database, reader, upgrade
 from db_sync_alt.verify import store as verification
 
-# The nonce-only release created chain.epoch_nonces without max_tx_size and its schema-1 view over it.
+# The nonce-only release created chain.epoch_nonces without max_tx_size and its schema-1 view over it,
+# and its datums with a value that is never NULL and an output datum hash that references a datum.
 NONCE_ONLY_DDL = """DROP VIEW public.epoch_param;
 ALTER TABLE chain.epoch_nonces DROP COLUMN max_tx_size;
-CREATE VIEW public.epoch_param AS SELECT epoch AS epoch_no,nonce FROM chain.epoch_nonces WHERE first_generation<=(SELECT id FROM chain.ready_generation);"""
+CREATE VIEW public.epoch_param AS SELECT epoch AS epoch_no,nonce FROM chain.epoch_nonces WHERE first_generation<=(SELECT id FROM chain.ready_generation);
+ALTER TABLE chain.datums ALTER COLUMN value SET NOT NULL;
+ALTER TABLE chain.outputs ADD CONSTRAINT outputs_datum_hash_fkey FOREIGN KEY(datum_hash) REFERENCES chain.datums(hash);"""
 
 
 @contextlib.contextmanager
@@ -34,6 +37,14 @@ def nonce_only():
 
     def contract_for(network, *, legacy=False):
         return legacy_contract_for(network, legacy=True)
+
+    # Its schema-3 served datum table did not take a NULL value either.
+    upgrade_v3 = upgrade._upgrade_v3
+
+    def _upgrade_v3(store, *args, **kwargs):
+        result = upgrade_v3(store, *args, **kwargs)
+        store.db.execute('ALTER TABLE serve.datum ALTER COLUMN value SET NOT NULL')
+        return result
 
     # The nonce-only release neither read nor recorded an epoch's size.
     read_epoch, complete_epoch = adapter.epoch_facts, adapter.complete_inherited_epoch
@@ -70,5 +81,6 @@ def nonce_only():
             stack.enter_context(patch.object(module, 'complete_inherited_epoch', complete_inherited_epoch))
         # The nonce-only release's upgrade ended at schema 4.
         stack.enter_context(patch.object(upgrade, '_upgrade_v5', lambda store, state, checkpoint: None))
+        stack.enter_context(patch.object(upgrade, '_upgrade_v3', _upgrade_v3))
         yield
 
