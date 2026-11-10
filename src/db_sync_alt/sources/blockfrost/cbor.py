@@ -80,6 +80,35 @@ class Decoder:
             return Tag(n,self.item(depth+1))
         if m==7 and n in (20,21,22):return {20:False,21:True,22:None}[n]
         raise Refusal('cbor_unsupported_simple')
+    def skip(self):
+        """Read past one item without building it; return its (start, end) byte span.
+
+        For data no fact depends on, such as transaction auxiliary data. Ledger
+        metadata may nest to any depth below the transaction size and repeat map
+        keys, so neither refuses here: an explicit stack replaces recursion, and
+        the input length and the shared item budget bound the work. Leaves go
+        through `item`, so malformed heads, truncation, string chunks, UTF-8 and
+        simple values refuse with the same reason codes as everywhere else.
+        """
+        start=self.pos;todo=[1]  # per open container: items left, or -1/-2 (array/map groups) until a break
+        while todo:
+            if todo[-1]<0:
+                if self.data[self.pos:self.pos+1]==b'\xff':self.pos+=1;todo.pop()
+                else:todo.append(-todo[-1])
+                continue
+            if todo[-1]==0:todo.pop();continue
+            todo[-1]-=1;at=self.pos;self.remaining-=1
+            if self.remaining<0:raise Refusal('cbor_item_limit')
+            m,n=self.head()
+            if m not in (4,5,6):self.pos=at;self.remaining+=1;self.item();continue
+            if m==6:
+                if n is None:raise Refusal('cbor_invalid_tag')
+                todo.append(1)
+            elif n is None:todo.append(-1 if m==4 else -2)
+            else:
+                if n*(2 if m==5 else 1)>self.remaining:raise Refusal('cbor_item_limit')
+                todo.append(n*(2 if m==5 else 1))
+        return start,self.pos
 
 def key_identity(v):
     if type(v) in (int,bytes,str):return (type(v).__name__,v)
@@ -149,7 +178,8 @@ def decode_transaction(raw_hex,expected_hash):
     start=d.pos;body=d.item(1);end=d.pos
     actual=hashlib.blake2b(raw[start:end],digest_size=32).hexdigest()
     if actual!=expected_hash:raise Refusal('cbor_body_hash_mismatch')
-    witness=d.item(1);valid=d.item(1);d.item(1)  # auxiliary data: read past it, not used
+    witness=d.item(1);valid=d.item(1)
+    aux_start=d.pos;d.item(1);auxiliary=raw[aux_start:d.pos]  # auxiliary data: kept as bytes, read only by bridge_metadatum
     if n is None and d.take(1)!=b'\xff':raise Refusal('cbor_envelope_arity')
     if d.pos!=len(raw):raise Refusal('cbor_trailing_bytes')
     if not isinstance(body,dict) or not {0,1,2}.issubset(body) or any(type(k) is not int or k not in set(range(23))-{10,12} for k in body):raise Refusal('cbor_unsupported_body')
@@ -169,7 +199,74 @@ def decode_transaction(raw_hex,expected_hash):
     supported_return=isinstance(returned,list) and len(returned) in (2,3) or isinstance(returned,dict) and {0,1}.issubset(returned) and set(returned)<={0,1,2,3}
     return {'hash':bytes.fromhex(actual),'valid':valid,'ordinary':inputs(body[0]),'collateral':inputs(body.get(13,[])),
             'reference':inputs(body.get(18,[])),'mints':tuple(sorted(facts)),'output_count':len(body[1]),'collateral_return':16 in body,'body_bytes':end-start,
-            'outputs':tuple(output_details(o) for o in body[1]),'collateral_output':output_details(returned) if supported_return else None}
+            'outputs':tuple(output_details(o) for o in body[1]),'collateral_output':output_details(returned) if supported_return else None,
+            'auxiliary_data':None if auxiliary==b'\xf6' else auxiliary,'auxiliary_data_hash':body.get(7)}
+
+
+# What `bridge_metadatum` finds for one metadata label: no such label, the label's metadatum (with the
+# recipient bytes the node would read from its JSON rendering, or None), or nothing certain.
+ABSENT='absent'
+PRESENT='present'
+UNKNOWN='unknown'
+# A one-element array of one (possibly chunked) string: the deepest shape that can be a recipient.
+RECIPIENT_DEPTH=2
+
+
+def bridge_metadatum(aux,label):
+    """(ABSENT|PRESENT|UNKNOWN, recipient) for metadata `label` in auxiliary data bytes `aux`.
+
+    Only that label's value is decoded, with an explicit depth bound: an over-deep or undecodable
+    value, or any shape but a one-element array holding bytes or a `0x`-hexadecimal text, is a
+    metadatum without a recipient, never a refusal. cardano-db-sync renders bytes as `0x` + hex,
+    which the node decodes back to the same bytes. Other labels and the scripts are only skipped.
+    A structure this reader does not recognise, a repeated label with different readings or a
+    malformed item gives UNKNOWN: anyone can put such data on chain."""
+    if aux is None:return ABSENT,None
+    try:
+        d=Decoder(aux,max_bytes=len(aux)+1,max_items=len(aux)+1)
+        m,n=d.head()
+        if m==6 and n==259:
+            m,n=d.head()
+            if m!=5:return UNKNOWN,None
+            found=False;i=0
+            while n is None or i<n:
+                if n is None and d.data[d.pos:d.pos+1]==b'\xff':d.pos+=1;break
+                key=d.item(1);i+=1
+                if key==0 and not found:found=True;break
+                d.skip()
+            if not found:return ABSENT,None
+            m,n=d.head()
+        elif m==4:
+            if n is not None and n<1:return UNKNOWN,None
+            m,n=d.head()
+        elif m!=5:return UNKNOWN,None
+        if m!=5:return UNKNOWN,None
+        readings=set();i=0
+        while n is None or i<n:
+            if n is None and d.data[d.pos:d.pos+1]==b'\xff':break
+            key=d.item(1);i+=1
+            if type(key) is not int:return UNKNOWN,None
+            value_start,value_end=d.skip()
+            if key==label:readings.add(_recipient(aux[value_start:value_end]))
+    except Refusal:
+        return UNKNOWN,None
+    if not readings:return ABSENT,None
+    if len(readings)!=1:return UNKNOWN,None
+    return PRESENT,readings.pop()
+
+
+def _recipient(raw):
+    """The recipient bytes of one metadatum's CBOR, or None when it cannot be one."""
+    try:
+        d=Decoder(raw,max_bytes=len(raw)+1,max_depth=RECIPIENT_DEPTH,max_items=len(raw)+1)
+        value=d.item()
+    except Refusal:
+        return None
+    if not isinstance(value,list) or len(value)!=1:return None
+    element=value[0]
+    if isinstance(element,bytes):return element
+    if isinstance(element,str) and element.startswith('0x') and re.fullmatch('(?:[0-9a-fA-F]{2})*',element[2:]):return bytes.fromhex(element[2:])
+    return None
 
 
 def decode_datum(raw):

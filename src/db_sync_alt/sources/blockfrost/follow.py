@@ -277,7 +277,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
         try:
             facts,stats=source.block_facts(block)
             # Fact order is dependency ordered at commit, with outputs before spends.
-            order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs']
+            order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs','tx_metadata']
             diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'])
             with store.atomic():
                 for table in order:
