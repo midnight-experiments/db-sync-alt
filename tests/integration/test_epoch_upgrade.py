@@ -308,8 +308,11 @@ class EpochUpgradeTests(CheckpointFixture):
     def test_upgraded_store_is_refused_by_the_nonce_only_release(self):
         dsn = self.legacy()
         self.upgrade(dsn)
-        with nonce_only(), self.assertRaisesRegex(Refusal, 'unsupported_format'):
-            PgStore(conninfo=dsn)
+        with nonce_only():
+            # The schema is checked before the contract: schema 5 is unknown to the earlier release.
+            for readonly in (False, True):
+                with self.subTest(readonly=readonly), self.assertRaisesRegex(Refusal, 'unsupported_database_identity'):
+                    PgStore(conninfo=dsn, readonly=readonly, allow_incomplete=True)
 
     def test_upgrade_from_a_cardano_db_sync_source(self):
         dsn = self.legacy()
@@ -372,6 +375,36 @@ class EpochUpgradeTests(CheckpointFixture):
             verify_store(restored)
             self.assertEqual(restored.db.execute('SELECT * FROM serve.epoch_param ORDER BY 1').fetchall(),
                              original.db.execute('SELECT * FROM serve.epoch_param ORDER BY 1').fetchall())
+
+    def test_restore_whose_upgrade_refuses_is_left_ready_for_upgrade(self):
+        dsn = self.legacy()
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        archive, manifest = folder / 'v3.dump', folder / 'v3.json'
+        with nonce_only():
+            backup(archive, manifest, conninfo=dsn)
+        # Not enough of the day's budget for 2 requests per stored epoch: refused before the destination is touched.
+        destination = self.database()
+        poor = Counting(parameters()); poor.status = lambda: {'budget_used': 49995, 'daily_limit': 50000}
+        with self.assertRaisesRegex(Refusal, 'provider_budget_insufficient'):
+            restore(archive, manifest, conninfo=destination, epoch_source=lambda network: ProviderEpochSource(poor, network))
+        self.assertEqual(poor.calls, [])
+        with psycopg.connect(destination, autocommit=True) as db:
+            self.assertTrue(empty_destination(db))
+        # The upgrade step refuses after the archive is in: restored, ready, nonce-only, reader not granted.
+        routes = parameters()
+        answers = [routes['/epochs/2/parameters'], dict(routes['/epochs/2/parameters'], max_tx_size=12003)]
+        routes['/epochs/2/parameters'] = lambda: answers.pop(0)
+        role = self.reader(destination)
+        with self.assertRaisesRegex(Refusal, 'epoch_parameters_changed'):
+            restore(archive, manifest, conninfo=destination, reader_role=role, epoch_source=lambda network: ProviderEpochSource(Counting(routes), network))
+        with PgStore(conninfo=destination, readonly=True, allow_legacy=True) as store:
+            state = store.state()
+            self.assertEqual((store.legacy_format, state['schema_version'], state['migration_state']), (True, 4, 'ready'))
+            self.assertFalse(store.db.execute("SELECT has_database_privilege(%s,current_database(),'CONNECT')", (role,)).fetchone()[0])
+            verify_store(store)
+        # `upgrade` finishes it; the reader is granted afterwards.
+        self.upgrade(destination)
+        self.assertEqual(self.cost(destination, [OFFSET + 10]), {OFFSET + 10: [{'max': SIZES[2]}]})
 
     def test_v4_backup_round_trip_needs_no_source(self):
         dsn = self.legacy()

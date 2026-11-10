@@ -28,8 +28,7 @@ VERSION = 1
 PURPOSE = 'db-sync-alt:' + JOB
 # Refusals that keep the staged answers: the source was unavailable, nothing it answered was wrong.
 TRANSIENT = 'epoch_parameters_source_unavailable'
-KEEP_STAGED = frozenset({TRANSIENT, 'source_timeout', 'source_query_failed',
-                         'provider_accounting_unavailable', 'provider_budget_insufficient'})
+KEEP_STAGED = frozenset({TRANSIENT, 'source_timeout', 'source_query_failed'})
 
 
 def admit(store, source):

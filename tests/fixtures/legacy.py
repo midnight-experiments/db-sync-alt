@@ -11,7 +11,7 @@ release finds when it opens an existing database.
 import contextlib
 from unittest.mock import patch
 
-from db_sync_alt import contract
+from db_sync_alt import backup, contract
 from db_sync_alt.sources.blockfrost import adapter, follow
 from db_sync_alt.store import database, reader, upgrade
 from db_sync_alt.verify import store as verification
@@ -60,6 +60,9 @@ def nonce_only():
         stack.enter_context(patch.object(contract, 'CAPABILITIES', dict(contract.LEGACY_CAPABILITIES)))
         stack.enter_context(patch.object(contract, 'contract_for', contract_for))
         stack.enter_context(patch.object(database, 'SCHEMA_VERSION', 4))
+        # The nonce-only releases know schemas 1 to 4 only, and check that before the contract.
+        for module in (database, backup):
+            stack.enter_context(patch.object(module, 'SUPPORTED_SCHEMA_VERSIONS', (1, 2, 3, 4)))
         stack.enter_context(patch.object(reader, 'SCHEMA_VERSION', 4))
         stack.enter_context(patch.object(database.PgStore, '__init__', init))
         for module in (adapter, verification):
