@@ -22,6 +22,57 @@ import time
 from urllib.parse import unquote, urlsplit
 
 MAX_BYTES = 32 * 1024 * 1024
+# Arrays and objects nested deeper than this in a provider answer are cut out. Python's JSON decoder and
+# encoder recurse in C and fail between 5,000 and 10,000 levels, and anyone can put metadata that deep on
+# chain. Every value cardano-db-sync stores as JSON (nesting up to 2,000) arrives whole.
+RESPONSE_DEPTH = 4000
+_STRUCTURE = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}"]')
+_PAIRS = {'[': ']', '{': '}'}
+# Stands in for a cut container while the shallow rest is decoded. U+0000 never occurs in provider JSON
+# (PostgreSQL's jsonb cannot hold it).
+_CUT_KEY = '\x00db-sync-alt:nested-too-deep'
+
+
+class TooDeep(dict):
+    """An array or object nested deeper than RESPONSE_DEPTH in a provider answer: cut, empty."""
+
+
+def _object(pairs):
+    return TooDeep() if pairs == [(_CUT_KEY, True)] else dict(pairs)
+
+
+def loads(raw):
+    """A provider answer as `json.loads` decodes it, except that every array or object nested deeper
+    than RESPONSE_DEPTH is a `TooDeep`. Malformed JSON raises ValueError, as `json.loads` does; no input
+    raises RecursionError."""
+    text = raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else raw
+    if text.count('[') + text.count('{') <= RESPONSE_DEPTH:
+        return json.loads(raw)  # cannot nest deeper: the common answer, decoded as before
+    stack, spans, start = [], [], None
+    for token in _STRUCTURE.finditer(text):
+        value = token.group()
+        if value[0] == '"':
+            if len(value) == 1:
+                raise ValueError('unterminated string')
+        elif value in _PAIRS:
+            stack.append(value)
+            if len(stack) == RESPONSE_DEPTH + 1:
+                start = token.start()
+        else:
+            if not stack or _PAIRS[stack.pop()] != value:
+                raise ValueError('unbalanced brackets')
+            if len(stack) == RESPONSE_DEPTH and start is not None:
+                spans.append((start, token.end()));start = None
+    if stack:
+        raise ValueError('unbalanced brackets')
+    if not spans:
+        return json.loads(raw)
+    cut, pieces, position = json.dumps({_CUT_KEY: True}), [], 0
+    for first, end in spans:
+        pieces += [text[position:first], cut];position = end
+    pieces.append(text[position:])
+    return json.loads(''.join(pieces), object_pairs_hook=_object)
+
 
 class ProviderError(RuntimeError):
     def __init__(self, code, *, http_status=None, kind=None):
@@ -178,7 +229,7 @@ class PortableClient:
                     _atomic(self.state,data)
                 if code != 200:raise ProviderError('provider_request_failed_counted',http_status=code)
                 if len(raw)>MAX_BYTES or self.key.encode() in raw:raise ProviderError('unsafe_provider_response')
-                result=json.loads(raw)
+                result=loads(raw)
                 if self.key in json.dumps(result,ensure_ascii=False):raise ProviderError('unsafe_provider_response')
                 if path=='/metrics':
                     if not isinstance(result,list):raise ProviderError('invalid_provider_metrics')

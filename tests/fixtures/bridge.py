@@ -63,12 +63,13 @@ def metadata_cbor(metadata):
 
 
 class Tx:
-    """One transaction: CBOR (with its auxiliary data), its provider rows and its db-sync metadata rows."""
-    def __init__(self, height, index, *, spends=(), outputs, metadata=None, provider=None, dbsync=None):
+    """One transaction: CBOR (with its auxiliary data), its provider rows and its db-sync metadata rows.
+    `aux` gives the auxiliary data bytes directly (for values the test encoder cannot nest)."""
+    def __init__(self, height, index, *, spends=(), outputs, metadata=None, provider=None, dbsync=None, aux=None):
         self.height, self.index, self.spends, self.outputs = height, index, list(spends), outputs
         user = hashlib.sha256(b'user-%d-%d' % (height, index)).digest()
         self.inputs = [(user, 0)] + [(origin.hash, i) for origin, i in self.spends]
-        aux = metadata_cbor(metadata)
+        aux = metadata_cbor(metadata) if aux is None else aux
         body = {0: [[h, i] for h, i in sorted(self.inputs)], 1: [[b'\x60' + bytes([n]) * 28, 1] for n in range(len(outputs))], 2: 3}
         if aux is not None:
             body[7] = hashlib.blake2b(aux, digest_size=32).digest()
@@ -92,12 +93,25 @@ class Tx:
         return any(o['address'] == ICS for o in self.outputs)
 
 
-def transfer(height, index, amount, metadata, provider, dbsync, *, assets=None, spends=()):
+def transfer(height, index, amount, metadata, provider, dbsync, *, assets=None, spends=(), aux=None):
     outputs = [output(0, ICS, 2000000, assets or [(NIGHT, amount)]), output(1, 'addr_test1change', 1000000)]
-    return Tx(height, index, spends=spends, outputs=outputs, metadata=metadata, provider=provider, dbsync=dbsync)
+    return Tx(height, index, spends=spends, outputs=outputs, metadata=metadata, provider=provider, dbsync=dbsync, aux=aux)
 
 
-def scenario():
+# Nesting no JSON library of the service could decode recursively: anyone can put it on chain.
+HOSTILE_DEPTH = 20000
+
+
+def hostile(height, index):
+    """A transfer whose bridge metadatum nests HOSTILE_DEPTH arrays, in its CBOR and in its provider answer
+    (raw JSON bytes: the answer cannot be built as a Python value and re-encoded)."""
+    value = b'\x81' * HOSTILE_DEPTH + b'\x80'
+    aux = b'\xd9\x01\x03\xa1\x00\xa1' + enc(KEY) + value
+    answer = b'[{"label":"6500973","json_metadata":' + b'[' * (HOSTILE_DEPTH + 1) + b']' * (HOSTILE_DEPTH + 1) + b'}]'
+    return transfer(height, index, 4, None, answer, [(KEY, None)], aux=aux)
+
+
+def scenario(*, hostile_transfer=False):
     hexed = lambda b: '0x' + b.hex()
     text = '0x' + RECIPIENTS[1][:20].hex()
     t11 = [
@@ -117,6 +131,9 @@ def scenario():
         transfer(12, 4, 10, {KEY: [RECIPIENTS[3]]}, [{'label': '6500973', 'json_metadata': [hexed(RECIPIENTS[3])]}], [(KEY, [hexed(RECIPIENTS[3])])],
                  assets=[(NIGHT, 10), (OTHER, 5)]),
     ]
+    if hostile_transfer:
+        # Replaces the control-character transfer: block h=12 keeps its transaction count.
+        t12[1] = hostile(12, 1)
     return {11: t11, 12: t12}
 
 
@@ -145,7 +162,7 @@ def routes(chain=None):
 def baseline(conninfo):
     """Generation 0 (as `blockfrost_generation.baseline`) with this scenario's headers; returns the open store."""
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.object(base, 'block', lambda h, fork=0, transition=False: block(h)))
+        stack.enter_context(patch.object(base, 'block', lambda h, fork=0, transition=False, unrelated=0: block(h)))
         return base.baseline(conninfo)
 
 

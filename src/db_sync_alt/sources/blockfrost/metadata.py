@@ -8,7 +8,9 @@ JavaScript round trip; it is stored as jsonb with this normalization only:
 - a number written as a float with an integral value (`1e+21`, from an integer beyond 2^53) is an
   integer; a non-finite number is a provider error;
 - like cardano-db-sync 13.8, a value containing U+0000 (which jsonb cannot hold), text that is not
-  Unicode, or arrays and objects nested deeper than 2000 is NULL (`present` 1, `json` None).
+  Unicode, or arrays and objects nested deeper than 2000 is NULL (`present` 1, `json` None). That
+  includes an answer the provider client had to cut (`provider.TooDeep`, nesting beyond 4000): such
+  an answer never fails the request or stops ingest.
 
 Big integers beyond 2^53 therefore keep Blockfrost's rounded value: midnight-node reads only a
 one-element array holding a `0x` string, so its decision is the same as on cardano-db-sync.
@@ -24,6 +26,7 @@ import math
 from db_sync_alt.bridge import recipient
 from db_sync_alt.contract import BRIDGE_METADATA_KEY, Refusal, canonical
 from db_sync_alt.sources.blockfrost.cbor import ABSENT, UNKNOWN, bridge_metadatum
+from db_sync_alt.sources.blockfrost.provider import TooDeep
 
 LABEL = str(BRIDGE_METADATA_KEY)
 MAX_NESTING = 2000
@@ -39,6 +42,8 @@ def normalize(value):
     stack = [(value, 0)]
     while stack:
         item, depth = stack.pop()
+        if isinstance(item, TooDeep):
+            return None
         if isinstance(item, (list, dict)):
             depth += 1
             if depth > MAX_NESTING:

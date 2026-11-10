@@ -9,9 +9,12 @@ refusals that keep coverage complete.
 """
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
+import tempfile
 import threading
+import time
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -23,7 +26,7 @@ from psycopg.conninfo import make_conninfo
 
 from db_sync_alt.bridge import parse_checkpoint, recipient
 from db_sync_alt.contract import Refusal
-from db_sync_alt.sources.blockfrost import adapter, metadata
+from db_sync_alt.sources.blockfrost import adapter, metadata, provider
 from db_sync_alt.sources.blockfrost.poller import HeadPoller, PollBudgetStore, owner_binding
 from db_sync_alt.sources.blockfrost.sync import SyncDriver
 from db_sync_alt.store.reader import grant_reader
@@ -41,6 +44,20 @@ TYPES = ['text', 'text', 'bytea', 'bytea', 'int8', 'int4']
 SCHEMA = Path(__file__).resolve().parents[1] / 'fixtures' / 'data' / 'dbsync_schema.sql'
 OFFSET, TARGET = bridge.OFFSET, bridge.TARGET
 START = OFFSET + 11  # coverage start: the block after generation 0's target
+PROVIDER_KEY = 'preprod' + 'synthetic0000000000000000'
+
+
+class RawBlockfrost:
+    """HTTP transport of db-sync-alt's own client: every route answered as raw JSON bytes (bytes routes as given)."""
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def __call__(self, path):
+        self.calls.append(path)
+        if path not in self.routes:
+            return 404, {}, b'{"status_code":404}'
+        value = self.routes[path]
+        return 200, {}, value if isinstance(value, bytes) else json.dumps(value).encode()
 
 
 def metadata_calls(calls):
@@ -264,6 +281,58 @@ class BridgeMetadataTests(unittest.TestCase):
                        (t11[0].hash, g['id']))
         with self.assertRaisesRegex(Refusal, 'selected_asset_outside_profile'):
             verify_store(store)
+
+    def portable(self, routes):
+        """db-sync-alt's own accounted client over `routes`, with a private ledger and a simulated clock."""
+        ledger = tempfile.TemporaryDirectory()
+        self.addCleanup(ledger.cleanup)
+        now, transport = [time.time()], RawBlockfrost(routes)
+        client = provider.PortableClient(PROVIDER_KEY, Path(ledger.name) / 'accounting', network=PREPROD, transport=transport,
+                                         clock=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+        return client, transport
+
+    def test_hostile_nesting_never_stops_acquisition_or_follow(self):
+        chain = bridge.scenario(hostile_transfer=True)
+        routes = bridge.routes(chain)
+        target = chain[12][1]
+        path = '/txs/' + target.hash.hex() + '/metadata'
+        # The same parse path serves every endpoint: the transfer's details carry an equally deep extra field.
+        deep = b'[' * bridge.HOSTILE_DEPTH + b']' * bridge.HOSTILE_DEPTH
+        details = '/txs/' + target.hash.hex()
+        routes[details] = json.dumps(routes[details])[:-1].encode() + b',"note":' + deep + b'}'
+        # Positive control: decoded without a bound, the answer fails the counted request.
+        client, _ = self.portable(routes)
+        with patch.object(provider, 'loads', json.loads), self.assertRaisesRegex(provider.ProviderError, 'provider_request_failed_counted'):
+            client.get(path)
+        stored = lambda store: store.db.execute('SELECT present,json FROM chain.tx_metadata WHERE tx_hash=%s', (target.hash,)).fetchone()
+        # Acquisition: the full Blockfrost update.
+        _, store = self.ready()
+        client, transport = self.portable(routes)
+        with contextlib.redirect_stdout(io.StringIO()):
+            adapter.update(store, CountingProvider(500, client), bridge.PROFILE, TARGET, hooks=FixtureHooks())
+        self.assertEqual(store.generation()['target_height'], TARGET)
+        self.assertEqual(stored(store), (1, None))
+        self.assertEqual((transport.calls.count(path), transport.calls.count(details)), (1, 1))
+        verify_store(store)
+        # Follow: the service's sync driver.
+        dsn, follower = self.ready()
+        follower.certify_ready_full()
+        client, transport = self.portable(routes)
+        health, stop = real.SyncFixture.state(self), threading.Event()
+        pollstore = PollBudgetStore(None, owner_binding(follower), conninfo=dsn)
+        try:
+            poller = HeadPoller(lambda: pollstore, lambda: client, health, stop, network=PREPROD)
+            poller.tick(pollstore, client)
+            driver = SyncDriver(SimpleNamespace(sync={}), client=client, profile=bridge.PROFILE)
+            driver._poller = poller
+            driver.run_once(follower, health, stop)
+        finally:
+            pollstore.close()
+        self.assertEqual(follower.generation()['target_height'], TARGET)
+        self.assertEqual(stored(follower), (1, None))
+        self.assertEqual(transport.calls.count(path), 1)
+        verify_store(follower)
+        self.assertEqual(follower.digests(follower.generation()['id']), store.digests(store.generation()['id']))
 
     def test_the_provider_must_agree_with_the_transaction_cbor(self):
         t = self.chain[11][0]

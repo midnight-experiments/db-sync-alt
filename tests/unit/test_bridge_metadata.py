@@ -97,6 +97,12 @@ class NormalizationTests(unittest.TestCase):
             with self.subTest(value=repr(bad)), self.assertRaisesRegex(Refusal, 'provider_bad_metadata'):
                 normalize(bad)
 
+    def test_answers_the_provider_client_cut_are_null(self):
+        from db_sync_alt.sources.blockfrost.provider import TooDeep
+        self.assertIsNone(normalize(TooDeep()))
+        self.assertIsNone(normalize([[TooDeep()]]))
+        self.assertEqual(provider_metadatum([{'label': '6500973', 'json_metadata': [TooDeep()]}]), (True, None))
+
     def test_values_cardano_db_sync_stores_as_null(self):
         deep = []
         for _ in range(2000):
