@@ -171,6 +171,14 @@ def output_details(output):
     return {'address':address,'value':str(coin),'assets':tuple(sorted(assets)),'datum_hash':datum,'classification_safe':safe,'datum_known':datum_known}
 
 def decode_transaction(raw_hex,expected_hash):
+    """Discovery facts of one transaction whose original body bytes hash to `expected_hash`.
+
+    Auxiliary data is only skipped (`Decoder.skip`); `auxiliary_data_span` is
+    its byte span in the transaction. A reader of one metadata label decodes
+    just that value from those bytes with an explicit depth bound, and treats an
+    over-deep or undecodable value as absent, never as a refusal: anyone can put
+    such metadata on chain.
+    """
     if not isinstance(raw_hex,str) or len(raw_hex)>8*1024*1024 or len(raw_hex)%2 or re.fullmatch('[0-9a-f]+',raw_hex) is None:raise Refusal('cbor_invalid_hex')
     if not isinstance(expected_hash,str) or re.fullmatch('[0-9a-f]{64}',expected_hash) is None:raise Refusal('cbor_invalid_hash')
     raw=bytes.fromhex(raw_hex);d=Decoder(raw);m,n=d.head()
@@ -178,8 +186,7 @@ def decode_transaction(raw_hex,expected_hash):
     start=d.pos;body=d.item(1);end=d.pos
     actual=hashlib.blake2b(raw[start:end],digest_size=32).hexdigest()
     if actual!=expected_hash:raise Refusal('cbor_body_hash_mismatch')
-    witness=d.item(1);valid=d.item(1)
-    aux_start=d.pos;d.item(1);auxiliary=raw[aux_start:d.pos]  # auxiliary data: kept as bytes, read only by bridge_metadatum
+    witness=d.item(1);valid=d.item(1);auxiliary=d.skip()
     if n is None and d.take(1)!=b'\xff':raise Refusal('cbor_envelope_arity')
     if d.pos!=len(raw):raise Refusal('cbor_trailing_bytes')
     if not isinstance(body,dict) or not {0,1,2}.issubset(body) or any(type(k) is not int or k not in set(range(23))-{10,12} for k in body):raise Refusal('cbor_unsupported_body')
@@ -200,7 +207,8 @@ def decode_transaction(raw_hex,expected_hash):
     return {'hash':bytes.fromhex(actual),'valid':valid,'ordinary':inputs(body[0]),'collateral':inputs(body.get(13,[])),
             'reference':inputs(body.get(18,[])),'mints':tuple(sorted(facts)),'output_count':len(body[1]),'collateral_return':16 in body,'body_bytes':end-start,
             'outputs':tuple(output_details(o) for o in body[1]),'collateral_output':output_details(returned) if supported_return else None,
-            'auxiliary_data':None if auxiliary==b'\xf6' else auxiliary,'auxiliary_data_hash':body.get(7)}
+            'auxiliary_data_span':auxiliary,'auxiliary_data':None if raw[auxiliary[0]:auxiliary[1]]==b'\xf6' else raw[auxiliary[0]:auxiliary[1]],
+            'auxiliary_data_hash':body.get(7)}
 
 
 # What `bridge_metadatum` finds for one metadata label: no such label, the label's metadatum (with the

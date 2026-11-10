@@ -81,6 +81,10 @@
 - Startup verification on a long history no longer times out when PostgreSQL
   misestimates the generation membership: the full metadata check now
   hash-joins materialized blocks.
+- Fix Blockfrost acquisition and follow stopping at a block that holds a
+  transaction whose metadata nests deeper than about 62 levels or repeats a
+  map key. Anyone can submit such a transaction. Transaction auxiliary data is
+  now read past without being decoded; malformed transaction bytes still refuse.
 
 ## 0.3.0
 
