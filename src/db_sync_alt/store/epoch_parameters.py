@@ -27,7 +27,7 @@ VERSION = 1
 PURPOSE = 'db-sync-alt:' + JOB
 # Refusals that keep the staged answers: the source was unavailable, nothing it answered was wrong.
 TRANSIENT = 'epoch_parameters_source_unavailable'
-KEEP_STAGED = frozenset({TRANSIENT, 'source_timeout', 'source_query_failed', 'request_budget_exhausted',
+KEEP_STAGED = frozenset({TRANSIENT, 'source_timeout', 'source_query_failed',
                          'provider_accounting_unavailable', 'provider_budget_insufficient'})
 
 
@@ -161,8 +161,6 @@ def _resumed(store, job_id, generation, source):
     job = store.sync_job(JOB)
     if job is None or job.get('job_id') != job_id:
         return None
-    if job.get('state') == 'exhausted':
-        raise Refusal('request_budget_exhausted')
     if (job.get('state') != 'active' or job.get('kind') != 'epoch-parameters' or job.get('version') != VERSION
             or job.get('generation') != generation or job.get('source') != source.identity
             or not isinstance(job.get('reads'), list) or len(job['reads']) != 2):
@@ -206,8 +204,8 @@ def read_twice(store, epochs, generation, source):
                 for epoch in todo:
                     if source.counted:
                         if job['attempts'] >= job['budget']:
-                            job['state'] = 'exhausted'
-                            store.save_sync_job(JOB, job)
+                            # This attempt's requests are spent (the provider ledger keeps the day's
+                            # count); an explicit rerun starts the reads over.
                             raise Refusal('request_budget_exhausted')
                         job['attempts'] += 1
                         store.save_sync_job(JOB, job)  # reserved before the request is sent

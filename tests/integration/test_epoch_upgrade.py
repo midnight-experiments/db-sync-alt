@@ -284,6 +284,18 @@ class EpochUpgradeTests(CheckpointFixture):
             self.upgrade(dsn, client=client)
         self.assertEqual(client.calls, [])
 
+    def test_spent_request_budget_discards_the_attempt(self):
+        dsn = self.legacy()
+        before = self.inventory(dsn)
+        new_job = epoch_parameters._new_job
+        def small(*args):
+            return {**new_job(*args), 'budget': 3}
+        with patch.object(epoch_parameters, '_new_job', small), self.assertRaisesRegex(Refusal, 'request_budget_exhausted'):
+            self.upgrade(dsn)
+        self.assertEqual(self.inventory(dsn), before)
+        result, client = self.upgrade(dsn)
+        self.assertEqual((len(client.calls), result['epoch_parameters']['provider_requests']), (8, 8))
+
     def test_upgraded_store_is_refused_by_the_nonce_only_release(self):
         dsn = self.legacy()
         self.upgrade(dsn)
