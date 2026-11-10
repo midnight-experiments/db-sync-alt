@@ -143,8 +143,10 @@ class Profile:
         self.auth=bytes(raw)[1:29].hex()
         self.permissioned=self.configs['permissioned-candidates-config']['permissioned_candidates_policy_id'].removeprefix('0x')
         self.governance={v['policy_id'] for v in self.configs['federated-authority-config'].values()}
+        # The registered-candidates address is not a profile address: node 2.1.101 selects committees without
+        # registrations, so an output there is kept only for a profile asset, as at any other address.
         self.candidate=self.configs['registered-candidates-addresses']['committee_candidates_address']
-        self.addresses={self.mapping,self.candidate}|{v['address'] for v in self.configs['federated-authority-config'].values()}
+        self.addresses={self.mapping}|{v['address'] for v in self.configs['federated-authority-config'].values()}
         self.units={self.night,self.auth,self.permissioned}|self.governance
         for key,address in [('ics-config','illiquid_circulation_supply_validator_address'),('reserve-config','reserve_validator_address')]:
             c=self.configs[key];self.addresses.add(c[address]);self.units.add(c['asset']['policy_id'].removeprefix('0x')+c['asset']['asset_name'].encode().hex())
