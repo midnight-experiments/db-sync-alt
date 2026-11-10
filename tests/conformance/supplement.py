@@ -10,18 +10,19 @@ Expectations:
   complete         complete without an error
   observed         off the node's run path: run and recorded, not judged; its reachability guard is
                    the named case(s), which must pass
+  component        exact non-emitted builder literal: inventory only, linked to the final query
+                   refusal cases; never sent to PostgreSQL as an incomplete statement
 
-Facts used for the reachability arguments (pinned reference sources, midnight-node 1.0.400):
-the node depends on partner-chains-db-sync-data-sources with the features block-source,
-candidate-source, mc-hash, sidechain-rpc and bridge (not governed-map, not block-participation),
-and builds only the partner-chains block, mc-hash, sidechain-rpc and bridge data sources; its
-candidate (authority selection) data source is midnight-node's own.
+The catalogue and the dynamic bridge builder come from the pinned midnight-node 2.1.101 reference.
+Literal presence does not prove the features or runtime paths of a native artifact.
+Bridge remains unqualified; these cases test its required refusal, not native compatibility.
 """
+import hashlib
 import re
 
 from db_sync_alt.resources import data_dir
 
-from conformance.statements import by_name, by_text, placeholders
+from conformance.statements import BRIDGE_SOURCE, bridge_fragment, by_name, by_text, placeholders, sha
 
 INDEX_NAMES = ('idx_ma_tx_out_ident', 'idx_tx_out_address', 'idx_ma_tx_out_id_ident', 'idx_multi_asset_policy_name',
                'idx_block_block_no', 'idx_tx_block_id', 'idx_tx_out_tx_id', 'idx_tx_out_data_hash', 'idx_tx_in_tx_in_id',
@@ -49,17 +50,11 @@ REACH = {
     'get_utxos_for_address_tx_in_consumed': 'Off the run path: used only with TxInConfiguration::Consumed, which the node '
                                             'selects only when tx_in is missing or empty; the from_connection cases prove '
                                             'Enabled.',
-    'get_bridge_txs': 'These catalogue entries are fragments: the node never sends them alone. It sends the bridge query '
-                      'it formats at run time (WITH transfers AS (...), inputs AS (<fragment>) ...), which reads '
-                      'tx_metadata. The bridge capability is not supported, so that query must fail closed.',
+    'get_bridge_txs': 'The six catalogue entries are non-emitted bridge/reserve input/output components. The pinned '
+                      'builder assembles them into a six-bind query reading tx_metadata. Components are inventoried '
+                      'without execution and linked to final-query refusal cases. Bridge remains unqualified.',
     'get_block_info_for_tx_hash': 'Bridge data source only (resolving a transaction checkpoint). The bridge capability is '
                                   'not supported: the endpoint may refuse, or answer exactly what db-sync answers.',
-    'get_datums_at_address_with_token_tx_in_enabled': 'Not compiled into the node: partner-chains feature governed-map '
-                                                      'is not enabled.',
-    'get_datums_at_address_with_token_tx_in_consumed': 'Not compiled into the node: partner-chains feature governed-map '
-                                                       'is not enabled.',
-    'get_stake_pool_delegations_for_pools': 'Not compiled into the node: partner-chains feature block-participation is '
-                                            'not enabled (block participation is also out of scope).',
     'get_token_utxo_for_epoch#partner-chains': 'Not called by the node: it belongs to the partner-chains candidate data '
                                                'source, which the node does not build (it uses its own). Same columns, '
                                                'filter and order as the node\'s variant: the endpoint may refuse, or answer '
@@ -67,14 +62,37 @@ REACH = {
 }
 
 
-def bridge_query():
-    """The bridge query exactly as the node formats it (block checkpoint, no row limit, tx_in enabled)."""
-    source = (data_dir('reference') / 'partner-chains/toolkit/data-sources/db-sync/src/db_model.rs').read_text()
-    transfers = re.search(r'let transfers_subquery = format!\(\s*"([\s\S]*?)"\s*\);', source).group(1)
-    enabled = re.search(r'TxInConfiguration::Enabled => \{\s*"([\s\S]*?)"\s*\},', source[source.index('let inputs_subquery'):]).group(1)
-    outer = re.search(r'QueryBuilder::new\(&format!\("([\s\S]*?)"\)\);', source).group(1)
-    transfers = transfers.replace('{checkpoint_limit}', 'block.block_no > 4500196').replace('{max_rows}', 'null')
-    return outer.replace('{transfers_subquery}', transfers).replace('{inputs_subquery}', enabled)
+def bridge_query(configuration='Enabled'):
+    """Exact released builder, block checkpoint/no row limit, in either tx_in mode."""
+    source = (data_dir('reference') / BRIDGE_SOURCE).read_bytes()
+    if hashlib.sha256(source).hexdigest() != 'a016a1a87356905083c5f817fd8d4ac1b79e639ddd315b792689c51b223a813d':
+        raise ValueError('unclassified bridge builder source')
+    if configuration not in ('Enabled', 'Consumed'):
+        raise ValueError('unknown bridge tx_in configuration')
+    body = source.decode().split('pub(crate) async fn get_bridge_txs(', 1)[1]
+    substitutions = {'checkpoint_limit': 'block.block_no > 4500196', 'max_rows': 'null'}
+    for name in ('bridge_inputs_subquery', 'reserve_inputs_subquery'):
+        block = re.search(r'let ' + name + r' = match tx_in_configuration \{([\s\S]*?)\n\t\};', body).group(1)
+        substitutions[name] = re.search(r'TxInConfiguration::' + configuration + r' => \{\s*"([\s\S]*?)"', block).group(1)
+    for name in ('bridge_outputs_subquery', 'reserve_outputs_subquery'):
+        substitutions[name] = re.search(r'let ' + name + r' = "([\s\S]*?)";', body).group(1)
+    query = re.search(r'let mut query_builder = QueryBuilder::new\(&format!\(\s*"([\s\S]*?)"\s*\)\);', body).group(1)
+    for name, value in substitutions.items():
+        query = query.replace('{' + name + '}', value)
+    if '{' in query or '}' in query or placeholders(query) != 6:
+        raise ValueError('incomplete bridge builder reconstruction')
+    return query
+
+
+def bridge_values(profile, target):
+    """Public packaged ICS/reserve/native-token values in the released bind order."""
+    ics, reserve = profile.configs['ics-config'], profile.configs['reserve-config']
+    if ics['asset'] != reserve['asset']:
+        raise ValueError('bridge native-token configuration mismatch')
+    asset = ics['asset']
+    return [ics['illiquid_circulation_supply_validator_address'], reserve['reserve_validator_address'],
+            bytes.fromhex(asset['policy_id'].removeprefix('0x')), asset['asset_name'].encode(),
+            TOKEN_TRANSFER_METADATUM_KEY, target]
 
 
 class Case:
@@ -90,7 +108,6 @@ def cases(profile, header, corpus_cases):
     target = header['target']
     epoch = min(c['case']['args'][1] for c in corpus_cases if c['case']['name'] == 'get_token_utxo_for_epoch')
     node_variant = next(c for c in corpus_cases if c['case']['name'] == 'get_token_utxo_for_epoch' and c['case']['args'][1] == epoch)
-    stake_epoch = min(c['case']['args'][0] for c in corpus_cases if c['case']['name'] == 'get_stake_distribution')
     permissioned = bytes.fromhex(profile.permissioned)
     driver = lambda sql: by_text(sql)
     out = [
@@ -120,17 +137,20 @@ def cases(profile, header, corpus_cases):
             out.append(Case(group + ':' + index, entry, 'error_or_complete', guard=['index_exists:' + index], post=index))
     out.append(Case('get_utxos_for_address_tx_in_consumed', by_name('get_utxos_for_address_tx_in_consumed'), 'observed',
                     values=[profile.candidate, target], guard=['from_connection:tx_in-relation', 'from_connection:tx_in-populated']))
-    out.append(Case('get_bridge_txs:formatted-query', None, 'error', sql=bridge_query(),
-                    types=['text', 'bytea', 'bytea', 'int4', 'int8'],
-                    values=[profile.mapping, permissioned, b'', target, TOKEN_TRANSFER_METADATUM_KEY]))
-    for entry in sorted(_all('get_bridge_txs'), key=lambda e: e['sql']):
-        out.append(Case('get_bridge_txs:fragment-' + ('consumed' if 'consumed_by_tx_id' in entry['sql'] else 'enabled'), entry, 'observed',
-                        values=[profile.mapping], guard=['get_bridge_txs:formatted-query']))
+    queries = {mode: bridge_query(mode) for mode in ('Enabled', 'Consumed')}
+    for mode, query in queries.items():
+        out.append(Case('get_bridge_txs:formatted-' + mode, None, 'error', sql=query,
+                        types=['text', 'text', 'bytea', 'bytea', 'int8', 'int4'], values=bridge_values(profile, target)))
+    for entry in sorted(_all('get_bridge_txs'), key=lambda e: sha(e['sql'])):
+        if not bridge_fragment(entry):
+            raise ValueError('unclassified bridge component')
+        normalized = ' '.join(entry['sql'].split())
+        guards = ['get_bridge_txs:formatted-' + mode for mode, query in queries.items()
+                  if normalized in ' '.join(query.split())]
+        if not guards:
+            raise ValueError('bridge component absent from assembled queries')
+        out.append(Case('get_bridge_txs:component-' + sha(entry['sql'])[:12], entry, 'component', guard=guards))
     out.append(Case('get_block_info_for_tx_hash', by_name('get_block_info_for_tx_hash'), 'error_or_rows', expected='verified-asset-create'))
-    for name in ('get_datums_at_address_with_token_tx_in_enabled', 'get_datums_at_address_with_token_tx_in_consumed'):
-        out.append(Case(name, by_name(name), 'observed', values=[profile.candidate, target, permissioned, b'']))
-    out.append(Case('get_stake_pool_delegations_for_pools', by_name('get_stake_pool_delegations_for_pools'), 'observed',
-                    values=[stake_epoch, [bytes(28)]]))
     out.append(Case('get_token_utxo_for_epoch#partner-chains', by_name('get_token_utxo_for_epoch', parameters=3), 'error_or_digest',
                     values=[permissioned, b'', epoch], expected=node_variant['expected']))
     return out

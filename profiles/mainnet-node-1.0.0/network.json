@@ -37,8 +37,8 @@
     "openapi": "1d4d5d8bac8f0c641eea5c6f7b1f3fbbed8d1505"
   },
   "node_queries": {
-    "tag": "node-1.0.400",
-    "commit": "3acfd2edecdcd91373b6a506933f4c14ad3f0308"
+    "tag": "node-2.1.101",
+    "commit": "86774edf8cc76345a5c3a4221f3fe80c094b1c33"
   },
   "health": {
     "serving_lag_max_blocks": 9

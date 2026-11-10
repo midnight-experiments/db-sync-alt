@@ -27,7 +27,7 @@ from db_sync_alt.resources import profile_dir  # noqa: E402
 
 from conformance import corpus as corpus_file, harness, supplement  # noqa: E402
 from conformance.client import QueryError  # noqa: E402
-from conformance.statements import HELPERS, sha, statements  # noqa: E402
+from conformance.statements import HELPERS, bridge_fragment, sha, statements  # noqa: E402
 
 
 def conninfo(dsn):
@@ -51,6 +51,14 @@ def run_supplement(endpoint, profile, corpus, verified):
             expected = [{'block_number': row['block_number!: _'], 'tx_ix': row['tx_index_in_block: _']}]
         record = {'label': case.label, 'expect': case.expect if isinstance(case.expect, str) else case.expect[0],
                   'statement_sha256': sha(case.statement['sql']) if case.statement else None}
+        if case.expect == 'component':
+            if case.statement is None or not bridge_fragment(case.statement) or not case.guard:
+                raise Refusal('unbound_non_emitted_component')
+            record.update(outcome={'executed': False, 'kind': 'non_emitted_component'}, verdict='component',
+                          reach=supplement.reach(case), guard=list(case.guard))
+            results.append(record)
+            by_label[case.label] = record
+            continue
         try:
             if case.simple:
                 result = endpoint.simple(case.statement['sql'])
@@ -107,7 +115,11 @@ def judge(case, encoded, expected):
 
 
 def coverage(corpus, endpoint, supplementary):
-    """Each catalogue statement and how this run exercised it; all must be exercised."""
+    """Every catalogue literal: executed statements or source-bound dynamic components.
+
+    Component inventory is explicitly distinguished from SQL execution; its final
+    query guards are judged separately and cannot be replaced by inventory alone.
+    """
     used = collections.Counter(item['case']['query_sha256'] for item in corpus.cases)
     labels = collections.defaultdict(list)
     for record in supplementary:
@@ -122,8 +134,10 @@ def coverage(corpus, endpoint, supplementary):
             row['helper_calls'] = endpoint.calls[entry['name']]
         if labels[fingerprint]:
             row['supplement'] = labels[fingerprint]
+        if bridge_fragment(entry):
+            row['kind'] = 'non_emitted_component'
         table[fingerprint] = row
-    missing = [fp for fp, row in table.items() if set(row) == {'name'}]
+    missing = [fp for fp, row in table.items() if not any(k in row for k in ('corpus_cases', 'helper_calls', 'supplement'))]
     return table, missing
 
 

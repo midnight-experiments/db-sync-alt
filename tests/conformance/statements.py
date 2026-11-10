@@ -20,6 +20,7 @@ PARAMETERS = {
     'get_asset_creates': I8 + I4 * 6 + I8 * 6,
     'get_asset_spends': I8 + I4 * 6 + I8 * 4,
     'get_low_bounds': I4,
+    'get_max_tx_size': I4,
     'get_high_bounds': I4,
     'resolve_ident': ['bytea', 'bytea'],
     'get_block_by_hash': ['bytea'],
@@ -36,7 +37,6 @@ PARAMETERS = {
     'get_highest_block': ['int4', 'int8', 'int8', 'timestamp', 'timestamp'],
     'get_latest_block_info': [],
     'get_block_info_for_tx_hash': ['bytea'],
-    'get_bridge_txs': ['text'],
     'get_datums_at_address_with_token_tx_in_enabled': ['text', 'int4', 'bytea', 'bytea'],
     'get_datums_at_address_with_token_tx_in_consumed': ['text', 'int4', 'bytea', 'bytea'],
     'get_stake_pool_delegations_for_pools': ['int4', 'bytea[]'],
@@ -57,6 +57,32 @@ DRIVER = {
 # SQLx sends these through the simple query protocol (connection setup and ping).
 SIMPLE = ("SET extra_float_digits = 3; SET application_name = 'sqlx'", 'SET extra_float_digits = 3', 'SELECT 1')
 
+# These exact pinned literals are QueryBuilder components, never standalone SQL.
+# Keep them in the production catalogue and conformance inventory. Only the
+# standalone serving-gate test excludes them; native bridge qualification is a
+# separate requirement while bridge_qualified remains False.
+BRIDGE_SOURCE = 'partner-chains/toolkit/data-sources/db-sync/src/db_model.rs'
+BRIDGE_FRAGMENT_SHA256 = frozenset({
+    '545e69ef0253e0fa7570cd435545114f79ad3f89d73d0e4af306c572c5de8a92',
+    '3fd9bc1a2c55850375c5837a12146121100f451d495d0f9aaa1681790084a3e9',
+    '7a27cccd61025e7ebf3c071be326ad5ba5f9c673b4e226454f0bea612c3a58ca',
+    '69ddde6a09704a1afb96cc13ff4aaa799f234d20270698a26cd07e9fa0b8d753',
+    '3b8f8846c4111c61085d7eccea02e5c79676509fabf61b33688451b1c49f7f4a',
+    '8a1f63b463e057479caea1f70218bac7c490b3342caf612e982f0272c9ab08f1',
+})
+# The final released builder binds these native expressions in this exact order.
+# This is not a parameter map for any individual component or proof that the
+# dynamic bridge query is supported by the compact dataset.
+BRIDGE_DYNAMIC_BINDINGS = (
+    ('&ics_address.0', 'text'),
+    ('&reserve_address.0', 'text'),
+    ('&native_token.policy_id.0', 'bytea'),
+    ('&native_token.asset_name.0', 'bytea'),
+    ('i64::try_from(TOKEN_TRANSFER_METADATUM_KEY).expect("Constant is valid i64")', 'int8'),
+    ('to_block', 'int4'),
+)
+
+
 
 def sha(sql):
     return hashlib.sha256(sql.encode()).hexdigest()
@@ -66,7 +92,22 @@ def placeholders(sql):
     return max((int(n) for n in re.findall(r'\$(\d+)', sql)), default=0)
 
 
+def bridge_fragment(entry):
+    """Classify only the exact released bridge components, refusing drift."""
+    fingerprint = sha(entry['sql'])
+    if entry['name'] != 'get_bridge_txs' and fingerprint not in BRIDGE_FRAGMENT_SHA256:
+        return False
+    sources = entry.get('sources', [entry])
+    if (fingerprint not in BRIDGE_FRAGMENT_SHA256 or entry['name'] != 'get_bridge_txs'
+            or entry['file'] != BRIDGE_SOURCE
+            or sources != [{'name': 'get_bridge_txs', 'file': BRIDGE_SOURCE}]):
+        raise ValueError('unclassified bridge SQL literal or provenance')
+    return True
+
+
 def parameter_types(entry):
+    if bridge_fragment(entry):
+        raise ValueError('non-emitted bridge query fragment has no standalone parameter types')
     name, sql = entry['name'], entry['sql']
     if name == 'driver':
         types = DRIVER.get(sql, [])
@@ -82,6 +123,12 @@ def parameter_types(entry):
 def statements():
     """Every catalogue statement: fingerprint -> entry (name, sql, sources)."""
     return {sha(entry['sql']): entry for entry in CAT.values()}
+
+
+def emitted_statements():
+    """Standalone catalogue statements; dynamic components retain their inventory."""
+    return {fingerprint: entry for fingerprint, entry in statements().items()
+            if not bridge_fragment(entry)}
 
 
 def by_name(name, *, part=None, parameters=None):

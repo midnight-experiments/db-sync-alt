@@ -2,23 +2,27 @@
 import datetime
 import decimal
 import gzip
+import hashlib
+import re
 from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 from db_sync_alt.contract import Profile, Refusal, canonical
-from db_sync_alt.node_queries import CAT
+from db_sync_alt.node_queries import CAT, REFERENCE
 from db_sync_alt.resources import profile_dir
 
 from conformance import corpus as corpus_file, harness, supplement
-from conformance.client import encode
-from conformance.run import coverage, judge
-from conformance.statements import HELPERS, by_name, parameter_types, placeholders, sha, statements
+from conformance.client import QueryError, encode
+from conformance.run import coverage, judge, run_supplement
+from conformance.statements import (BRIDGE_DYNAMIC_BINDINGS, BRIDGE_FRAGMENT_SHA256, BRIDGE_SOURCE, HELPERS,
+                                    bridge_fragment, by_name, emitted_statements, parameter_types, placeholders, sha, statements)
 
 CORPUS_FAMILIES = ('get_asset_creates', 'get_asset_spends', 'get_block_by_hash', 'get_blocks_by_numbers', 'get_deregistrations',
                    'get_epoch_for_block_hash', 'get_epoch_nonce', 'get_governance_body_utxo', 'get_highest_block',
-                   'get_latest_block_for_epoch', 'get_latest_block_info', 'get_latest_stable_epoch', 'get_registrations',
+                   'get_latest_block_for_epoch', 'get_latest_block_info', 'get_latest_stable_epoch', 'get_max_tx_size', 'get_registrations',
                    'get_stake_distribution', 'get_token_utxo_for_epoch', 'get_utxos_for_address_tx_in_enabled')
 
 
@@ -31,6 +35,8 @@ def synthetic_corpus(directory, profile, *, cases=None, header_changes=None):
             case = {'name': entry['name'], 'query_sha256': sha(entry['sql']), 'args': [277] if entry['name'] in ('get_token_utxo_for_epoch', 'get_stake_distribution', 'get_epoch_nonce') else []}
             if entry['name'] == 'get_token_utxo_for_epoch':
                 case['args'] = [{'asset': profile.permissioned}, 277]
+            elif entry['name'] == 'get_max_tx_size':
+                case['args'] = [4500300]
             items.append({'case': case, 'expected': harness.digest([]), 'id': i})
     families = {}
     for item in items:
@@ -44,11 +50,43 @@ def synthetic_corpus(directory, profile, *, cases=None, header_changes=None):
 
 
 class StatementTests(unittest.TestCase):
-    def test_every_catalogue_statement_has_sqlx_parameter_types(self):
-        self.assertEqual(len(CAT), 51)
-        for entry in CAT.values():
+    def test_every_emitted_catalogue_statement_has_sqlx_parameter_types(self):
+        self.assertEqual(len(CAT), 53)
+        emitted = emitted_statements()
+        self.assertEqual(len(emitted), 47)
+        fragments = {sha(entry['sql']) for entry in CAT.values() if bridge_fragment(entry)}
+        self.assertEqual(fragments, BRIDGE_FRAGMENT_SHA256)
+        self.assertEqual(set(statements()), set(emitted) | fragments)
+        for entry in emitted.values():
             with self.subTest(statement=entry['name'], sha=sha(entry['sql'])[:12]):
                 self.assertEqual(len(parameter_types(entry)), placeholders(entry['sql']))
+        for fingerprint in fragments:
+            with self.subTest(fragment=fingerprint), self.assertRaisesRegex(ValueError, 'non-emitted bridge'):
+                parameter_types(statements()[fingerprint])
+
+    def test_bridge_classification_refuses_changed_sql_and_provenance(self):
+        original = statements()[min(BRIDGE_FRAGMENT_SHA256)]
+        for changed in (
+            {**original, 'sql': original['sql'] + ' AND true'},
+            {**original, 'name': 'get_asset_creates'},
+            {**original, 'file': 'unknown.rs'},
+            {**original, 'sources': [{'name': 'get_bridge_txs', 'file': 'unknown.rs'}]},
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'unclassified bridge'):
+                bridge_fragment(changed)
+
+    def test_bridge_final_bind_order_matches_exact_released_builder(self):
+        source = (REFERENCE / BRIDGE_SOURCE).read_bytes()
+        self.assertEqual(hashlib.sha256(source).hexdigest(),
+                         'a016a1a87356905083c5f817fd8d4ac1b79e639ddd315b792689c51b223a813d')
+        body = source.decode().split('pub(crate) async fn get_bridge_txs(', 1)[1]
+        binds = body.split('let query = query_builder', 1)[1].split('Ok(query.fetch_all', 1)[0]
+        # One bind per line; the metadata-key bind itself contains nested calls.
+        expressions = re.findall(r'^\s*\.bind\((.*)\)[;]?$', binds, re.MULTILINE)
+        self.assertEqual(expressions, [expression for expression, _ in BRIDGE_DYNAMIC_BINDINGS])
+        self.assertEqual([kind for _, kind in BRIDGE_DYNAMIC_BINDINGS],
+                         ['text', 'text', 'bytea', 'bytea', 'int8', 'int4'])
+        self.assertEqual(sorted({int(n) for n in re.findall(r'\$(\d+)', body)}), [1, 2, 3, 4, 5, 6])
 
     def test_event_and_bound_statements_bind_the_node_types(self):
         self.assertEqual(parameter_types(by_name('get_asset_creates')), ['int8'] + ['int4'] * 6 + ['int8'] * 6)
@@ -110,7 +148,8 @@ class CorpusTests(unittest.TestCase):
     def test_valid_corpus_loads_with_its_own_inventory(self):
         path = synthetic_corpus(self.directory.name, self.profile)
         corpus = corpus_file.load(path, profile=self.profile)
-        self.assertEqual(len(corpus.cases), 18)
+        self.assertEqual(len(corpus.cases), 19)
+        self.assertEqual(corpus.families['get_max_tx_size'], 1)
         self.assertEqual(sum(corpus.families.values()), corpus.header['cases'])
         self.assertEqual(corpus_file.load(path, expect_sha256=corpus.sha256).sha256, corpus.sha256)
 
@@ -153,16 +192,58 @@ class SupplementTests(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case.label):
                 self.assertTrue(supplement.reach(case))
-                if case.statement is not None and not case.simple:
+                if case.expect == 'component':
+                    self.assertTrue(bridge_fragment(case.statement))
+                    self.assertTrue(case.guard)
+                    self.assertTrue(all(g.startswith('get_bridge_txs:formatted-') for g in case.guard))
+                elif case.statement is not None and not case.simple:
                     self.assertEqual(len(supplement.statement_types(case)), placeholders(case.sql or case.statement['sql']))
 
     def test_bridge_query_is_formatted_from_the_reference_source(self):
-        query = supplement.bridge_query()
-        self.assertNotIn('{', query)
-        self.assertEqual(placeholders(query), 5)
-        self.assertIn('LEFT JOIN           tx_metadata', query)
-        self.assertIn('LEFT JOIN tx_in     ON tx_in.tx_out_id = tx_out.tx_id', query)
-        self.assertIn('LIMIT null', query)
+        for mode in ('Enabled', 'Consumed'):
+            with self.subTest(mode=mode):
+                query = supplement.bridge_query(mode)
+                self.assertNotIn('{', query)
+                self.assertEqual(placeholders(query), 6)
+                self.assertIn('LEFT JOIN tx_metadata ON tx_metadata.tx_id = tx.id AND tx_metadata.key = $5', query)
+                self.assertIn('WHERE block.block_no <= $6', query)
+                self.assertIn('LIMIT null', query)
+                if mode == 'Enabled':
+                    self.assertIn('ON tx_out.tx_id = tx_in.tx_out_id AND tx_out.index = tx_in.tx_out_index', query)
+                else:
+                    self.assertIn('tx_out.consumed_by_tx_id IS NOT NULL', query)
+        with self.assertRaisesRegex(ValueError, 'unknown bridge'):
+            supplement.bridge_query('unknown')
+
+    def test_bridge_values_follow_public_ICS_reserve_and_native_token_configuration(self):
+        profile = Profile(profile_dir('preprod'))
+        values = supplement.bridge_values(profile, 4500300)
+        ics, reserve = profile.configs['ics-config'], profile.configs['reserve-config']
+        self.assertEqual(values, [ics['illiquid_circulation_supply_validator_address'], reserve['reserve_validator_address'],
+                                 bytes.fromhex(ics['asset']['policy_id'].removeprefix('0x')), ics['asset']['asset_name'].encode(),
+                                 supplement.TOKEN_TRANSFER_METADATUM_KEY, 4500300])
+        self.assertNotEqual(values[0], profile.mapping)
+
+    def test_components_are_not_executed_and_need_final_query_refusal(self):
+        entry = statements()[min(BRIDGE_FRAGMENT_SHA256)]
+        component = supplement.Case('get_bridge_txs:component-test', entry, 'component',
+                                    guard=['get_bridge_txs:formatted-Enabled'])
+        final = supplement.Case('get_bridge_txs:formatted-Enabled', None, 'error', sql=supplement.bridge_query(),
+                                types=['text', 'text', 'bytea', 'bytea', 'int8', 'int4'], values=['ics', 'reserve', b'p', b'n', 1, 2])
+        endpoint = mock.Mock()
+        endpoint.calls = {'formatted': 0}
+        endpoint.client.query.side_effect = QueryError('statement', '42501')
+        corpus = mock.Mock(header={}, cases=[])
+        with mock.patch.object(supplement, 'cases', return_value=[component, final]):
+            results = run_supplement(endpoint, None, corpus, {})
+        self.assertEqual(endpoint.client.query.call_count, 1)
+        self.assertEqual(results[0]['outcome'], {'executed': False, 'kind': 'non_emitted_component'})
+        self.assertEqual((results[0]['verdict'], results[0]['guard_verdict']), ('component', 'pass'))
+        endpoint.client.query.reset_mock()
+        with mock.patch.object(supplement, 'cases', return_value=[component]):
+            results = run_supplement(endpoint, None, corpus, {})
+        endpoint.client.query.assert_not_called()
+        self.assertEqual(results[0]['guard_verdict'], 'fail')
 
     def test_expectations_judge_refusals_and_answers(self):
         Case = supplement.Case
