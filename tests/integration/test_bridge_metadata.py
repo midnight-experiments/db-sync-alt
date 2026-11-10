@@ -9,7 +9,6 @@ refusals that keep coverage complete.
 """
 import contextlib
 import io
-import json
 import os
 from pathlib import Path
 import threading
@@ -23,11 +22,10 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
 from db_sync_alt.bridge import parse_checkpoint, recipient
-from db_sync_alt.contract import Refusal, digest
+from db_sync_alt.contract import Refusal
 from db_sync_alt.sources.blockfrost import adapter, metadata
 from db_sync_alt.sources.blockfrost.poller import HeadPoller, PollBudgetStore, owner_binding
 from db_sync_alt.sources.blockfrost.sync import SyncDriver
-from db_sync_alt.store.database import PgStore
 from db_sync_alt.store.reader import grant_reader
 from db_sync_alt.store.upgrade import upgrade_store
 from db_sync_alt.verify.store import verify_store
