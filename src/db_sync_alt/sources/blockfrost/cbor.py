@@ -80,6 +80,35 @@ class Decoder:
             return Tag(n,self.item(depth+1))
         if m==7 and n in (20,21,22):return {20:False,21:True,22:None}[n]
         raise Refusal('cbor_unsupported_simple')
+    def skip(self):
+        """Read past one item without building it; return its (start, end) byte span.
+
+        For data no fact depends on, such as transaction auxiliary data. Ledger
+        metadata may nest to any depth below the transaction size and repeat map
+        keys, so neither refuses here: an explicit stack replaces recursion, and
+        the input length and the shared item budget bound the work. Leaves go
+        through `item`, so malformed heads, truncation, string chunks, UTF-8 and
+        simple values refuse with the same reason codes as everywhere else.
+        """
+        start=self.pos;todo=[1]  # per open container: items left, or -1/-2 (array/map groups) until a break
+        while todo:
+            if todo[-1]<0:
+                if self.data[self.pos:self.pos+1]==b'\xff':self.pos+=1;todo.pop()
+                else:todo.append(-todo[-1])
+                continue
+            if todo[-1]==0:todo.pop();continue
+            todo[-1]-=1;at=self.pos;self.remaining-=1
+            if self.remaining<0:raise Refusal('cbor_item_limit')
+            m,n=self.head()
+            if m not in (4,5,6):self.pos=at;self.remaining+=1;self.item();continue
+            if m==6:
+                if n is None:raise Refusal('cbor_invalid_tag')
+                todo.append(1)
+            elif n is None:todo.append(-1 if m==4 else -2)
+            else:
+                if n*(2 if m==5 else 1)>self.remaining:raise Refusal('cbor_item_limit')
+                todo.append(n*(2 if m==5 else 1))
+        return start,self.pos
 
 def key_identity(v):
     if type(v) in (int,bytes,str):return (type(v).__name__,v)
@@ -142,6 +171,14 @@ def output_details(output):
     return {'address':address,'value':str(coin),'assets':tuple(sorted(assets)),'datum_hash':datum,'classification_safe':safe,'datum_known':datum_known}
 
 def decode_transaction(raw_hex,expected_hash):
+    """Discovery facts of one transaction whose original body bytes hash to `expected_hash`.
+
+    Auxiliary data is only skipped (`Decoder.skip`); `auxiliary_data_span` is
+    its byte span in the transaction. A reader of one metadata label decodes
+    just that value from those bytes with an explicit depth bound, and treats an
+    over-deep or undecodable value as absent, never as a refusal: anyone can put
+    such metadata on chain.
+    """
     if not isinstance(raw_hex,str) or len(raw_hex)>8*1024*1024 or len(raw_hex)%2 or re.fullmatch('[0-9a-f]+',raw_hex) is None:raise Refusal('cbor_invalid_hex')
     if not isinstance(expected_hash,str) or re.fullmatch('[0-9a-f]{64}',expected_hash) is None:raise Refusal('cbor_invalid_hash')
     raw=bytes.fromhex(raw_hex);d=Decoder(raw);m,n=d.head()
@@ -149,7 +186,7 @@ def decode_transaction(raw_hex,expected_hash):
     start=d.pos;body=d.item(1);end=d.pos
     actual=hashlib.blake2b(raw[start:end],digest_size=32).hexdigest()
     if actual!=expected_hash:raise Refusal('cbor_body_hash_mismatch')
-    witness=d.item(1);valid=d.item(1);d.item(1)  # auxiliary data: read past it, not used
+    witness=d.item(1);valid=d.item(1);auxiliary=d.skip()
     if n is None and d.take(1)!=b'\xff':raise Refusal('cbor_envelope_arity')
     if d.pos!=len(raw):raise Refusal('cbor_trailing_bytes')
     if not isinstance(body,dict) or not {0,1,2}.issubset(body) or any(type(k) is not int or k not in set(range(23))-{10,12} for k in body):raise Refusal('cbor_unsupported_body')
@@ -169,7 +206,8 @@ def decode_transaction(raw_hex,expected_hash):
     supported_return=isinstance(returned,list) and len(returned) in (2,3) or isinstance(returned,dict) and {0,1}.issubset(returned) and set(returned)<={0,1,2,3}
     return {'hash':bytes.fromhex(actual),'valid':valid,'ordinary':inputs(body[0]),'collateral':inputs(body.get(13,[])),
             'reference':inputs(body.get(18,[])),'mints':tuple(sorted(facts)),'output_count':len(body[1]),'collateral_return':16 in body,'body_bytes':end-start,
-            'outputs':tuple(output_details(o) for o in body[1]),'collateral_output':output_details(returned) if supported_return else None}
+            'outputs':tuple(output_details(o) for o in body[1]),'collateral_output':output_details(returned) if supported_return else None,
+            'auxiliary_data_span':auxiliary}
 
 
 def decode_datum(raw):

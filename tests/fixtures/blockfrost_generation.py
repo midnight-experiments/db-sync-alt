@@ -5,6 +5,7 @@ Generation 0 also holds a spend before the start cursor (block h=10, transaction
 served `tx_in` is never empty.
 """
 import contextlib
+import hashlib
 import io
 from db_sync_alt.resources import profile_dir
 from db_sync_alt.sources.blockfrost.adapter import block_row, update
@@ -18,28 +19,44 @@ OFFSET=4500187
 PROFILE=Profile(profile_dir('preprod'))
 POLICY=bytes.fromhex(PROFILE.night[:56]);NAME=bytes.fromhex(PROFILE.night[56:])
 
-def block(h,fork=0,transition=False):
+def block(h,fork=0,transition=False,unrelated=0):
     # Fork is confined above committed height 10; old ready witness is immutable.
     bh=lambda n:(n+fork*10000 if n>10 else n).to_bytes(32,'big').hex()
-    return {'hash':bh(h),'height':OFFSET+h,'previous_block':bh(h-1),'epoch':(0 if h==8 else 1 if h==9 else 3 if transition and h>=12 else 2),'slot':h*20,'time':1700000000+h,'tx_count':5 if h==10 else 1 if h in (11,12) else 0}
+    return {'hash':bh(h),'height':OFFSET+h,'previous_block':bh(h-1),'epoch':(0 if h==8 else 1 if h==9 else 3 if transition and h>=12 else 2),'slot':h*20,'time':1700000000+h,'tx_count':5 if h==10 else 1+unrelated if h==12 else 1 if h==11 else 0}
 
 def out(index=0):return {'output_index':index,'address':'relevant','amount':[{'unit':'lovelace','quantity':'100'},{'unit':PROFILE.night,'quantity':'3'}],'data_hash':None}
 # Prerequisite spend before the start cursor (block h=10, indexes 0 and 1; the cursor is index 4).
 PRE_ORIGIN=tx({0:[],1:[[b'p',100]],2:3});PRE_SPEND=tx({0:[[bytes.fromhex(PRE_ORIGIN[1]),0]],1:[],2:3})
+# Auxiliary data that anyone can put on chain: a metadatum nested 1000 levels deep (label 674), and a
+# tagged auxiliary-data map whose label-674 metadatum is an indefinite-length map with a repeated key.
+HOSTILE_AUXILIARY=(b'\xa1\x19\x02\xa2'+b'\x81'*1000+b'\x00',b'\xd9\x01\x03\xa1\x00\xa1\x19\x02\xa2\xbf\x61k\x01\x61k\x02\xff')
+CLEAN_AUXILIARY=(b'\xf6',b'\xf6')
 
-def fixtures(fork=0,transition=False):
+def unrelated_tx(index,auxiliary):
+    """An unrelated transaction (no inputs or outputs) carrying `auxiliary`, hash-bound by body key 7 when present."""
+    body={0:[],1:[],2:100+index}
+    if auxiliary!=b'\xf6':body[7]=hashlib.blake2b(auxiliary,digest_size=32).digest()
+    return tx(body,auxiliary=auxiliary)
+
+def fixtures(fork=0,transition=False,auxiliary=()):
+    """Provider routes; each `auxiliary` entry adds one unrelated transaction after the relevant one in block h=12."""
+    at=lambda h:block(h,fork,transition,len(auxiliary))
     original=tx({0:[],1:[[b'a',100]],2:3});spend=tx({0:[[bytes.fromhex(original[1]),0]],1:[],2:3});mint=tx({0:[],1:[],2:3,9:{b'q'*28:{b'other':22},POLICY:{NAME:9,b'incidental':33}}})
-    route={'/metrics':[],'/genesis':{'network_magic':1},'/blocks/latest':block(2172,fork,transition)}
+    route={'/metrics':[],'/genesis':{'network_magic':1},'/blocks/latest':at(2172)}
     for h in range(8,2173):
-        b=block(h,fork,transition);route['/blocks/'+str(OFFSET+h)]=b;route['/blocks/'+b['hash']]=b
-        route['/blocks/'+b['hash']+'/next?count=100&page=1']=[block(n,fork,transition) for n in range(h+1,min(h+101,2173))]
+        b=at(h);route['/blocks/'+str(OFFSET+h)]=b;route['/blocks/'+b['hash']]=b
+        route['/blocks/'+b['hash']+'/next?count=100&page=1']=[at(n) for n in range(h+1,min(h+101,2173))]
     for h,(raw,th) in zip((10,11,12),(original,spend,mint)):
-        b=block(h,fork,transition);route['/blocks/'+b['hash']+'/txs/cbor?count=100&page=1&order=asc']=[{'tx_hash':th,'cbor':raw}]
+        b=at(h);route['/blocks/'+b['hash']+'/txs/cbor?count=100&page=1&order=asc']=[{'tx_hash':th,'cbor':raw}]
         route['/txs/'+th+'/cbor']={'cbor':raw}
         route['/txs/'+th]={'hash':th,'block':b['hash'],'block_height':OFFSET+h,'index':4 if h==10 else 0,'valid_contract':True}
         inp=[dict(out(),tx_hash=original[1],reference=False,collateral=False)] if h==11 else []
         route['/txs/'+th+'/utxos']={'hash':th,'inputs':inp,'outputs':[out()] if h==10 else []}
-    b=block(10,fork,transition)
+    for index,data in enumerate(auxiliary,1):
+        raw,th=unrelated_tx(index,data)
+        route['/blocks/'+at(12)['hash']+'/txs/cbor?count=100&page=1&order=asc'].append({'tx_hash':th,'cbor':raw})
+        route['/txs/'+th+'/utxos']={'hash':th,'inputs':[],'outputs':[]}
+    b=at(10)
     for index,((raw,th),inputs,outputs) in enumerate([(PRE_ORIGIN,[],[out()]),(PRE_SPEND,[dict(out(),tx_hash=PRE_ORIGIN[1],reference=False,collateral=False)],[])]):
         route['/txs/'+th+'/cbor']={'cbor':raw};route['/txs/'+th+'/utxos']={'hash':th,'inputs':inputs,'outputs':outputs}
         route['/txs/'+th]={'hash':th,'block':b['hash'],'block_height':OFFSET+10,'index':index,'valid_contract':True}

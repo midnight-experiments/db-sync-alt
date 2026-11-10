@@ -2,7 +2,7 @@
 import unittest
 from db_sync_alt.contract import Refusal
 from fixtures.blockfrost import FixtureHooks
-from fixtures.blockfrost_generation import OFFSET, advance, baseline, block, fixtures
+from fixtures.blockfrost_generation import CLEAN_AUXILIARY, HOSTILE_AUXILIARY, OFFSET, advance, baseline, block, fixtures
 from fixtures.database import SyncFixture
 
 
@@ -56,6 +56,13 @@ class GenerationTests(SyncFixture):
         completed=receipt(1,'2');self.assertEqual(completed['epoch_end']['height'],OFFSET+11);self.assertEqual(completed['stake_inherited_from'],0)
         new=receipt(1,'3');self.assertIsNone(new['epoch_end']);self.assertEqual(new['epoch_anchor']['height'],OFFSET+12)
         self.assertEqual(s.digests(0),before);self.assertEqual(s.db.execute('SELECT first_generation FROM chain.epoch_stakes WHERE epoch=2').fetchone()[0],0)
+    def test_hostile_auxiliary_data_beside_a_relevant_transaction_stores_the_clean_facts(self):
+        # Block h=12 gains two unrelated transactions, so it is not generation 0's provisional block (fork=1).
+        digests=lambda auxiliary:self.advance(self.store(),fixtures(fork=1,auxiliary=auxiliary)[0])['digests']
+        hostile,clean,plain=digests(HOSTILE_AUXILIARY),digests(CLEAN_AUXILIARY),digests(())
+        self.assertEqual(hostile,clean)
+        self.assertEqual({k:v for k,v in hostile.items() if k!='blocks'},{k:v for k,v in plain.items() if k!='blocks'})
+        self.assertEqual(hostile['mints']['count'],1)
     def test_wrong_network_no_pending(self):
         s=self.store()
         routes,_=fixtures();routes['/genesis']['network_magic']=2
