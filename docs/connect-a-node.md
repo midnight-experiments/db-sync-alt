@@ -95,8 +95,12 @@ db-sync-alt serves that data forward only, from its **coverage start**:
 - An update from cardano-db-sync (`acquire --source dbsync`, for example to
   catch up after a provider outage) holds no metadata either: coverage then
   starts again with the next update from Blockfrost, and `coverage_start` moves
-  past it. Once the bridge is active, keep following from Blockfrost and state
-  the checkpoint (below), so that such a gap shows as an unsupported checkpoint.
+  past it. `acquire` says so when it publishes such an update after covered
+  blocks: its result carries `bridge_coverage_ended` (the previous and the new
+  coverage start) and the warning `bridge_metadata_coverage_restarted`, also
+  printed on stderr. Once the bridge is active, keep following from Blockfrost
+  and state the checkpoint (below), so that such a gap shows as an unsupported
+  checkpoint.
 
 `db-sync-alt status` and the service's `/status` report it under `bridge`:
 
@@ -140,10 +144,12 @@ Check the checkpoint before the governance call takes effect, and again after:
 
 ## Connections
 
-midnight-node's cardano-db-sync pool opens up to 35 connections; db-sync-alt's
-own serving check opens one more as the reader from time to time. Give the
-reader a connection limit of at least 36 plus your headroom (40 in the
-examples), and the server enough `max_connections` for every database on it.
+midnight-node 2.1.101 opens up to 32 connections to its cardano-db-sync database
+(six pools: candidates 5, sidechain 5, main chain hash 5, cNIGHT observation 10,
+federated authority 5, bridge 2); db-sync-alt's own serving check opens one more
+as the reader from time to time. db-sync-alt requires a reader connection limit
+of at least 36, which leaves 3 spare, plus your headroom (40 in the examples),
+and the server enough `max_connections` for every database on it.
 
 ## Checking the connection
 

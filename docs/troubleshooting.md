@@ -49,10 +49,12 @@ warning never makes `/health` fail.
 | --- | --- |
 | `reader_statement_timeout_unset`, `reader_idle_in_transaction_timeout_unset` | The reader login has no `statement_timeout` or `idle_in_transaction_session_timeout` default |
 | `reader_search_path_not_public` | The reader login's `search_path` default is not `public` |
-| `reader_connection_limit_unset`, `reader_connection_limit_below_node_pool` | The reader login has no connection limit, or one below 36 (the node's pool of 35 and the service's check) |
+| `reader_connection_limit_unset`, `reader_connection_limit_below_node_pool` | The reader login has no connection limit, or one below 36 (node 2.1.101's pools of up to 32 connections, the service's check and 3 spare) |
 | `node_requirements_unchecked` | The service configuration has no `node` section, so the node's k and configuration were not compared with the profile |
 | `node_security_parameter_mismatch` | The node's configured k differs from the profile's ([node requirements](connect-a-node.md#node-requirements)) |
 | `node_configuration_mismatch` | A Cardano address or policy file of the node's network configuration differs from the profile's, or is missing |
+
+| `bridge_metadata_coverage_restarted` (`acquire --source dbsync`) | The published update from cardano-db-sync follows blocks that held bridge metadata; it holds none, so the bridge metadata coverage now starts after it (`bridge_coverage_ended` gives the previous and the new start). Before bridge activation this needs nothing; after it, the node can stop at a transfer inside the update: follow from Blockfrost instead ([bridge readiness](connect-a-node.md#bridge-readiness)) |
 
 ## Service error codes
 

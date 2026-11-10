@@ -28,7 +28,8 @@
   `node.bridge_checkpoint`) to have it checked: an unsupported checkpoint is
   reported, and `/health` answers 503 `bridge_checkpoint_unsupported`. An
   update from cardano-db-sync holds no metadata: coverage starts again after
-  it. Blockfrost's integers beyond 2^53 are stored as Blockfrost rounds them;
+  it, and `acquire` reports the coverage it ended and warns
+  (`bridge_metadata_coverage_restarted`). Blockfrost's integers beyond 2^53 are stored as Blockfrost rounds them;
   the node reads the same recipient. Answers nested deeper than 4,000 levels
   are cut instead of failing the request, by db-sync-alt's Blockfrost client
   and by the external accounting client of `DBSYNC_PROVIDER_ADAPTER=shared`

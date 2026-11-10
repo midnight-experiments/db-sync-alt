@@ -23,8 +23,9 @@ administrator,
   `pg_control_system()` (allowed to everyone by default);
 - a **reader login** for the Midnight node, with its own defaults: a statement
   timeout, an idle-in-transaction timeout, `search_path` `public` and a
-  connection limit of at least 36 (the node's pool of 35 and one connection for
-  db-sync-alt's serving check) plus headroom. Give it nothing else.
+  connection limit of at least 36 (node 2.1.101's pools of up to 32
+  connections, one for db-sync-alt's serving check and 3 spare) plus headroom.
+  Give it nothing else.
 
 ```sql
 CREATE ROLE db_sync_alt_owner LOGIN PASSWORD '<owner password>';

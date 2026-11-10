@@ -16,7 +16,9 @@ NODE_RELATIONS = ('block', 'tx', 'tx_out', 'tx_in', 'ma_tx_out', 'multi_asset', 
 GATE = 'chain.gate()'
 # Role defaults the reader should carry (ALTER ROLE ... SET, by the operator).
 SETTINGS = ('statement_timeout', 'idle_in_transaction_session_timeout', 'search_path', 'default_transaction_read_only')
-# midnight-node's cardano-db-sync connection pool, plus one connection for the service's own serving check.
+# Connections midnight-node opens to cardano-db-sync, with margin: node 2.1.101 runs six pools of at most
+# 32 connections (candidates 5, sidechain 5, main chain hash 5, cNIGHT observation 10, federated authority
+# 5, bridge 2), so 35 leaves 3 spare. The reader also needs one connection for the service's serving check.
 NODE_CONNECTIONS = 35
 READER_CONNECTIONS = NODE_CONNECTIONS + 1
 SYSTEM_SCHEMAS = "n.nspname NOT LIKE 'pg\\_%%' AND n.nspname<>'information_schema'"

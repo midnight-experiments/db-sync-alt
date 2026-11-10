@@ -120,6 +120,22 @@ def coverage_start(store):
     return store.db.execute('SELECT target_height FROM chain.generations WHERE id=%s', (newest,)).fetchone()[0] + 1
 
 
+def coverage(store):
+    """`report(store)` of a serving store that holds bridge metadata; None for any other store."""
+    state = store.state()
+    if not stored(store) or state['schema_version'] < 5 or state['canonical_ready'] is None or state['revoked']:
+        return None
+    return report(store)
+
+
+def ended(before, ready, after):
+    """How an update without bridge metadata ended coverage: None unless the ready lineage held covered
+    blocks (`before`, the report while `ready` was the ready generation) and the start moved (`after`)."""
+    if before is None or after is None or before['coverage_start'] > ready['target_height'] or after['coverage_start'] == before['coverage_start']:
+        return None
+    return {'previous_coverage_start': before['coverage_start'], 'coverage_start': after['coverage_start']}
+
+
 def parse_checkpoint(text):
     """The node's bridge data checkpoint as the operator states it: `block:<n>` or `tx:<hash>`
     (Tx and TxReserveTransfer checkpoints both name a transaction)."""
