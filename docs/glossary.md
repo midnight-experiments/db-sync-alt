@@ -56,6 +56,15 @@ database cannot see a query's parameters, so a node whose k or addresses differ
 from the profile gets empty answers outside it
 ([node requirements](connect-a-node.md#node-requirements)).
 
+## Bridge metadata coverage
+
+The Cardano blocks from which the database holds everything midnight-node's
+token bridge query reads: the `tx_metadata` (key 6500973) of every transaction
+with an output at the ICS address, and every asset of the ICS and reserve
+outputs. It starts with the first update acquired from Blockfrost and never ends;
+`status` reports its first block as `bridge.coverage_start`
+([bridge readiness](connect-a-node.md#bridge-readiness)).
+
 ## Schemas 1 to 5
 
 The layouts of a db-sync-alt database. A new database is created as schema 1;
@@ -67,9 +76,10 @@ Schema 3 serves the node directly: every node-facing relation calls the
 relations only (the service, `restore --reader-role`, `db-sync-alt grant-reader`).
 Schema 4 adds [integrity checkpoints](#integrity-checkpoint), so verification
 starts at the last one instead of the first generation. Schema 5 serves each
-epoch's `max_tx_size` in `epoch_param`; a database written before it (fact
-format `midnight-compact-cardano-v1`, nonces only) gets every stored epoch's
-size from an authoritative source when it is upgraded. Backups record their schema.
+epoch's `max_tx_size` in `epoch_param` and the [bridge metadata](#bridge-metadata-coverage)
+in `tx_metadata`; a database written before it (fact format
+`midnight-compact-cardano-v1`, nonces only, no bridge metadata) gets every stored
+epoch's size from an authoritative source when it is upgraded. Backups record their schema.
 
 ## Integrity checkpoint
 

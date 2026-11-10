@@ -86,15 +86,18 @@ generation, which the run checks first.
 
 `drills` runs node queries in states where the data must not be trusted or is
 not published: outside the covered epochs, below the coverage start, beyond the
-witness, for addresses and assets outside the profile, the bridge query, while
-the service restarts, while the updater is stopped, across a publication and
+witness, for addresses and assets outside the profile, while the service
+restarts, while the updater is stopped, across a publication and
 after revocation. A probe may fail (fail-closed) or return the published
 answer; any other answer, including empty rows, fails the drill. A query the
 node never sends (outside the covered epochs or blocks, or the profile) may also
 be answered, as `unreachable`, when the database covers the edges of the node's
-domain; while the updater is stopped every probe must keep answering. Drills that
-change the deployment ask an external controller through `--control-dir`
-(protocol in `tests/conformance/drills.py`).
+domain; while the updater is stopped every probe must keep answering. The
+`bridge` drill checks that the node's bridge query (tx_in mode) and `tx_metadata`
+answer through the reader; whether the node's bridge checkpoint lies in the
+metadata coverage is the operator's `status --bridge-checkpoint` report, which a
+reader cannot see. Drills that change the deployment ask an external controller
+through `--control-dir` (protocol in `tests/conformance/drills.py`).
 
 ## Memory
 

@@ -6,10 +6,30 @@
   carries the epoch's maximum transaction size, served as
   `epoch_param.max_tx_size`. midnight-node 2.1.101 reads
   `MAX(epoch_param.max_tx_size)` of the cursor block's epoch on its cost-based
-  cNIGHT observation path and stops cNIGHT observations without it. The
-  packaged node query sources and all network profiles now pin node 2.1.101
+  cNIGHT observation path and stops cNIGHT observations without it. The same
+  format holds the token bridge's metadata (below). The packaged node query
+  sources and all network profiles now pin node 2.1.101
   (`86774edf8cc76345a5c3a4221f3fe80c094b1c33`); profile configurations and
   genesis are unchanged.
+- Serve the token bridge's data for midnight-node 2.1.101, forward only. Once
+  governance sets the bridge's checkpoint, the node runs its bridge query on
+  every block import and stops when the answer differs from the block author's;
+  before this version, the reader could not read `tx_metadata` at all. Every
+  update from Blockfrost now stores the `tx_metadata` of key 6500973 of each
+  transaction with an output at the ICS address (one request per such
+  transaction, checked against the transaction's own CBOR), keeps every asset
+  of the ICS and reserve outputs, and serves them as `tx_metadata` and
+  `ma_tx_out` to the reader. Coverage starts with the first update from
+  Blockfrost: after the upgraded update for a database of 0.3.x, after the
+  bootstrap for a database built from cardano-db-sync (which stores no
+  metadata). Nothing older is fetched. `db-sync-alt status`, `/status` and the
+  upgrade report `bridge.coverage_start`. State the bridge's on-chain checkpoint
+  (`status --bridge-checkpoint`, `run --node-bridge-checkpoint` or
+  `node.bridge_checkpoint`) to have it checked: an unsupported checkpoint is
+  reported, and `/health` answers 503 `bridge_checkpoint_unsupported`. Once
+  coverage has started, `acquire` from cardano-db-sync refuses
+  (`bridge_metadata_source_missing`). Blockfrost's integers beyond 2^53 are
+  stored as Blockfrost rounds them; the node reads the same recipient.
 - Upgrade an existing database in place, with the service stopped:
   `db-sync-alt upgrade --service <name>`. A database written by 0.3.x or
   earlier holds each epoch's nonce but not its size: the upgrade reads every

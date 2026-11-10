@@ -68,7 +68,8 @@ against its already verified parent, so it does not re-read all history.
 From schema 3 the node can read PostgreSQL directly. The schema `serve` holds the
 ready generation in cardano-db-sync's shape — `block`, `tx`, `tx_out`, `tx_in`,
 `ma_tx_out`, `multi_asset`, `datum`, `epoch_param`, `pool_hash`, `epoch_stake`
-with db-sync's column names, base types and the eleven index names the node
+and, from schema 5, `tx_metadata` (the bridge metadata of key 6500973, `id` and
+`tx_id` the transaction's positional ID) with db-sync's column names, base types and the eleven index names the node
 checks — and `public` holds one view per table that adds only the
 [serving gate](glossary.md#serving-gate). The rows are written in chain order
 when the upgrade builds them and grow by appends inside each publication
@@ -80,10 +81,14 @@ queries rely on without being able to check it: the witness is the target plus
 the network's k, headers are contiguous from the start cursor to the witness,
 events and prerequisites are complete, every required epoch has its nonce and
 `max_tx_size`, at least one stake row and (once completed) its end block, the registered-candidates
-address holds nothing, and at least one spend is served.
+address holds nothing, and at least one spend is served. A generation acquired
+from Blockfrost also holds the bridge metadata of every transaction with an
+output at the ICS address in its new blocks, and no other, and every asset of the
+ICS and reserve outputs it stores
+([bridge readiness](connect-a-node.md#bridge-readiness)).
 
 Only the owner and the roles db-sync-alt grants may connect to its database;
-the node's reader gets CONNECT, SELECT on the ten views and EXECUTE on the gate
+the node's reader gets CONNECT, SELECT on the eleven views and EXECUTE on the gate
 once the database serves (the service at start, `restore --reader-role`,
 `db-sync-alt grant-reader`), and the service refuses a reader that can do more.
 
@@ -94,7 +99,7 @@ and pools keep the stable IDs of the stored facts.
 
 ## Query boundary
 
-The node's SQL runs unchanged on the ten gated views; the SQL catalogue under
+The node's SQL runs unchanged on the eleven gated views; the SQL catalogue under
 `reference/` (the unchanged Midnight node sources) is what the conformance
 harness and the tests run. A view cannot see a statement's parameters, so the
 database does not refuse a query by its range: the publication invariants above

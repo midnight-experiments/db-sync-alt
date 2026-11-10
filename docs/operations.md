@@ -96,8 +96,14 @@ reports a mismatch in `warnings` (`node_security_parameter_mismatch`,
 `node_configuration_mismatch`); serving continues:
 
 ```json
-{"node": {"security_parameter": 2160, "configuration_dir": "/path/to/midnight-node/res/preprod"}}
+{"node": {"security_parameter": 2160, "configuration_dir": "/path/to/midnight-node/res/preprod", "bridge_checkpoint": "block:4612000"}}
 ```
+
+`bridge_checkpoint` is the token bridge's on-chain data checkpoint, `block:<n>`
+or `tx:<hash>` ([bridge readiness](connect-a-node.md#bridge-readiness)). Unlike
+the other values it can make `/health` fail: while the bridge metadata coverage
+does not support it, `/health` answers 503 with `bridge_checkpoint_unsupported`.
+Leave it out while the bridge is not active.
 
 `configuration_dir` is the node's network configuration directory (the
 `res/<network>` directory of the midnight-node sources or image); db-sync-alt
@@ -126,6 +132,7 @@ same command again resumes. Nothing restarts it automatically.
 | `--state-dir PATH` | `~/.local/share/db-sync-alt/native` | Private state; reuse it on every start |
 | `--http-port` | 18080 | Status port on loopback |
 | `--node-security-parameter K`, `--node-configuration-dir PATH` | | The Midnight node's k and network configuration directory, compared with the profile and reported in `warnings` ([node requirements](#node-requirements)) |
+| `--node-bridge-checkpoint block:N\|tx:HASH` | | The bridge's on-chain data checkpoint; `/health` fails while the bridge metadata coverage does not support it ([bridge readiness](connect-a-node.md#bridge-readiness)) |
 
 For each secret, a file or prompt option wins over the environment variable,
 which wins over a value in the URL. Prefer files or prompts: values given on the
@@ -233,6 +240,11 @@ when the lifecycle, PostgreSQL, the reader's serving check, the workers,
 freshness and lag are all within policy, otherwise 503 with reason codes
 ([troubleshooting](troubleshooting.md)). After a restart, freshness is unknown
 until the first poll. Health requests never call the provider.
+
+`db-sync-alt status --service <name>` prints the same database facts offline,
+including `bridge` (the bridge metadata coverage start); add
+`--bridge-checkpoint block:<n>` or `tx:<hash>` to check the bridge's on-chain
+checkpoint against it ([bridge readiness](connect-a-node.md#bridge-readiness)).
 
 Stop the service before backups, upgrades and other administrative commands;
 they take the same writer lock and refuse to run next to it. Stopping the

@@ -10,6 +10,10 @@ Measured at the Preprod chain tip:
 | Publishing new blocks, ≈ 9 requests per block | ≈ 24,700 |
 | **Total** | **≈ 33,400** |
 
+Bridge metadata adds one request per published transaction with an output at
+the ICS address (two with relevance filtering, which repeats every request for
+its independent pass). Such transactions are rare.
+
 Upgrading a database of 0.3.x or earlier to this version reads each stored
 epoch's parameters twice: 2 requests per stored epoch, once
 ([upgrade to schema 5](recovery.md#upgrade-to-schema-5)); `db-sync-alt status`

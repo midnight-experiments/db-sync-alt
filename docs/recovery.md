@@ -83,7 +83,10 @@ output reports the integrity base (`base_generation`) and the checkpoint written
 since the database's first generation, as a 0.1.x start does: on a large
 database it takes about as long as one such start. The service then starts from
 the last checkpoint. The step to schema 5 serves each epoch's `max_tx_size` in
-`epoch_param` and makes the serving gate require schema 5, in one transaction.
+`epoch_param`, serves `tx_metadata` (empty until the first update from Blockfrost:
+the [bridge metadata coverage](connect-a-node.md#bridge-readiness) starts after
+the upgraded update, and the output's `bridge.coverage_start` names that block)
+and makes the serving gate require schema 5, in one transaction.
 
 ### Epoch parameters of a database of 0.3.x or earlier
 

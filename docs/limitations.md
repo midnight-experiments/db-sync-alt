@@ -15,9 +15,17 @@
 - **Not a db-sync replacement.** db-sync-alt keeps only the Cardano data the
   profile selects in the relations the pinned Midnight queries read. Other
   assets or addresses and ranges outside the [coverage](glossary.md#coverage)
-  are not held; the reader login can read nothing else. Candidate registrations, invalid
-  transactions and bridge data are not covered; a database that would need them
-  is refused (`unsupported_capability`).
+  are not held; the reader login can read nothing else. Candidate registrations and invalid
+  transactions are not covered; a database that would need them is refused
+  (`unsupported_capability`).
+- **Bridge data from the coverage start only.** The token bridge's metadata is
+  stored forward only, from the first update acquired from Blockfrost after a
+  cardano-db-sync bootstrap or an upgrade from 0.3.x; nothing older is fetched.
+  A bridge checkpoint older than the coverage start, or a checkpoint transaction
+  outside the profile's addresses and assets, is reported as unsupported
+  ([bridge readiness](connect-a-node.md#bridge-readiness)). Large integers in
+  metadata are stored as Blockfrost returns them (rounded beyond 2^53), not as
+  cardano-db-sync stores them; the node's reading of a recipient is the same.
 - **PostgreSQL 17 only**, server and client tools.
 - **Initial data is required.** An empty database is filled from a snapshot or
   backup, or from your own db-sync; a Blockfrost key alone cannot fill it.

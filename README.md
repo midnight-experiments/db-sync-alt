@@ -212,7 +212,8 @@ publication waits for it and `sync` reads `checkpointing`.
 
 db-sync-alt **0.3.0** is experimental. It serves the SQL queries of **Midnight
 node 2.1.101**, including the epoch `max_tx_size` its cost-based cNIGHT
-observation reads.
+observation reads and, from its coverage start, the token bridge data its bridge
+query reads ([bridge readiness](docs/connect-a-node.md#bridge-readiness)).
 
 - **Networks** (`--network`): **Preprod** is supported and tested end to end.
   The **Mainnet** and **Preview** profiles are packaged but not tested on their
