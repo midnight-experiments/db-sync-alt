@@ -21,7 +21,7 @@ BEGIN
    IF TG_TABLE_NAME='checkpoints' THEN
     IF NEW.phase='relevance' AND NEW.unit='anchor' THEN
      IF TG_OP<>'INSERT' OR rowstatus IS DISTINCT FROM 'ready'
-        OR NOT EXISTS(SELECT 1 FROM chain.service_state WHERE id=1 AND schema_version=4 AND migration_state='ready' AND NOT revoked AND canonical_ready=g)
+        OR NOT EXISTS(SELECT 1 FROM chain.service_state WHERE id=1 AND schema_version=5 AND migration_state='ready' AND NOT revoked AND canonical_ready=g)
         OR EXISTS(SELECT 1 FROM chain.generations WHERE status='pending')
         OR current_setting('db_sync_alt.projection_write',true) IS DISTINCT FROM 'on'
         OR current_setting('db_sync_alt.relevance_anchor_write',true) IS NULL

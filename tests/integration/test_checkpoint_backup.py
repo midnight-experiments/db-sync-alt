@@ -43,7 +43,7 @@ class CheckpointBackupPGTests(CheckpointFixture):
             receipt = backup(archive, manifest, conninfo=dsn)
         self.assertEqual(calls, [(3,)])
         body = json.loads(manifest.read_text())
-        self.assertEqual((body['format'], body['schema_version'], body['canonical_ready']), ('db-sync-alt-postgresql-backup-v3', 4, 3))
+        self.assertEqual((body['format'], body['schema_version'], body['canonical_ready']), ('db-sync-alt-postgresql-backup-v4', 5, 3))
         self.assertEqual(list(body['generations']), ['3'])
         self.assertIn('integrity_checkpoints', body['physical_inventory'])
         self.assertEqual(body['physical_inventory']['integrity_checkpoints']['count'], 1)
@@ -76,19 +76,32 @@ class CheckpointBackupPGTests(CheckpointFixture):
         return self.node(dsn, role).execute(QUERY).fetchone()
 
     def test_schema3_backup_restores_upgraded_with_its_first_checkpoint(self):
-        dsn, store = self.history(2, schema=3)
-        expected = verify_store(store)
-        store.close()
+        """A schema-3 backup of an earlier release (the 0.1.0 snapshot's shape) restores, then is
+        upgraded to schema 5 with its first checkpoint and every stored epoch's size."""
+        from db_sync_alt.store import database
+        from db_sync_alt.store.epoch_parameters import ProviderEpochSource
+        from fixtures.database import AccountedFake
+        from fixtures.legacy import nonce_only
         archive, manifest = self.archive('v2')
-        backup(archive, manifest, conninfo=dsn)
+        with nonce_only():
+            dsn, store = self.history(2, schema=3)
+            expected = verify_store(store)
+            store.close()
+            with patch.object(database, 'SCHEMA_VERSION', 3):
+                backup(archive, manifest, conninfo=dsn)
         body = json.loads(manifest.read_text())
         self.assertEqual((body['format'], body['schema_version']), ('db-sync-alt-postgresql-backup-v2', 3))
         self.assertEqual(sorted(body['generations']), ['0', '1', '2'])  # format v2 records every ready generation
+        sizes = {'/epochs/%d/parameters' % e: {'epoch': e, 'nonce': '6e' * 32, 'max_tx_size': 12000 + e} for e in range(3)}
+        epochs = lambda network: ProviderEpochSource(AccountedFake(sizes), network)
         destination = self.database(); role = self.reader(destination)
-        result = restore(archive, manifest, conninfo=destination, expected_manifest_sha256=file_hash(manifest)['sha256'], reader_role=role)
+        with self.assertRaisesRegex(Refusal, 'epoch_parameters_source_required'):
+            restore(archive, manifest, conninfo=destination, reader_role=role)
+        result = restore(archive, manifest, conninfo=destination, expected_manifest_sha256=file_hash(manifest)['sha256'], reader_role=role,
+                         epoch_source=epochs)
         self.assertEqual(result['reader']['reader'], role)
         schema, base, rows, canonical = self.state_of(destination)
-        self.assertEqual((schema, base, canonical, [row[:2] for row in rows]), (4, 2, 2, [(2, 0)]))
+        self.assertEqual((schema, base, canonical, [row[:2] for row in rows]), (5, 2, 2, [(2, 0)]))
         self.assertEqual(rows[0][3], expected['digests'])
         answer = self.node(destination, role).execute(QUERY).fetchone()
         self.assertEqual(answer[1], OFFSET + 2170 + 2)
@@ -96,8 +109,8 @@ class CheckpointBackupPGTests(CheckpointFixture):
         self.assertEqual(walked, set())
         # Without the reader as well: a restored schema-3 backup is always upgraded.
         plain = self.database()
-        restore(archive, manifest, conninfo=plain)
-        self.assertEqual(self.state_of(plain)[:2], (4, 2))
+        restore(archive, manifest, conninfo=plain, epoch_source=epochs)
+        self.assertEqual(self.state_of(plain)[:2], (5, 2))
 
     def test_tampered_v3_backups_are_refused(self):
         dsn, store = self.history(1)

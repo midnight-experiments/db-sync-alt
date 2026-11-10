@@ -1,9 +1,9 @@
-"""Explicit, fenced schema upgrades (1 -> 2 -> 3 -> 4); never run as an implicit live startup step."""
+"""Explicit, fenced schema upgrades (1 -> 2 -> 3 -> 4 -> 5); never run as an implicit live startup step."""
 from pathlib import Path
 from psycopg import sql
 from db_sync_alt.contract import TABLES,Refusal
 
-LATEST=4
+LATEST=5
 
 
 def _upgrade_v2(store,state):
@@ -129,17 +129,58 @@ def _upgrade_v4(store,state,checkpoint):
     return written
 
 
-def upgrade_store(store,ordinal_source=None):
-    """Upgrade a ready store to schema 4. A store whose inputs or output assets have no ledger
+def _relevance_guard_v5(db):
+    """The relevance-anchor branch of the immutability guard admits anchors on the serving schema: a
+    schema-4 store whose guard already has that branch gets its schema-5 successor."""
+    from db_sync_alt.store.database import relevance_anchor_sql
+    previous=relevance_anchor_sql(4).split('AS $$',1)[1].split('END $$;',1)[0]
+    actual=db.execute("SELECT prosrc FROM pg_proc WHERE oid='chain.guard_immutable()'::regprocedure").fetchone()[0]
+    if actual==previous+'END ':
+        db.execute(relevance_anchor_sql(5))
+
+
+def _schema_v5(store):
+    """Inside the caller's gated transaction: served epoch parameters, gate and ready view of schema 5."""
+    from db_sync_alt.store.database import apply_privileges
+    store.db.execute(Path(__file__).with_name('schema_v5.sql').read_text())
+    _relevance_guard_v5(store.db)
+    store.db.execute('UPDATE chain.service_state SET schema_version=5 WHERE id=1')
+    apply_privileges(store.db)
+
+
+def _upgrade_v5(store,state,checkpoint):
+    """Schema 5 of a store whose facts already carry max_tx_size: one transaction for the served
+    column, the gate and the version, with the checkpoint `checkpoint` holds when it is newer than the base."""
+    from db_sync_alt.store.database import SERVING_LOCK,PROJECTION_WRITE
+    from db_sync_alt.store.incremental import insert_checkpoint,integrity_base
+    with store.atomic():
+        store.db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
+        if store.state()!=state:raise Refusal('upgrade_state_changed')
+        store.db.execute('SELECT set_config(%s,%s,true)',(PROJECTION_WRITE,'on'))
+        written=None
+        if checkpoint is not None and checkpoint.generation>integrity_base(store)[0]:
+            written=insert_checkpoint(store,checkpoint)['generation']
+        _schema_v5(store)
+    return written
+
+
+def upgrade_store(store,ordinal_source=None,epoch_source=None):
+    """Upgrade a ready store to schema 5. A store whose inputs or output assets have no ledger
     ordinal (written before schema 3) needs `ordinal_source`, a read-only db-sync source.
 
-    The full verification that starts the upgrade also writes the first integrity checkpoint."""
+    A nonce-only store (written before epoch parameters) also needs `epoch_source`, an authoritative
+    source of every stored epoch's max_tx_size (store/epoch_parameters.py); without one it is
+    refused before anything is read or changed. The full verification that starts the upgrade also
+    writes the next integrity checkpoint of a store whose facts are already complete."""
     from db_sync_alt.verify.store import verify_store
     from db_sync_alt.store.incremental import certify_checkpoint
     store.require_writer()
-    state=store.state()
-    if state['schema_version']==LATEST:return {'schema_version':LATEST,'changed':False}
-    if state['schema_version'] not in (1,2,3) or state['migration_state']!='ready' or state['revoked']:raise Refusal('upgrade_requires_ready')
+    state=store.state();legacy=store.legacy_generation(None)
+    if state['schema_version']==LATEST and not legacy:return {'schema_version':LATEST,'changed':False}
+    if state['schema_version'] not in (1,2,3,4,LATEST) or state['migration_state']!='ready' or state['revoked']:raise Refusal('upgrade_requires_ready')
+    if legacy:
+        from db_sync_alt.store.epoch_parameters import admit
+        admit(store,epoch_source)
     if state['schema_version']==1:
         # Schema 2 makes the verified canonical generation the integrity base: nothing to checkpoint.
         report=verify_store(store);checkpoint=None
@@ -150,35 +191,66 @@ def upgrade_store(store,ordinal_source=None):
         _upgrade_v2(store,state);state=store.state()
     if state['schema_version']==2:
         served=_upgrade_v3(store,state,ordinal_source);state=store.state()
-    written=_upgrade_v4(store,state,checkpoint)
+    written=None
+    if state['schema_version']==3:
+        written=_upgrade_v4(store,state,checkpoint);state=store.state();checkpoint=None
+    epochs=None
+    if legacy:
+        from db_sync_alt.store.epoch_parameters import upgrade_epoch_parameters
+        epochs=upgrade_epoch_parameters(store,state,epoch_source)
+    else:
+        written=_upgrade_v5(store,state,checkpoint) or written
     from db_sync_alt.store import serve
     serve.verify(store,store.state()['canonical_ready'])
     result={'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served}
+    if epochs is not None:result['epoch_parameters']=epochs
     if ordinal_source is not None and any(served.get('ordinals_from_source',{}).values()):
         identity=getattr(ordinal_source,'validated_identity',None)
         if identity is not None:result['ordinal_source_identity']=identity
     return result
 
 
+# What a nonce-only store needs to be upgraded, named in the refusal.
+EPOCH_SOURCE_REQUIRED=('--source-service with --source-attestation (a cardano-db-sync of the network), or the '
+                       'Blockfrost settings the service uses (DBSYNC_PROVIDER_KEY_FILE and DBSYNC_PROVIDER_STATE, '
+                       'or DBSYNC_PROVIDER_ADAPTER=shared with DBSYNC_SHARED_ROOT)')
+
+
+def epoch_source(network,sql_source=None):
+    """The authoritative source of a nonce-only store's epoch parameters: the given cardano-db-sync,
+    else the network's accounted Blockfrost client when one is configured, else None."""
+    from db_sync_alt.store.epoch_parameters import ProviderEpochSource,SQLEpochSource
+    if sql_source is not None:return SQLEpochSource(sql_source)
+    from db_sync_alt.sources.blockfrost.provider import ProviderError,configured_client
+    try:client=configured_client(network)
+    except ProviderError:return None
+    return ProviderEpochSource(client,network)
+
+
 def main(argv=None):
     import argparse
     import json
     from db_sync_alt.store.database import PgStore
-    parser=argparse.ArgumentParser(prog='db-sync-alt upgrade',description=__doc__)
+    parser=argparse.ArgumentParser(prog='db-sync-alt upgrade',description=__doc__+'\n\nA store written before epoch parameters reads every stored epoch\'s '
+                                   'max_tx_size twice from --source-service, or else from Blockfrost (2 requests per stored epoch).')
     parser.add_argument('--service',required=True)
-    parser.add_argument('--source-service',help='read-only cardano-db-sync of the same network for missing ledger ordinals; requires --source-attestation')
+    parser.add_argument('--source-service',help='read-only cardano-db-sync of the same network for missing ledger ordinals and epoch parameters; requires --source-attestation')
     parser.add_argument('--source-attestation',type=Path,help='truthful version/retention JSON, as for acquire; requires --source-service')
     args=parser.parse_args(argv)
     try:
         if bool(args.source_service)!=bool(args.source_attestation):raise Refusal('source_attestation_pair_required')
-        with PgStore(args.service) as store:
+        with PgStore(args.service,allow_legacy=True) as store:
             source=None
             if args.source_service:
                 from db_sync_alt.contract import Profile
                 from db_sync_alt.resources import profile_dir
                 from db_sync_alt.sources.dbsync.reader import SQLSource
                 source=SQLSource(args.source_service,Profile(profile_dir(store.network.network),store.network.network),json.loads(args.source_attestation.read_text()))
-            result=upgrade_store(store,source)
+            epochs=epoch_source(store.network,source) if store.legacy_format else None
+            result=upgrade_store(store,source,epochs)
         print(json.dumps(result,sort_keys=True,default=str))
-    except Refusal as e:parser.exit(2,json.dumps({'error':e.code})+'\n')
+    except Refusal as e:
+        body={'error':e.code}
+        if e.code=='epoch_parameters_source_required':body['required']=EPOCH_SOURCE_REQUIRED
+        parser.exit(2,json.dumps(body)+'\n')
     except Exception:parser.exit(2,'{"error":"schema_upgrade_failed"}\n')

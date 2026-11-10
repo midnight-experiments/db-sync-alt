@@ -1,31 +1,42 @@
 {
   "repository": "https://github.com/midnightntwrk/midnight-node",
-  "tag": "node-1.0.400",
-  "commit": "3acfd2edecdcd91373b6a506933f4c14ad3f0308",
+  "tag": "node-2.1.101",
+  "commit": "86774edf8cc76345a5c3a4221f3fe80c094b1c33",
   "files": {
     "primitives/mainchain-follower/src/db/queries/cnight_observation.rs": {
       "source": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
-      "sha256": "ea64edeea9d9053b94da7410fffdb677067e9d458fcc7c14937072397496396b"
+      "sha256": "42a1b5f5683e958e37ff7f294e4a11036af4a38300c3a6678d80021ea55d0226",
+      "git_blob_sha1": "5a2c1538bd111972d782285e2a987cf3bcb71f4c"
     },
     "primitives/mainchain-follower/src/db/queries/federated_authority_observation.rs": {
       "source": "primitives/mainchain-follower/src/db/queries/federated_authority_observation.rs",
-      "sha256": "eaf508cb65ca614f980f554cf271d3c647bf0741430387616c9c2ec469ecf571"
+      "sha256": "eaf508cb65ca614f980f554cf271d3c647bf0741430387616c9c2ec469ecf571",
+      "git_blob_sha1": "d4f2060dd6118fb5713f7455cb9e852383e5baef"
     },
     "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs": {
       "source": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
-      "sha256": "766ca723443a3ab5eef62dde4382accbff9070047a16be7a1f79e46c13d0eb90"
+      "sha256": "46268764f92e9c071ba9ede1045b974e43acb1f1657c04fbc33f0afedd07728f",
+      "git_blob_sha1": "f119ec4bab85edd965b9c97b385d16af864ad123"
     },
     "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs": {
       "source": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
-      "sha256": "caa4c336e5d74ac9d1b33fffb278b3b133e4d6b9d6a56362ebdc6803f5ff09bf"
+      "sha256": "a016a1a87356905083c5f817fd8d4ac1b79e639ddd315b792689c51b223a813d",
+      "git_blob_sha1": "f763cf0ac1cd582148c91c1f50a2948e43fc3299"
     },
     "node/src/main_chain_follower.rs": {
       "source": "node/src/main_chain_follower.rs",
-      "sha256": "5ec07c1f59ee2b605f0fca1d21602cf78f44fac7973a38bc71fb5367c54bf284"
+      "sha256": "ade75747ed612809373de14ca94e53f2731f6794723fee56c2cee8c2821add22",
+      "git_blob_sha1": "dea4efc082378f360286fe47f1429260739f1482"
     },
     "primitives/mainchain-follower/src/db/multi_asset_cache.rs": {
       "source": "primitives/mainchain-follower/src/db/multi_asset_cache.rs",
-      "sha256": "78ba4fc3a0ec63ab43364b0a8b8c428f7accebd6da3a6e6f97598ba17bdf3bc3"
+      "sha256": "78ba4fc3a0ec63ab43364b0a8b8c428f7accebd6da3a6e6f97598ba17bdf3bc3",
+      "git_blob_sha1": "1a1fad0d6591417c3098c391377baaeb72d0137b"
+    },
+    "primitives/mainchain-follower/src/db/types.rs": {
+      "source": "primitives/mainchain-follower/src/db/types.rs",
+      "sha256": "333f3a8305b8bcdb7844a2b2cf70483d0f9551a5bb79e86be29110061c149673",
+      "git_blob_sha1": "f048d5a8243cef1b1c7a7a2d1ac2548393cd372a"
     }
   }
 }

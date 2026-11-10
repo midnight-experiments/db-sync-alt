@@ -16,6 +16,7 @@ from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 from db_sync_alt.contract import Refusal
 from db_sync_alt.store.database import PgStore, RESTORE_GUARD
+from db_sync_alt.store.upgrade import upgrade_store
 from db_sync_alt.backup import backup, restore
 from db_sync_alt.verify.store import verify_store, validate_prior_answers, physical_inventory
 from fixtures.generations import make_store, PROFILE, START, h, block
@@ -115,6 +116,9 @@ class PgCoreTests(unittest.TestCase):
     def test_backup_restore_all_physical_rows_and_ids_without_test_fixtures(self):
         conninfo,_=self.stored();folder=Path(self.tmp.name)/uuid.uuid4().hex;folder.mkdir()
         archive=folder/'state.dump';manifest=folder/'state.json'
+        # Only the current schema is backed up.
+        self.assert_code('upgrade_required_before_backup',lambda:backup(archive,manifest,conninfo=conninfo))
+        with PgStore(conninfo=conninfo) as store:upgrade_store(store)
         with PgStore(conninfo=conninfo,readonly=True) as store:
             before=physical_inventory(store);ids=store.db.execute('SELECT hash,id FROM chain.blocks ORDER BY hash').fetchall()
         receipt=backup(archive,manifest,conninfo=conninfo)
@@ -159,6 +163,7 @@ print('postgres-only-runtime-ok')
 
     def test_restore_interruption_marker_and_wrong_profile(self):
         conninfo,_=self.stored();folder=Path(self.tmp.name)/uuid.uuid4().hex;folder.mkdir()
+        with PgStore(conninfo=conninfo) as store:upgrade_store(store)
         archive=folder/'state.dump';manifest=folder/'state.json';backup(archive,manifest,conninfo=conninfo)
         destination=self.db()
         with patch('db_sync_alt.backup.run_cli',side_effect=Refusal('postgres_backup_tool_failure')):
@@ -295,7 +300,7 @@ print('postgres-only-runtime-ok')
         with PgStore(conninfo=conninfo) as store:
             self.membership_reference_views(store);before_views=self.assert_view_equality(store)
             previous=store.generation();target=previous['target_height']+1;witness=target+2160
-            manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'required_epochs':[0,1,2],'capabilities':{'bridge_qualified':False,'candidates_empty':True},'anchors':{n:{'height':height,'hash':block(height,True)['hash'].hex()} for n,height in [('start',START),('target',target),('witness',witness)]}}
+            manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'required_epochs':[0,1,2],'capabilities':{'bridge_qualified':False,'candidates_empty':True,'epoch_max_tx_size_v1':True},'anchors':{n:{'height':height,'hash':block(height,True)['hash'].hex()} for n,height in [('start',START),('target',target),('witness',witness)]}}
             manifest.update(source_identity={'adapter':'db-sync-direct-pg-v1'},parent_digest=digest(previous['manifest']['digests']),acquisition={'version':1,'window_blocks':1000})
             gen=store.begin_generation(source='cardano-db-sync-postgresql',start=PROFILE.start,target=target,witness=witness,manifest=manifest,parent=2)
             with self.assertRaises(Refusal):store.publish(gen,manifest)

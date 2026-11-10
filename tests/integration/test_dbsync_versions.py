@@ -74,11 +74,37 @@ def seed(db,profile,creating_version='13.6.0.5'):
         insert(db,'pool_hash',dict(id=1,hash_raw=b'p'*28,view='pool_fixture'))
         insert(db,'stake_address',dict(id=1,hash_raw=b's'*29,view='stake1_fixture'))
         for e in range(epoch-2,epoch+1):
-            insert(db,'epoch_param',dict(epoch_no=e,nonce=H('epoch'+str(e)),block_id=s))
+            insert(db,'epoch_param',dict(epoch_no=e,nonce=H('epoch'+str(e)),max_tx_size=12000+e,block_id=s))
             insert(db,'epoch_stake_progress',dict(epoch_no=e,completed=True))
             insert(db,'epoch_stake',dict(id=e,epoch_no=e,pool_id=1,addr_id=1,amount=123456))
         insert(db,'extra_migrations',dict(token='StakeDistrEnded'))
     return target
+
+def seed_preview_parameters(db,profile):
+    """Real13.8 catalogue, Preview genesis, two distinct protocol-size epochs."""
+    apply_upstream(db,'13.8.0.0')
+    insert(db,'meta',dict(network_name='preview',version='13.8.0.0',start_time='2020-01-01'))
+    insert(db,'slot_leader',dict(id=1,hash=b'l'*28,description='fixture'))
+    with db.transaction():
+        for height in range(0,profile.security+4):
+            insert(db,'block',dict(id=height+1,hash=H(height),block_no=height,previous_id=height if height else None,epoch_no=0 if height<2 else 1,slot_no=height,time='2026-01-01',tx_count=10,slot_leader_id=1))
+        for ident,height in [(1,0),(2,1),(3,2),(4,3)]:
+            insert(db,'tx',dict(id=ident,hash=H('preview-tx'+str(ident)),block_id=height+1,block_index=0,valid_contract=True))
+        insert(db,'multi_asset',dict(id=1,policy=bytes.fromhex(profile.night[:56]),name=bytes.fromhex(profile.night[56:]),fingerprint='fixture'))
+        insert(db,'datum',dict(id=1,hash=H('datum'),value=Jsonb({'int':7}),bytes=b'\x07',tx_id=1))
+        for ident,tx,address,datum in [(1,1,profile.mapping,H('datum')),(2,2,'holder',None),(3,4,'other',None)]:
+            insert(db,'tx_out',dict(id=ident,tx_id=tx,index=0,address=address,value=2000000,data_hash=datum,address_has_script=False))
+        insert(db,'ma_tx_out',dict(id=1,quantity=1000,tx_out_id=2,ident=1))
+        insert(db,'tx_in',dict(id=1,tx_in_id=3,tx_out_id=2,tx_out_index=0))
+        insert(db,'ma_tx_mint',dict(id=1,quantity=1000,tx_id=2,ident=1))
+        insert(db,'pool_hash',dict(id=1,hash_raw=b'p'*28,view='fixture_pool'))
+        insert(db,'stake_address',dict(id=1,hash_raw=b'\xe0'+b'a'*28,view='stake_test1fixture'))
+        for epoch,size in [(0,12000),(1,24000)]:
+            insert(db,'epoch_param',dict(epoch_no=epoch,nonce=H('preview-epoch'+str(epoch)),max_tx_size=size,block_id=1 if epoch==0 else 3))
+            insert(db,'epoch_stake_progress',dict(epoch_no=epoch,completed=True))
+            insert(db,'epoch_stake',dict(id=epoch+1,epoch_no=epoch,pool_id=1,addr_id=1,amount=123))
+        insert(db,'extra_migrations',dict(token='StakeDistrEnded'))
+    return 3
 
 class SourceVersions(unittest.TestCase):
     @classmethod
@@ -181,14 +207,14 @@ class SourceVersions(unittest.TestCase):
                     if initial_schema==3:upgrade._upgrade_v3(store,store.state(),None)
                     self.assertEqual(store.state()['schema_version'],initial_schema)
                     result=upgrade.upgrade_store(store,UnusedSource())
-                    self.assertEqual(result['schema_version'],4)
+                    self.assertEqual(result['schema_version'],5)
                     self.assertEqual(result['base_generation'],store.integrity()['base'])
                     self.assertIn('checkpoint_generation',result)
                     self.assertNotIn('ordinal_source_identity',result)
                     self.assertEqual(store.digests(store.generation()['id']),before)
                     self.assertEqual(store.meta('profile'),profile)
                     verify_store(store)
-                    self.assertEqual(upgrade.upgrade_store(store),{'schema_version':4,'changed':False})
+                    self.assertEqual(upgrade.upgrade_store(store),{'schema_version':5,'changed':False})
 
     def test_upgrade_cli_recovers_missing_ordinals_from_attested_13_8_source(self):
         from db_sync_alt.store import upgrade
@@ -202,7 +228,7 @@ class SourceVersions(unittest.TestCase):
         out=io.StringIO()
         with contextlib.redirect_stdout(out):
             upgrade.main(['--service',alias,'--source-service',self.templates['13.8.0.0'][1],'--source-attestation',str(att)])
-        result=json.loads(out.getvalue());self.assertEqual(result['schema_version'],4)
+        result=json.loads(out.getvalue());self.assertEqual(result['schema_version'],5)
         self.assertIn('checkpoint_generation',result)
         self.assertGreater(result['ordinals_from_source']['inputs'],0)
         self.assertEqual(result['ordinal_source_identity']['schema'],[16,52,6])
@@ -210,3 +236,87 @@ class SourceVersions(unittest.TestCase):
         with PgStore(conninfo=dsn) as store:
             verify_store(store)
             self.assertEqual(store.generation()['manifest']['source_identity']['schema'],[16,52,6])
+
+
+class EpochParameterSQLTests(unittest.TestCase):
+    def setUp(self):
+        from db_sync_alt.resources import profile_dir
+        self.dbs=Databases();self.addCleanup(self.dbs.close)
+        self.profile=Profile(profile_dir('preview'),'preview')
+        self.source_dsn,self.source_alias=self.dbs.create()
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            self.target=seed_preview_parameters(db,self.profile)
+
+    def reader(self):
+        return CountedSQLSource(self.source_alias,self.profile,{'dbsync_version':'13.8.0.0','tx_in_retained':True,'epoch_stake_retained':True,'operator_attested':True})
+
+    def test_real_13_8_max_duplicates_and_distinct_epoch_values(self):
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            insert(db,'epoch_param',dict(epoch_no=1,nonce=H('preview-epoch1'),max_tx_size=18000,block_id=3))
+            insert(db,'epoch_param',dict(epoch_no=1,nonce=H('preview-epoch1'),max_tx_size=30000,block_id=3))
+        source=self.reader()
+        with source.snapshot():
+            source.check_source()
+            self.assertEqual(source.epoch_parameters(0)['max_tx_size'],12000)
+            self.assertEqual(source.epoch_parameters(1)['max_tx_size'],30000)
+        dsn,_=self.dbs.create()
+        with PgStore(conninfo=dsn,create=True,network='preview') as store:
+            result=acquire(source,store,self.profile,target_height=self.target,window_blocks=10000)
+            from db_sync_alt.verify.prerequisites import prerequisite_coverage
+            coverage=prerequisite_coverage(store,store.generation(),require_complete=True)
+            self.assertEqual((coverage['version'],coverage['complete'],coverage['position'],len(coverage['chunks'])),(2,True,0,0))
+            self.assertEqual({row['epoch']:row['max_tx_size'] for row in store.rows('epoch_nonces',0)},{0:12000,1:30000})
+            self.assertEqual(verify_store(store)['digests'],result['digests'])
+            from db_sync_alt.store.upgrade import upgrade_store
+            self.assertEqual(upgrade_store(store)['schema_version'],5)
+            query='SELECT MAX(epoch_param.max_tx_size)::BIGINT FROM block JOIN epoch_param ON epoch_param.epoch_no = block.epoch_no WHERE block.block_no = %s'
+            self.assertEqual(store.db.execute(query,(0,)).fetchone(),(12000,))
+            self.assertEqual(store.db.execute(query,(2,)).fetchone(),(30000,))
+            self.assertEqual(store.db.execute(query,(999999,)).fetchone(),(None,))
+
+    def test_negative_source_value_cannot_hide_behind_valid_maximum(self):
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            insert(db,'epoch_param',dict(epoch_no=1,nonce=H('preview-epoch1'),max_tx_size=-1,block_id=3))
+        source=self.reader()
+        with source.snapshot(),self.assertRaisesRegex(Refusal,'invalid_epoch_max_tx_size'):
+            source.epoch_parameters(1)
+
+    def test_zero_and_nonce_ambiguity_are_separate_from_size_duplicates(self):
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            db.execute('UPDATE epoch_param SET max_tx_size=0 WHERE epoch_no=0')
+        source=self.reader()
+        with source.snapshot():self.assertEqual(source.epoch_parameters(0)['max_tx_size'],0)
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            insert(db,'epoch_param',dict(epoch_no=0,nonce=H('another-nonce'),max_tx_size=12000,block_id=1))
+        with source.snapshot(),self.assertRaisesRegex(Refusal,'epoch_nonce_unavailable'):
+            source.epoch_parameters(0)
+
+    def test_independent_inventory_rejects_changed_candidate_size(self):
+        dsn,_=self.dbs.create()
+        with PgStore(conninfo=dsn,create=True,network='preview') as store:
+            original=store.insert
+            def wrong(table,row,generation):
+                if table=='epoch_nonces':row={**row,'max_tx_size':row['max_tx_size']+1}
+                return original(table,row,generation)
+            from unittest.mock import patch
+            with patch.object(store,'insert',wrong),self.assertRaises(Refusal):
+                acquire(self.reader(),store,self.profile,target_height=self.target,window_blocks=10000)
+            self.assertIsNone(store.state()['canonical_ready'])
+
+    def test_source_parameter_missing_null_or_absent_is_unqualified(self):
+        source=self.reader()
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            db.execute('DELETE FROM epoch_param WHERE epoch_no=1')
+        with source.snapshot(),self.assertRaisesRegex(Refusal,'epoch_parameters_unavailable'):
+            source.epoch_parameters(1)
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            db.execute('ALTER TABLE epoch_param ALTER COLUMN max_tx_size DROP NOT NULL')
+            insert(db,'epoch_param',dict(epoch_no=1,nonce=H('preview-epoch1'),max_tx_size=None,block_id=3))
+        with source.snapshot(),self.assertRaisesRegex(Refusal,'invalid_epoch_max_tx_size'):
+            source.epoch_parameters(1)
+        with source.snapshot(),self.assertRaisesRegex(Refusal,'unsupported_source_column_type'):
+            source.check_source()
+        with psycopg.connect(self.source_dsn,autocommit=True) as db:
+            db.execute('ALTER TABLE epoch_param DROP COLUMN max_tx_size')
+        with source.snapshot(),self.assertRaisesRegex(Refusal,'source_columns_missing'):
+            source.check_source()

@@ -12,6 +12,8 @@ its chain position:
   ma_tx_out.id = tx_out.id * 2^12 + asset ordinal
 
 Every field is range-checked by the tables' constraints (overflow is refused, never wrapped).
+From schema 5, epoch_param also holds each epoch's max_tx_size (midnight-node 2.1.101 reads
+MAX(epoch_param.max_tx_size) of the cursor block's epoch); below schema 5 it has nonces only.
 multi_asset, datum, pool_hash and epoch_stake keep the stable IDs of the stored facts. The tables
 are written in ID order (chain order) when built and grow by appends at each publication, inside
 the publication transaction.
@@ -45,7 +47,7 @@ EXPECTED = {
                  ' JOIN chain.assets m ON m.policy=a.policy AND m.name=a.name WHERE a.first_generation{scope}%(g)s',
     'multi_asset': 'SELECT id,policy,name FROM chain.assets WHERE first_generation{scope}%(g)s',
     'datum': 'SELECT id,hash,value FROM chain.datums WHERE first_generation{scope}%(g)s',
-    'epoch_param': 'SELECT epoch AS epoch_no,nonce FROM chain.epoch_nonces WHERE first_generation{scope}%(g)s',
+    'epoch_param': 'SELECT epoch AS epoch_no,nonce{sizes} FROM chain.epoch_nonces WHERE first_generation{scope}%(g)s',
     'pool_hash': 'SELECT p.id,p.pool_hash AS hash_raw FROM chain.pools p WHERE EXISTS(SELECT 1 FROM chain.epoch_stakes s'
                  ' WHERE s.pool_hash=p.pool_hash AND s.first_generation{scope}%(g)s)',
     'epoch_stake': 'SELECT s.id,p.id AS pool_id,s.amount,s.epoch AS epoch_no FROM chain.epoch_stakes s JOIN chain.pools p USING(pool_hash)'
@@ -59,7 +61,7 @@ COLUMNS = {
     'ma_tx_out': ('id', 'quantity', 'tx_out_id', 'ident'),
     'multi_asset': ('id', 'policy', 'name'),
     'datum': ('id', 'hash', 'value'),
-    'epoch_param': ('epoch_no', 'nonce'),
+    'epoch_param': ('epoch_no', 'nonce', 'max_tx_size'),
     'pool_hash': ('id', 'hash_raw'),
     'epoch_stake': ('id', 'pool_id', 'amount', 'epoch_no'),
 }
@@ -71,16 +73,32 @@ CURRENT = 'SELECT height,hash FROM chain.current_membership'
 BLOCK_RANGE = 100000
 
 
-def expected(table, generation, *, only_new=False):
+# The served epoch parameters gain max_tx_size at schema 5.
+SIZES_SCHEMA = 5
+
+
+def sizes(db):
+    """Whether the served epoch_param carries max_tx_size (schema 5 and later)."""
+    return db.execute('SELECT schema_version FROM chain.service_state WHERE id=1').fetchone()[0] >= SIZES_SCHEMA
+
+
+def columns(db, table):
+    if table == 'epoch_param' and not sizes(db):
+        return COLUMNS[table][:2]
+    return COLUMNS[table]
+
+
+def expected(table, generation, *, only_new=False, db=None):
     """SQL and parameters of the rows `table` must hold for `generation` (only its own rows with `only_new`)."""
     if table == 'block':
         return BLOCKS.format(source=CURRENT), {}
-    return EXPECTED[table].format(scope='=' if only_new else '<='), {'g': generation}
+    served = ',max_tx_size' if table == 'epoch_param' and (db is None or sizes(db)) else ''
+    return EXPECTED[table].format(scope='=' if only_new else '<=', sizes=served), {'g': generation}
 
 
 def _insert(db, table, query, params):
-    columns = ','.join(COLUMNS[table])
-    return db.execute('INSERT INTO serve.' + table + '(' + columns + ') SELECT ' + columns + ' FROM (' + query + ') x ORDER BY '
+    names = ','.join(columns(db, table))
+    return db.execute('INSERT INTO serve.' + table + '(' + names + ') SELECT ' + names + ' FROM (' + query + ') x ORDER BY '
                       + KEYS[table], params).rowcount
 
 
@@ -88,7 +106,7 @@ def build(db, generation):
     """Fill the empty served tables for `generation` (the current projection), in chain order."""
     counts = {}
     for table in TABLES:
-        query, params = expected(table, generation)
+        query, params = expected(table, generation, db=db)
         counts[table] = _insert(db, table, query, params)
     _mark(db, generation)
     return counts
@@ -104,7 +122,7 @@ def advance(db, generation, *, cutoff, bindings, bindings_args):
     counts = {'block_removed': db.execute('DELETE FROM serve.block WHERE id>%s', (cutoff,)).rowcount}
     counts['block'] = _insert(db, 'block', BLOCKS.format(source=bindings), bindings_args)
     for table in TABLES[1:]:
-        query, params = expected(table, generation, only_new=True)
+        query, params = expected(table, generation, only_new=True, db=db)
         if table == 'pool_hash':
             query = query + ' AND NOT EXISTS(SELECT 1 FROM serve.pool_hash x WHERE x.id=p.id)'
         counts[table] = _insert(db, table, query, params)
@@ -134,7 +152,7 @@ def verify(store, generation):
         if table == 'block':
             mismatch = _blocks_differ(db)
         else:
-            query, params = expected(table, generation)
+            query, params = expected(table, generation, db=db)
             mismatch = _differ(db, table, 'serve.' + table, query, params)
         if mismatch:
             raise Refusal('serve_rows_mismatch')
@@ -148,7 +166,7 @@ def verify(store, generation):
 
 
 def _differ(db, table, served, query, params):
-    key, cols = KEYS[table], COLUMNS[table]
+    key, cols = KEYS[table], columns(db, table)
     left = 'ROW(' + ','.join('s.' + c for c in cols) + ')'
     right = 'ROW(' + ','.join('e.' + c for c in cols) + ')'
     return db.execute('SELECT 1 FROM ' + served + ' s FULL JOIN (' + query + ') e ON e.' + key + '=s.' + key

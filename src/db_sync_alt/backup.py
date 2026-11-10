@@ -12,12 +12,18 @@ from db_sync_alt.contract import Refusal, canonical
 from db_sync_alt.store.database import PgStore, OWNER, POSTGRES_MAJOR, RESTORE_GUARD, SUPPORTED_SCHEMA_VERSIONS, WRITER_LOCK, SERVING_LOCK, apply_privileges, connect, empty_destination
 from db_sync_alt.verify.store import verify_store, physical_inventory
 
-BACKUP_FORMAT='db-sync-alt-postgresql-backup-v3'
-# Backups of older schemas are still restored: schema 3 is upgraded to the current schema during the
-# restore, schemas 1 and 2 (no served tables) by `db-sync-alt upgrade` afterwards.
-FORMATS={'db-sync-alt-postgresql-backup-v1':(1,2),'db-sync-alt-postgresql-backup-v2':(3,),BACKUP_FORMAT:(4,)}
+BACKUP_FORMAT='db-sync-alt-postgresql-backup-v4'
+# Only stores of the current schema are backed up. Backups of older schemas are still restored:
+# schemas 3 and 4 are upgraded to the current schema during the restore, schemas 1 and 2 (no served
+# tables) by `db-sync-alt upgrade` afterwards. Formats before v4 hold stores written before epoch
+# parameters: their upgrade reads every stored epoch's max_tx_size from an authoritative source.
+FORMATS={'db-sync-alt-postgresql-backup-v1':(1,2),'db-sync-alt-postgresql-backup-v2':(3,),'db-sync-alt-postgresql-backup-v3':(4,),BACKUP_FORMAT:(5,)}
 # Formats whose restore serves the node.
-SERVING_FORMATS=('db-sync-alt-postgresql-backup-v2',BACKUP_FORMAT)
+SERVING_FORMATS=('db-sync-alt-postgresql-backup-v2','db-sync-alt-postgresql-backup-v3',BACKUP_FORMAT)
+# Formats that record one verification walk from the integrity base (schema 4 and later).
+SINGLE_WALK_FORMATS=('db-sync-alt-postgresql-backup-v3',BACKUP_FORMAT)
+# Formats whose restore runs the upgrade to the current schema.
+UPGRADED_ON_RESTORE=('db-sync-alt-postgresql-backup-v2','db-sync-alt-postgresql-backup-v3')
 
 
 def safe_file(path,*,existing):
@@ -77,7 +83,7 @@ def generation_reports(store):
 
 
 def format_reports(store,backup_format,canonical=None):
-    return reports(store,canonical) if backup_format==BACKUP_FORMAT else generation_reports(store)
+    return reports(store,canonical) if backup_format in SINGLE_WALK_FORMATS else generation_reports(store)
 
 
 def backup(archive,manifest,service=None,*,conninfo='',reserve_check=None,pg_dump='pg_dump'):
@@ -88,6 +94,8 @@ def backup(archive,manifest,service=None,*,conninfo='',reserve_check=None,pg_dum
     temp_manifest=manifest.parent/('.'+manifest.name+'.'+uuid.uuid4().hex+'.partial')
     try:
         with PgStore(service,conninfo=conninfo,reserve_check=reserve_check) as store:
+            from db_sync_alt.store import database
+            if store.state()['schema_version']!=database.SCHEMA_VERSION:raise Refusal('upgrade_required_before_backup')
             check_tool(pg_dump,store.db)
             if store.pending() is not None:raise Refusal('pending_generation_cannot_backup')
             if store.meta('source_conflict'):raise Refusal('revoked_database_cannot_backup')
@@ -111,10 +119,12 @@ def backup(archive,manifest,service=None,*,conninfo='',reserve_check=None,pg_dum
         temp.unlink(missing_ok=True);temp_manifest.unlink(missing_ok=True)
 
 
-def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_check=None,pg_restore='pg_restore',expected_manifest_sha256=None,expected_network=None,reader_role=None):
+def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_check=None,pg_restore='pg_restore',expected_manifest_sha256=None,expected_network=None,reader_role=None,epoch_source=None):
     """Restore into an empty database; `reader_role` gets the node reader's grants again once the
-    restored database serves. No other role may connect before (PUBLIC loses CONNECT). A schema-3
-    backup is upgraded to the current schema, with its first integrity checkpoint, before that."""
+    restored database serves. No other role may connect before (PUBLIC loses CONNECT). A schema-3 or
+    schema-4 backup is upgraded to the current schema before that; its store predates epoch
+    parameters, so `epoch_source(network)` must give their authoritative source
+    (store/epoch_parameters.py), checked before the destination is touched."""
     archive=safe_file(archive,existing=True);manifest=safe_file(manifest,existing=True)
     if expected_manifest_sha256 and file_hash(manifest)['sha256']!=expected_manifest_sha256:raise Refusal('backup_manifest_checksum_mismatch')
     try:body=json.loads(manifest.read_text())
@@ -126,6 +136,14 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
     profile=body.get('profile',{})
     network=for_identity(profile)
     if network is None or (expected_network is not None and network.network!=expected_network):raise Refusal('backup_profile_mismatch')
+    source=None
+    if body['format'] in UPGRADED_ON_RESTORE:
+        source=epoch_source(network) if epoch_source is not None else None
+        if source is None:raise Refusal('epoch_parameters_source_required')
+        # The upgrade reads every stored epoch twice: the day's budget must cover it before the
+        # destination is touched (the upgrade checks it again).
+        epochs=body.get('physical_inventory',{}).get('epoch_nonces',{}).get('count') if isinstance(body.get('physical_inventory'),dict) else None
+        if source.counted and type(epochs) is int and epochs>=0:source.check_budget(2*epochs)
     if reserve_check:reserve_check()
     with connect(destination_service,conninfo=conninfo) as db:
         if not db.execute('SELECT pg_try_advisory_lock(%s,%s)',WRITER_LOCK).fetchone()[0]:raise Refusal('writer_busy')
@@ -164,9 +182,9 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
             # Observations are runtime state; startup must refresh before healthy.
             db.execute("UPDATE chain.service_state SET canonical_ready=%s,migration_state='ready',publication_serial=%s WHERE id=1",(ready,body['publication_serial']))
             db.execute('DROP SCHEMA '+RESTORE_GUARD+' CASCADE')
-        if body['schema_version']==3:
+        if body['format'] in UPGRADED_ON_RESTORE:
             from db_sync_alt.store.upgrade import upgrade_store
-            upgrade_store(store)
+            upgrade_store(store,epoch_source=source)
         granted=None
         if reader_role is not None:
             # The reader may connect only now that the restored database serves.
@@ -186,13 +204,31 @@ def main(argv=None):
         if name=='restore':
             command.add_argument('--expected-manifest-sha256')
             command.add_argument('--reader-role',help="existing login role midnight-node connects with; granted read access after the restore")
+            command.add_argument('--source-service',help='read-only cardano-db-sync of the network for the epoch parameters a v2/v3 backup lacks; requires --source-attestation (default: Blockfrost, 2 requests per stored epoch)')
+            command.add_argument('--source-attestation',type=Path,help='truthful version/retention JSON, as for acquire; requires --source-service')
     args=parser.parse_args(argv)
     try:
         if args.command=='backup':result=backup(args.archive,args.manifest,args.service)
-        elif args.command=='restore':result=restore(args.archive,args.manifest,args.service,expected_manifest_sha256=args.expected_manifest_sha256,reader_role=args.reader_role)
+        elif args.command=='restore':
+            if bool(args.source_service)!=bool(args.source_attestation):raise Refusal('source_attestation_pair_required')
+            def epochs(network):
+                from db_sync_alt.store.upgrade import epoch_source
+                sql_source=None
+                if args.source_service:
+                    from db_sync_alt.contract import Profile
+                    from db_sync_alt.resources import profile_dir
+                    from db_sync_alt.sources.dbsync.reader import SQLSource
+                    sql_source=SQLSource(args.source_service,Profile(profile_dir(network.network),network.network),json.loads(args.source_attestation.read_text()))
+                return epoch_source(network,sql_source)
+            result=restore(args.archive,args.manifest,args.service,expected_manifest_sha256=args.expected_manifest_sha256,reader_role=args.reader_role,epoch_source=epochs)
         else:
-            with PgStore(args.service,readonly=True,allow_incomplete=args.command=='status') as store:
+            with PgStore(args.service,readonly=True,allow_incomplete=args.command=='status',allow_legacy=True) as store:
                 result=store.status() if args.command=='status' else {'generations':reports(store),'physical_inventory':physical_inventory(store)}
         print(canonical(result))
-    except Refusal as error:parser.exit(2,canonical({'error':error.code})+'\n')
+    except Refusal as error:
+        body={'error':error.code}
+        if error.code=='epoch_parameters_source_required':
+            from db_sync_alt.store.upgrade import EPOCH_SOURCE_REQUIRED
+            body['required']=EPOCH_SOURCE_REQUIRED
+        parser.exit(2,canonical(body)+'\n')
     except Exception:parser.exit(2,canonical({'error':'postgres_operation_failed'})+'\n')

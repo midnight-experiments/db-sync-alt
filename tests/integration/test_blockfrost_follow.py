@@ -132,24 +132,40 @@ class FollowSourcePGTests(unittest.TestCase):
             finally:poll.close()
 
     def test_schema1_direct_poll_restore_then_upgrade_preserves_policy(self):
+        """A schema-1 backup written before epoch parameters restores with its poll policy, then
+        upgrades with each stored epoch's size."""
         from db_sync_alt.cli.acquire import blockfrost_once
         from db_sync_alt.backup import backup,restore
+        from db_sync_alt.contract import Refusal
+        from db_sync_alt.store import database
+        from db_sync_alt.store.epoch_parameters import ProviderEpochSource
         from db_sync_alt.sources.blockfrost.poller import day_at
-        dsn=self.make();routes,_=gen_fixture.fixtures()
-        with PgStore(conninfo=dsn) as store:
-            self.assertFalse(store.supports_incremental)
-            blockfrost_once(store,self.profile,target_height=gen_fixture.OFFSET+11,client=real.AccountedFake(routes))
-            key='provider-poll-'+day_at(time.time());before=copy.deepcopy(store.sync_job(key))
-            original=copy.deepcopy(store.meta('poll-budget-policy:'+before['day']))
+        from fixtures.legacy import nonce_only
+        routes,_=gen_fixture.fixtures()
         archive=Path(self.tmp.name)/'schema1-native-poll.dump';manifest=archive.with_suffix('.json')
-        backup(archive,manifest,conninfo=dsn);destination=self.database()
+        with nonce_only():
+            dsn=self.make()
+            with PgStore(conninfo=dsn) as store:
+                self.assertFalse(store.supports_incremental)
+                blockfrost_once(store,self.profile,target_height=gen_fixture.OFFSET+11,client=real.AccountedFake(routes))
+                key='provider-poll-'+day_at(time.time());before=copy.deepcopy(store.sync_job(key))
+                original=copy.deepcopy(store.meta('poll-budget-policy:'+before['day']))
+            # An earlier release backed up the schema it served.
+            with patch.object(database,'SCHEMA_VERSION',1):backup(archive,manifest,conninfo=dsn)
+        with self.assertRaisesRegex(Refusal,'epoch_parameters_upgrade_required'):
+            backup(archive.with_name('again.dump'),manifest.with_name('again.json'),conninfo=dsn)
+        destination=self.database()
         result=restore(archive,manifest,conninfo=destination)
         self.assertEqual(len(result['poll_restore_binding']['added_metadata']),1)
-        with PgStore(conninfo=destination) as recovered:
-            self.assertFalse(recovered.supports_incremental)
+        sizes=real.AccountedFake({'/epochs/%d/parameters'%e:{'epoch':e,'nonce':'6e'*32,'max_tx_size':12000+e} for e in range(3)})
+        with PgStore(conninfo=destination,allow_legacy=True) as recovered:
+            self.assertTrue(recovered.legacy_format);self.assertFalse(recovered.supports_incremental)
             self.assertEqual(recovered.sync_job(key),before)
             self.assertEqual(recovered.meta('poll-budget-policy:'+before['day']),original)
-            upgrade_store(recovered);recovered.certify_ready_full()
+            self.assertEqual(upgrade_store(recovered,epoch_source=ProviderEpochSource(sizes,PREPROD))['schema_version'],5)
+        self.assertEqual(len(sizes.calls),6)
+        with PgStore(conninfo=destination) as recovered:
+            recovered.certify_ready_full()
             poll=PollBudgetStore(None,owner_binding(recovered),conninfo=destination)
             try:self.assertEqual(poll.sync_job(key),before)
             finally:poll.close()
@@ -221,7 +237,7 @@ class FollowSourcePGTests(unittest.TestCase):
         service=Service(cfg,runtime=Runtime(cfg),sync_driver=driver)
         try:
             service.start();self.assertTrue(entered.wait(15),service.failure)
-            self.assertEqual(service.health.snapshot()['schema_version'],'4')
+            self.assertEqual(service.health.snapshot()['schema_version'],'5')
             before=driver._poller.latest().sequence
             deadline=time.monotonic()+3
             while driver._poller.latest().sequence<before+2 and time.monotonic()<deadline:time.sleep(.01)

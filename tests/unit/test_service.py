@@ -274,6 +274,17 @@ class LifecycleTests(unittest.TestCase):
                 load_sync_driver(config())
         self.assertEqual(captured.exception.code, 'sync_unavailable')
 
+    def test_epoch_parameter_refusals_map_to_reported_codes(self):
+        from db_sync_alt.contract import Refusal
+        for code in ('epoch_parameters_upgrade_required', 'epoch_parameters_source_required', 'upgrade_required_before_backup'):
+            self.assertEqual(failure_code(Refusal(code)), 'schema_upgrade_required')
+        for code in ('invalid_epoch_max_tx_size', 'epoch_parameter_receipt_mismatch', 'epoch_parameters_upgrade_invalid'):
+            self.assertEqual(failure_code(Refusal(code)), 'invalid_coverage')
+        # A first-run restore whose upgrade step refused leaves a restored database that needs `upgrade`.
+        for code in ('epoch_parameters_changed', 'epoch_parameters_nonce_mismatch', 'epoch_parameters_unavailable',
+                     'epoch_parameters_source_unavailable', 'provider_budget_insufficient', 'upgrade_state_changed'):
+            self.assertEqual(failure_code(Refusal(code)), 'schema_upgrade_required')
+
     def test_secret_exceptions_never_enter_status_or_failure_code(self):
         runtime = Runtime()
         runtime.verify_error = RuntimeError('postgres://alice:do-not-print@private-secret-directory')

@@ -4,7 +4,7 @@ The source must report the profile's `meta.network_name`; k comes from the profi
 import contextlib
 import datetime
 import re
-from db_sync_alt.contract import Refusal, canonical, required_epochs
+from db_sync_alt.contract import Refusal, canonical, required_epochs, epoch_size, generation_capabilities
 from db_sync_alt.sources.dbsync.compatibility import SOURCE_COLUMNS, source_version, validate_columns, validate_modes, validate_attestation
 
 BLOCK_COLUMNS='b.hash,b.block_no AS height,p.hash AS parent_hash,b.epoch_no AS epoch,b.slot_no AS slot,b.time,b.tx_count'
@@ -92,6 +92,7 @@ class SQLSource:
         missing=self.one("SELECT count(*) AS n FROM unnest(%s::bigint[]) e(epoch) WHERE NOT EXISTS "
                          "(SELECT 1 FROM epoch_param p WHERE p.epoch_no=e.epoch AND p.nonce IS NOT NULL)",(epochs,))['n']
         if missing:raise Refusal('epoch_nonce_unavailable')
+        for epoch in epochs:self.epoch_parameters(epoch)
         missing=self.one("SELECT count(*) AS n FROM unnest(%s::bigint[]) e(epoch) WHERE NOT EXISTS "
                          "(SELECT 1 FROM epoch_stake p WHERE p.epoch_no=e.epoch)",(epochs,))['n']
         if missing:raise Refusal('epoch_stake_unavailable')
@@ -111,7 +112,7 @@ class SQLSource:
                   'retention':{'tx_in':True,'epoch_stake':True}}
         return {'identity':self.profile.identity,'anchors':anchors,'source_identity':identity,
                 'required_epochs':epochs,
-                'capabilities':{'bridge_qualified':False,'candidates_empty':True},'sampled_head':head}
+                'capabilities':generation_capabilities(),'sampled_head':head}
     def ordinals(self,inputs,output_assets,anchors):
         """Ledger ordinals of already stored facts: `inputs` as (tx, origin tx, origin index) and
         `output_assets` as (tx, output index, policy, name) keys; every key must be found."""
@@ -194,11 +195,26 @@ class SQLSource:
         for r in self.stream('SELECT t.hash AS tx_hash,o.index AS output_index,a.policy,a.name,m.quantity::text AS quantity,'+ASSET_ORDINAL+' AS ordinal FROM ma_tx_out m JOIN multi_asset a ON a.id=m.ident JOIN tx_out o ON o.id=m.tx_out_id JOIN tx t ON t.id=o.tx_id WHERE o.id=ANY(%s::bigint[]) AND '+self.asset_predicate(),(outs,*self.asset_params())):yield 'output_assets',r
         for r in self.stream('SELECT t.hash AS tx_hash,ot.hash AS origin_hash,i.tx_out_index AS origin_index,'+INPUT_ORDINAL+' AS ordinal FROM tx_in i JOIN tx t ON t.id=i.tx_in_id JOIN tx ot ON ot.id=i.tx_out_id WHERE i.id=ANY(%s::bigint[])',(spends,)):yield 'inputs',r
         for r in self.stream('SELECT t.hash AS tx_hash,a.policy,a.name,sum(m.quantity)::text AS quantity FROM ma_tx_mint m JOIN multi_asset a ON a.id=m.ident JOIN tx t ON t.id=m.tx_id WHERE t.id=ANY(%s::bigint[]) AND '+self.asset_predicate()+' GROUP BY t.hash,a.policy,a.name',(mints,*self.asset_params())):yield 'mints',r
+    def epoch_parameters(self,epoch):
+        """The epoch's nonce and max_tx_size from all of its epoch_param rows.
+
+        The node reads MAX(max_tx_size) over the epoch's rows, so unequal valid sizes are allowed
+        and their maximum is the fact. Every row is validated first: a NULL, negative or
+        out-of-range size is never hidden behind a valid larger one. The nonce must be present
+        and the same in every row."""
+        row=self.one("SELECT count(*) AS n,count(nonce) AS nonces,count(DISTINCT nonce) AS distinct_nonces,"
+                     "min(encode(nonce,'hex')) AS nonce,max(max_tx_size)::bigint AS max_tx_size,"
+                     "coalesce(bool_or(max_tx_size IS NULL OR max_tx_size<0 OR max_tx_size>2147483647),false) AS invalid "
+                     "FROM epoch_param WHERE epoch_no=%s",(epoch,))
+        if not row['n']:raise Refusal('epoch_parameters_unavailable')
+        if row['nonces']!=row['n'] or row['distinct_nonces']!=1:raise Refusal('epoch_nonce_unavailable')
+        if row['invalid'] is not False:raise Refusal('invalid_epoch_max_tx_size')
+        nonce=bytes.fromhex(row['nonce'])
+        if len(nonce)!=32:raise Refusal('epoch_nonce_unavailable')
+        return {'epoch':epoch,'nonce':nonce,'max_tx_size':epoch_size(row['max_tx_size'])}
     def epochs(self,epoch,target):
         if self.one('SELECT completed FROM epoch_stake_progress WHERE epoch_no=%s',(epoch,))['completed'] is not True:raise Refusal('epoch_stake_not_complete')
-        r=self.one('SELECT epoch_no AS epoch,nonce FROM epoch_param WHERE epoch_no=%s',(epoch,))
-        if r['nonce'] is None:raise Refusal('epoch_nonce_unavailable')
-        yield 'epoch_nonces',r
+        yield 'epoch_nonces',self.epoch_parameters(epoch)
         count=0
         for r in self.stream('SELECT s.epoch_no AS epoch,p.hash_raw AS pool_hash,sum(s.amount)::text AS amount FROM epoch_stake s JOIN pool_hash p ON p.id=s.pool_id WHERE s.epoch_no=%s GROUP BY s.epoch_no,p.hash_raw ORDER BY p.hash_raw',(epoch,)):
             count+=1;yield 'epoch_stakes',r

@@ -93,6 +93,8 @@ class StatusSummaryTests(unittest.TestCase):
                     with d.PgStore(conninfo=limited,readonly=True) as store,self.assertRaises(psycopg.errors.InsufficientPrivilege):store.status()
     def test_restore_reports_database_size_without_listing_generations(self):
         source=self.blank();make_store(source)
+        from db_sync_alt.store.upgrade import upgrade_store
+        with d.PgStore(conninfo=source) as store:upgrade_store(store)
         archive,manifest=self.root/'state.dump',self.root/'state.json';backup(archive,manifest,conninfo=source)
         destination=self.blank()
         with patch.object(d.PgStore,'status',side_effect=AssertionError('restore_listed_generations')):

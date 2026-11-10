@@ -1,5 +1,5 @@
 """PostgreSQL integrity, inherited completeness, and immutable answer-domain checks."""
-from db_sync_alt.contract import FORMAT, Refusal, digest, required_epochs
+from db_sync_alt.contract import FORMAT, LEGACY_FORMAT, Refusal, digest, required_epochs, generation_capabilities, epoch_size
 from db_sync_alt.networks import for_identity
 
 
@@ -78,9 +78,11 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     for asset in (delta_rows(store,'assets',gen) if delta else store.rows('assets',gen)):
         policy=asset['policy'].hex();unit=policy+asset['name'].hex()
         if unit not in units and policy not in governance:raise Refusal('selected_asset_outside_profile')
-    if m.get('contracts')!=digest(network.contract) or profile_digest(g)!=digest(identity):raise Refusal('manifest_contract_mismatch')
+    # Generations sealed in the nonce-only format keep its contract and capabilities.
+    legacy=store.legacy_generation(gen)
+    if m.get('contracts')!=digest(network.legacy_contract if legacy else network.contract) or profile_digest(g)!=digest(identity):raise Refusal('manifest_contract_mismatch')
     if any(type(v) is not bool for v in m.get('capabilities',{}).values()):raise Refusal('unsupported_capabilities')
-    if m.get('capabilities')!={'bridge_qualified':False,'candidates_empty':True}:raise Refusal('unsupported_capabilities')
+    if m.get('capabilities')!=generation_capabilities(legacy=legacy):raise Refusal('unsupported_capabilities')
     if g['witness_height']!=g['target_height']+network.security:raise Refusal('invalid_witness')
     if (g['start_height'],g['start_index'])!=network.start or g['target_height']<g['start_height']:raise Refusal('invalid_start_cursor')
     anchors=m.get('anchors',{});expected_anchors={'start':g['start_height'],'target':g['target_height'],'witness':g['witness_height']}
@@ -166,6 +168,13 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     # matches both epoch and hash. Pre-S endpoints need not include a successor.
     for checkpoint in store.checkpoint_rows(phase='epochs',**({'generation':gen} if delta else {'before':gen+1})):
         receipt=checkpoint['receipt'];anchor=receipt.get('epoch_end')
+        # A provider epoch receipt of the current format names the size it read; the stored fact
+        # must hold it. Receipts sealed in the nonce-only format stay as they were written.
+        if receipt.get('source_kind')=='blockfrost-cardano' and not store.legacy_generation(checkpoint['generation']):
+            fact=store.epoch_nonce(int(checkpoint['unit']),gen)
+            try:size=epoch_size(receipt.get('max_tx_size'))
+            except Refusal:raise Refusal('epoch_parameter_receipt_mismatch') from None
+            if fact is None or fact.get('max_tx_size')!=size:raise Refusal('epoch_parameter_receipt_mismatch')
         if anchor:
             epoch=receipt.get('epoch')
             if type(epoch) is not int or checkpoint['unit']!=str(epoch) or not isinstance(anchor,dict) or type(anchor.get('height')) is not int or anchor['height']>g['target_height']:raise Refusal('epoch_anchor_mismatch')
@@ -207,6 +216,11 @@ def verify_checkpoint(store,g,computed,checkpoint,*,require_ready=True):
 def verify_store(store,generation=None,*,require_ready=True):
     from db_sync_alt.store.incremental import incremental,compute_proof,validate_completion_v2,integrity_base
     g=store.generation(generation);gen=g['id'];m=g['manifest']
+    record=getattr(store,'epoch_upgrade',None)
+    if record is not None and gen>=record['generation']:
+        # Sizes the epoch parameter upgrade added to epochs sealed before it.
+        from db_sync_alt.store.epoch_parameters import verify_record
+        verify_record(store)
     verify_structure(store,g,require_ready=require_ready)
     computed=store.digests(gen)
     base,checkpoint=integrity_base(store) if store.supports_incremental else (None,None)
@@ -239,7 +253,7 @@ def verify_store(store,generation=None,*,require_ready=True):
             from db_sync_alt.store import serve
             serve.verify(store,gen)
     store.progress('verification_complete',generation=gen)
-    return {'verification':'offline-integrity','generation':gen,'format':FORMAT,'digests':computed,'semantic_sha256':digest(computed),'source_completeness':m.get('validation',{}).get('kind','not-certified')}
+    return {'verification':'offline-integrity','generation':gen,'format':LEGACY_FORMAT if store.legacy_generation(gen) else FORMAT,'digests':computed,'semantic_sha256':digest(computed),'source_completeness':m.get('validation',{}).get('kind','not-certified')}
 
 
 def validate_prior_answers(store,generation):

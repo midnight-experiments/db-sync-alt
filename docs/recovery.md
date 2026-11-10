@@ -45,23 +45,35 @@ Restore checks the manifest's SHA-256 (when given), the archive's bytes, the
 format, the PostgreSQL major version and the profile; it then restores, verifies
 the canonical generation (every generation for a backup of format v2 or v1) and
 the physical inventory against the manifest, and only then marks the database
-ready. A backup of a schema-3 database (format v2, such as the 0.1.0 Preprod
-snapshot) is then upgraded to schema 4, with its first integrity checkpoint
-where one can be written, before the reader is granted. `db-sync-alt run --archive … --manifest …` does the same
-for an empty database. Each restore adds a receipt that binds every polling job
+ready. A backup of a schema-3 or schema-4 database (formats v2 and v3, such as
+the 0.1.0 Preprod snapshot) was written before epoch parameters: the restore then
+runs the [upgrade to schema 5](#upgrade-to-schema-5) before the reader is
+granted, reading every stored epoch's `max_tx_size` from Blockfrost or from
+`--source-service` with `--source-attestation`. Without either it refuses before
+touching the destination (`epoch_parameters_source_required`).
+`db-sync-alt run --archive … --manifest …` does the same for an empty database,
+with the service's Blockfrost settings. Each restore adds a receipt that binds every polling job
 to the new database; job identity, counts and back-off are kept. Freshness is
 unknown until the first poll.
 
 Restore refuses a database that is not empty. An interrupted restore leaves the
 database owned but not ready (`incomplete_restore`): keep it for diagnosis and
-restore into another empty database. There is no in-place overwrite and no
+restore into another empty database.
+
+If the upgrade step of a restore refuses (for example `epoch_parameters_changed`
+or a failed source request), the backup is already restored and verified: the
+database is ready but still of the earlier format, and the reader has not been
+granted. Do not restore again: fix the cause, run `db-sync-alt upgrade` on that
+database, then `db-sync-alt grant-reader` (or start the service, which grants
+the reader). The service reports this state as `schema_upgrade_required`. There is no in-place overwrite and no
 automatic clean-up.
 
-## Upgrade to schema 4
+## Upgrade to schema 5
 
-The service needs schema 4. A database built with `db-sync-alt acquire --create`
-starts as schema 1; a database served by db-sync-alt 0.1.x is schema 3. Stop the
-service, upgrade, then start the service with this version:
+The service needs schema 5. A database built with `db-sync-alt acquire --create`
+starts as schema 1; a database served by db-sync-alt 0.2.x or 0.3.x is schema 4
+and one served by 0.1.x is schema 3. Stop the service, upgrade, then start the
+service with this version:
 
 ```sh
 db-sync-alt upgrade --service db_sync_alt
@@ -77,10 +89,56 @@ output reports the integrity base (`base_generation`) and the checkpoint written
 (`checkpoint_generation`). The first verification walks every update published
 since the database's first generation, as a 0.1.x start does: on a large
 database it takes about as long as one such start. The service then starts from
-the last checkpoint.
+the last checkpoint. The step to schema 5 serves each epoch's `max_tx_size` in
+`epoch_param` and makes the serving gate require schema 5, in one transaction.
 
-There is no downgrade: db-sync-alt 0.1.x refuses a schema-4 database
-(`unsupported_database_identity`). To go back, keep a `pg_dump` of the database
+### Epoch parameters of a database of 0.3.x or earlier
+
+A database written before this version holds each epoch's nonce but not its
+maximum transaction size, which midnight-node 2.1.101 reads
+([connect a node](connect-a-node.md#what-the-node-can-read)). The upgrade adds it for every
+stored epoch from an authoritative source, never a default:
+
+- Blockfrost, with the settings the service uses (`DBSYNC_PROVIDER_KEY_FILE`
+  and `DBSYNC_PROVIDER_STATE`, or `DBSYNC_PROVIDER_ADAPTER=shared` with
+  `DBSYNC_SHARED_ROOT`): two `GET /epochs/{n}/parameters` requests per stored
+  epoch and nothing else, counted in the same daily ledger as the service.
+  `db-sync-alt status` shows the stored epochs and the requests before you
+  start; the upgrade refuses before any request if the day's remaining budget
+  is smaller (`provider_budget_insufficient`).
+- Or a cardano-db-sync of the network, with `--source-service` and
+  `--source-attestation` as below: no Blockfrost request.
+
+Every stored epoch is read in two complete passes. Each answer must name the
+epoch, carry the stored nonce and a size from 0 to 2,147,483,647, and both
+passes must agree; otherwise the upgrade refuses (`epoch_parameters_changed`,
+`epoch_parameters_nonce_mismatch`, `invalid_epoch_max_tx_size`). Answers are
+kept as they arrive: an interrupted upgrade continues where it stopped, and once
+both passes are kept a rerun sends no request, unless the attempt spent its own
+request budget (4 per stored epoch) on failing requests: then its answers are
+discarded and a rerun reads again (`request_budget_exhausted`). The sizes, the
+new fact contract, a record of the sizes and their source, and schema 5 are
+committed in one transaction that also verifies the result; any refusal leaves
+the database as it was, still served by the release that wrote it.
+
+That transaction holds exclusive locks on the node-facing `epoch_param`, its
+served table and the epoch facts while it verifies the whole database, about as
+long as one `db-sync-alt verify`: a running node's epoch reads wait until it
+commits. Stop the node as well as the service for the upgrade. If another
+session holds a lock on those relations, the commit gives up after 5 seconds
+and `upgrade` prints `schema_upgrade_failed`; nothing is changed, the answers
+are kept and a rerun sends no request. Earlier generations, their
+receipts and integrity checkpoints are kept unchanged and verified as they were
+sealed; the record binds the sizes added to their epochs, and integrity
+checkpoints of later updates include the sizes.
+
+The upgrade refuses while an unfinished update exists
+(`upgrade_pending_generation`): start the earlier release again, let it publish,
+and stop it when `db-sync-alt status` shows no pending generation.
+
+There is no downgrade: db-sync-alt 0.3.x and earlier refuse a schema-5 database
+and 0.1.x refuses schema 4, both with `unsupported_database_identity`
+(`invalid_identity` in the service). To go back, keep a `pg_dump` of the database
 taken with the service stopped before the upgrade, and restore it.
 With the Compose deployment, run the same command in the image
 ([Compose](docker.md#upgrade)).

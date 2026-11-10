@@ -78,8 +78,8 @@ same transaction. Verification compares every served row with the stored facts.
 Before a generation is published the verifier also requires what the node's
 queries rely on without being able to check it: the witness is the target plus
 the network's k, headers are contiguous from the start cursor to the witness,
-events and prerequisites are complete, every required epoch has its nonce, at
-least one stake row and (once completed) its end block, the registered-candidates
+events and prerequisites are complete, every required epoch has its nonce and
+`max_tx_size`, at least one stake row and (once completed) its end block, the registered-candidates
 address holds nothing, and at least one spend is served.
 
 Only the owner and the roles db-sync-alt grants may connect to its database;

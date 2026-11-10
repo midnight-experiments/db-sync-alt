@@ -6,7 +6,7 @@ import shutil
 import tempfile
 import unittest
 
-from db_sync_alt.contract import NUMERIC_FIELDS, Profile, Refusal, validate_numeric
+from db_sync_alt.contract import NUMERIC_FIELDS, Profile, Refusal, validate_numeric, epoch_size, generation_capabilities, digest
 from db_sync_alt.resources import profile_dir
 
 
@@ -20,6 +20,33 @@ class ContractTests(unittest.TestCase):
                     with self.assertRaisesRegex(Refusal,'invalid_numeric_domain'):validate_numeric(table,dict(valid,**{key:str(value) if key in ('value','quantity','amount') else value}))
         for value in ('01','-0','+1',' 1','1.0','1e3'):
             with self.assertRaises(Refusal):validate_numeric('mints',{'quantity':value})
+
+    def test_epoch_size_is_strict_inclusive_and_never_defaulted(self):
+        for value in (0,12000,24000,2**31-1):
+            self.assertEqual(epoch_size(value),value)
+            validate_numeric('epoch_nonces',{'epoch':2,'nonce':b'n'*32,'max_tx_size':value})
+        for value in (None,True,False,-1,2**31,12000.0,'12000'):
+            with self.subTest(value=value),self.assertRaisesRegex(Refusal,'invalid_epoch_max_tx_size'):
+                epoch_size(value)
+        with self.assertRaisesRegex(Refusal,'invalid_numeric_domain'):
+            validate_numeric('epoch_nonces',{'epoch':2,'nonce':b'n'*32})
+        # Facts sealed in the nonce-only format are checked over their own columns.
+        validate_numeric('epoch_nonces',{'epoch':2,'nonce':b'n'*32},legacy=True)
+
+    def test_nonce_only_contract_is_recognised_but_never_current(self):
+        from db_sync_alt import networks
+        for name in networks.names():
+            network=networks.network_profile(name)
+            self.assertIs(networks.for_contract(network.contract),network)
+            self.assertIs(networks.for_contract(network.legacy_contract,legacy=True),network)
+            with self.assertRaisesRegex(Refusal,'unsupported_format'):networks.for_contract(network.legacy_contract)
+            with self.assertRaisesRegex(Refusal,'unsupported_format'):networks.for_contract(network.contract,legacy=True)
+            self.assertNotEqual(digest(network.contract),digest(network.legacy_contract))
+        profile=Profile(profile_dir('preview'))
+        # The profile identity is unchanged by the fact format; the contract and capability carry it.
+        self.assertEqual(set(profile.identity),{'network','config_sha256','genesis','configs','profile'})
+        self.assertIs(generation_capabilities()['epoch_max_tx_size_v1'],True)
+        self.assertNotIn('epoch_max_tx_size_v1',generation_capabilities(legacy=True))
 
     def test_trusted_profile(self):
         with tempfile.TemporaryDirectory() as tmp:

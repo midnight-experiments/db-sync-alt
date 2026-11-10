@@ -255,10 +255,11 @@ class Runner:
         return self.outside_domain(queries, 'the node queries only the addresses and assets of its configuration, which the profile must equal (documented operator requirement)', edges)
 
     def drill_bridge(self):
-        queries = [('bridge:formatted-query', ('formatted', supplement.bridge_query(), ['text', 'bytea', 'bytea', 'int4', 'int8'],
-                                               [self.profile.mapping, bytes.fromhex(self.profile.permissioned), b'', self.corpus.header['target'],
-                                                supplement.TOKEN_TRANSFER_METADATUM_KEY])),
-                   ('bridge:tx_metadata', ('formatted', 'SELECT id, key, tx_id, json FROM tx_metadata LIMIT 1', [], []))]
+        queries = [('bridge:formatted-' + mode, ('formatted', supplement.bridge_query(mode),
+                    ['text', 'text', 'bytea', 'bytea', 'int8', 'int4'],
+                    supplement.bridge_values(self.profile, self.corpus.header['target'])))
+                   for mode in ('Enabled', 'Consumed')]
+        queries.append(('bridge:tx_metadata', ('formatted', 'SELECT id, key, tx_id, json FROM tx_metadata LIMIT 1', [], [])))
         return self.must_fail(queries)
 
     def watch(self, until_ready, limit, interval=1.0):

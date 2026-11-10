@@ -234,11 +234,13 @@ def rebind_pending_witness(store,generation):
     return store.generation(generation)['manifest']
 
 def delta_rows(store,table,gen):
+    """The facts `gen` added, with the columns it was sealed over."""
     from db_sync_alt.store.database import logical_row
+    columns=store.sealed_tables(gen)[table]
     with store.db.transaction():
         with store.db.cursor(name='delta_'+table) as cur:
-            cur.execute('SELECT '+','.join(TABLES[table])+' FROM chain.'+table+' WHERE first_generation=%s ORDER BY '+','.join(KEYS[table]),(gen,))
-            for row in cur:yield logical_row(table,dict(zip(TABLES[table],row)))
+            cur.execute('SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE first_generation=%s ORDER BY '+','.join(KEYS[table]),(gen,))
+            for row in cur:yield logical_row(table,dict(zip(columns,row)))
 
 def inventory(rows):
     h=hashlib.sha256();count=0
@@ -259,10 +261,10 @@ def _membership_inventory(store,gen,*,removed=False):
 def compute_proof(store,g):
     gen=g['id'];m=g['manifest'];parent=store.generation(g['parent']);reuse=store.db.execute('SELECT through_height,receipt FROM chain.generation_reuse WHERE generation=%s',(gen,)).fetchone()
     if not reuse:raise Refusal('metadata_reuse_missing')
-    facts={}
+    facts={};legacy=store.legacy_generation(gen)
     for table in TABLES:
         def validated():
-            for row in delta_rows(store,table,gen):validate_numeric(table,row);yield row
+            for row in delta_rows(store,table,gen):validate_numeric(table,row,legacy=legacy);yield row
         facts[table]=inventory(validated());store.progress('delta_family_complete',generation=gen,family=table,rows=facts[table]['count'])
     added=_membership_inventory(store,gen);removed=_membership_inventory(store,gen,removed=True)
     oldcounts=parent['manifest']['integrity']['semantic']['counts'] if incremental(parent) else {k:v['count'] for k,v in parent['manifest']['digests'].items()}

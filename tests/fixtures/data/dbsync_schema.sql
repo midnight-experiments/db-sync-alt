@@ -20,7 +20,7 @@ CREATE TABLE datum(id bigint PRIMARY KEY,hash hash32type UNIQUE NOT NULL,value j
 CREATE TABLE multi_asset(id bigint PRIMARY KEY,policy hash28type NOT NULL,name asset32type NOT NULL,UNIQUE(policy,name));
 CREATE TABLE ma_tx_out(id bigint PRIMARY KEY,quantity word64type NOT NULL,tx_out_id bigint NOT NULL REFERENCES tx_out(id),ident bigint NOT NULL REFERENCES multi_asset(id),UNIQUE(tx_out_id,ident));
 CREATE TABLE ma_tx_mint(id bigint PRIMARY KEY,quantity int65type NOT NULL,tx_id bigint NOT NULL REFERENCES tx(id),ident bigint NOT NULL REFERENCES multi_asset(id));
-CREATE TABLE epoch_param(epoch_no word31type PRIMARY KEY,nonce hash32type);
+CREATE TABLE epoch_param(epoch_no word31type PRIMARY KEY,nonce hash32type,max_tx_size word31type NOT NULL);
 CREATE TABLE pool_hash(id bigint PRIMARY KEY,hash_raw hash28type UNIQUE NOT NULL);
 CREATE TABLE epoch_stake(id bigint PRIMARY KEY,pool_id bigint NOT NULL REFERENCES pool_hash(id),amount lovelace NOT NULL,epoch_no word31type NOT NULL);
 CREATE TABLE tx_metadata(id bigint PRIMARY KEY,key word64type,tx_id bigint NOT NULL REFERENCES tx(id),json jsonb);

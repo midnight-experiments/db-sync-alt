@@ -4,7 +4,11 @@ import hashlib
 import json
 import re
 
-FORMAT = 'midnight-compact-cardano-v1'
+FORMAT = 'midnight-compact-cardano-v2'
+# The nonce-only format of stores written before epoch parameters. Such a store is still
+# recognised and verified as it was sealed, and `db-sync-alt upgrade` moves it to FORMAT.
+LEGACY_FORMAT = 'midnight-compact-cardano-v1'
+EPOCH_CAPABILITY = 'epoch_max_tx_size_v1'
 SCHEMA_VERSION = (15, 48, 6)
 PROFILE_FILES = ('cnight-config', 'federated-authority-config', 'permissioned-candidates-config',
                  'registered-candidates-addresses', 'ics-config', 'reserve-config')
@@ -18,13 +22,14 @@ TABLES = {
  'output_assets': ('tx_hash','output_index','policy','name','quantity'),
  'mints': ('tx_hash','policy','name','quantity'),
  'datums': ('hash','value'),
- 'epoch_nonces': ('epoch','nonce'),
+ 'epoch_nonces': ('epoch','nonce','max_tx_size'),
  'epoch_stakes': ('epoch','pool_hash','amount'),
 }
 KEYS = {'blocks':('hash',),'transactions':('hash',),'outputs':('tx_hash','output_index'),
  'inputs':('tx_hash','origin_hash','origin_index'),'assets':('policy','name'),
  'output_assets':('tx_hash','output_index','policy','name'),'mints':('tx_hash','policy','name'),
  'datums':('hash',),'epoch_nonces':('epoch',),'epoch_stakes':('epoch','pool_hash')}
+LEGACY_TABLES = {**TABLES, 'epoch_nonces': ('epoch','nonce')}
 
 class Refusal(Exception):
     """Safe machine-readable code, never source driver text or secrets."""
@@ -41,11 +46,13 @@ NUMERIC_FIELDS={
  'inputs':{'origin_index':(0,32767)},
  'output_assets':{'output_index':(0,32767),'quantity':(0,2**64-1)},
  'mints':{'quantity':(-(10**20-1),10**20-1)},
- 'epoch_nonces':{'epoch':(0,2**31-1)},
+ 'epoch_nonces':{'epoch':(0,2**31-1),'max_tx_size':(0,2**31-1)},
  'epoch_stakes':{'epoch':(0,2**31-1),'amount':(0,2**64-1)},
 }
-def validate_numeric(table,row):
-    for column,(lower,upper) in NUMERIC_FIELDS.get(table,{}).items():
+LEGACY_NUMERIC_FIELDS={**NUMERIC_FIELDS,'epoch_nonces':{'epoch':(0,2**31-1)}}
+def validate_numeric(table,row,*,legacy=False):
+    for column,(lower,upper) in (LEGACY_NUMERIC_FIELDS if legacy else NUMERIC_FIELDS).get(table,{}).items():
+        if column not in row:raise Refusal('invalid_numeric_domain')
         value=row[column]
         if column in ('value','quantity','amount'):
             if not isinstance(value,str) or not re.fullmatch(r'-?(0|[1-9][0-9]*)',value) or len(value)>21:raise Refusal('invalid_numeric_domain')
@@ -55,6 +62,18 @@ def validate_numeric(table,row):
             if type(value) is not int:raise Refusal('invalid_numeric_domain')
             parsed=value
         if not lower<=parsed<=upper:raise Refusal('invalid_numeric_domain')
+
+def epoch_size(value):
+    """An epoch's maximum transaction size as the source states it: an integer 0..2147483647,
+    zero included. Never a protocol default, never coerced from another type."""
+    if type(value) is not int or not 0<=value<=2**31-1:raise Refusal('invalid_epoch_max_tx_size')
+    return value
+
+# Manifest capabilities of a generation: the nonce-only format had no epoch parameters.
+CAPABILITIES={'bridge_qualified':False,'candidates_empty':True,EPOCH_CAPABILITY:True}
+LEGACY_CAPABILITIES={'bridge_qualified':False,'candidates_empty':True}
+def generation_capabilities(*,legacy=False):
+    return dict(LEGACY_CAPABILITIES if legacy else CAPABILITIES)
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -126,8 +145,16 @@ def required_epochs(start_epoch, target_epoch):
     return list(range(max(0, start_epoch - 2), target_epoch + 1))
 
 
-def contract_for(network):
-    """The fact contract of a network: stored when a database is created, its digest in every manifest."""
-    return {'block_membership':'ancestor-committed-prefix-v1','format':FORMAT,'algorithm':network.algorithm,'security':network.security,'tables':TABLES,'keys':KEYS,
-            'quantities':'canonical decimal TEXT','hashes':'raw bytes','timestamps':'UTC ISO-8601 microseconds',
-            'datum':'canonical semantic JSON','bridge_qualified':False,'schema_version':SCHEMA_VERSION}
+def contract_for(network,*,legacy=False):
+    """The fact contract of a network: stored when a database is created, its digest in every manifest.
+    `legacy` gives the nonce-only contract of stores written before epoch parameters."""
+    contract={'block_membership':'ancestor-committed-prefix-v1','format':LEGACY_FORMAT if legacy else FORMAT,'algorithm':network.algorithm,'security':network.security,
+              'tables':LEGACY_TABLES if legacy else TABLES,'keys':KEYS,
+              'quantities':'canonical decimal TEXT','hashes':'raw bytes','timestamps':'UTC ISO-8601 microseconds',
+              'datum':'canonical semantic JSON','bridge_qualified':False,'schema_version':SCHEMA_VERSION}
+    if not legacy:
+        # The node reads MAX(max_tx_size) of the cursor block's epoch: every source row of the
+        # epoch is validated and their maximum is the fact.
+        contract['epoch_parameters']={'version':1,'capability':EPOCH_CAPABILITY,
+                                      'max_tx_size':'maximum of the validated per-epoch source values, integers 0..2147483647'}
+    return contract

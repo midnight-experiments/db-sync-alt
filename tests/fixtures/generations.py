@@ -1,6 +1,6 @@
 """Small fully valid three-generation store (db-sync shaped, synthetic); no external acquisition."""
 import hashlib
-from db_sync_alt.contract import Profile, digest, canonical
+from db_sync_alt.contract import Profile, digest, canonical, generation_capabilities
 from db_sync_alt.resources import profile_dir
 from fixtures import synthetic
 
@@ -21,7 +21,7 @@ def make_store(conninfo,*,before_seal=None,**store_options):
     with synthetic.create(conninfo,PROFILE.identity,**store_options) as store:
         for gen in range(3):
             target=START+gen;witness=target+2160;fork=gen>0
-            manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'required_epochs':[0,1,2],'capabilities':{'bridge_qualified':False,'candidates_empty':True},'anchors':{name:{'height':n,'hash':block(n,fork)['hash'].hex()} for name,n in [('start',START),('target',target),('witness',witness)]}}
+            manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'required_epochs':[0,1,2],'capabilities':generation_capabilities(),'anchors':{name:{'height':n,'hash':block(n,fork)['hash'].hex()} for name,n in [('start',START),('target',target),('witness',witness)]}}
             parent=gen-1 if gen else None
             synthetic.begin(store,start=PROFILE.start,target=target,witness=witness,manifest=manifest,parent=parent)
             with store.atomic():
@@ -42,7 +42,7 @@ def make_store(conninfo,*,before_seal=None,**store_options):
                     for key in (origin,spend):store.insert('output_assets',{'tx_hash':key,'output_index':0,'policy':policy,'name':name,'quantity':'3','ordinal':0},gen)
                     store.insert('mints',{'tx_hash':spend,'policy':policy,'name':name,'quantity':'-1'},gen)
                     for epoch in range(3):
-                        store.insert('epoch_nonces',{'epoch':epoch,'nonce':h('nonce'+str(epoch))},gen)
+                        store.insert('epoch_nonces',{'epoch':epoch,'nonce':h('nonce'+str(epoch)),'max_tx_size':12000+epoch},gen)
                         store.insert('epoch_stakes',{'epoch':epoch,'pool_hash':b'p'*28,'amount':str(2**64-1)},gen)
                         receipt={'epoch':epoch,'source_kind':'cardano-db-sync-postgresql'}
                         if epoch<2:receipt['epoch_end']={'height':START-2+epoch,'hash':block(START-2+epoch)['hash'].hex()}

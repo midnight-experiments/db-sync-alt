@@ -12,8 +12,8 @@ updates, or an explicitly trusted non-Mainnet history as described below. An
 upgrade alone does not make arbitrary full-scan history eligible. An unsupported
 history refuses with `relevance_parent_unsupported` before provider requests.
 
-The schema version remains 4; fact format 1, backup v3 and the packaged
-query/profile identities remain. Filtered history requires a reader that checks
+Filtering changes neither the schema, the fact format, the backup format nor
+the packaged query and profile identities. Filtered history requires a reader that checks
 relevance proofs. Keep that compatible package and profile with the database and
 its backups, even after switching filtering off.
 

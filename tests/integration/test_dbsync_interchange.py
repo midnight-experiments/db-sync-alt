@@ -60,7 +60,7 @@ class InterchangeTests(unittest.TestCase):
                         for i,r in enumerate(prepared.rows('mints',1)):db.execute('INSERT INTO ma_tx_mint VALUES(%s,%s,%s,%s)',(i+1,r['quantity'],tx_ids[r['tx_hash']],asset_ids[(r['policy'],r['name'])]))
                         pools={r['pool_hash'] for r in prepared.rows('epoch_stakes',1)};pool_ids={p:i+1 for i,p in enumerate(sorted(pools))}
                         for pool,pid in pool_ids.items():db.execute('INSERT INTO pool_hash VALUES(%s,%s)',(pid,pool))
-                        for r in prepared.rows('epoch_nonces',1):db.execute('INSERT INTO epoch_param VALUES(%s,%s)',(r['epoch'],r['nonce']));db.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)',(r['epoch'],))
+                        for r in prepared.rows('epoch_nonces',1):db.execute('INSERT INTO epoch_param VALUES(%s,%s,%s)',(r['epoch'],r['nonce'],r['max_tx_size']));db.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)',(r['epoch'],))
                         for i,r in enumerate(prepared.rows('epoch_stakes',1)):db.execute('INSERT INTO epoch_stake VALUES(%s,%s,%s,%s)',(i+1,pool_ids[r['pool_hash']],r['amount'],r['epoch']))
                 expected=prepared.digests(1)
             cfg=Path(tmp.name)/'pg_service.conf';cfg.write_text('[source]\n'+''.join(k+'='+v+'\n' for k,v in psycopg.conninfo.conninfo_to_dict(source_dsn).items()));os.environ['PGSERVICEFILE']=str(cfg)
@@ -76,7 +76,7 @@ class InterchangeTests(unittest.TestCase):
                 self.assertEqual(store.generation()['manifest']['acquisition']['window_blocks'],1000)
                 if self.incremental:
                     from db_sync_alt.store.upgrade import upgrade_store
-                    self.assertEqual(upgrade_store(store)['schema_version'],4)
+                    self.assertEqual(upgrade_store(store)['schema_version'],5)
                     self.assertTrue(store.supports_checkpoints)
                     store.certify_ready_full()
                 old_ids=store.db.execute('SELECT hash,id FROM chain.transactions ORDER BY id').fetchall();old_digest=store.digests(0)

@@ -23,7 +23,7 @@ from db_sync_alt.verify.store import verify_store
 from fixtures.generations import PROFILE, START, block, h, make_store
 
 from conformance.client import QueryError, TypedClient
-from conformance.statements import parameter_types, statements
+from conformance.statements import emitted_statements, parameter_types
 
 MAX = (1 << 63) - 1
 NODE_INDEXES = ('idx_multi_asset_policy_name_hex', 'idx_ma_tx_out_ident', 'idx_tx_out_address', 'idx_ma_tx_out_id_ident',
@@ -67,9 +67,12 @@ def values(types, hit):
 
 
 def gated_statements():
-    """Every catalogue SELECT that reads relations (not the PostgreSQL catalogue)."""
+    """Every standalone catalogue SELECT reading relations outside the PostgreSQL catalogue.
+
+    The bridge query's builder components are never sent alone (bridge data is not served).
+    """
     out = []
-    for entry in statements().values():
+    for entry in emitted_statements().values():
         text = entry['sql'].lstrip().upper()
         if entry['name'] == 'driver' or not text.startswith(('SELECT', 'WITH')) or any(c in entry['sql'] for c in CATALOG):
             continue
@@ -127,6 +130,58 @@ class NativeServingTests(unittest.TestCase):
             db.execute('SET session_replication_role = replica')
             db.execute(statement)
 
+    def test_epoch_sizes_follow_cursor_epoch_through_restricted_wire_reader(self):
+        from conformance.statements import by_name
+        entry=by_name('get_max_tx_size');client=self.client()
+        for height,want in [(START-2,12000),(START-1,12001),(START,12002),(0,None)]:
+            self.assertEqual(client.query(entry['sql'],['int4'],[height]).rows,[{'max':want}])
+        with self.assertRaises(QueryError) as error:
+            client.query('UPDATE epoch_param SET max_tx_size=1',[],[])
+        self.assertEqual(error.exception.sqlstate,'42501')
+        self.change('UPDATE serve.epoch_param SET max_tx_size=24000 WHERE epoch_no=2')
+        with PgStore(conninfo=self.dsn,readonly=True) as store,self.assertRaisesRegex(Refusal,'serve_rows_mismatch'):
+            verify_store(store)
+
+    def test_released_tie_orders_input_arrays_and_invalid_datum_payload(self):
+        from conformance.statements import by_name
+        from db_sync_alt.contract import canonical
+        def extra(store,generation):
+            if generation!=0:return
+            with store.atomic():
+                store.insert('datums',{'hash':h('invalid-datum'),'value':canonical({'not_a_plutus_datum':1})},generation)
+                policy=bytes.fromhex(PROFILE.night[:56]);name=bytes.fromhex(PROFILE.night[56:])
+                # Reverse insertion order gives the released tie-breakers work to do.
+                for index in (2,1):
+                    store.insert('outputs',{'tx_hash':h('spend'),'output_index':index,'address':PROFILE.mapping,'value':'2','datum_hash':h('invalid-datum')},generation)
+                    store.insert('output_assets',{'tx_hash':h('spend'),'output_index':index,'policy':policy,'name':name,'quantity':'1','ordinal':0},generation)
+                    store.insert('outputs',{'tx_hash':h('origin'),'output_index':index,'address':'holder','value':'2','datum_hash':None},generation)
+                    store.insert('output_assets',{'tx_hash':h('origin'),'output_index':index,'policy':policy,'name':name,'quantity':'1','ordinal':0},generation)
+                    store.insert('inputs',{'tx_hash':h('spend'),'origin_hash':h('origin'),'origin_index':index,'ordinal':index},generation)
+        self.owner.close()
+        self.admin.execute(sql.SQL('DROP DATABASE {} WITH (FORCE)').format(sql.Identifier(self.name)))
+        self.admin.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(self.name)))
+        make_store(self.dsn,before_seal=extra)
+        with PgStore(conninfo=self.dsn) as store:
+            upgrade_store(store);grant_reader(store.db,self.reader);verify_store(store)
+        self.owner=psycopg.connect(self.dsn,autocommit=True)
+        ident=self.owner.execute('SELECT id FROM public.multi_asset WHERE policy=%s AND name=%s',(bytes.fromhex(PROFILE.night[:56]),bytes.fromhex(PROFILE.night[56:]))).fetchone()[0]
+        client=self.client()
+        creates=by_name('get_asset_creates');args=[ident,START,0,START,10,100,0,0,MAX,0,MAX,0,MAX]
+        rows=client.query(creates['sql'],parameter_types(creates),args).rows
+        self.assertEqual([row['utxo_index: _'] for row in rows],[0,1,2])
+        spends=by_name('get_asset_spends');args=[ident,START,0,START,10,100,0,0,MAX,0,MAX]
+        rows=client.query(spends['sql'],parameter_types(spends),args).rows
+        self.assertEqual([row['utxo_index: _'] for row in rows],[0,1,2])
+        registrations=by_name('get_registrations');args=[PROFILE.mapping,ident,START,0,START,10,100,0,0,MAX,0,MAX,0,MAX]
+        rows=client.query(registrations['sql'],parameter_types(registrations),args).rows
+        self.assertEqual([row['utxo_index: _'] for row in rows],[1,2])
+        self.assertEqual([row['full_datum!: DbDatumIfValid'] for row in rows],[{'not_a_plutus_datum':1}]*2)
+        utxos=by_name('get_utxos_for_address_tx_in_enabled',part='primitives')
+        rows=client.query(utxos['sql'],parameter_types(utxos),[PROFILE.mapping,START]).rows
+        self.assertTrue(rows)
+        self.assertTrue(all(row['tx_inputs']==[h('origin').hex()+'#'+str(index) for index in range(3)] for row in rows))
+        # The reader receives the stored payload exactly; decoding it is the node's DbDatumIfValid.
+
     def test_reader_privileges_and_node_catalogue_checks(self):
         self.assertEqual(self.granted['relations'], ['public.' + n for n in NODE_RELATIONS])
         client = self.client()
@@ -176,9 +231,9 @@ class NativeServingTests(unittest.TestCase):
                     self.assertEqual(self.outcome(auto, entry, hit), ready[key])
                 self.assertEqual(self.outcome(generic, entry, hit), ready[key])
         answering = {key for key, value in ready.items() if value[0] == 'rows'}
-        # Only statements of features the node does not run fail while serving (missing relation).
+        # Every standalone statement of the pinned catalogue answers while serving.
         self.assertEqual({entry['name'] for entry in entries for hit in (True, False) if (entry['sql'], hit) not in answering},
-                         {'get_stake_pool_delegations_for_pools'})
+                         set())
         self.assertGreater(sum(ready[key][1] for key in answering if key[1]), 10)
         original = self.owner.execute('SELECT revoked,canonical_ready,migration_state,owner FROM chain.service_state').fetchone()
         projection = self.owner.execute('SELECT projection_generation FROM chain.integrity_state').fetchone()[0]
@@ -366,7 +421,7 @@ class ServedTablesTests(unittest.TestCase):
             self.assertEqual(store.state()['schema_version'], 2)
             source = Source({'inputs': {k: 3 for k in inputs}, 'output_assets': {k: 0 for k in assets}})
             result = upgrade_store(store, source)
-            self.assertEqual((result['schema_version'], result['ordinals_from_source']), (4, {'inputs': 1, 'output_assets': 2}))
+            self.assertEqual((result['schema_version'], result['ordinals_from_source']), (5, {'inputs': 1, 'output_assets': 2}))
             self.assertEqual(source.calls, [(inputs, assets, ['start', 'target'])])
             self.assertEqual(store.db.execute('SELECT id FROM serve.tx_in').fetchall(), [((START * 4096 + 4) * 4096 + 3,)])
             self.assertEqual(upgrade.missing_ordinals(store.db), {'inputs': [], 'output_assets': []})
@@ -379,7 +434,7 @@ class ServedTablesTests(unittest.TestCase):
         archive, manifest = folder / 'serve.dump', folder / 'serve.manifest.json'
         backup(archive, manifest, conninfo=dsn)
         body = json.loads(manifest.read_text())
-        self.assertEqual((body['format'], body['schema_version']), ('db-sync-alt-postgresql-backup-v3', 4))
+        self.assertEqual((body['format'], body['schema_version']), ('db-sync-alt-postgresql-backup-v4', 5))
         self.assertEqual(set(k for k in body['physical_inventory'] if k.startswith('serve.')), {'serve.' + t for t in serve.TABLES})
         role = self.reader()
         restored = self.database()

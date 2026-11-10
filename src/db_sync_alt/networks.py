@@ -213,6 +213,12 @@ class NetworkProfile:
         from db_sync_alt.contract import contract_for
         return contract_for(self)
 
+    @property
+    def legacy_contract(self):
+        """The nonce-only contract of this network's stores written before epoch parameters."""
+        from db_sync_alt.contract import contract_for
+        return contract_for(self, legacy=True)
+
     def valid_key(self, key):
         """A Blockfrost project key of this network (prefix and shape only)."""
         return isinstance(key, str) and re.fullmatch(re.escape(self.key_prefix) + '[A-Za-z0-9]{13,}', key) is not None
@@ -267,11 +273,12 @@ def network_profile(value):
     return entry[1]
 
 
-def for_contract(value):
-    """The packaged network whose fact contract is `value` (a persisted contract)."""
+def for_contract(value, *, legacy=False):
+    """The packaged network whose fact contract is `value` (a persisted contract); with `legacy`,
+    whose nonce-only contract it is."""
     normalized = json.loads(canonical(value)) if value is not None else None
     for _, profile in _packaged().values():
-        if json.loads(canonical(profile.contract)) == normalized:
+        if json.loads(canonical(profile.legacy_contract if legacy else profile.contract)) == normalized:
             return profile
     raise Refusal('unsupported_format')
 

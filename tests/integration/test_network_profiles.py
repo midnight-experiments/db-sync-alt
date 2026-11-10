@@ -82,7 +82,7 @@ def fill_preview(c, profile, network_name='preview'):
         c.execute('INSERT INTO pool_hash VALUES(1,%s)', (b'p' * 28,))
         for e in (0, 1):
             c.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)', (e,))
-            c.execute('INSERT INTO epoch_param VALUES(%s,%s)', (e, H('epoch' + str(e))))
+            c.execute('INSERT INTO epoch_param VALUES(%s,%s,%s)', (e, H('epoch' + str(e)), 12000 + e))
             c.execute('INSERT INTO epoch_stake VALUES(%s,1,123456,%s)', (e + 1, e))
 
 
@@ -158,7 +158,7 @@ class NetworkStoreTests(unittest.TestCase):
         with store:
             store.set_meta('profile', self.preview.identity)
             manifest = {'identity': self.preview.identity, 'contracts': digest(PREVIEW.contract),
-                        'capabilities': {'bridge_qualified': False, 'candidates_empty': True},
+                        'capabilities': {'bridge_qualified': False, 'candidates_empty': True, 'epoch_max_tx_size_v1': True},
                         'source_identity': {'adapter': 'db-sync-direct-pg-v1'}}
             with self.assertRaisesRegex(Refusal, 'invalid_bounds'):
                 store.begin_generation(source='cardano-db-sync-postgresql', start=(0, 0), target=T, witness=T + 2160, manifest=manifest)

@@ -88,7 +88,9 @@ past an error.
 ## Upgrade
 
 A database of an older schema needs `db-sync-alt upgrade` once, with the service
-stopped ([upgrade to schema 4](recovery.md#upgrade-to-schema-4)). Build the new
+stopped ([upgrade to schema 5](recovery.md#upgrade-to-schema-5)); a database of
+0.3.x or earlier also needs the Blockfrost settings in the container, as the
+service has them, or a cardano-db-sync source. Build the new
 image and set `APP_IMAGE` in `compose.env` to it, then:
 
 ```sh

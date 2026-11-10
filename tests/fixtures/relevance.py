@@ -75,7 +75,7 @@ class SQLFixture:
             else:c.execute('INSERT INTO tx_in VALUES(2,4,3,0)')
             c.execute('INSERT INTO pool_hash VALUES(1,%s)',(b'p'*28,))
             for e,h in ([(273,S-100),(274,S-50),(275,S-1)] if S else [(0,0)]):
-                c.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)',(e,));c.execute('INSERT INTO epoch_param VALUES(%s,%s)',(e,H('epoch'+str(e))));c.execute('INSERT INTO epoch_stake VALUES(%s,1,123,%s)',(e,e))
+                c.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)',(e,));c.execute('INSERT INTO epoch_param VALUES(%s,%s,%s)',(e,H('epoch'+str(e)),12000+e));c.execute('INSERT INTO epoch_stake VALUES(%s,1,123,%s)',(e,e))
     @classmethod
     def database(cls,template=None):
         name='relevance_'+uuid.uuid4().hex[:12];cls.names.append(name);cls.admin.execute(sql.SQL('CREATE DATABASE {}'+(' TEMPLATE {}' if template else '')).format(sql.Identifier(name),*([sql.Identifier(template)] if template else [])))

@@ -7,10 +7,10 @@ imply upstream endorsement.
 ## Midnight node and Partner Chains reference material
 
 Source: [midnightntwrk/midnight-node at
-3acfd2edecdcd91373b6a506933f4c14ad3f0308](https://github.com/midnightntwrk/midnight-node/tree/3acfd2edecdcd91373b6a506933f4c14ad3f0308),
-tag `node-1.0.400`.
+86774edf8cc76345a5c3a4221f3fe80c094b1c33](https://github.com/midnightntwrk/midnight-node/tree/86774edf8cc76345a5c3a4221f3fe80c094b1c33),
+tag `node-2.1.101`.
 
-The six Rust files under `reference/` are unchanged copies of the corresponding
+The seven Rust files under `reference/` are unchanged copies of the corresponding
 paths at that commit. They supply the runtime SQL catalogue. Their exact hashes
 are recorded in [`reference/source-manifest.json`](reference/source-manifest.json); do not edit them as
 ordinary application code. Midnight source files retain their Midnight
@@ -19,12 +19,15 @@ vendored component; its package declares Apache-2.0.
 
 - [Midnight node license copy](docs/licenses/midnight-node-LICENSE)
 - [Partner Chains license copy](docs/licenses/partner-chains-LICENSE)
-- [Pinned Partner Chains package declaration](https://github.com/midnightntwrk/midnight-node/blob/3acfd2edecdcd91373b6a506933f4c14ad3f0308/partner-chains/toolkit/data-sources/db-sync/Cargo.toml)
+- [Pinned Partner Chains package declaration](https://github.com/midnightntwrk/midnight-node/blob/86774edf8cc76345a5c3a4221f3fe80c094b1c33/partner-chains/toolkit/data-sources/db-sync/Cargo.toml)
 
 The six configuration files in `profiles/preprod-node-1.0.400/` are unchanged
-copies of upstream `res/preprod/` at the same commit. Their paths and SHA-256
-hashes are recorded in that directory's `source-manifest.json`. The upstream
-root and Partner Chains root had no `NOTICE` file at this pinned revision.
+copies of upstream `res/preprod/` at commit
+`3acfd2edecdcd91373b6a506933f4c14ad3f0308` (tag `node-1.0.400`). Their paths and SHA-256
+hashes are recorded in that directory's `source-manifest.json`. The license
+copies above were taken at that commit; the upstream root and Partner Chains
+root had no `NOTICE` file there. Each reference source keeps its own upstream
+copyright and license header.
 
 ## Installed dependencies
 

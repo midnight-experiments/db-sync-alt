@@ -134,7 +134,7 @@ class InspectionTests(unittest.TestCase):
         args=SimpleNamespace(network='preprod',http_port=18099,node_security_parameter=None,node_configuration_dir=None)
         class GatePassed(Exception):pass
         with psycopg.connect(dsn,autocommit=True) as db:
-            db.execute('UPDATE chain.service_state SET schema_version=4')
+            db.execute('UPDATE chain.service_state SET schema_version=5')
             with patch.object(d.PgStore,'status',side_effect=AssertionError('native_gate_loaded_history')),patch.object(launcher,'private',side_effect=GatePassed),self.assertRaises(GatePassed):
                 launcher.configure(args,params,'fixture',self.root,db,True)
             db.execute('UPDATE chain.service_state SET revoked=true')

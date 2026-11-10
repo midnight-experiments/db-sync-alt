@@ -8,7 +8,7 @@ import contextlib
 import io
 from db_sync_alt.resources import profile_dir
 from db_sync_alt.sources.blockfrost.adapter import block_row, update
-from db_sync_alt.contract import Profile, digest
+from db_sync_alt.contract import Profile, digest, generation_capabilities
 from fixtures import synthetic
 from fixtures.blockfrost import CountingProvider, Fake
 from fixtures.cbor import tx
@@ -46,7 +46,7 @@ def fixtures(fork=0,transition=False):
     if transition:
         from fixtures.blockfrost import POOL
         for epoch,total,nonce in [(2,'123','6e'*32),(3,'19','cc'*32)]:
-            route['/epochs/'+str(epoch)]={'epoch':epoch,'active_stake':total};route['/epochs/'+str(epoch)+'/parameters']={'epoch':epoch,'nonce':nonce}
+            route['/epochs/'+str(epoch)]={'epoch':epoch,'active_stake':total};route['/epochs/'+str(epoch)+'/parameters']={'epoch':epoch,'nonce':nonce,'max_tx_size':12000+epoch}
             route['/epochs/'+str(epoch)+'/blocks?count=1&page=1&order=desc']=[block(11 if epoch==2 else 2172,fork,transition)['hash']]
         route['/epochs/3/stakes?count=100&page=1&order=asc']=[{'stake_address':'stake_test1a','pool_id':POOL,'amount':'19'}]
     return route,original
@@ -55,7 +55,7 @@ def baseline(conninfo,transition=False):
     """Write generation 0 into a new store on the empty database `conninfo`; returns the open writer store."""
     routes,original=fixtures(transition=transition);s=synthetic.create(conninfo,PROFILE.identity)
     try:
-        manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'anchors':{n:{'height':OFFSET+h,'hash':block(h,transition=transition)['hash']} for n,h in [('start',10),('target',10),('witness',2170)]},'required_epochs':[0,1,2],'capabilities':{'bridge_qualified':False,'candidates_empty':True},'source_identity':{'fixture':'sql'}}
+        manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'anchors':{n:{'height':OFFSET+h,'hash':block(h,transition=transition)['hash']} for n,h in [('start',10),('target',10),('witness',2170)]},'required_epochs':[0,1,2],'capabilities':generation_capabilities(),'source_identity':{'fixture':'sql'}}
         g=synthetic.begin(s,start=PROFILE.start,target=OFFSET+10,witness=OFFSET+2170,manifest=manifest)
         with s.atomic():
             synthetic.add_blocks(s,g,[block_row(block(h,transition=transition)) for h in range(8,2171)])
@@ -69,7 +69,7 @@ def baseline(conninfo,transition=False):
             s.insert('inputs',{'tx_hash':ps,'origin_hash':po,'origin_index':0,'ordinal':0},g)
             s.checkpoint(g,'metadata','all',{'lo':OFFSET+10,'hi':OFFSET+2170,'source_kind':'cardano-db-sync-postgresql','synthetic_fixture':True});s.checkpoint(g,'events','all',{'lo':OFFSET+10,'hi':OFFSET+10,'source_kind':'cardano-db-sync-postgresql','synthetic_fixture':True});s.checkpoint(g,'prerequisites','complete',{'source_kind':'cardano-db-sync-postgresql','synthetic_fixture':True})
             for epoch in range(3):
-                s.insert('epoch_nonces',{'epoch':epoch,'nonce':b'n'*32},g);s.insert('epoch_stakes',{'epoch':epoch,'pool_hash':b'p'*28,'amount':'123'},g);s.checkpoint(g,'epochs',epoch,{'epoch':epoch,'source_kind':'cardano-db-sync-postgresql','synthetic_fixture':True,'epoch_end':{'height':OFFSET+8+epoch,'hash':block(8+epoch)['hash']} if epoch<2 else None})
+                s.insert('epoch_nonces',{'epoch':epoch,'nonce':b'n'*32,'max_tx_size':12000+epoch},g);s.insert('epoch_stakes',{'epoch':epoch,'pool_hash':b'p'*28,'amount':'123'},g);s.checkpoint(g,'epochs',epoch,{'epoch':epoch,'source_kind':'cardano-db-sync-postgresql','synthetic_fixture':True,'epoch_end':{'height':OFFSET+8+epoch,'hash':block(8+epoch)['hash']} if epoch<2 else None})
         synthetic.seal(s,g,manifest,synthetic_fixture=True)
         synthetic.open_serving(s,g)
     except BaseException:

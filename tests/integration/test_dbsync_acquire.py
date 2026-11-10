@@ -55,7 +55,7 @@ class SQLTests(unittest.TestCase):
             c.execute('INSERT INTO tx_in VALUES(1,4,1,0),(2,5,2,0),(3,7,3,0); INSERT INTO ma_tx_mint VALUES(1,-7,6,1)')
             c.execute('INSERT INTO pool_hash VALUES(1,%s)',(b'p'*28,))
             for e in (273,274,275):
-                c.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)',(e,));c.execute('INSERT INTO epoch_param VALUES(%s,%s)',(e,H('epoch'+str(e))));c.execute('INSERT INTO epoch_stake VALUES(%s,1,123456,%s)',(e,e))
+                c.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)',(e,));c.execute('INSERT INTO epoch_param VALUES(%s,%s,%s)',(e,H('epoch'+str(e)),12000+e));c.execute('INSERT INTO epoch_stake VALUES(%s,1,123456,%s)',(e,e))
     @classmethod
     def database(cls):
         name='db_sync_alt_test_sql_'+uuid.uuid4().hex[:10];cls.dbs.append(name)
@@ -194,6 +194,8 @@ raise SystemExit(pg_acquire.main(sys.argv[1:]))
                 self.assertNotIn('snapshot',row['receipt'])
                 if row['phase'] in ('prerequisites','metadata','events','epochs'):self.assertIs(row['receipt']['read_only'],True)
             dsn=store.db.info.dsn
+            from db_sync_alt.store.upgrade import upgrade_store
+            upgrade_store(store)
         folder=Path(self.tmp.name)/uuid.uuid4().hex;folder.mkdir()
         backup(folder/'state.dump',folder/'state.json',conninfo=dsn)
         dump=subprocess.run(['pg_restore','-f','-',str(folder/'state.dump')],capture_output=True,text=True,check=True).stdout

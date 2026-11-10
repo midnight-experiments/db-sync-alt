@@ -208,7 +208,7 @@ agree. It picks the highest confirmed target unless `--target-height` is given,
 works in windows of `--window-blocks` (default 1,000) and checks free space
 (`--reserve PATH:BYTES`, BYTES a whole number of bytes, default
 `/:10737418240`, 10 GiB). `upgrade` turns the new schema-1
-database into schema 4 and builds the served tables. After that, `db-sync-alt
+database into schema 5 and builds the served tables. After that, `db-sync-alt
 run` with the same database resumes it and follows Blockfrost.
 
 Measured on Preprod (a db-sync on the same machine, PostgreSQL 17 with 1 CPU and
@@ -287,5 +287,6 @@ provide both `--source-service SOURCE` and
 version/retention fields as `acquire`. Ordinary upgrades whose ordinals already
 exist need neither option. Existing `upgrade --source-service SOURCE` commands
 must include the attestation; source schema, mode, type and version checks run
-before ordinal recovery. Existing schema-4 databases and backup formats remain
-compatible; adding source support does not require reacquiring their facts.
+before ordinal recovery. The same source options give the upgrade of a database
+of 0.3.x or earlier each stored epoch's `max_tx_size` without Blockfrost
+requests ([upgrade to schema 5](recovery.md#upgrade-to-schema-5)).

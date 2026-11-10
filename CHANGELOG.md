@@ -2,7 +2,43 @@
 
 ## Unreleased
 
-
+- **BREAKING: schema 5, fact format v2 and backup format v4.** Every epoch fact
+  carries the epoch's maximum transaction size, served as
+  `epoch_param.max_tx_size`. midnight-node 2.1.101 reads
+  `MAX(epoch_param.max_tx_size)` of the cursor block's epoch on its cost-based
+  cNIGHT observation path and stops cNIGHT observations without it. The
+  packaged node query sources and all network profiles now pin node 2.1.101
+  (`86774edf8cc76345a5c3a4221f3fe80c094b1c33`); profile configurations and
+  genesis are unchanged.
+- Upgrade an existing database in place, with the service and the node stopped:
+  `db-sync-alt upgrade --service <name>`. A database written by 0.3.x or
+  earlier holds each epoch's nonce but not its size: the upgrade reads every
+  stored epoch's `max_tx_size` twice from Blockfrost with the service's
+  Blockfrost settings (2 requests per stored epoch, counted in the same daily
+  budget; `db-sync-alt status` shows the count beforehand), or from a
+  cardano-db-sync given with `--source-service` and `--source-attestation` (no
+  Blockfrost request). Both reads must agree and carry the stored nonce. Answers
+  are kept as they arrive, so a rerun continues where it stopped without
+  repeating an answered request, unless the attempt spent its own request
+  budget (4 per stored epoch) on failing requests. The change commits in one
+  transaction that verifies the whole database and, until it commits, locks the
+  node's `epoch_param`; any refusal leaves the database as it was. Stop the
+  service when `status` shows no pending generation (the upgrade refuses with
+  `upgrade_pending_generation` otherwise).
+- The packaged profiles' `network.json` now names the node 2.1.101 query pin. A
+  copy given with `--profile-dir` must be refreshed from this release, or every
+  command refuses it (`untrusted_network_profile`).
+- 0.3.x and earlier cannot open an upgraded database: they refuse schema 5 with
+  `unsupported_database_identity` (`invalid_identity` in the service). There is
+  no downgrade; keep a `pg_dump` of the stopped database to go back.
+  Backups are written only of schema-5 databases (format v4). Restoring a v2 or
+  v3 backup runs the same upgrade and needs the same source settings, which are
+  checked before the destination database is touched.
+- Acquisition validates every epoch's size (an integer from 0 to 2,147,483,647,
+  zero included, never a default) and keeps the maximum of an epoch's
+  cardano-db-sync rows, as the node does. A cardano-db-sync source needs its
+  typed `epoch_param.max_tx_size` column. Blockfrost acquisition reads the size
+  from the epoch parameters it already requests: no extra request.
 - Add optional filtering that can skip unnecessary UTxO and transaction-detail
   requests for unrelated transactions while retaining matching facts. Select it
   with `sync.relevance_enabled` or `--relevance` / `--no-relevance`; it is off by
@@ -19,7 +55,7 @@
   work. Resume uses the immutable stored window; a CLI override cannot change it.
 - **BREAKING reader requirement:** SQL acquisition receipt version 2 requires
   the updated reader/service; the 0.3.0 reader cannot admit it. It is separate from
-  schema 4, incremental manifest version 2 and backup format version 3. Supported
+  the schema, incremental manifest and backup format versions. Supported
   five-field version 1 receipts retain their validation; other adapter-versioned
   receipt field sets refuse.
 - Startup verification on a long history no longer times out when PostgreSQL

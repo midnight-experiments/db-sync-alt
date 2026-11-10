@@ -49,10 +49,27 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(Refusal):pool_hash(POOL[:-1]+'q')
     def epoch_routes(self):
         block={'hash':'aa'*32,'height':99,'previous_block':'bb'*32,'epoch':4,'slot':500,'time':1660000000,'tx_count':1}
-        return {'/metrics':[], '/epochs/4':{'epoch':4,'active_stake':'19'},'/epochs/4/parameters':{'epoch':4,'nonce':'cc'*32},'/epochs/4/blocks?count=1&page=1&order=desc':['aa'*32],'/blocks/'+'aa'*32:block,'/epochs/4/stakes?count=100&page=1&order=asc':[{'stake_address':'stake_test1a','pool_id':POOL,'amount':'10'},{'stake_address':'stake_test1b','pool_id':POOL,'amount':'9'}]}
+        return {'/metrics':[], '/epochs/4':{'epoch':4,'active_stake':'19'},'/epochs/4/parameters':{'epoch':4,'nonce':'cc'*32,'max_tx_size':12000},'/epochs/4/blocks?count=1&page=1&order=desc':['aa'*32],'/blocks/'+'aa'*32:block,'/epochs/4/stakes?count=100&page=1&order=asc':[{'stake_address':'stake_test1a','pool_id':POOL,'amount':'10'},{'stake_address':'stake_test1b','pool_id':POOL,'amount':'9'}]}
     def test_epoch_complete_twice(self):
         p=ProviderClient(30,Fake(self.epoch_routes()));nonce,stakes,anchor,receipt=epoch_facts(p,4,stake_prefix='stake_test1');self.assertEqual(stakes[0]['amount'],'19');self.assertEqual(receipt['stake_addresses'],2);self.assertEqual(nonce['nonce'],b'\xcc'*32)
         self.assertEqual(sum('/stakes?' in x for x in p.client.calls),2)
+        # The size comes from the two parameter reads epoch_facts already makes: no extra request.
+        self.assertEqual(nonce,{'epoch':4,'nonce':b'\xcc'*32,'max_tx_size':12000});self.assertEqual(receipt['max_tx_size'],12000)
+        self.assertEqual(sum(x=='/epochs/4/parameters' for x in p.client.calls),2)
+        self.assertEqual(len(p.client.calls),11)
+    def test_epoch_max_tx_size_domain(self):
+        for value in (0,1,16384,2**31-1):
+            routes=self.epoch_routes();routes['/epochs/4/parameters']['max_tx_size']=value
+            self.assertEqual(epoch_facts(ProviderClient(30,Fake(routes)),4,stake_prefix='stake_test1')[0]['max_tx_size'],value)
+        for value in (None,True,False,16384.0,'16384',-1,2**31):
+            routes=self.epoch_routes();routes['/epochs/4/parameters']['max_tx_size']=value
+            with self.assertRaisesRegex(Refusal,'invalid_epoch_max_tx_size'):epoch_facts(ProviderClient(30,Fake(routes)),4,stake_prefix='stake_test1')
+        routes=self.epoch_routes();del routes['/epochs/4/parameters']['max_tx_size']
+        with self.assertRaisesRegex(Refusal,'invalid_epoch_max_tx_size'):epoch_facts(ProviderClient(30,Fake(routes)),4,stake_prefix='stake_test1')
+    def test_epoch_max_tx_size_changed_between_reads(self):
+        routes=self.epoch_routes();first=routes['/epochs/4/parameters'];values=[first,dict(first,max_tx_size=12001)]
+        routes['/epochs/4/parameters']=lambda:values.pop(0)
+        with self.assertRaisesRegex(Refusal,'provider_epoch_changed'):epoch_facts(ProviderClient(30,Fake(routes)),4,stake_prefix='stake_test1')
     def test_epoch_null_duplicate_missing_changed(self):
         for mutate in ('null','duplicate','missing','changed'):
             routes=self.epoch_routes();key='/epochs/4/stakes?count=100&page=1&order=asc'

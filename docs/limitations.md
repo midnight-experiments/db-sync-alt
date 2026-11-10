@@ -1,7 +1,7 @@
 # Limitations
 
 - **One query set; one qualified network.** The SQL queries of Midnight node
-  1.0.400 only. Cardano Mainnet, Preprod and Preview have network profiles, but
+  2.1.101 only. Cardano Mainnet, Preprod and Preview have network profiles, but
   only Preprod has been built, followed and checked against cardano-db-sync end
   to end; Mainnet and Preview are tested on synthetic data only
   ([networks](networks.md)). Other networks have no profile and are refused.

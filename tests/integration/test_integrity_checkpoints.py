@@ -60,11 +60,11 @@ class CheckpointPGTests(CheckpointFixture):
         self.assertNotIn('error', outcome)
         self.assertEqual(during, [published] * 3)
         result = outcome['result']
-        self.assertEqual((result['schema_version'], result['checkpoint_generation'], result['base_generation']), (4, 2, 2))
+        self.assertEqual((result['schema_version'], result['checkpoint_generation'], result['base_generation']), (5, 2, 2))
         self.assertEqual(result['full_verification'], before)
         self.assertEqual(node.execute(query).fetchone(), published)
         self.assertEqual(self.node(dsn, role).execute(query).fetchone(), published)
-        self.assertEqual(store.state()['schema_version'], 4)
+        self.assertEqual(store.state()['schema_version'], 5)
         self.assertEqual(self.checkpoints(store), [(2, 0)])
         row = store.db.execute('SELECT root,digests,service_version FROM chain.integrity_checkpoints').fetchone()
         self.assertEqual(row[:2], (incremental.integrity_reference(store.generation(2))['sha256'], before['digests']))
@@ -75,7 +75,7 @@ class CheckpointPGTests(CheckpointFixture):
             node.execute('SELECT * FROM chain.integrity_checkpoints')
         self.assertTrue(store.db.execute("SELECT has_table_privilege(%s,'chain.integrity_checkpoints','SELECT')", (role,)).fetchone() == (False,))
         # A second upgrade changes nothing; the next start verifies from the checkpoint.
-        self.assertEqual(upgrade_store(store), {'schema_version': 4, 'changed': False})
+        self.assertEqual(upgrade_store(store), {'schema_version': 5, 'changed': False})
         store, walked = self.startup(dsn, store)
         self.assertEqual(walked, set())
 
@@ -183,7 +183,7 @@ class CheckpointPGTests(CheckpointFixture):
         store.close()
         store = self.open(dsn)
         result = upgrade_store(store)
-        self.assertEqual((result['schema_version'], result['checkpoint_generation'], result['base_generation']), (4, 2, 2))
+        self.assertEqual((result['schema_version'], result['checkpoint_generation'], result['base_generation']), (5, 2, 2))
         self.assertEqual(self.checkpoints(store), [(2, 0)])
         store, walked = self.startup(dsn, store)
         self.assertEqual(walked, set())
