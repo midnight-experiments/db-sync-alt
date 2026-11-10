@@ -15,9 +15,9 @@
 - **Not a db-sync replacement.** db-sync-alt keeps only the Cardano data the
   profile selects in the relations the pinned Midnight queries read. Other
   assets or addresses and ranges outside the [coverage](glossary.md#coverage)
-  are not held; the reader login can read nothing else. Invalid transactions
-  are not covered; a database that would need them is refused
-  (`unsupported_capability`).
+  are not held; the reader login can read nothing else. A phase-2-invalid
+  transaction is held as cardano-db-sync holds it: its collateral inputs and
+  collateral return, with `valid_contract` false.
 - **No candidate registrations.** The node's registration queries for
   operators, the RPC methods `sidechain_getRegistrations`,
   `sidechain_getAriadneParameters` and `systemParameters_getAriadneParameters`

@@ -50,9 +50,11 @@ class Refusal(Exception):
 
 # These bounds are the existing PostgreSQL projection domains. Enforce them
 # at ingestion and during streaming verification, including hand-edited files.
+# `valid` is cardano-db-sync's valid_contract: 0 for a phase-2-invalid transaction, which, as in
+# cardano-db-sync, holds only its collateral inputs (inputs) and its collateral return (outputs).
 NUMERIC_FIELDS={
  'blocks':{'height':(0,2**31-1),'epoch':(0,2**31-1),'slot':(0,2**63-1),'tx_count':(0,2**63-1)},
- 'transactions':{'tx_index':(0,2**31-1),'valid':(1,1)},
+ 'transactions':{'tx_index':(0,2**31-1),'valid':(0,1)},
  'outputs':{'output_index':(0,32767),'value':(0,2**64-1)},
  'inputs':{'origin_index':(0,32767)},
  'output_assets':{'output_index':(0,32767),'quantity':(0,2**64-1)},
@@ -61,7 +63,7 @@ NUMERIC_FIELDS={
  'epoch_stakes':{'epoch':(0,2**31-1),'amount':(0,2**64-1)},
  'tx_metadata':{'present':(0,1)},
 }
-LEGACY_NUMERIC_FIELDS={**NUMERIC_FIELDS,'epoch_nonces':{'epoch':(0,2**31-1)}}
+LEGACY_NUMERIC_FIELDS={**NUMERIC_FIELDS,'transactions':{'tx_index':(0,2**31-1),'valid':(1,1)},'epoch_nonces':{'epoch':(0,2**31-1)}}
 def validate_numeric(table,row,*,legacy=False):
     for column,(lower,upper) in (LEGACY_NUMERIC_FIELDS if legacy else NUMERIC_FIELDS).get(table,{}).items():
         if column not in row:raise Refusal('invalid_numeric_domain')

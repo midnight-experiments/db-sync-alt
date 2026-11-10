@@ -130,7 +130,7 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     if first is None or target is None or m.get('required_epochs')!=required_epochs(first['epoch'],target['epoch']):raise Refusal('epoch_bounds_mismatch')
     membership,args=store.membership_sql(gen) if delta else ('SELECT * FROM chain.membership(%s)',(gen,))
     scope='=' if delta else '<='
-    if db.execute('SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid<>1) LIMIT 1',(*args,gen,g['target_height'])).fetchone():raise Refusal('transaction_coverage_invalid')
+    if db.execute('SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1)) LIMIT 1',(*args,gen,g['target_height'])).fetchone():raise Refusal('transaction_coverage_invalid')
     # Physical FK validity alone does not guarantee referenced facts belong to this prefix.
     relationships=[('transactions','blocks','c.block_hash=p.hash'),('outputs','transactions','c.tx_hash=p.hash'),('outputs','datums','c.datum_hash=p.hash'),('inputs','transactions','c.tx_hash=p.hash'),('inputs','outputs','c.origin_hash=p.tx_hash AND c.origin_index=p.output_index'),('output_assets','outputs','c.tx_hash=p.tx_hash AND c.output_index=p.output_index'),('output_assets','assets','c.policy=p.policy AND c.name=p.name'),('mints','transactions','c.tx_hash=p.hash'),('mints','assets','c.policy=p.policy AND c.name=p.name')]
     for child,parent,join in relationships:

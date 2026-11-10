@@ -16,9 +16,11 @@ from db_sync_alt.sources.blockfrost import adapter, follow
 from db_sync_alt.store import database, reader, upgrade
 from db_sync_alt.verify import store as verification
 
-# The nonce-only release created chain.epoch_nonces without max_tx_size, its schema-1 view over it and
-# no bridge metadata family.
-NONCE_ONLY_DDL = """DROP TABLE chain.tx_metadata;
+# The nonce-only release created chain.epoch_nonces without max_tx_size, its schema-1 view over it, no
+# bridge metadata family and valid transactions only (its unnamed column check, CHECK(valid=1)).
+NONCE_ONLY_DDL = """ALTER TABLE chain.transactions DROP CONSTRAINT transactions_valid_check;
+ALTER TABLE chain.transactions ADD CHECK(valid=1);
+DROP TABLE chain.tx_metadata;
 DROP VIEW public.epoch_param;
 ALTER TABLE chain.epoch_nonces DROP COLUMN max_tx_size;
 CREATE VIEW public.epoch_param AS SELECT epoch AS epoch_no,nonce FROM chain.epoch_nonces WHERE first_generation<=(SELECT id FROM chain.ready_generation);"""

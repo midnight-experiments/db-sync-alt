@@ -263,3 +263,56 @@ class LedgerOrdinalTests(unittest.TestCase):
             # A bridge-covered generation keeps every asset of an ICS (or reserve) output; positions are among all assets.
             with self.subTest(address=address, bridge=bridge):
                 self.assertEqual(stored, [(u, sorted(units).index(u)) for u in kept])
+
+
+class PhaseTwoInvalidTests(unittest.TestCase):
+    """Issue 00031: a phase-2-invalid transaction spent only its collateral and created only its collateral
+    return. Blockfrost answers it from cardano-db-sync's rows: the collateral inputs as ordinary inputs with every
+    asset, the return as an ordinary output at index = number of body outputs."""
+    C,I=(b'c'*32,0),(b'i'*32,0)
+    def decoded(self,valid=False,returned=True,collateral=None):
+        b={0:[list(self.I)],1:[[b'\x60'+bytes(28),2000000]],2:200000,9:{b'p'*28:{b'n':1}},13:[list(collateral or self.C)],17:300000}
+        if returned:b[16]=[b'\x60'+bytes(28),4000000]
+        return decode_transaction(*tx(b,valid))
+    def row(self,k,**flags):return {**out(k[0].hex(),k[1]),'collateral':False,'reference':False,**flags}
+    def output(self,index,**flags):return {**out(),'output_index':index,'collateral':False,**flags}
+    def test_effects_are_the_collateral_and_its_return(self):
+        from db_sync_alt.sources.blockfrost.adapter import ledger_effects
+        d=self.decoded();answer={'inputs':[self.row(self.C)],'outputs':[self.output(1)]}
+        spent,created,minted=ledger_effects(answer,d)
+        self.assertEqual((set(spent),[r['output_index'] for r in created],minted),({self.C},[1],()))
+        # Without a collateral return nothing is created.
+        self.assertEqual(ledger_effects({'inputs':[self.row(self.C)],'outputs':[]},self.decoded(returned=False))[1],[])
+        # The body input of the transaction is the collateral too: still one spent output.
+        d=self.decoded(collateral=self.I)
+        self.assertEqual(set(ledger_effects({'inputs':[self.row(self.I)],'outputs':[self.output(1)]},d)[0]),{self.I})
+    def test_rows_that_are_not_the_ledger_effects_refuse(self):
+        from db_sync_alt.sources.blockfrost.adapter import ledger_effects
+        d=self.decoded()
+        for name,answer,code in (
+                ('body input',{'inputs':[self.row(self.C),self.row(self.I)],'outputs':[self.output(1)]},'provider_input_membership_mismatch'),
+                ('missing collateral',{'inputs':[],'outputs':[self.output(1)]},'provider_missing_input_membership'),
+                ('collateral role',{'inputs':[self.row(self.C,collateral=True)],'outputs':[self.output(1)]},'provider_input_membership_mismatch'),
+                ('reference role',{'inputs':[self.row(self.C,reference=True)],'outputs':[self.output(1)]},'provider_input_membership_mismatch'),
+                ('duplicate',{'inputs':[self.row(self.C),self.row(self.C)],'outputs':[self.output(1)]},'provider_input_membership_mismatch'),
+                ('body output',{'inputs':[self.row(self.C)],'outputs':[self.output(0),self.output(1)]},'provider_output_count_mismatch'),
+                ('missing return',{'inputs':[self.row(self.C)],'outputs':[]},'provider_output_count_mismatch'),
+                ('return as collateral',{'inputs':[self.row(self.C)],'outputs':[self.output(1,collateral=True)]},'provider_output_role_mismatch')):
+            with self.subTest(name),self.assertRaisesRegex(Refusal,code):ledger_effects(answer,d)
+        with self.assertRaisesRegex(Refusal,'provider_output_count_mismatch'):
+            ledger_effects({'inputs':[self.row(self.C)],'outputs':[self.output(1)]},self.decoded(returned=False))
+    def test_unrelated_invalid_transactions_ingest_with_no_facts(self):
+        """The sweep's probe (cases A and B) in full mode: nothing relevant, nothing stored, no refusal."""
+        from fixtures.networks import PREPROD_PROFILE
+        from db_sync_alt.sources.blockfrost.adapter import BlockfrostSource
+        from db_sync_alt.sources.blockfrost.relevance import address_text
+        text=address_text(b'\x60'+bytes(28),'preprod')
+        for collateral in (self.C,self.I):
+            d=self.decoded(collateral=collateral);raw,h=tx({0:[list(self.I)],1:[[b'\x60'+bytes(28),2000000]],2:200000,9:{b'p'*28:{b'n':1}},13:[list(collateral)],17:300000,16:[b'\x60'+bytes(28),4000000]},False)
+            self.assertEqual(d['hash'].hex(),h)
+            utxos={'hash':h,'inputs':[dict(self.row(collateral),address=text)],'outputs':[dict(self.output(1),address=text)]}
+            routes={'/blocks/'+'bb'*32+'/txs/cbor?count=100&page=1&order=asc':[{'tx_hash':h,'cbor':raw}],'/txs/'+h+'/utxos':utxos}
+            store=type('Store',(),{'generation':lambda self,g=None:{'id':1,'target_height':10**9,'manifest':{},'parent':0},'fact':lambda self,t,k:None})()
+            source=BlockfrostSource(ProviderClient(100,Fake({'/metrics':[],**routes})),PREPROD_PROFILE,store,1,stop_requested=lambda:False)
+            facts,stats,_=source._collect({'hash':b'\xbb'*32,'height':1,'tx_count':1})
+            self.assertEqual((facts,stats['transactions_scanned']),([],1))
