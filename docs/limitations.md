@@ -15,9 +15,11 @@
 - **Not a db-sync replacement.** db-sync-alt keeps only the Cardano data the
   profile selects in the relations the pinned Midnight queries read. Other
   assets or addresses and ranges outside the [coverage](glossary.md#coverage)
-  are not held; the reader login can read nothing else. Candidate registrations and invalid
-  transactions are not covered; a database that would need them is refused
-  (`unsupported_capability`).
+  are not held; the reader login can read nothing else. Candidate registrations
+  are not covered; a database that would need them is refused
+  (`unsupported_capability`). A phase-2-invalid transaction is held as
+  cardano-db-sync holds it: its collateral inputs and collateral return, with
+  `valid_contract` false.
 - **Bridge data from the coverage start only.** The token bridge's metadata is
   stored forward only, from the first update acquired from Blockfrost after the
   newest update without it (a cardano-db-sync bootstrap or catch-up, or an

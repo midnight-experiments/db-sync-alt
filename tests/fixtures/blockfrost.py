@@ -15,6 +15,25 @@ from fixtures.networks import PREPROD
 POOL='pool13m26ky08vz205232k20u8ft5nrg8u68klhn0xfsk9m4gsqsc44v'
 NOT_FOUND=object()  # a route the provider answers with HTTP 404
 
+
+def pool_id(raw):
+    """Bech32 pool ID of 28 key-hash bytes, as Blockfrost renders it."""
+    alphabet='qpzry9x8gf2tvdw0s3jn54khce6mua7l';data=[];acc=bits=0
+    for value in raw:
+        acc=acc<<8|value;bits+=8
+        while bits>=5:bits-=5;data.append(acc>>bits&31)
+    if bits:data.append(acc<<(5-bits)&31)
+    def polymod(values):
+        chk=1
+        for v in values:
+            top=chk>>25;chk=(chk&0x1ffffff)<<5^v
+            for i,g in enumerate((0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3)):
+                if top>>i&1:chk^=g
+        return chk
+    hrp=[ord(x)>>5 for x in 'pool']+[0]+[ord(x)&31 for x in 'pool']
+    check=polymod(hrp+data+[0]*6)^1
+    return 'pool1'+''.join(alphabet[x] for x in data+[check>>5*(5-i)&31 for i in range(6)])
+
 class Fake:
     def __init__(self,routes):self.routes=routes;self.calls=[]
     def get(self,p,**kw):

@@ -171,6 +171,45 @@ def ordinary_outputs(rows,decoded):
     return normal
 
 
+def collateral_inputs(rows,decoded):
+    """The outputs a phase-2-invalid transaction spent: exactly its collateral inputs. cardano-db-sync stores
+    them as the transaction's tx_in rows, so Blockfrost lists them like ordinary inputs, with every asset."""
+    if not isinstance(rows,list):raise Refusal('provider_bad_inputs')
+    spent={}
+    for r in rows:
+        try:k=(hexbytes(r['tx_hash'],32),integer(r['output_index']))
+        except (KeyError,TypeError):raise Refusal('provider_bad_input') from None
+        if any(role in r and type(r[role]) is not bool for role in ('collateral','reference')):raise Refusal('provider_bad_input_role')
+        if k not in decoded['collateral'] or k in spent or r.get('collateral') is True or r.get('reference') is True:raise Refusal('provider_input_membership_mismatch')
+        output_value(r);spent[k]=r
+    if set(spent)!=decoded['collateral']:raise Refusal('provider_missing_input_membership')
+    return spent
+
+
+def collateral_return(rows,decoded):
+    """The outputs a phase-2-invalid transaction created: its collateral return alone, at index = the number
+    of body outputs, or none. cardano-db-sync stores it as the transaction's tx_out row (not collateral)."""
+    if not isinstance(rows,list):raise Refusal('provider_missing_outputs')
+    expected={decoded['output_count']} if decoded['collateral_return'] else set();seen=set()
+    for row in rows:
+        index=integer(row.get('output_index'))
+        if index not in expected or index in seen:raise Refusal('provider_output_count_mismatch')
+        if 'collateral' in row and row['collateral'] is not False:raise Refusal('provider_output_role_mismatch')
+        seen.add(index)
+    if seen!=expected:raise Refusal('provider_output_count_mismatch')
+    return list(rows)
+
+
+def ledger_effects(response,decoded,resolve_origin=None):
+    """What a transaction did on chain, from its `/txs/{hash}/utxos` rows checked against its CBOR: the
+    outputs it spent (outpoint to row), the outputs it created (rows) and its mint. A phase-2-invalid
+    transaction spent only its collateral and created only its collateral return; its body inputs, outputs
+    and mint never took effect, and cardano-db-sync stores none of them."""
+    if decoded['valid']:
+        return classify_inputs(response.get('inputs'),decoded,resolve_origin),ordinary_outputs(response.get('outputs'),decoded),decoded['mints']
+    return collateral_inputs(response.get('inputs'),decoded),collateral_return(response.get('outputs'),decoded),()
+
+
 def inventory(provider,block):
     diagnostic_context(provider,'events.inventory',block_height=block.get('height'),block_hash=block.get('hash'))
     if block['tx_count']==0:return []
@@ -192,8 +231,94 @@ def inventory(provider,block):
     if len(txs)!=block['tx_count']:raise Refusal('provider_transaction_count_mismatch')
     return txs
 
+# Retired pools can still hold stake in an epoch: its distribution is the snapshot taken one epoch earlier,
+# before that boundary reaps retiring pools. Pools retired at E - 2 or later are read for epoch E.
+RETIRED_WINDOW = 2
+MAX_POOLS = 100000
+
+
+def _pool_rows(rows):
+    if not isinstance(rows, list) or len(rows) > 100:raise Refusal('provider_bad_page')
+    return rows
+
+
+def retired_pools(provider, epoch):
+    """Pool IDs retired at epoch `epoch - RETIRED_WINDOW` or later, newest first."""
+    out = []
+    for page in range(1, 10001):
+        rows = _pool_rows(provider.get('/pools/retired?' + urlencode({'count': 100, 'page': page, 'order': 'desc'})))
+        for r in rows:
+            if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
+            if integer(r.get('epoch')) < epoch - RETIRED_WINDOW:return out
+            pool_hash(r.get('pool_id'));out.append(r['pool_id'])
+        if len(rows) < 100:return out
+    raise Refusal('provider_page_limit')
+
+
+def _add(pools, pool_id, amount):
+    key = pool_hash(pool_id)
+    if key in pools:raise Refusal('provider_duplicate_or_invalid_stake')
+    pools[key] = (pool_id, amount)
+    if len(pools) > MAX_POOLS:raise Refusal('provider_epoch_size_limit')
+
+
+def current_pool_stakes(provider, epoch, *, stake_prefix):
+    """Per-pool stake of the current epoch: `/pools/extended` and the retired window through `/pools/{id}`, each
+    the sum of the epoch's epoch_stake rows of that pool. A pool with sum 0 holds rows only if the epoch's per-address
+    listing of that pool is non-empty."""
+    pools = {}
+    for rows in provider.pages('/pools/extended'):
+        for r in rows:
+            if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
+            _add(pools, r.get('pool_id'), integer(r.get('active_stake')))
+    for pool_id in retired_pools(provider, epoch):
+        if pool_hash(pool_id) in pools:continue  # retired, then registered again
+        r = provider.get('/pools/' + pool_id)
+        if not isinstance(r, dict) or r.get('pool_id') != pool_id:raise Refusal('provider_duplicate_or_invalid_stake')
+        _add(pools, pool_id, integer(r.get('active_stake')))
+    out = {}
+    for key, (pool_id, amount) in pools.items():
+        if amount == 0:
+            rows = _pool_rows(provider.get('/epochs/' + str(epoch) + '/stakes/' + pool_id + '?count=1&page=1'))
+            if not rows:continue
+            if not isinstance(rows[0], dict) or not isinstance(rows[0].get('stake_address'), str) or not rows[0]['stake_address'].startswith(stake_prefix):
+                raise Refusal('provider_duplicate_or_invalid_stake')
+        out[key] = amount
+    return out
+
+
+def historical_pool_stakes(provider, epoch):
+    """Per-pool stake of a completed epoch: every registered pool and the retired window, from each pool's history
+    (a row exists exactly where the pool has epoch_stake rows in that epoch)."""
+    candidates = {}
+    for rows in provider.pages('/pools'):
+        for pool_id in rows:
+            _add(candidates, pool_id, None)
+    for pool_id in retired_pools(provider, epoch):
+        if pool_hash(pool_id) not in candidates:_add(candidates, pool_id, None)
+    out = {}
+    for key, (pool_id, _) in sorted(candidates.items()):
+        for page in range(1, 10001):
+            rows = _pool_rows(provider.get('/pools/' + pool_id + '/history?' + urlencode({'count': 100, 'page': page, 'order': 'desc'})))
+            done = len(rows) < 100
+            for r in rows:
+                if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
+                row_epoch = integer(r.get('epoch'))
+                if row_epoch == epoch:
+                    if integer(r.get('delegators_count')) < 1:raise Refusal('provider_duplicate_or_invalid_stake')
+                    out[key] = integer(r.get('active_stake'))
+                if row_epoch <= epoch:done = True;break
+            if done:break
+        else:raise Refusal('provider_page_limit')
+    return out
+
+
 def epoch_facts(provider,epoch,target=None,*,stake_prefix):
-    """Two complete unique-address reads, total/nonce/max_tx_size/end-anchor equality."""
+    """Two complete per-pool reads of an epoch's stake distribution, with total/nonce/max_tx_size/end-anchor equality.
+
+    The facts are the SQL path's per-pool sums. Requests grow with the number of pools, never with the number of
+    delegated addresses: the current epoch (the latest block's) through `/pools/extended`, a completed one through each
+    pool's history."""
     def header():
         summary=provider.get('/epochs/'+str(epoch));params=provider.get('/epochs/'+str(epoch)+'/parameters')
         if summary.get('epoch')!=epoch or params.get('epoch')!=epoch or summary.get('active_stake') is None or params.get('nonce') is None:raise Refusal('provider_epoch_not_ready')
@@ -210,21 +335,23 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
         if target is not None and anchor['height']>target:
             anchor=block_row(provider.get('/blocks/'+str(target)))
             if anchor['height']!=target or anchor['epoch']!=epoch:raise Refusal('provider_epoch_anchor_mismatch')
-        return total,{'epoch':epoch,'nonce':nonce,'max_tx_size':size},anchor,completed
+        # The pool endpoints' "current epoch" is the latest block's epoch: read it the same way.
+        current=block_row(provider.get('/blocks/latest'))['epoch']
+        if current<epoch:raise Refusal('provider_epoch_not_ready')
+        return total,{'epoch':epoch,'nonce':nonce,'max_tx_size':size},anchor,completed,current
     first=header();reads=[]
+    source='pools-current' if first[4]==epoch else 'pools-history'
     for _ in range(2):
-        seen={};pools={};total=0
-        for rows in provider.pages('/epochs/'+str(epoch)+'/stakes'):
-            for r in rows:
-                address=r.get('stake_address')
-                if not isinstance(address,str) or not address.startswith(stake_prefix) or address in seen:raise Refusal('provider_duplicate_or_invalid_stake')
-                pool=pool_hash(r.get('pool_id'));amount=integer(r.get('amount'));seen[address]=(pool.hex(),str(amount));pools[pool]=pools.get(pool,0)+amount;total+=amount
-                if len(seen)>1000000:raise Refusal('provider_epoch_size_limit')
-        if not seen or total!=first[0]:raise Refusal('provider_epoch_total_mismatch')
-        reads.append((digest(seen),pools,len(seen)))
+        reads.append(current_pool_stakes(provider,epoch,stake_prefix=stake_prefix) if source=='pools-current' else historical_pool_stakes(provider,epoch))
+    # A boundary crossed during the reads moves the latest block's epoch: that is a wait (then the completed
+    # epoch is read from the pools' histories), checked before the sums, which such a read cannot match.
     last=header()
-    if first!=last or reads[0]!=reads[1]:raise Refusal('provider_epoch_changed')
-    return first[1],[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(reads[0][1].items())],first[2],{'max_tx_size':first[1]['max_tx_size'],'stake_addresses':reads[0][2],'stake_digest':reads[0][0],'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
+    if first!=last:raise Refusal('provider_epoch_changed')
+    for pools in reads:
+        if not pools or sum(pools.values())!=first[0]:raise Refusal('provider_epoch_total_mismatch')
+    if reads[0]!=reads[1]:raise Refusal('provider_epoch_changed')
+    pools=reads[0]
+    return first[1],[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(pools.items())],first[2],{'max_tx_size':first[1]['max_tx_size'],'stake_source':source,'stake_pools':len(pools),'stake_digest':digest({k.hex():str(v) for k,v in pools.items()}),'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
 
 class BlockfrostSource:
     def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False):
@@ -250,13 +377,13 @@ class BlockfrostSource:
         r=block_row(self.provider.get('/blocks/'+h.hex()))
         if r['hash']!=h or r['height']>self.target:raise Refusal('provider_origin_block_mismatch')
         self.add('blocks',r);return r
-    def transaction(self,h,expected_block=None,expected_index=None):
+    def transaction(self,h,expected_block=None,expected_index=None,expected_valid=None):
         if h in self.cache:return self.cache[h]
         r=self.provider.get('/txs/'+h.hex())
-        if r.get('hash')!=h.hex() or type(r.get('valid_contract')) is not bool or not r['valid_contract']:raise Refusal('provider_relevant_invalid_transaction')
+        if r.get('hash')!=h.hex() or type(r.get('valid_contract')) is not bool or (expected_valid is not None and r['valid_contract']!=expected_valid):raise Refusal('provider_transaction_mismatch')
         block=self.block(hexbytes(r.get('block'),32));index=integer(r.get('index'))
         if integer(r.get('block_height'))!=block['height'] or index>=block['tx_count'] or (expected_block is not None and block['hash']!=expected_block) or (expected_index is not None and index!=expected_index):raise Refusal('provider_transaction_position_mismatch')
-        self.add('transactions',{'hash':h,'block_hash':block['hash'],'tx_index':index,'valid':1});self.cache[h]=r;return r
+        self.add('transactions',{'hash':h,'block_hash':block['hash'],'tx_index':index,'valid':1 if r['valid_contract'] else 0});self.cache[h]=r;return r
     def datum(self,h,inline=None):
         """Store datum `h` as cardano-db-sync 13.8 does, from its CBOR bound to `h`; `inline` is the
         output's own datum CBOR.
@@ -297,8 +424,9 @@ class BlockfrostSource:
         self.transaction(h)
         response=self.provider.get('/txs/'+h.hex()+'/utxos')
         if response.get('hash')!=h.hex():raise Refusal('provider_origin_hash_mismatch')
+        # A created output: a valid transaction's collateral return (listed as collateral) never exists.
         matches=[x for x in response.get('outputs',[]) if x.get('output_index')==index]
-        if len(matches)!=1 or output_value(matches[0])!=output_value(observed):raise Refusal('provider_origin_conflict')
+        if len(matches)!=1 or matches[0].get('collateral') is True or output_value(matches[0])!=output_value(observed):raise Refusal('provider_origin_conflict')
         self.output(h,matches[0])
     def _collect(self,block):
         self.cache={};self.facts=[];txs=inventory(self.provider,block)
@@ -310,32 +438,27 @@ class BlockfrostSource:
             if self.discovery and not self.discovery.select(decoded):continue
             response=self.provider.get('/txs/'+h.hex()+'/utxos')
             if response.get('hash')!=h.hex():raise Refusal('provider_utxo_hash_mismatch')
-            ordinary=classify_inputs(response.get('inputs'),decoded,lambda origin,index:fetch_original_output(self.provider,origin,index))
-            outputs=ordinary_outputs(response.get('outputs'),decoded)
+            spent,created,minted=ledger_effects(response,decoded,lambda origin,index:fetch_original_output(self.provider,origin,index))
             if self.discovery:
                 from db_sync_alt.sources.blockfrost.relevance import compare_outputs
                 compare_outputs(decoded,response['outputs'],self.profile.network.network)
-                self.discovery.advance(decoded,outputs)
-            # Unsupported relevant invalid transactions include relevant
-            # collateral-return facts even though valid ones ignore that output.
-            if not decoded['valid']:outputs=response['outputs']
-            relevant_out=[x for x in outputs if self.profile.relevant(output_value(x)[0]['address'],output_value(x)[1])]
-            relevant_in=[(k,x) for k,x in ordinary.items() if self.profile.relevant(output_value(x)[0]['address'],output_value(x)[1])]
+                self.discovery.advance(decoded,created)
+            relevant_out=[x for x in created if self.profile.relevant(output_value(x)[0]['address'],output_value(x)[1])]
+            relevant_in=[(k,x) for k,x in spent.items() if self.profile.relevant(output_value(x)[0]['address'],output_value(x)[1])]
             if self.discovery and any(not self.discovery.contains(key) for key,_ in relevant_in):raise Refusal('relevance_parent_incomplete')
-            mints=[m for m in decoded['mints'] if self.profile.required(m[0],m[1])]
-            if self.discovery and not decoded['valid'] and any(self.discovery.contains(key) for key in decoded['collateral']):raise Refusal('unsupported_relevant_invalid_transaction')
+            mints=[m for m in minted if self.profile.required(m[0],m[1])]
             if not (relevant_out or relevant_in or mints):continue
-            if not decoded['valid']:raise Refusal('unsupported_relevant_invalid_transaction')
-            self.transaction(h,block['hash'],index)
+            self.transaction(h,block['hash'],index,decoded['valid'])
             for x in relevant_out:self.output(h,x)
-            ordinals=ledger_ordinals(ordinary)
+            ordinals=ledger_ordinals(spent)
             for (origin,oi),x in relevant_in:
                 self.origin(origin,oi,x);self.add('inputs',{'tx_hash':h,'origin_hash':origin,'origin_index':oi,'ordinal':ordinals[(origin,oi)]})
             for p,n,q in mints:
                 self.add('assets',{'policy':p,'name':n});self.add('mints',{'tx_hash':h,'policy':p,'name':n,'quantity':str(q)})
             # The bridge query reads the metadata of transactions with an output at the ICS address.
+            # cardano-db-sync stores none for a phase-2-invalid transaction.
             if self.bridge and any(output_value(x)[0]['address']==self.profile.ics for x in relevant_out):
-                self.add('tx_metadata',metadata.fetch(self.provider,decoded))
+                self.add('tx_metadata',metadata.fetch(self.provider,decoded) if decoded['valid'] else metadata.fact(h,False,None))
         return self.facts,{'transactions_scanned':len(txs),'facts':len(self.facts)},txs
     def block_facts(self,block):
         facts,stats,txs=self._collect(block)
@@ -385,27 +508,28 @@ def handoff_overlap(provider,store,profile,parent):
     rows=store.recent_transactions(parent['id'],limit=8)
     checked=0
     for transaction in rows:
-        h,block,index=(transaction[k] for k in ('hash','block_hash','tx_index'))
+        h,block,index,valid=(transaction[k] for k in ('hash','block_hash','tx_index','valid'))
         diagnostic_context(provider,'handoff',block_hash=block,transaction_index=index,transaction_hash=h)
         raw=provider.get('/txs/'+h.hex()+'/cbor');decoded=decode_transaction(raw.get('cbor'),h.hex())
         u=provider.get('/txs/'+h.hex()+'/utxos')
-        if u.get('hash')!=h.hex() or not decoded['valid']:raise Refusal('provider_handoff_fact_conflict')
-        ordinary=classify_inputs(u.get('inputs'),decoded,lambda origin,index:fetch_original_output(provider,origin,index))
+        if u.get('hash')!=h.hex() or decoded['valid']!=(valid==1):raise Refusal('provider_handoff_fact_conflict')
+        spent,created,minted=ledger_effects(u,decoded,lambda origin,index:fetch_original_output(provider,origin,index))
         expected={};covered={}
         for out in store.transaction_outputs(h,parent['id']):
             assets={(bytes(r['policy']),bytes(r['name'])):int(r['quantity']) for r in store.output_assets(h,out['output_index'],parent['id'])}
             expected[out['output_index']]=({k:out[k] for k in ('address','value','datum_hash')},assets)
             covered[out['output_index']]=store.bridge_covered(store.output_generation(h,out['output_index']))
         seen={}
-        for out in ordinary_outputs(u.get('outputs'),decoded):
+        for out in created:
             val,assets=output_value(out);index=integer(out['output_index'])
             if profile.relevant(val['address'],assets):seen[index]=(val,profile.kept_assets(val['address'],assets,covered=covered.get(index,False)))
-        ins={k for k,v in ordinary.items() if profile.relevant(output_value(v)[0]['address'],output_value(v)[1])}
+        ins={k for k,v in spent.items() if profile.relevant(output_value(v)[0]['address'],output_value(v)[1])}
         expected_ins={(bytes(r['origin_hash']),r['origin_index']) for r in store.transaction_inputs(h,parent['id'])}
-        mint={ (p,n):q for p,n,q in decoded['mints'] if profile.required(p,n)}
+        mint={ (p,n):q for p,n,q in minted if profile.required(p,n)}
         expected_mint={(bytes(r['policy']),bytes(r['name'])):int(r['quantity']) for r in store.transaction_mints(h,parent['id'])}
         stored=store.fact('tx_metadata',(h,)) if 'tx_metadata' in store.physical_tables else None
-        if seen!=expected or ins!=expected_ins or mint!=expected_mint or (stored is not None and not metadata.stored_agrees(decoded,stored)):raise Refusal('provider_handoff_fact_conflict')
+        metadata_agrees=stored is None or (metadata.stored_agrees(decoded,stored) if decoded['valid'] else stored['present']==0)
+        if seen!=expected or ins!=expected_ins or mint!=expected_mint or not metadata_agrees:raise Refusal('provider_handoff_fact_conflict')
         checked+=1
     if not checked:raise Refusal('provider_nonempty_handoff_unqualified')
     return checked

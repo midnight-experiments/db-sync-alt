@@ -295,4 +295,63 @@ raise SystemExit(pg_acquire.main(sys.argv[1:]))
             self.assertTrue(all(r['receipt']['hi']-r['receipt']['lo']+1<=600 for r in receipts))
             verify_store(store)
 
+    def test_blockfrost_per_pool_epoch_stake_equals_the_sql_path(self):
+        """The Blockfrost epoch stage reads stake per pool; for the same cardano-db-sync rows its facts equal the
+        SQL path's GROUP BY, for the current epoch (pool list) and for a completed one (pool histories). Blockfrost's
+        answers are rendered from this database the way its SQL renders them (pools_extended.sql, pools_pool_id.sql,
+        pools_pool_id_history.sql, epochs_number.sql)."""
+        from db_sync_alt.sources.blockfrost.adapter import epoch_facts
+        from db_sync_alt.sources.dbsync.reader import SQLSource
+        from fixtures.blockfrost import CountingProvider, pool_id
+        dsn,service=self.database();E=600
+        raw={i:hashlib.sha256(b'pool'+bytes([i])).digest()[:28] for i in range(1,8)};ids={pool_id(r):i for i,r in raw.items()}
+        registered=[1,2,3,4,5,6];retired=[(7,E-1)]
+        # Pool 5's delegators hold 0 (a row with a zero sum); pool 6 has no delegators; pool 7 retired at E - 1.
+        counts={1:900,2:700,3:300,4:1,5:2,7:40}
+        with psycopg.connect(dsn,autocommit=True) as c:
+            c.execute((ROOT/'tests/fixtures/data/dbsync_schema.sql').read_text())
+            c.execute("CREATE TABLE epoch_stake_progress(epoch_no word31type NOT NULL,completed boolean NOT NULL)")
+            with c.transaction():
+                for i,r in raw.items():c.execute('INSERT INTO pool_hash VALUES(%s,%s)',(i,r))
+                n=0
+                for epoch in (E-1,E):
+                    for pool,count in counts.items():
+                        for k in range(count):
+                            n+=1;c.execute('INSERT INTO epoch_stake VALUES(%s,%s,%s,%s)',(n,pool,0 if pool==5 else 1000+k%7+epoch,epoch))
+                c.execute("INSERT INTO block(id,hash,block_no,epoch_no,slot_no,time,tx_count) VALUES(1,%s,10,%s,10,'2026-01-01',0)",(H('end'),E))
+                c.execute('INSERT INTO epoch_stake_progress VALUES(%s,true)',(E,));c.execute('INSERT INTO epoch_param VALUES(%s,%s,16384)',(E,H('nonce')))
+        source=SQLSource(service,self.profile)
+        with source.snapshot():sql_facts=[dict(r,pool_hash=bytes(r['pool_hash'])) for t,r in source.epochs(E,5) if t=='epoch_stakes']
+        self.assertEqual(len(sql_facts),6)
+        reader=psycopg.connect(dsn,autocommit=True);self.addCleanup(reader.close)
+        one=lambda q,a=():reader.execute(q,a).fetchone()[0]
+        class Rendered:
+            def __init__(self,current):self.current=current
+            def get(self,path,purpose=None):
+                base=path.split('?')[0];query=dict(x.split('=') for x in path.split('?',1)[1].split('&')) if '?' in path else {}
+                page=lambda rows:rows[(int(query.get('page',1))-1)*int(query.get('count',100)):int(query.get('page',1))*int(query.get('count',100))]
+                block={'hash':'aa'*32,'height':99,'previous_block':'bb'*32,'epoch':E,'slot':500,'time':1660000000,'tx_count':1}
+                if path=='/metrics':return []
+                if path=='/blocks/latest':return dict(block,hash='ab'*32,height=120,epoch=self.current)
+                if path=='/epochs/%d'%E:return {'epoch':E,'active_stake':str(one('SELECT COALESCE(SUM(amount),0) FROM epoch_stake WHERE epoch_no=%s',(E,)))}
+                if path=='/epochs/%d/parameters'%E:return {'epoch':E,'nonce':H('nonce').hex(),'max_tx_size':16384}
+                if path=='/epochs/%d/blocks?count=1&page=1&order=desc'%E:return ['aa'*32]
+                if path=='/blocks/'+'aa'*32:return block
+                stake=lambda i,e:one('SELECT COALESCE(SUM(amount),0) FROM epoch_stake WHERE pool_id=%s AND epoch_no=%s',(i,e))
+                if base=='/pools/extended':return page([{'pool_id':pool_id(raw[i]),'active_stake':str(stake(i,self.current))} for i in registered])
+                if base=='/pools':return page([pool_id(raw[i]) for i in registered])
+                if base=='/pools/retired':return page([{'pool_id':pool_id(raw[i]),'epoch':e} for i,e in retired])
+                if base.startswith('/epochs/%d/stakes/'%E):
+                    i=ids[base.rsplit('/',1)[1]];return [{'stake_address':'stake_test1u'+'q'*53,'amount':'0'}] if one('SELECT count(*) FROM epoch_stake WHERE pool_id=%s AND epoch_no=%s',(i,E)) else []
+                if base.endswith('/history'):
+                    i=ids[base.split('/')[2]]
+                    rows=reader.execute('SELECT epoch_no,SUM(amount)::text,COUNT(*) FROM epoch_stake WHERE pool_id=%s AND epoch_no<%s GROUP BY epoch_no ORDER BY epoch_no DESC',(i,self.current)).fetchall()
+                    return page([{'epoch':e,'active_stake':a,'delegators_count':n,'blocks':0,'active_size':0.0,'rewards':'0','fees':'0'} for e,a,n in rows])
+                if base.startswith('/pools/'):return {'pool_id':base.split('/')[2],'active_stake':str(stake(ids[base.split('/')[2]],self.current))}
+                raise AssertionError(path)
+        for current,kind in ((E,'pools-current'),(E+1,'pools-history')):
+            with self.subTest(kind=kind):
+                _,facts,_,receipt=epoch_facts(CountingProvider(10000,Rendered(current)),E,stake_prefix='stake_test1')
+                self.assertEqual(receipt['stake_source'],kind);self.assertEqual(facts,sql_facts)
+
 if __name__=='__main__':unittest.main(verbosity=2)

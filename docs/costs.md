@@ -14,6 +14,11 @@ Bridge metadata adds one request per published transaction with an output at
 the ICS address (two with relevance filtering, which repeats every request for
 its independent pass). Such transactions are rare.
 
+Each new epoch's stake is read per pool, twice, whatever the number of
+delegated stake addresses: about 2 × (pools / 100 + pools without stake) for
+the current epoch (≈ 1,300 requests on Mainnet), or about 2 × pools when
+catching up an epoch that has already ended (≈ 6,100 on Mainnet).
+
 Upgrading a database of 0.3.x or earlier to this version reads each stored
 epoch's parameters twice: 2 requests per stored epoch, once
 ([upgrade to schema 5](recovery.md#upgrade-to-schema-5)); `db-sync-alt status`

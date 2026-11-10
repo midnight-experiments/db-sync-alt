@@ -23,7 +23,10 @@ A database created by db-sync-alt is owned by the `db-sync-alt` identity and has
 a schema version (1 to 5) and a fact format. The service and the node's reader
 need schema 5 with fact format `midnight-compact-cardano-v2`, whose epoch facts
 carry `max_tx_size` and which holds bridge metadata (`tx_metadata`) from its
-coverage start. `db-sync-alt upgrade` brings an older database there
+coverage start. It holds a phase-2-invalid transaction as cardano-db-sync 13.8
+does: `valid_contract` false, its collateral inputs as `tx_in` and its
+collateral return as `tx_out` (at the index after the body outputs); its body
+inputs, outputs and mint never took effect and are not held. `db-sync-alt upgrade` brings an older database there
 ([recovery](recovery.md#upgrade-to-schema-5)); a database of 0.3.x or earlier
 (fact format `midnight-compact-cardano-v1`) also needs each stored epoch's size
 from Blockfrost or a cardano-db-sync. db-sync-alt 0.3.x and earlier refuse an

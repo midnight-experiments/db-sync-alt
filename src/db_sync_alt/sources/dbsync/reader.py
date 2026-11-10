@@ -182,9 +182,9 @@ class SQLSource:
         txs=sorted(txids)
         if not txs:return
         for r in self.stream('SELECT DISTINCT '+BLOCK_COLUMNS+' FROM tx t JOIN block b ON b.id=t.block_id LEFT JOIN block p ON p.id=b.previous_id WHERE t.id=ANY(%s::bigint[])',(txs,)):yield 'blocks',self.block_row(r)
+        # A phase-2-invalid transaction's tx_in and tx_out rows are its collateral inputs and return.
         for r in self.stream('SELECT t.hash,b.hash AS block_hash,t.block_index AS tx_index,t.valid_contract AS valid FROM tx t JOIN block b ON b.id=t.block_id WHERE t.id=ANY(%s::bigint[]) ORDER BY b.block_no,t.block_index',(txs,)):
-            if r['valid'] is not True:raise Refusal('invalid_relevant_transaction')
-            r['valid']=1;yield 'transactions',r
+            r['valid']=1 if r['valid'] is True else 0;yield 'transactions',r
         # A datum hash without a datum row is a preimage not on chain yet: the output keeps the hash.
         # An inline datum is always in the source, under the output's own hash.
         missing=self.one('SELECT count(*) AS n FROM tx_out o LEFT JOIN datum di ON di.id=o.inline_datum_id WHERE o.id=ANY(%s::bigint[]) AND o.inline_datum_id IS NOT NULL AND (di.id IS NULL OR di.hash IS DISTINCT FROM o.data_hash)',(outs,))['n']

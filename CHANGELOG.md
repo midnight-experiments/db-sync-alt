@@ -95,6 +95,32 @@
   nested deeper than about 60 levels or with a repeated map key. Anyone can
   submit such a transaction. The witness set must still be a map; its content
   is now read past without being decoded.
+- Fix Blockfrost following stopping for good at an epoch whose stake
+  distribution has more than about 499,000 delegated stake addresses
+  (Mainnet has more; anyone can register more). The epoch's stake is now read
+  per pool, the same per-pool sums cardano-db-sync acquisition stores: the
+  current epoch from the pool list, a completed epoch from each pool's history.
+  Requests grow with the number of pools (about 1,300 per new Mainnet epoch,
+  6,100 when catching up a completed one), never with delegated addresses.
+- Fix Blockfrost acquisition and follow stopping at every phase-2-invalid
+  transaction in full mode, and at a selected one in relevance mode. Such a
+  transaction is accepted on chain whenever a script fails, also without an
+  attacker. db-sync-alt now stores it as cardano-db-sync 13.8 does: only its
+  collateral inputs are spent and only its collateral return is created (at
+  the index after the body outputs); its body inputs, outputs and mint, which
+  never took effect, are not stored. One that touches nothing relevant stores
+  nothing. A relevant one (a spent collateral or a returned output of the
+  profile) is served with `valid_contract` false, from a cardano-db-sync source
+  as well as from Blockfrost; this is part of fact format v2 and schema 5,
+  which allow `transactions.valid` 0 (the upgrade replaces the check in place;
+  an older database holds valid transactions only). Before, such a
+  transaction stopped the update, or revoked serving
+  (`unsupported_relevant_invalid_transaction`, `invalid_relevant_transaction`).
+- Fix relevance mode stopping (`provider_output_cbor_mismatch`) at a valid
+  transaction whose collateral return carries a native asset, which Blockfrost
+  lists with lovelace only, and at an output to a pointer address encoded with
+  redundant zero groups, which the ledger and cardano-db-sync re-serialise
+  minimally. Anyone can submit either; full mode was not affected.
 - Fix Blockfrost acquisition and follow stopping at a relevant output (at a
   profile address such as ICS, reserve, cNIGHT mapping or governance, or at any
   address when it carries cNIGHT) whose datum is nested deeper than 64 levels,

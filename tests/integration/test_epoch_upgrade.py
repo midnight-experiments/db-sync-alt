@@ -147,6 +147,11 @@ class EpochUpgradeTests(CheckpointFixture):
         self.assertIn('DBSYNC_PROVIDER_KEY_FILE', refusal['required'])
         self.assertEqual(self.inventory(dsn), before)
 
+    @staticmethod
+    def valid_check(store):
+        return store.db.execute("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='chain.transactions'::regclass"
+                                " AND conname='transactions_valid_check'").fetchone()[0]
+
     def test_upgrade_reads_every_stored_epoch_twice_and_serves_the_cost_query(self):
         dsn = self.legacy()
         with PgStore(conninfo=dsn, readonly=True, allow_legacy=True) as store:
@@ -154,6 +159,7 @@ class EpochUpgradeTests(CheckpointFixture):
             receipts = store.db.execute('SELECT generation,phase,unit,receipt FROM chain.checkpoints ORDER BY 1,2,3').fetchall()
             checkpoints = store.db.execute('SELECT * FROM chain.integrity_checkpoints ORDER BY generation').fetchall()
             old_digests = {g: store.digests(g) for g in (0, 1)}
+            self.assertEqual(self.valid_check(store), 'CHECK ((valid = 1))')
         result, client = self.upgrade(dsn)
         self.assertEqual(result['schema_version'], 5)
         self.assertEqual(result['epoch_parameters'], {'generation': 1, 'epochs': 4, 'source': 'blockfrost-cardano',
@@ -171,6 +177,8 @@ class EpochUpgradeTests(CheckpointFixture):
             self.assertEqual(record['legacy_contract_sha256'], digest(store.network.legacy_contract))
             self.assertEqual(dict(store.db.execute('SELECT epoch,max_tx_size FROM chain.epoch_nonces').fetchall()), SIZES)
             self.assertEqual(dict(store.db.execute('SELECT epoch_no,max_tx_size FROM serve.epoch_param').fetchall()), SIZES)
+            # Schema 5 holds phase-2-invalid transactions (valid 0): the check is replaced in place.
+            self.assertEqual(self.valid_check(store), 'CHECK ((valid = ANY (ARRAY[0, 1])))')
             self.assertIsNone(store.sync_job(epoch_parameters.JOB))
             # Nothing sealed before the upgrade is rewritten; those generations verify as sealed.
             self.assertEqual(store.db.execute('SELECT id,manifest FROM chain.generations ORDER BY id').fetchall(), manifests)
