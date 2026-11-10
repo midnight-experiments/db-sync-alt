@@ -65,6 +65,11 @@
   transaction whose metadata nests deeper than about 62 levels or repeats a
   map key. Anyone can submit such a transaction. Transaction auxiliary data is
   now read past without being decoded; malformed transaction bytes still refuse.
+- Fix Blockfrost acquisition and follow stopping at a block that holds a
+  transaction whose witness set carries Plutus data (a datum or a redeemer)
+  nested deeper than about 60 levels or with a repeated map key. Anyone can
+  submit such a transaction. The witness set must still be a map; its content
+  is now read past without being decoded.
 
 ## 0.3.0
 

@@ -102,4 +102,24 @@ class AuxiliaryDataTests(unittest.TestCase):
             if outcomes[0] not in ('cbor_depth_limit','cbor_duplicate_map_key','cbor_unsupported_map_key'):
                 self.assertEqual(outcomes[1],outcomes[0],bytes(data).hex())
 
+class WitnessSetTests(unittest.TestCase):
+    """Plutus data in a witness set may nest to any depth and repeat map keys; only the map head is checked."""
+    def test_any_plutus_data_is_skipped(self):
+        cases={'datum, 1000 nested lists':b'\xa1\x04\x81'+b'\x81'*1000+b'\x00',
+               'tagged datum set, indefinite map with a repeated key':b'\xa1\x04\xd9\x01\x02\x81\xbf\x01\x00\x01\x00\xff',
+               'redeemer map, 1000 nested constructors':b'\xa1\x05\xa1\x82\x00\x00\x82'+b'\xd8\x79\x81'*1000+b'\xd8\x79\x80\x82\x01\x01',
+               'redeemer list, repeated key':b'\xa1\x05\x81\x84\x00\x00\xa2\x01\x00\x01\x00\x82\x01\x01',
+               'indefinite witness map':b'\xbf\x04\x81\x00\xff'}
+        plain=decode_transaction(*tx(body()));plain.pop('auxiliary_data_span')
+        for name,witness in cases.items():
+            with self.subTest(name):
+                d=decode_transaction(*tx(body(),witness=witness));d.pop('auxiliary_data_span')
+                self.assertEqual(d,plain)
+    def test_malformed_or_non_map_witness_set_refuses_with_existing_codes(self):
+        for witness,code in [(b'\x80','cbor_unsupported_envelope'),(b'\x00','cbor_unsupported_envelope'),(b'\xf6','cbor_unsupported_envelope'),
+                             (b'\xa1\x04','cbor_truncated'),(b'\xa1\x04\x81\x5b'+b'\xff'*8,'cbor_truncated'),(b'\xbb'+b'\xff'*8,'cbor_item_limit'),
+                             (b'\xbc','cbor_reserved_encoding'),(b'\xff','cbor_unsupported_simple'),(b'\xbf\x04\xff','cbor_unsupported_simple')]:
+            with self.subTest(code=code,witness=witness.hex()):
+                with self.assertRaisesRegex(Refusal,'^'+code+'$'):decode_transaction(*tx(body(),witness=witness))
+
 if __name__=='__main__':unittest.main()
