@@ -242,6 +242,20 @@ class BlockfrostSource:
             self.known=known;self.store=CertifiedReadView(store,parent,known)
             self.discovery=Discovery(store,profile,parent,independent=audit)
             if not audit:self.auditor=BlockfrostSource(provider,profile,store,generation,stop_requested,audit=True,coverage=self.coverage,known=known,relevance_enabled=True)
+    def rebind(self,provider,stop_requested):
+        """Continue with another pass's provider; the discovery state stays."""
+        for source in (self,self.auditor):
+            if source is not None:source.provider=provider;source.stop_requested=stop_requested
+    def _discoveries(self):return [d for d in (self.discovery,self.auditor.discovery if self.auditor else None) if d is not None]
+    def begin_unit(self):
+        """Mark the discovery state before one block's work (see `rollback_unit`)."""
+        for d in self._discoveries():d.block_created=set()
+        self.unit_keys=sum(map(len,self.known.values())) if self.discovery else 0
+    def rollback_unit(self):
+        """Undo the discovery additions of a block whose work stopped. False when its keys already reached `known`:
+        then the state cannot be rolled back."""
+        for d in self._discoveries():d.created-=d.block_created;d.block_created=set()
+        return not self.discovery or sum(map(len,self.known.values()))==self.unit_keys
     def add(self,table,row):self.facts.append((table,row))
     def has(self,table,where,params):return self.store.fact(table,params) is not None
     def block(self,h):
