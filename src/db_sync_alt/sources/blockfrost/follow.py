@@ -9,7 +9,7 @@ import weakref
 from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, BlockfrostSource, block_row,
     check_anchor, handoff_overlap, diagnostic_context, complete_inherited_epoch,
     epoch_facts)
-from db_sync_alt.contract import Refusal, digest, required_epochs
+from db_sync_alt.contract import Refusal, digest, required_epochs, generation_capabilities
 
 _QUALIFIED = weakref.WeakKeyDictionary()
 
@@ -198,7 +198,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
                              'target':{'height':target,'hash':targetrow['hash'].hex()},
                              'witness':{'height':witness,'hash':witnessrow['hash'].hex()}},
                   'required_epochs':required_epochs(startepoch,targetrow['epoch']),
-                  'capabilities':ready['manifest']['capabilities'],
+                  'capabilities':generation_capabilities(),
                   'parent_ref':integrity_reference(ready)}
         if coverage is not None:manifest['relevance_coverage']=coverage
         with store.atomic():

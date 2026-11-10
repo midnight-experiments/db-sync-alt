@@ -11,7 +11,7 @@ import logging
 import re
 from urllib.parse import urlencode
 from db_sync_alt.sources.blockfrost.cbor import decode_transaction, decode_datum
-from db_sync_alt.contract import TABLES, Refusal, canonical, digest, jsonable, required_epochs
+from db_sync_alt.contract import TABLES, Refusal, canonical, digest, jsonable, required_epochs, epoch_size, generation_capabilities
 
 OPENAPI='1d4d5d8bac8f0c641eea5c6f7b1f3fbbed8d1505'
 
@@ -191,13 +191,13 @@ def inventory(provider,block):
     return txs
 
 def epoch_facts(provider,epoch,target=None,*,stake_prefix):
-    """Two complete unique-address reads, total/nonce/end-anchor equality."""
+    """Two complete unique-address reads, total/nonce/max_tx_size/end-anchor equality."""
     def header():
         summary=provider.get('/epochs/'+str(epoch));params=provider.get('/epochs/'+str(epoch)+'/parameters')
         if summary.get('epoch')!=epoch or params.get('epoch')!=epoch or summary.get('active_stake') is None or params.get('nonce') is None:raise Refusal('provider_epoch_not_ready')
         total=integer(summary['active_stake'])
         if total<=0:raise Refusal('provider_empty_epoch_unqualified')
-        nonce=hexbytes(params['nonce'],32)
+        nonce=hexbytes(params['nonce'],32);size=epoch_size(params.get('max_tx_size'))
         end=provider.get('/epochs/'+str(epoch)+'/blocks?count=1&page=1&order=desc')
         if not isinstance(end,list) or len(end)!=1:raise Refusal('provider_epoch_not_ready')
         anchor=block_row(provider.get('/blocks/'+end[0]))
@@ -208,7 +208,7 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
         if target is not None and anchor['height']>target:
             anchor=block_row(provider.get('/blocks/'+str(target)))
             if anchor['height']!=target or anchor['epoch']!=epoch:raise Refusal('provider_epoch_anchor_mismatch')
-        return total,nonce,anchor,completed
+        return total,{'epoch':epoch,'nonce':nonce,'max_tx_size':size},anchor,completed
     first=header();reads=[]
     for _ in range(2):
         seen={};pools={};total=0
@@ -222,7 +222,7 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
         reads.append((digest(seen),pools,len(seen)))
     last=header()
     if first!=last or reads[0]!=reads[1]:raise Refusal('provider_epoch_changed')
-    return {'epoch':epoch,'nonce':first[1]},[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(reads[0][1].items())],first[2],{'stake_addresses':reads[0][2],'stake_digest':reads[0][0],'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
+    return first[1],[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(reads[0][1].items())],first[2],{'max_tx_size':first[1]['max_tx_size'],'stake_addresses':reads[0][2],'stake_digest':reads[0][0],'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
 
 class BlockfrostSource:
     def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False):
@@ -340,7 +340,8 @@ def complete_inherited_epoch(provider,store,g,epoch,inherited):
     summary=provider.get('/epochs/'+str(epoch));params=provider.get('/epochs/'+str(epoch)+'/parameters')
     nonce=store.epoch_nonce(epoch,g['parent'])
     total=store.epoch_stake_total(epoch,g['parent'])
-    if summary.get('epoch')!=epoch or params.get('epoch')!=epoch or summary.get('active_stake') is None or integer(summary['active_stake'])!=total or nonce is None or hexbytes(params.get('nonce'),32)!=nonce['nonce']:raise Refusal('provider_inherited_epoch_conflict')
+    if (summary.get('epoch')!=epoch or params.get('epoch')!=epoch or summary.get('active_stake') is None or integer(summary['active_stake'])!=total
+            or nonce is None or hexbytes(params.get('nonce'),32)!=nonce['nonce'] or epoch_size(params.get('max_tx_size'))!=nonce['max_tx_size']):raise Refusal('provider_inherited_epoch_conflict')
     rows=provider.get('/epochs/'+str(epoch)+'/blocks?count=1&page=1&order=desc')
     if not isinstance(rows,list) or len(rows)!=1:raise Refusal('provider_epoch_not_ready')
     end=block_row(provider.get('/blocks/'+rows[0]))
@@ -348,7 +349,7 @@ def complete_inherited_epoch(provider,store,g,epoch,inherited):
     if end['epoch']!=epoch or end['height']>g['target_height'] or expected is None or expected['hash']!=end['hash'] or successor is None or successor['parent_hash']!=end['hash'] or successor['epoch']!=epoch+1:raise Refusal('provider_epoch_end_not_qualified')
     final=block_row(provider.get('/blocks/'+str(end['height'])))
     if final!=end:raise Refusal('provider_epoch_changed')
-    return {'epoch':epoch,'epoch_end':{'height':end['height'],'hash':end['hash'].hex()},'stake_inherited_from':inherited,'active_stake':str(total),'source_kind':'blockfrost-cardano','provider':provider.drain()}
+    return {'epoch':epoch,'max_tx_size':nonce['max_tx_size'],'epoch_end':{'height':end['height'],'hash':end['hash'].hex()},'stake_inherited_from':inherited,'active_stake':str(total),'source_kind':'blockfrost-cardano','provider':provider.drain()}
 
 
 def check_anchor(provider,store,anchor,*,committed):
@@ -426,7 +427,7 @@ def update(store,provider,profile,end_height=None,*,hooks,relevance_enabled=Fals
         startepoch=store.block_at(ready['id'],ready['start_height'])['epoch']
         manifest={'identity':profile.identity,'contracts':digest(profile.contract),'source_identity':profile.network.source_identity,
                   'anchors':{'start':ready['manifest']['anchors']['start'],'target':{'height':target,'hash':targetrow['hash'].hex()},'witness':{'height':target+k,'hash':witnessrow['hash'].hex()}},
-                  'required_epochs':required_epochs(startepoch,targetrow['epoch']),'capabilities':ready['manifest']['capabilities'],'parent_digest':digest(ready['manifest']['digests'])}
+                  'required_epochs':required_epochs(startepoch,targetrow['epoch']),'capabilities':generation_capabilities(),'parent_digest':digest(ready['manifest']['digests'])}
         with store.atomic():
             gen=store.begin_generation(source='blockfrost-cardano',start=profile.start,target=target,witness=target+k,manifest=manifest,parent=ready['id'])
             store.checkpoint(gen,'metadata','inherited',{'lo':ready['start_height'],'hi':ready['target_height'],'parent':ready['id'],'parent_digest':manifest['parent_digest'],'source_kind':'generation-inheritance','inherited_source_kind':ready['source']})
