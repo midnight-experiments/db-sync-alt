@@ -36,7 +36,7 @@ NODE_INDEXES = ('idx_multi_asset_policy_name_hex', 'idx_ma_tx_out_ident', 'idx_t
 TX = '(b.height::bigint*4096+t.tx_index)'
 # Expected rows of each served table, from the stored facts of generations `{scope}` the given one.
 EXPECTED = {
-    'tx': 'SELECT ' + TX + ' AS id,t.hash,b.height::bigint AS block_id,t.tx_index AS block_index,true AS valid_contract'
+    'tx': 'SELECT ' + TX + ' AS id,t.hash,b.height::bigint AS block_id,t.tx_index AS block_index,t.valid=1 AS valid_contract'
           ' FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash WHERE t.first_generation{scope}%(g)s',
     'tx_out': 'SELECT ' + TX + '*4096+o.output_index AS id,' + TX + ' AS tx_id,o.output_index AS index,o.address,o.value,'
               'o.datum_hash AS data_hash,NULL::bigint AS consumed_by_tx_id FROM chain.outputs o JOIN chain.transactions t ON t.hash=o.tx_hash'
