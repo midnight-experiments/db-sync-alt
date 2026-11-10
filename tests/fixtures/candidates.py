@@ -47,7 +47,7 @@ def payment(index):
 def routes(payments=POSITIONS):
     """Provider routes of block h=12 with `payments` (a subset of POSITIONS) and clean transactions elsewhere."""
     out, _ = base.fixtures(fork=1, witnesses=base.CLEAN_WITNESSES)
-    block = base.block(12, 1, False, len(POSITIONS))
+    block = base.block(12, 1, False, {12: len(POSITIONS)})
     listing = out['/blocks/' + block['hash'] + '/txs/cbor?count=100&page=1&order=asc']
     for index in payments:
         raw, th, row, source = payment(index)

@@ -6,6 +6,13 @@
 -- source) in the same transaction, before this file runs. The served table gains the column and
 -- the node-facing view adds it in place, so the reader's grant on the view is kept. The serving
 -- gate and the ready view require schema 5, replaced in the same transaction as the version.
+--
+-- Datums as cardano-db-sync 13.8 stores them: a value is NULL where db-sync stores NULL (its JSON
+-- nests deeper than 2000 levels), and an output keeps its datum hash while no preimage is on chain,
+-- with no datum row. A store created with this release has these columns already.
+ALTER TABLE chain.datums ALTER COLUMN value DROP NOT NULL;
+ALTER TABLE chain.outputs DROP CONSTRAINT IF EXISTS outputs_datum_hash_fkey;
+ALTER TABLE serve.datum ALTER COLUMN value DROP NOT NULL;
 ALTER TABLE serve.epoch_param ADD COLUMN max_tx_size public.word31type;
 UPDATE serve.epoch_param s SET max_tx_size=c.max_tx_size FROM chain.epoch_nonces c WHERE c.epoch=s.epoch_no;
 ALTER TABLE serve.epoch_param ALTER COLUMN max_tx_size SET NOT NULL;

@@ -317,6 +317,24 @@ class EpochUpgradeTests(CheckpointFixture):
         result, client = self.upgrade(dsn)
         self.assertEqual((len(client.calls), result['epoch_parameters']['provider_requests']), (8, 8))
 
+    def test_upgrade_takes_datums_as_cardano_db_sync_stores_them(self):
+        """The earlier release's datum columns (a value never NULL, an output datum hash that references a datum)
+        take a NULL value and a hash without a preimage after the upgrade, in its one migration."""
+        dsn = self.legacy()
+
+        def constraints():
+            with PgStore(conninfo=dsn, readonly=True, allow_legacy=True) as store:
+                return store.db.execute(
+                    "SELECT (SELECT attnotnull FROM pg_attribute WHERE attrelid='chain.datums'::regclass AND attname='value'),"
+                    "(SELECT attnotnull FROM pg_attribute WHERE attrelid='serve.datum'::regclass AND attname='value'),"
+                    "EXISTS(SELECT 1 FROM pg_constraint WHERE conname='outputs_datum_hash_fkey' AND conrelid='chain.outputs'::regclass)").fetchone()
+        self.assertEqual(constraints(), (True, True, True))
+        self.upgrade(dsn)
+        self.assertEqual(constraints(), (False, False, False))
+        with PgStore(conninfo=dsn, readonly=True) as store:
+            self.assertEqual(store.state()['schema_version'], 5)
+            verify_store(store)
+
     def test_upgraded_store_is_refused_by_the_nonce_only_release(self):
         dsn = self.legacy()
         self.upgrade(dsn)

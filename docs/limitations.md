@@ -48,6 +48,16 @@
   the same bounded decoder. Bridge metadata that deep is stored as NULL, as
   cardano-db-sync stores nesting beyond 2,000. An external client that decodes
   answers without the standard `json` module's `loads` keeps its own limits.
+- **Datums db-sync-alt cannot see.** A datum row is added when db-sync-alt reads
+  a transaction that carries the preimage: the output's own transaction or a
+  spend of it. cardano-db-sync also adds the row when the preimage appears only in
+  an unrelated transaction while the output is unspent; db-sync-alt does not.
+  The node reads such rows only for registration, governance and D-parameter
+  outputs, which carry tokens only their minting policies create. Through
+  Blockfrost, a datum hash that matches only some redeemer's data also gets a
+  row (Blockfrost answers both kinds), and a preimage already on chain when the
+  output is read is stored with it. From a cardano-db-sync source, datums are
+  copied as that source stores them.
 - **PostgreSQL 17 only**, server and client tools.
 - **Initial data is required.** An empty database is filled from a snapshot or
   backup, or from your own db-sync; a Blockfrost key alone cannot fill it.

@@ -138,6 +138,17 @@
   holds. Serving registrations is future work (midnight-node#1761). Updates of
   the current format carry the capability `registered_candidates_unserved`;
   updates sealed in the nonce-only format keep `candidates_empty`.
+- Fix Blockfrost acquisition and follow stopping at a relevant output (at a
+  profile address such as ICS, reserve, cNIGHT mapping or governance, or at any
+  address when it carries cNIGHT) whose datum is nested deeper than 64 levels,
+  repeats a map key, holds an integer beyond 2^53 (which Blockfrost rounds), or
+  has no preimage on chain. Datums are now stored as cardano-db-sync 13.8 stores
+  them, from the datum's own CBOR with exact integers: the served `datum.value`
+  is NULL when its JSON nests deeper than 2000 levels, and an output whose
+  preimage is not on chain keeps its `data_hash` without a `datum` row until a
+  transaction carrying the preimage is read. A cardano-db-sync source is
+  accepted with such outputs too. Schema 5 makes `datum.value` nullable; see
+  [limitations](docs/limitations.md) for the datums db-sync-alt cannot see.
 
 ## 0.3.0
 
