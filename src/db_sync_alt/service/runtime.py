@@ -69,7 +69,7 @@ def failure_code(error):
     if raw in {'canonical_block_conflict', 'immutable_fact_conflict', 'conflicting_inherited_membership',
                'historical_selected_event_changed', 'historical_state_changed', 'historical_epoch_changed'}:
         return 'canonical_conflict'
-    if raw in {'unsupported_capabilities', 'unsupported_source_kind', 'unsupported_candidate_activity'}:
+    if raw in {'unsupported_capabilities', 'unsupported_source_kind'}:
         return 'unsupported_capability'
     if raw in {'reader_role_missing', 'invalid_reader_role', 'reader_privileges_not_exact'}:
         return 'invalid_reader_role'

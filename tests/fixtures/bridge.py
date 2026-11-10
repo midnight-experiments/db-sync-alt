@@ -162,7 +162,7 @@ def routes(chain=None):
 def baseline(conninfo):
     """Generation 0 (as `blockfrost_generation.baseline`) with this scenario's headers; returns the open store."""
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.object(base, 'block', lambda h, fork=0, transition=False, unrelated=0: block(h)))
+        stack.enter_context(patch.object(base, 'block', lambda h, fork=0, transition=False, added=None: block(h)))
         return base.baseline(conninfo)
 
 

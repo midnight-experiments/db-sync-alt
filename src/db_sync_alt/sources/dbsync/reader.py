@@ -103,8 +103,6 @@ class SQLSource:
         target=head-k if end is None else end
         if target<self.profile.start[0] or target+k>head:raise Refusal('unconfirmed_target')
         anchors={'start':self.anchor(self.profile.start[0]),'target':self.anchor(target),'witness':self.anchor(target+k)}
-        bad=self.one('SELECT count(*) AS n FROM tx_out o JOIN tx t ON t.id=o.tx_id JOIN block b ON b.id=t.block_id WHERE o.address=%s AND b.block_no<=%s',(self.profile.candidate,target))['n']
-        if bad:raise Refusal('candidates_unsupported')
         # Only what verification and provenance need; nothing that identifies the source host.
         epochs=required_epochs(anchors['start']['epoch'],anchors['target']['epoch'])
         self.check_epoch_coverage(epochs)

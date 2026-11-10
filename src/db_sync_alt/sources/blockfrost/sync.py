@@ -30,8 +30,7 @@ FATAL_CONFLICTS = frozenset({
     'historical_state_changed', 'historical_epoch_changed',
     'conflicting_inherited_membership',
 })
-UNSUPPORTED = frozenset({'unsupported_nonempty_candidates', 'unsupported_candidate_activity',
-                         'unsupported_capabilities'})
+UNSUPPORTED = frozenset({'unsupported_capabilities'})
 EPOCH_WAIT = frozenset({'provider_epoch_not_ready', 'provider_epoch_end_not_qualified',
                          'provider_epoch_changed'})
 # Fail-closed pending anchor refusals are reported under their own code.
@@ -229,14 +228,12 @@ FAILURE_CODES = frozenset({
     'unconfirmed_target',
     'unknown_fact_table',
     'unowned_database',
-    'unsupported_candidate_activity',
     'unsupported_capabilities',
     'unsupported_capability',
     'unsupported_cursor',
     'unsupported_database_identity',
     'unsupported_format',
     'unsupported_network',
-    'unsupported_nonempty_candidates',
     'unsupported_postgres_version',
     'unsupported_profile',
     'unsupported_source',

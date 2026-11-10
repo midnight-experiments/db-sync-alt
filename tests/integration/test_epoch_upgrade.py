@@ -199,6 +199,10 @@ class EpochUpgradeTests(CheckpointFixture):
         g = store.generation()
         self.assertEqual((g['id'], g['manifest']['capabilities']['epoch_max_tx_size_v1'], g['manifest']['contracts']),
                          (2, True, digest(store.network.contract)))
+        # Generations sealed before the upgrade keep `candidates_empty`; new ones say registered candidates are not served.
+        self.assertEqual([m['capabilities'] for _, m in manifests], [{'bridge_qualified': False, 'candidates_empty': True}] * 2)
+        self.assertIs(g['manifest']['capabilities']['registered_candidates_unserved'], True)
+        self.assertNotIn('candidates_empty', g['manifest']['capabilities'])
         # The first update after the upgrade is covered; the coverage start stays where the upgrade put it.
         self.assertIs(g['manifest']['capabilities']['bridge_metadata_v1'], True)
         self.assertEqual(store.status()['bridge']['coverage_start'], OFFSET + 13)

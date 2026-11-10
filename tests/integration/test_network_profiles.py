@@ -158,7 +158,7 @@ class NetworkStoreTests(unittest.TestCase):
         with store:
             store.set_meta('profile', self.preview.identity)
             manifest = {'identity': self.preview.identity, 'contracts': digest(PREVIEW.contract),
-                        'capabilities': {'candidates_empty': True, 'epoch_max_tx_size_v1': True, 'bridge_metadata_v1': False},
+                        'capabilities': {'registered_candidates_unserved': True, 'epoch_max_tx_size_v1': True, 'bridge_metadata_v1': False},
                         'source_identity': {'adapter': 'db-sync-direct-pg-v1'}}
             with self.assertRaisesRegex(Refusal, 'invalid_bounds'):
                 store.begin_generation(source='cardano-db-sync-postgresql', start=(0, 0), target=T, witness=T + 2160, manifest=manifest)
