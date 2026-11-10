@@ -84,7 +84,8 @@ def fixtures(fork=0,transition=False,auxiliary=(),witnesses=(),payments=(),spend
     for payment,(raw,th) in zip(payments,paid):
         place(payment.height,raw,th,[],[payment_output(payment)])
         if not payment.inline:route['/scripts/datum/'+payment.hash.hex()+'/cbor']={'cbor':payment.datum.hex()} if payment.on_chain else NOT_FOUND
-        if payment.on_chain and payment.served is not None:route['/scripts/datum/'+payment.hash.hex()]={'json_value':payment.served}
+        # Blockfrost serves db-sync's NULL value as {}.
+        if payment.on_chain:route['/scripts/datum/'+payment.hash.hex()]={'json_value':{} if payment.served is None else payment.served}
     for k,(raw,th) in zip(spends,spent):
         place(12,raw,th,[dict(payment_output(payments[k]),tx_hash=paid[k][1],reference=False,collateral=False)],[])
     b=at(10)
