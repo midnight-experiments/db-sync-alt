@@ -197,7 +197,7 @@ class HealthState:
             self._relevance = dict(requested='relevance' if enabled else 'full', effective=effective, reason=reason)
 
     def verified_schema(self, version):
-        if type(version) is not int or version not in (1,2,3,4):
+        if type(version) is not int or version not in (1,2,3,4,5):
             raise ValueError('unsupported schema identity')
         with self._lock:self._identity['schema_version']=str(version)
 

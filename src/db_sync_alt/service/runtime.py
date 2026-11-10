@@ -73,8 +73,10 @@ def failure_code(error):
         return 'unsupported_capability'
     if raw in {'reader_role_missing', 'invalid_reader_role', 'reader_privileges_not_exact'}:
         return 'invalid_reader_role'
-    if raw == 'reader_requires_current_schema':
+    if raw in {'reader_requires_current_schema', 'epoch_parameters_upgrade_required'}:
         return 'schema_upgrade_required'
+    if raw in {'invalid_epoch_max_tx_size', 'epoch_parameter_receipt_mismatch', 'epoch_parameters_upgrade_invalid'}:
+        return 'invalid_coverage'
     if any(base.__module__.startswith('psycopg') and base.__name__ in {'OperationalError', 'InterfaceError'}
            for base in type(error).__mro__):
         return 'database_unavailable'

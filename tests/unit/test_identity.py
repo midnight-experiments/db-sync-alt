@@ -20,10 +20,18 @@ class IdentityTests(unittest.TestCase):
     def test_contract_and_profile(self):
         profile = contract.Profile(profile_dir('preprod'))
         preprod = networks.network_profile('preprod')
-        self.assertEqual(contract.digest(contract.contract_for(preprod)), '65da5fbe1e66529141f8ae3e8b9330e0b2110d2ed17ef3ac94899c84f6e5cbab')
-        self.assertEqual(contract.digest(profile.contract), '65da5fbe1e66529141f8ae3e8b9330e0b2110d2ed17ef3ac94899c84f6e5cbab')
-        self.assertEqual((contract.FORMAT, preprod.algorithm, preprod.security, contract.SCHEMA_VERSION),
-                         ('midnight-compact-cardano-v1', 'preprod-selective-v1', 2160, (15, 48, 6)))
+        self.assertEqual(contract.digest(contract.contract_for(preprod)), '54bf7fc0ea580536856c9ebfd0884bc07a4ffa80f1e1670d7d22dc170b120f36')
+        self.assertEqual(contract.digest(profile.contract), '54bf7fc0ea580536856c9ebfd0884bc07a4ffa80f1e1670d7d22dc170b120f36')
+        # The nonce-only contract stored by every earlier release: stores and backups that carry it
+        # must still be recognised to be verified and upgraded.
+        self.assertEqual(contract.digest(contract.contract_for(preprod, legacy=True)), '65da5fbe1e66529141f8ae3e8b9330e0b2110d2ed17ef3ac94899c84f6e5cbab')
+        self.assertEqual(contract.digest(preprod.legacy_contract), '65da5fbe1e66529141f8ae3e8b9330e0b2110d2ed17ef3ac94899c84f6e5cbab')
+        self.assertEqual((contract.FORMAT, contract.LEGACY_FORMAT, preprod.algorithm, preprod.security, contract.SCHEMA_VERSION),
+                         ('midnight-compact-cardano-v2', 'midnight-compact-cardano-v1', 'preprod-selective-v1', 2160, (15, 48, 6)))
+        self.assertEqual(contract.TABLES['epoch_nonces'], ('epoch', 'nonce', 'max_tx_size'))
+        self.assertEqual(contract.LEGACY_TABLES['epoch_nonces'], ('epoch', 'nonce'))
+        self.assertEqual(contract.generation_capabilities(), {'bridge_qualified': False, 'candidates_empty': True, 'epoch_max_tx_size_v1': True})
+        self.assertEqual(contract.generation_capabilities(legacy=True), {'bridge_qualified': False, 'candidates_empty': True})
         self.assertEqual(preprod.config_sha256, '88a096f98b01f55c0680eb523f58fa9c4c141f3546794e4f5fd1084a76e32304')
         self.assertEqual(contract.digest(profile.configs), preprod.config_sha256)
         self.assertEqual(contract.digest(profile.identity), 'd69ed610ff7a698df5b1186e03f4c1c1bcc25a5530861aa9ffcb167cdd5a3d48')
@@ -45,7 +53,8 @@ class IdentityTests(unittest.TestCase):
         recorded = json.loads((Path(__file__).resolve().parents[1] / 'fixtures/data/completion-g3-manifest.json').read_text())
         g, m = recorded['generation'], recorded['generation']['manifest']
         profile = contract.Profile(profile_dir('preprod'))
-        self.assertEqual(m['contracts'], contract.digest(profile.contract))
+        # Recorded before epoch parameters: it binds the nonce-only contract.
+        self.assertEqual(m['contracts'], contract.digest(profile.network.legacy_contract))
         self.assertEqual(m['source_identity'], profile.network.source_identity)
         self.assertEqual(contract.canonical(m['identity']), contract.canonical(profile.identity))
         self.assertEqual(g['witness_height'] - g['target_height'], profile.security)
@@ -64,24 +73,29 @@ class IdentityTests(unittest.TestCase):
 
     def test_query_catalogue(self):
         catalogue = sorted((k, v['name'], v['file'], json.dumps(v.get('sources', []), sort_keys=True)) for k, v in CAT.items())
-        self.assertEqual(len(CAT), 51)
-        self.assertEqual(sha(catalogue), 'c553e6b8bda9a675efcc0424ed4d3e400d25ebe9d19ba7b93edd837e4298b171')
+        self.assertEqual(len(CAT), 53)
+        self.assertEqual(sha(catalogue), 'cce2bb97d3bc7b44869990c09bc423b88be61aeb410e5b6b81be478c47c9029d')
+        for name in networks.names():
+            self.assertEqual(networks.network_profile(name).node_queries,
+                             {'tag': 'node-2.1.101', 'commit': '86774edf8cc76345a5c3a4221f3fe80c094b1c33'}, name)
 
     def test_persisted_database_and_backup_identifiers(self):
         from db_sync_alt import backup
         from db_sync_alt.store import database, incremental
         self.assertEqual((database.OWNER, database.RESTORE_GUARD, database.PROJECTION_WRITE),
                          ('db-sync-alt', 'db_sync_alt_restore_guard', 'db_sync_alt.projection_write'))
-        self.assertEqual(backup.BACKUP_FORMAT, 'db-sync-alt-postgresql-backup-v3')
+        self.assertEqual(backup.BACKUP_FORMAT, 'db-sync-alt-postgresql-backup-v4')
         self.assertEqual(backup.FORMATS, {'db-sync-alt-postgresql-backup-v1': (1, 2), 'db-sync-alt-postgresql-backup-v2': (3,),
-                                          'db-sync-alt-postgresql-backup-v3': (4,)})
-        self.assertEqual(backup.SERVING_FORMATS, ('db-sync-alt-postgresql-backup-v2', 'db-sync-alt-postgresql-backup-v3'))
-        self.assertEqual((database.SCHEMA_VERSION, database.SUPPORTED_SCHEMA_VERSIONS), (4, (1, 2, 3, 4)))
+                                          'db-sync-alt-postgresql-backup-v3': (4,), 'db-sync-alt-postgresql-backup-v4': (5,)})
+        self.assertEqual(backup.SERVING_FORMATS, ('db-sync-alt-postgresql-backup-v2', 'db-sync-alt-postgresql-backup-v3',
+                                                  'db-sync-alt-postgresql-backup-v4'))
+        self.assertEqual((database.SCHEMA_VERSION, database.SUPPORTED_SCHEMA_VERSIONS), (5, (1, 2, 3, 4, 5)))
+        self.assertEqual(database.EPOCH_UPGRADE, 'epoch-parameters-upgrade')
         self.assertEqual(incremental.FULL_DIGESTS, 'full-digests-v1')
         self.assertEqual(incremental.PROFILE_FIELD, {'certified-parent-delta-v1': 'identity', 'certified-parent-delta-v2': 'identity_sha256'})
         self.assertEqual((incremental.KIND_V1, incremental.KIND_V2), ('certified-parent-delta-v1', 'certified-parent-delta-v2'))
         store = Path(database.__file__).parent
-        for name in ('schema.sql', 'schema_v2.sql', 'schema_v3.sql', 'schema_v4.sql'):
+        for name in ('schema.sql', 'schema_v2.sql', 'schema_v3.sql', 'schema_v4.sql', 'schema_v5.sql'):
             self.assertIn("s.owner='" + database.OWNER + "'", (store / name).read_text(), name)
         for name in ('schema_v2.sql', 'schema_v4.sql'):
             self.assertIn("current_setting('" + database.PROJECTION_WRITE + "',true)", (store / name).read_text(), name)
