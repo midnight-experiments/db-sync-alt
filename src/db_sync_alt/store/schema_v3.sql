@@ -62,8 +62,8 @@ END $$;
 REVOKE EXECUTE ON FUNCTION chain.gate() FROM PUBLIC;
 CREATE OR REPLACE VIEW chain.ready_generation AS SELECT g.* FROM chain.service_state s JOIN chain.generations g ON g.id=s.canonical_ready WHERE s.id=1 AND s.owner='db-sync-alt' AND s.schema_version=3 AND NOT s.revoked AND s.migration_state='ready' AND g.status='ready';
 -- Node-facing relations: the served tables, each gated. block_parent and ma_tx_mint are not read
--- by the node and are removed so public holds only node-facing relations (and tx_metadata,
--- which is never granted).
+-- by the node and are removed so public holds only node-facing relations (and tx_metadata, a
+-- placeholder until schema 5 serves bridge metadata).
 DROP VIEW public.block_parent,public.ma_tx_mint,public.tx,public.tx_out,public.tx_in,public.datum,public.multi_asset,public.ma_tx_out,public.epoch_param,public.pool_hash,public.epoch_stake,public.block;
 CREATE VIEW public.block AS SELECT id,hash,epoch_no,slot_no,block_no,time,tx_count FROM serve.block WHERE chain.gate();
 CREATE VIEW public.tx AS SELECT id,hash,block_id,block_index,valid_contract FROM serve.tx WHERE chain.gate();
