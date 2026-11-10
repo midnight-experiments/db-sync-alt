@@ -11,11 +11,14 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 from db_sync_alt import networks
-from db_sync_alt.contract import TABLES, KEYS, FORMAT, Refusal, canonical, digest, jsonable, validate_numeric
+from db_sync_alt.contract import TABLES, LEGACY_TABLES, KEYS, FORMAT, LEGACY_FORMAT, Refusal, canonical, digest, jsonable, validate_numeric
 
 POSTGRES_MAJOR = 17
-SCHEMA_VERSION = 4
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4)
+SCHEMA_VERSION = 5
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4, 5)
+# Metadata key of the immutable record `db-sync-alt upgrade` writes when it adds the epoch
+# parameters to a nonce-only store (see store/upgrade.py).
+EPOCH_UPGRADE = 'epoch-parameters-upgrade'
 OWNER = 'db-sync-alt'
 RESTORE_GUARD = 'db_sync_alt_restore_guard'
 PROJECTION_WRITE = 'db_sync_alt.projection_write'
@@ -91,8 +94,11 @@ def bind_row(table,row):
 class PgStore:
     """One owned database of one network: `create` stores the network's fact contract,
     opening finds the network from it. `network` (a name or profile) is required to
-    create and, when given to open, must be the database's network."""
-    def __init__(self,service=None,*,conninfo='',readonly=False,create=False,reserve_check=None,progress_callback=None,allow_incomplete=False,network=None):
+    create and, when given to open, must be the database's network.
+
+    A store of the nonce-only fact format (written before epoch parameters) opens only with
+    `allow_legacy` (upgrade, verify, status); it never takes new facts."""
+    def __init__(self,service=None,*,conninfo='',readonly=False,create=False,reserve_check=None,progress_callback=None,allow_incomplete=False,network=None,allow_legacy=False):
         if readonly and create:raise Refusal('invalid_open_mode')
         if create and network is None:raise Refusal('network_required')
         expected=None if network is None else networks.network_profile(network)
@@ -113,18 +119,46 @@ class PgStore:
             self.db.execute('SET search_path=chain,public,pg_catalog')
             state=self.state()
             if state['owner']!=OWNER or state['schema_version'] not in SUPPORTED_SCHEMA_VERSIONS:raise Refusal('unsupported_database_identity')
-            self._network=networks.for_contract(self.meta('contract'))
+            self.bind_format(allow_legacy=allow_legacy)
             if expected is not None and self._network!=expected:raise Refusal('network_mismatch')
             if not (allow_incomplete or create) and state['migration_state']!='ready':raise Refusal('incomplete_owned_destination')
             if readonly:self.db.execute('SET default_transaction_read_only=on')
         except BaseException:
             self.close();raise
+    def bind_format(self,*,allow_legacy=False):
+        """Read the stored contract: the network, whether it is the nonce-only format and the epoch
+        parameter upgrade record, if any."""
+        contract=self.meta('contract')
+        try:
+            self._network=networks.for_contract(contract);self.legacy_format=False
+        except Refusal as error:
+            if error.code!='unsupported_format':raise
+            self._network=networks.for_contract(contract,legacy=True);self.legacy_format=True
+        if self.legacy_format and not allow_legacy:raise Refusal('epoch_parameters_upgrade_required')
+        record=None if self.legacy_format else self.meta(EPOCH_UPGRADE)
+        if record is not None and (not isinstance(record,dict) or type(record.get('generation')) is not int or record['generation']<0):
+            raise Refusal('epoch_parameters_upgrade_invalid')
+        self.epoch_upgrade=record
+        return self._network
     @property
     def network(self):
         """The profile of the network whose fact contract this database holds."""
         found=self.__dict__.get('_network')
-        if found is None:found=self._network=networks.for_contract(self.meta('contract'))
+        if found is None:found=self.bind_format(allow_legacy=True)
         return found
+    @property
+    def physical_tables(self):
+        """Stored columns of each fact family: the nonce-only store has no max_tx_size."""
+        return LEGACY_TABLES if self.__dict__.get('legacy_format') else TABLES
+    def legacy_generation(self,generation):
+        """Whether `generation` was sealed in the nonce-only format: every generation of a nonce-only
+        store, and those at or before the epoch parameter upgrade of an upgraded one."""
+        if self.__dict__.get('_network') is None:self.network
+        record=self.epoch_upgrade
+        return self.legacy_format or (record is not None and generation is not None and generation<=record['generation'])
+    def sealed_tables(self,generation):
+        """The columns `generation`'s digests, seals and proofs were computed over."""
+        return LEGACY_TABLES if self.legacy_generation(generation) else TABLES
     def close(self):
         if hasattr(self,'db'):self.db.close()
         self._writer=False
@@ -168,6 +202,7 @@ class PgStore:
         with self.db.transaction():yield
     def begin_generation(self,*,source,start,target,witness,manifest,parent=None):
         self.require_writer()
+        if self.legacy_generation(None):raise Refusal('epoch_parameters_upgrade_required')
         if source not in ('cardano-db-sync-postgresql','blockfrost-cardano'):raise Refusal('unsupported_source')
         if self.pending() or self.meta('source_conflict'):raise Refusal('pending_or_conflicting_lineage')
         latest=self.db.execute('SELECT max(id) FROM chain.generations').fetchone()[0]
@@ -187,6 +222,7 @@ class PgStore:
         return gen
     def require_pending(self,generation):
         self.require_writer()
+        if self.__dict__.get('legacy_format'):raise Refusal('epoch_parameters_upgrade_required')
         if generation is None:generation=self.meta('canonical_ready')
         if generation is None:raise Refusal('no_ready_generation')
         # Every mutation needs fresh status, not the potentially large manifest.
@@ -196,9 +232,9 @@ class PgStore:
     def fact(self,table,key_values):
         if table not in TABLES:raise Refusal('unknown_fact_table')
         if isinstance(key_values,dict):key_values=tuple(key_values[k] for k in KEYS[table])
-        where=' AND '.join(k+'=%s' for k in KEYS[table])
-        row=self.db.execute('SELECT '+','.join(TABLES[table])+' FROM chain.'+table+' WHERE '+where,tuple(key_values)).fetchone()
-        return logical_row(table,dict(zip(TABLES[table],row))) if row else None
+        where=' AND '.join(k+'=%s' for k in KEYS[table]);columns=self.physical_tables[table]
+        row=self.db.execute('SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE '+where,tuple(key_values)).fetchone()
+        return logical_row(table,dict(zip(columns,row))) if row else None
     def insert(self,table,row,generation):
         """Store one fact; inputs and output assets also need their ledger `ordinal` (0..4095)."""
         self.require_pending(generation)
@@ -367,7 +403,7 @@ class PgStore:
         _session(self)
         if self.db.info.transaction_status!=psycopg.pq.TransactionStatus.INTRANS:raise Refusal('relevance_anchor_transaction_required')
         state=self.state();g=self.generation()
-        if state['schema_version']!=4 or state['migration_state']!='ready' or state['revoked'] or self.pending() is not None:raise Refusal('relevance_parent_changed')
+        if state['schema_version']!=SCHEMA_VERSION or state['migration_state']!='ready' or state['revoked'] or self.pending() is not None:raise Refusal('relevance_parent_changed')
         validate_anchor(self,g,[{'receipt':receipt}])
         if self.completed(g['id'],'relevance','anchor'):raise Refusal('relevance_trust_already_initialized')
         old=Path(__file__).with_name('schema_v2.sql').read_text()
@@ -459,18 +495,19 @@ class PgStore:
         if self.db.execute("SELECT 1 FROM chain.generations WHERE id<%s AND status!='ready'",(generation,)).fetchone():raise Refusal('invalid_lineage')
         where='first_generation<=%s';args=[generation]
         if table=='blocks':where+=' AND hash IN(SELECT hash FROM chain.membership(%s))';args.append(generation)
-        query='SELECT '+','.join(TABLES[table])+' FROM chain.'+table+' WHERE '+where+' ORDER BY '+','.join(KEYS[table])
+        columns=self.sealed_tables(generation)[table]
+        query='SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE '+where+' ORDER BY '+','.join(KEYS[table])
         # Named cursors bound memory; transaction scope belongs to this iterator.
         with self.db.transaction():
             with self.db.cursor(name='rows_'+uuid.uuid4().hex) as cur:
                 cur.itersize=batch;cur.execute(query,args)
-                for row in cur:yield logical_row(table,dict(zip(TABLES[table],row)))
+                for row in cur:yield logical_row(table,dict(zip(columns,row)))
     def digests(self,generation):
-        result={}
+        result={};legacy=self.legacy_generation(generation)
         for table in TABLES:
             hasher=hashlib.sha256();count=0
             for row in self.rows(table,generation):
-                validate_numeric(table,row);hasher.update((canonical(jsonable(row))+'\n').encode());count+=1
+                validate_numeric(table,row,legacy=legacy);hasher.update((canonical(jsonable(row))+'\n').encode());count+=1
                 if count%10000==0:self.progress('digest',generation=generation,family=table,rows=count)
             result[table]={'count':count,'sha256':hasher.hexdigest()}
             self.progress('digest_family_complete',generation=generation,family=table,rows=count)
@@ -499,8 +536,13 @@ class PgStore:
         state=self.state();generations=[]
         if self.db.execute('SELECT id FROM chain.generations ORDER BY id LIMIT 1').fetchone() is not None:
             generations=[dict(zip(GENERATION_SUMMARY,r)) for r in self.db.execute('SELECT '+','.join(GENERATION_SUMMARY)+' FROM chain.generations ORDER BY id')]
-        result={'format':FORMAT,**state,'generations':generations,'bytes':self.database_bytes(),'checkpoints':self.db.execute('SELECT count(*) FROM chain.checkpoints').fetchone()[0]}
-        if state['schema_version']==4 and state['canonical_ready'] is not None:
+        legacy=self.legacy_generation(None)
+        result={'format':LEGACY_FORMAT if legacy else FORMAT,**state,'generations':generations,'bytes':self.database_bytes(),'checkpoints':self.db.execute('SELECT count(*) FROM chain.checkpoints').fetchone()[0]}
+        if legacy:
+            # `db-sync-alt upgrade` reads every stored epoch's parameters twice.
+            epochs=self.db.execute('SELECT count(*) FROM chain.epoch_nonces').fetchone()[0]
+            result['epoch_parameters_upgrade']={'required':True,'stored_epochs':epochs,'provider_requests':2*epochs}
+        if state['schema_version']>=4 and state['canonical_ready'] is not None:
             from db_sync_alt.sources.blockfrost.relevance import history_status
             result['relevance']={'history':history_status(self)}
         return result
@@ -528,7 +570,8 @@ class PgStore:
     def progress(self,phase,**fields):
         if self.progress_callback:self.progress_callback(phase,**fields)
     def _facts_where(self,table,where,args):
-        return [logical_row(table,dict(zip(TABLES[table],r))) for r in self.db.execute('SELECT '+','.join(TABLES[table])+' FROM chain.'+table+' WHERE '+where,args)]
+        columns=self.physical_tables[table]
+        return [logical_row(table,dict(zip(columns,r))) for r in self.db.execute('SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE '+where,args)]
     def output_assets(self,tx_hash,output_index,generation=None):return self._facts_where('output_assets','tx_hash=%s AND output_index=%s'+(' AND first_generation<=%s' if generation is not None else ''),(tx_hash,output_index,*(() if generation is None else (generation,))))
     def transaction_outputs(self,tx_hash,generation):return self._facts_where('outputs','tx_hash=%s AND first_generation<=%s',(tx_hash,generation))
     def transaction_inputs(self,tx_hash,generation):return self._facts_where('inputs','tx_hash=%s AND first_generation<=%s',(tx_hash,generation))
@@ -547,6 +590,6 @@ class PgStore:
 
 
 def inspect(service=None,*,conninfo=''):
-    with PgStore(service,conninfo=conninfo,readonly=True,allow_incomplete=True) as store:return store.status()
+    with PgStore(service,conninfo=conninfo,readonly=True,allow_incomplete=True,allow_legacy=True) as store:return store.status()
 def inspect_lifecycle(service=None,*,conninfo=''):
     with PgStore(service,conninfo=conninfo,readonly=True,allow_incomplete=True) as store:return store.lifecycle_state()

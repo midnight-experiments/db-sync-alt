@@ -12,12 +12,14 @@ from db_sync_alt.contract import Refusal, canonical
 from db_sync_alt.store.database import PgStore, OWNER, POSTGRES_MAJOR, RESTORE_GUARD, SUPPORTED_SCHEMA_VERSIONS, WRITER_LOCK, SERVING_LOCK, apply_privileges, connect, empty_destination
 from db_sync_alt.verify.store import verify_store, physical_inventory
 
-BACKUP_FORMAT='db-sync-alt-postgresql-backup-v3'
-# Backups of older schemas are still restored: schema 3 is upgraded to the current schema during the
-# restore, schemas 1 and 2 (no served tables) by `db-sync-alt upgrade` afterwards.
-FORMATS={'db-sync-alt-postgresql-backup-v1':(1,2),'db-sync-alt-postgresql-backup-v2':(3,),BACKUP_FORMAT:(4,)}
+BACKUP_FORMAT='db-sync-alt-postgresql-backup-v4'
+# Backups of older schemas are still restored: schemas 3 and 4 are upgraded to the current schema
+# during the restore, schemas 1 and 2 (no served tables) by `db-sync-alt upgrade` afterwards.
+FORMATS={'db-sync-alt-postgresql-backup-v1':(1,2),'db-sync-alt-postgresql-backup-v2':(3,),'db-sync-alt-postgresql-backup-v3':(4,),BACKUP_FORMAT:(5,)}
 # Formats whose restore serves the node.
-SERVING_FORMATS=('db-sync-alt-postgresql-backup-v2',BACKUP_FORMAT)
+SERVING_FORMATS=('db-sync-alt-postgresql-backup-v2','db-sync-alt-postgresql-backup-v3',BACKUP_FORMAT)
+# Formats that record one verification walk from the integrity base (schema 4 and later).
+SINGLE_WALK_FORMATS=('db-sync-alt-postgresql-backup-v3',BACKUP_FORMAT)
 
 
 def safe_file(path,*,existing):
@@ -77,7 +79,7 @@ def generation_reports(store):
 
 
 def format_reports(store,backup_format,canonical=None):
-    return reports(store,canonical) if backup_format==BACKUP_FORMAT else generation_reports(store)
+    return reports(store,canonical) if backup_format in SINGLE_WALK_FORMATS else generation_reports(store)
 
 
 def backup(archive,manifest,service=None,*,conninfo='',reserve_check=None,pg_dump='pg_dump'):
