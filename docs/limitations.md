@@ -26,6 +26,10 @@
   ([bridge readiness](connect-a-node.md#bridge-readiness)). Large integers in
   metadata are stored as Blockfrost returns them (rounded beyond 2^53), not as
   cardano-db-sync stores them; the node's reading of a recipient is the same.
+  ICS and reserve outputs stored before the coverage start hold only the
+  profile's assets: the bridge token of every packaged profile is one of them,
+  but if governance named a token outside the profile, a covered spend of such
+  an older output would be counted without it.
 - **PostgreSQL 17 only**, server and client tools.
 - **Initial data is required.** An empty database is filled from a snapshot or
   backup, or from your own db-sync; a Blockfrost key alone cannot fill it.

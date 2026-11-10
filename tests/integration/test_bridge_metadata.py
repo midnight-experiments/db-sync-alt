@@ -284,5 +284,47 @@ class BridgeMetadataTests(unittest.TestCase):
                 self.assertFalse(store.db.execute('SELECT 1 FROM chain.tx_metadata').fetchone())
 
 
+class BridgeRelevanceTests(unittest.TestCase):
+    """Relevance filtering (the Mainnet setting): the acquisition and its independent pass each fetch the
+    metadata once, and the stored fact is part of the certified inventory."""
+    @classmethod
+    def setUpClass(cls):
+        import fixtures.relevance as rf
+        cls.rf = rf
+        rf.configure('mainnet')
+        rf.SQLFixture.setup()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.rf.SQLFixture.teardown()
+
+    def test_relevance_mode_fetches_once_per_pass_and_certifies_the_metadata(self):
+        import hashlib
+        from db_sync_alt.sources.blockfrost.cbor import Tag
+        from db_sync_alt.sources.blockfrost.relevance import address_bytes
+        from fixtures.cbor import enc
+        rf = self.rf
+        recipient_bytes = hashlib.sha256(b'mainnet-recipient').digest()
+        aux = enc(Tag(259, {0: {6500973: [recipient_bytes]}}))
+        body = {0: [], 1: [[address_bytes(rf.PROFILE.ics, 'mainnet'), [2000000, {rf.P: {rf.N: 5}}]]], 2: 7,
+                7: hashlib.blake2b(aux, digest_size=32).digest()}
+        raw = enc(body)
+        h = hashlib.blake2b(raw, digest_size=32).hexdigest()
+        transfer = {'cbor': (b'\x84' + raw + enc({}) + enc(True) + aux).hex(), 'tx_hash': h, 'body': body, 'valid': True}
+        store, routes = rf.SQLFixture.prepare([[transfer]])
+        self.addCleanup(store.close)
+        routes['/txs/' + h + '/metadata'] = [{'label': '6500973', 'json_metadata': ['0x' + recipient_bytes.hex()]}]
+        _, calls = rf.SQLFixture.follow(store, routes, rf.T + 1)
+        self.assertEqual(calls.count('/txs/' + h + '/metadata'), 2)
+        g = store.generation()
+        self.assertEqual((g['target_height'], g['manifest']['capabilities']['bridge_metadata_v1']), (rf.T + 1, True))
+        self.assertIsNotNone(g['manifest'].get('relevance_coverage'))
+        self.assertEqual(store.fact('tx_metadata', (bytes.fromhex(h),)),
+                         {'tx_hash': bytes.fromhex(h), 'present': 1, 'json': '["0x' + recipient_bytes.hex() + '"]'})
+        proofs = [c['receipt']['relevance']['inventory']['tx_metadata'] for c in store.checkpoint_rows(generation=g['id'], phase='events')]
+        self.assertEqual(sum(p['count'] for p in proofs), 1)
+        verify_store(store)
+
+
 if __name__ == '__main__':
     unittest.main()
