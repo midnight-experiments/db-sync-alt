@@ -219,14 +219,11 @@ class IncrementalTests(SyncFixture):
             with self.assertRaisesRegex(Refusal,'conflicting_inherited_membership'):store.verify_pending_incremental(gen)
             self.assertEqual(store.state()['canonical_ready'],0)
 
-    def test_schema1_archive_restore_and_partial_pending_upgrade_resume(self):
-        from db_sync_alt.backup import backup,restore
-        from pathlib import Path
+    def test_schema1_partial_pending_upgrade_resume(self):
+        """A schema-1 store with an interrupted update upgrades and the update resumes. (Restoring a
+        schema-1 backup is covered with the earlier format in test_blockfrost_follow.)"""
         from db_sync_alt.errors import TransientSyncFailure
-        dsn=self.make()
-        archive=Path(self.tmp.name)/'gen_fixture.dump';manifest=Path(self.tmp.name)/'gen_fixture.json'
-        backup(archive,manifest,conninfo=dsn)
-        target=self.database();restore(archive,manifest,conninfo=target)
+        target=self.make()
         routes,_=gen_fixture.fixtures();broken=copy.deepcopy(routes)
         def unavailable():raise RuntimeError('HTTP 503; request counted, no automatic retry')
         broken['/blocks/'+gen_fixture.block(12)['hash']+'/txs/cbor?count=100&page=1&order=asc']=unavailable

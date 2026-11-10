@@ -194,6 +194,8 @@ raise SystemExit(pg_acquire.main(sys.argv[1:]))
                 self.assertNotIn('snapshot',row['receipt'])
                 if row['phase'] in ('prerequisites','metadata','events','epochs'):self.assertIs(row['receipt']['read_only'],True)
             dsn=store.db.info.dsn
+            from db_sync_alt.store.upgrade import upgrade_store
+            upgrade_store(store)
         folder=Path(self.tmp.name)/uuid.uuid4().hex;folder.mkdir()
         backup(folder/'state.dump',folder/'state.json',conninfo=dsn)
         dump=subprocess.run(['pg_restore','-f','-',str(folder/'state.dump')],capture_output=True,text=True,check=True).stdout

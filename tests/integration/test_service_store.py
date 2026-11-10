@@ -254,14 +254,26 @@ class RealServiceTests(unittest.TestCase):
         archive.unlink();manifest.unlink()  # Existing ready target must be sufficient.
         restarted=self.start(cfg);self.wait_ready(restarted)
         with PgStore(conninfo=dst,readonly=True) as store:self.assertEqual(store.generation()['target_height'],self.target)
-    def test_first_run_from_a_schema3_backup_serves_schema_4(self):
+    def test_first_run_from_an_earlier_schema3_backup_serves_schema_5(self):
+        """The service's first run restores a snapshot of an earlier release (schema 3, nonces only) and
+        upgrades it with every stored epoch's size from its provider."""
+        from unittest.mock import patch
+        from fixtures.database import AccountedFake
+        from fixtures.generations import h
+        from fixtures.legacy import nonce_only
         from fixtures.schema import to_schema3
-        source,_,_=self.database();make_store(source)
-        with PgStore(conninfo=source) as store:to_schema3(store)
+        from db_sync_alt.store import database, upgrade
+        from db_sync_alt.store.epoch_parameters import ProviderEpochSource
         archive=self.root/'schema3.dump';manifest=self.root/'schema3.json'
-        backup(archive,manifest,conninfo=source)
+        with nonce_only():
+            source,_,_=self.database();make_store(source)
+            with PgStore(conninfo=source) as store:to_schema3(store)
+            with patch.object(database,'SCHEMA_VERSION',3):backup(archive,manifest,conninfo=source)
+        sizes=AccountedFake({'/epochs/%d/parameters'%e:{'epoch':e,'nonce':h('nonce'+str(e)).hex(),'max_tx_size':12000+e} for e in range(3)})
         dst,name,alias=self.database();cfg,role=self.configuration(alias,dst,backup_archive=str(archive),backup_manifest=str(manifest))
-        service=self.start(cfg);self.wait_ready(service)
+        with patch.object(upgrade,'epoch_source',lambda network,sql_source=None:ProviderEpochSource(sizes,network)):
+            service=self.start(cfg);self.wait_ready(service)
+        self.assertEqual(len(sizes.calls),6)
         self.assertEqual(service.health.snapshot()['integrity'],{'base':2,'checkpointed_at':None})
         with PgStore(conninfo=dst,readonly=True) as store:
             self.assertEqual((store.state()['schema_version'],store.generation()['target_height']),(5,self.target))
