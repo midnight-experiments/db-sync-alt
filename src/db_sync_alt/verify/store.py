@@ -100,10 +100,13 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
         if db.execute('SELECT 1 FROM chain.membership_delta d JOIN chain.blocks b USING(hash) WHERE d.generation=%s AND d.height<>b.height LIMIT 1',(gen,)).fetchone():raise Refusal('metadata_gap_or_parent_conflict')
         expected=reuse[0]+1;previous=store.block_at(gen,reuse[0])['hash']
         metadata_query,metadata_args=store.membership_sql(gen)
-    # The full path materializes the lineage membership before the join. Inlined into the range join, the
-    # recursive membership function can take seconds to plan on a long history and outrun the statement timeout.
+    # The full path materializes the lineage membership and the block headers before the join. Inlined into the
+    # range join, the recursive membership function can take seconds to plan on a long history. PostgreSQL also
+    # estimates the materialized membership at a small fraction of its real size, so a join against chain.blocks
+    # itself becomes one primary-key lookup per membership row and outruns the statement timeout. With both sides
+    # materialized, PostgreSQL hash-joins the two scans.
     if delta:query='SELECT m.height,b.hash,b.parent_hash,b.height FROM ('+metadata_query+') m LEFT JOIN chain.blocks b ON b.hash=m.hash WHERE m.height BETWEEN %s AND %s ORDER BY m.height'
-    else:query='WITH m AS MATERIALIZED ('+metadata_query+') SELECT m.height,b.hash,b.parent_hash,b.height FROM m LEFT JOIN chain.blocks b ON b.hash=m.hash WHERE m.height BETWEEN %s AND %s ORDER BY m.height'
+    else:query='WITH m AS MATERIALIZED ('+metadata_query+'), b AS MATERIALIZED (SELECT hash,parent_hash,height FROM chain.blocks) SELECT m.height,b.hash,b.parent_hash,b.height FROM m LEFT JOIN b ON b.hash=m.hash WHERE m.height BETWEEN %s AND %s ORDER BY m.height'
     # Bounded stream, not fetchall of full history.
     with db.transaction():
         with db.cursor(name='verify_metadata') as cur:

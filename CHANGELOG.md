@@ -58,6 +58,9 @@
   the schema, incremental manifest and backup format versions. Supported
   five-field version 1 receipts retain their validation; other adapter-versioned
   receipt field sets refuse.
+- Startup verification on a long history no longer times out when PostgreSQL
+  misestimates the generation membership: the full metadata check now
+  hash-joins materialized blocks.
 
 ## 0.3.0
 
