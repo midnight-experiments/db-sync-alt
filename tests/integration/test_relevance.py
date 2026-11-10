@@ -1,4 +1,10 @@
 import copy
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +13,46 @@ from db_sync_alt.verify.store import verify_store
 from db_sync_alt.sources.blockfrost.relevance import qualified_parent
 from fixtures import relevance as f
 from fixtures.blockfrost import FixtureHooks
+
+
+def key(transaction,index=0):return (bytes.fromhex(transaction['tx_hash']),index)
+
+
+def sweep_cases():
+    """The ledger-valid transactions of issues 00031 and 00032, each alone, as (name, blocks, named).
+
+    The pointer address has redundant leading zero groups in its slot and transaction index, which the
+    ledger accepts from protocol version 9 and re-serialises minimally."""
+    pointer=bytes([0x40|(1 if f.PROFILE.network.network=='mainnet' else 0)])+b'p'*28+b'\x80\x81\x00\x80\x02\x03'
+    wallet=f.make_tx(160,outputs=[[f.OTHER,[200,{f.P:{f.N:5}}]]]);plain=f.make_tx(162)
+    # Its body would spend the wallet's cNIGHT, pay cNIGHT to the mapping address and mint: none of it took effect.
+    unrelated=f.make_tx(163,valid=False,inputs=[key(wallet)],relevant=True,mint=4,collateral=[key(plain)],returned=[f.OTHER,50])
+    invalid=f.make_tx(164,valid=False,mint=2,collateral=[key(wallet)],returned=[f.OTHER,[150,{f.P:{f.N:5}}]])
+    spend=f.make_tx(165,inputs=[key(invalid,1)])
+    returned=f.make_tx(166,relevant=True,collateral=[key(wallet)],returned=[f.OTHER,[190,{f.P:{f.N:5}}]])
+    pointed=f.make_tx(167,outputs=[[pointer,[100,{f.P:{f.N:1}}]]])
+    return [('unrelated invalid',[[wallet,plain,unrelated]],dict(wallet=wallet,plain=plain,unrelated=unrelated)),
+            ('relevant invalid',[[wallet,invalid],[spend]],dict(wallet=wallet,invalid=invalid,spend=spend)),
+            ('collateral return with an asset',[[wallet,returned]],dict(wallet=wallet,returned=returned)),
+            ('non-minimal pointer',[[pointed]],dict(pointed=pointed))]
+
+
+def mainnet_shared_root(routes,directory):
+    """An external accounting client (tests/fixtures/shared_client) for the relevance fixture's network."""
+    root=Path(directory)
+    shutil.copy(Path(__file__).resolve().parents[1]/'fixtures'/'shared_client'/'client.py',root/'client.py')
+    (root/'profiles.json').write_text(json.dumps({f.PROFILE.network.network:{'base_url':f.PROFILE.network.blockfrost_base}}))
+    (root/'answers').mkdir()
+    for path,value in routes.items():(root/'answers'/hashlib.sha256(path.encode()).hexdigest()).write_bytes(json.dumps(value).encode())
+    return root
+
+
+class Transport:
+    """HTTP transport of db-sync-alt's own client: every route answered as JSON bytes."""
+    def __init__(self,routes):self.routes=routes
+    def __call__(self,path):
+        if path not in self.routes:return 404,{},b'{"status_code":404}'
+        return 200,{},json.dumps(self.routes[path]).encode()
 
 class RelevancePGTests(unittest.TestCase):
     @classmethod
@@ -101,10 +147,85 @@ class RelevancePGTests(unittest.TestCase):
             with patch.object(store,'insert',side_effect=insert):
                 with self.assertRaisesRegex(Refusal,'independent_provider_mismatch'):f.SQLFixture.follow(store,routes,f.S+1)
             self.assertEqual(store.generation()['target_height'],f.S)
-    def test_invalid_collateral_return_and_collateral_spend_refuse(self):
-        for row in (f.make_tx(90,valid=False,returned=[f.ADDRESS,[100,{f.P:{f.N:3}}]]),f.make_tx(91,valid=False,collateral=[(bytes.fromhex(f.ROOT['tx_hash']),0)])):
-            store,routes=self.prepare([[row]])
-            with self.assertRaisesRegex(Refusal,'unsupported_relevant_invalid'):f.SQLFixture.follow(store,routes,f.S+1)
+    def full(self,rows,client=None):
+        from db_sync_alt.sources.blockfrost.adapter import update
+        from fixtures.blockfrost import Fake
+        store,routes=self.prepare(rows)
+        update(store,f.Provider(50000,client(routes) if client else Fake(routes)),f.PROFILE,f.S+len(rows),hooks=FixtureHooks())
+        return store
+    def relevance(self,rows,client=None):
+        from db_sync_alt.sources.blockfrost.follow import update_follow
+        store,routes=self.prepare(rows)
+        if client is None:f.SQLFixture.follow(store,routes,f.S+len(rows))
+        else:update_follow(store,f.Provider(50000,client(routes)),f.PROFILE,f.S+len(rows),hooks=FixtureHooks(),relevance_enabled=True)
+        return store
+    def facts(self,store):
+        """The facts the follow stored, in the shape cardano-db-sync has them."""
+        rows=lambda query:store.db.execute(query).fetchall()
+        return {'transactions':{bytes(h):v for h,v in rows('SELECT hash,valid FROM chain.transactions WHERE first_generation>0')},
+                'outputs':{(bytes(h),i):(a,str(v)) for h,i,a,v in rows('SELECT tx_hash,output_index,address,value FROM chain.outputs WHERE first_generation>0')},
+                'output_assets':{(bytes(h),i,bytes(p),bytes(n)):str(q) for h,i,p,n,q in rows('SELECT tx_hash,output_index,policy,name,quantity FROM chain.output_assets WHERE first_generation>0')},
+                'inputs':{(bytes(h),bytes(o),i):n for h,o,i,n in rows('SELECT tx_hash,origin_hash,origin_index,ordinal FROM chain.inputs WHERE first_generation>0')},
+                'mints':rows('SELECT tx_hash FROM chain.mints WHERE first_generation>0'),
+                'served':{bytes(h):v for h,v in rows('SELECT hash,valid_contract FROM serve.tx WHERE block_id>%d'%f.S)}}
+    def expected(self,named):
+        """cardano-db-sync 13.8's rows for the sweep cases: a phase-2-invalid transaction holds only its collateral
+        inputs (tx_in) and its collateral return (tx_out at the number of body outputs) with valid_contract false;
+        a valid transaction's collateral return is never created; a pointer address is the ledger's canonical one."""
+        from db_sync_alt.sources.blockfrost.relevance import address_text,_encode_address
+        network=f.PROFILE.network.network;other=address_text(f.OTHER,network);h=lambda name:key(named[name])[0]
+        out={'transactions':{},'outputs':{},'output_assets':{},'inputs':{},'mints':[],'served':{}}
+        def tx(name,valid):out['transactions'][h(name)]=valid;out['served'][h(name)]=valid==1
+        def output(name,index,address,value,quantity):
+            out['outputs'][(h(name),index)]=(address,str(value));out['output_assets'][(h(name),index,f.P,f.N)]=str(quantity)
+        if 'wallet' in named:tx('wallet',1);output('wallet',0,other,200,5)
+        if 'invalid' in named:
+            tx('invalid',0);output('invalid',1,other,150,5);out['inputs'][(h('invalid'),*key(named['wallet']))]=0
+            tx('spend',1);out['inputs'][(h('spend'),*key(named['invalid'],1))]=0
+        if 'returned' in named:tx('returned',1);output('returned',0,f.PROFILE.mapping,100,3)
+        if 'pointed' in named:
+            tx('pointed',1);output('pointed',0,_encode_address(bytes([named['pointed']['body'][1][0][0][0]])+b'p'*28+b'\x81\x00\x02\x03',network),100,1)
+        return out
+    def test_sweep_cases_ingest_in_full_and_relevance_mode_as_cardano_db_sync_stores_them(self):
+        """Issues 00031 and 00032, each case alone: full and relevance mode ingest it, store cardano-db-sync's
+        rows, serve valid_contract as it does, and agree."""
+        for name,rows,named in sweep_cases():
+            with self.subTest(case=name):
+                full=self.full(rows);relevance=self.relevance(rows)
+                self.assertEqual(self.facts(relevance),self.expected(named))
+                self.assertEqual(relevance.digests(relevance.generation()['id']),full.digests(full.generation()['id']))
+                verify_store(relevance);verify_store(full)
+    def test_sweep_cases_together_on_both_provider_adapters(self):
+        """All cases in one range through db-sync-alt's own client (full mode) and the shared adapter's external
+        client (relevance mode): the same facts as the in-process provider."""
+        from db_sync_alt.sources.blockfrost import provider
+        cases=sweep_cases();named={}
+        for _,_,more in cases:named.update(more)
+        rows=[[*cases[0][1][0],cases[2][1][0][1],cases[1][1][0][1],cases[3][1][0][0]],cases[1][1][1]]
+        def portable(routes):
+            ledger=self.enterContext(tempfile.TemporaryDirectory());now=[time.time()]
+            return provider.PortableClient(f.PROFILE.network.key_prefix+'synthetic0000000000000000',Path(ledger)/'accounting',network=f.PROFILE.network,
+                                           transport=Transport(routes),clock=lambda:now[0],sleep=lambda seconds:now.__setitem__(0,now[0]+seconds))
+        def shared(routes):
+            return provider.SharedClient(str(mainnet_shared_root(routes,self.enterContext(tempfile.TemporaryDirectory()))),network=f.PROFILE.network)
+        reference=self.relevance(rows);own=self.full(rows,portable);external=self.relevance(rows,shared)
+        self.assertEqual(self.facts(reference),self.expected(named))
+        digests=reference.digests(reference.generation()['id'])
+        self.assertEqual(own.digests(own.generation()['id']),digests);self.assertEqual(external.digests(external.generation()['id']),digests)
+    def test_invalid_transaction_validity_must_agree_with_its_cbor(self):
+        _,rows,named=sweep_cases()[1];store,routes=self.prepare(rows)
+        routes['/txs/'+named['invalid']['tx_hash']]['valid_contract']=True
+        with self.assertRaisesRegex(Refusal,'provider_transaction_mismatch'):f.SQLFixture.follow(store,routes,f.S+2)
+        self.assertEqual(store.generation()['target_height'],f.S)
+    def test_invalid_transaction_rows_must_be_its_collateral(self):
+        _,rows,named=sweep_cases()[1];path='/txs/'+named['invalid']['tx_hash']+'/utxos'
+        for mode,code in (('body output','provider_output_count_mismatch'),('collateral role','provider_input_membership_mismatch'),('missing return','provider_output_count_mismatch')):
+            with self.subTest(mode=mode):
+                store,routes=self.prepare(rows);answer=routes[path]
+                if mode=='body output':answer['outputs'].append(dict(answer['outputs'][0],output_index=0))
+                elif mode=='collateral role':answer['inputs'][0]['collateral']=True
+                else:answer['outputs']=[]
+                with self.assertRaisesRegex(Refusal,code):f.SQLFixture.follow(store,routes,f.S+2)
     def test_reference_and_collateral_overlap_preserve_ordinary_input(self):
         key=(bytes.fromhex(f.ROOT['tx_hash']),0)
         row=f.make_tx(92,inputs=[key],collateral=[key]);store,routes=self.prepare([[row]])
@@ -183,3 +304,44 @@ class RelevancePGTests(unittest.TestCase):
             def get_optional(self,path):return self.get(path)
         client=Fake(routes);update_follow(store,Provider(10000,client),legacy.PROFILE,legacy.OFFSET+11,hooks=FixtureHooks())
         self.assertEqual(client.calls.count('/txs/'+key+'/utxos'),1);self.assertNotIn('relevance_coverage',store.generation()['manifest'])
+
+
+class InvalidTransactionSQLTests(unittest.TestCase):
+    """A phase-2-invalid transaction in the cardano-db-sync source, as cardano-db-sync 13.8 stores it: tx with
+    valid_contract false, its collateral input as tx_in, its collateral return as tx_out at the number of body
+    outputs. It spends the relevant output of the root's PRE_SPEND and returns cNIGHT to a key address."""
+    @classmethod
+    def setUpClass(cls):
+        from db_sync_alt.sources.blockfrost.relevance import address_text
+        f.configure('mainnet');f.SQLFixture.setup()
+        cls.invalid=f.make_tx(170,valid=False,collateral=[key(f.PRE_SPEND)],returned=[f.OTHER,[60,{f.P:{f.N:3}}]])
+        cls.other=address_text(f.OTHER,'mainnet')
+        c=f.SQLFixture.source
+        with c.transaction():
+            c.execute('INSERT INTO tx VALUES(10,%s,%s,2,false)',(key(cls.invalid)[0],f.S-1))
+            c.execute('INSERT INTO tx_in VALUES(10,10,2,0)')
+            c.execute('INSERT INTO tx_out(id,tx_id,index,address,value,data_hash) VALUES(10,10,1,%s,60,NULL)',(cls.other,))
+            c.execute('INSERT INTO ma_tx_out VALUES(10,3,10,1)')
+    @classmethod
+    def tearDownClass(cls):f.SQLFixture.teardown()
+    def prepare(self,rows):
+        store,routes=f.SQLFixture.prepare(rows,history=[(f.S-1,2,self.invalid)]);self.addCleanup(store.close);return store,routes
+    def test_sql_source_stores_and_serves_it_and_blockfrost_continues_from_it(self):
+        spend=f.make_tx(171,inputs=[key(self.invalid,1)]);invalid=key(self.invalid)[0]
+        store,routes=self.prepare([[spend]])
+        self.assertEqual(store.fact('transactions',(invalid,))['valid'],0)
+        self.assertEqual(store.ordinal('inputs',(invalid,*key(f.PRE_SPEND))),0)
+        self.assertIsNone(store.fact('outputs',(invalid,0)))
+        self.assertEqual(store.fact('outputs',(invalid,1))['address'],self.other)
+        self.assertEqual([(bytes(r['policy']),bytes(r['name']),str(r['quantity'])) for r in store.output_assets(invalid,1)],[(f.P,f.N,'3')])
+        self.assertEqual(store.db.execute('SELECT valid_contract FROM serve.tx WHERE hash=%s',(invalid,)).fetchone(),(False,))
+        verify_store(store)
+        # The hand-off check reads the stored invalid transaction back from Blockfrost; the spend of its return follows.
+        _,calls=f.SQLFixture.follow(store,routes,f.S+1)
+        self.assertIn('/txs/'+self.invalid['tx_hash']+'/utxos',calls)
+        self.assertEqual(store.ordinal('inputs',(key(spend)[0],invalid,1)),0)
+        verify_store(store)
+        from db_sync_alt.sources.blockfrost.adapter import update
+        from fixtures.blockfrost import Fake
+        reference,paths=self.prepare([[spend]]);update(reference,f.Provider(50000,Fake(paths)),f.PROFILE,f.S+1,hooks=FixtureHooks())
+        self.assertEqual(reference.digests(reference.generation()['id']),store.digests(store.generation()['id']))
