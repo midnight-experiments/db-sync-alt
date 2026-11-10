@@ -13,7 +13,7 @@ COMMANDS = {
     'run': ('db_sync_alt.cli.run', 'run in the foreground against a local PostgreSQL 17 database', ()),
     'service': ('db_sync_alt.service.runtime', 'run the service from a configuration file', ()),
     'acquire': ('db_sync_alt.cli.acquire', 'build or extend generations from cardano-db-sync or Blockfrost', ()),
-    'upgrade': ('db_sync_alt.store.upgrade', 'upgrade a store to the current schema (3)', ()),
+    'upgrade': ('db_sync_alt.store.upgrade', 'upgrade a store to the current schema (5), adding epoch parameters to an older store', ()),
     'grant-reader': ('db_sync_alt.store.reader', "grant an operator-created login read access to the node's relations", ()),
     'backup': ('db_sync_alt.backup', 'write a PostgreSQL-native backup and its manifest', ('backup',)),
     'restore': ('db_sync_alt.backup', 'restore a verified backup into an empty database', ('restore',)),

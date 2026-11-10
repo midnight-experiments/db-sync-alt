@@ -210,25 +210,47 @@ def upgrade_store(store,ordinal_source=None,epoch_source=None):
     return result
 
 
+# What a nonce-only store needs to be upgraded, named in the refusal.
+EPOCH_SOURCE_REQUIRED=('--source-service with --source-attestation (a cardano-db-sync of the network), or the '
+                       'Blockfrost settings the service uses (DBSYNC_PROVIDER_KEY_FILE and DBSYNC_PROVIDER_STATE, '
+                       'or DBSYNC_PROVIDER_ADAPTER=shared with DBSYNC_SHARED_ROOT)')
+
+
+def epoch_source(network,sql_source=None):
+    """The authoritative source of a nonce-only store's epoch parameters: the given cardano-db-sync,
+    else the network's accounted Blockfrost client when one is configured, else None."""
+    from db_sync_alt.store.epoch_parameters import ProviderEpochSource,SQLEpochSource
+    if sql_source is not None:return SQLEpochSource(sql_source)
+    from db_sync_alt.sources.blockfrost.provider import ProviderError,configured_client
+    try:client=configured_client(network)
+    except ProviderError:return None
+    return ProviderEpochSource(client,network)
+
+
 def main(argv=None):
     import argparse
     import json
     from db_sync_alt.store.database import PgStore
-    parser=argparse.ArgumentParser(prog='db-sync-alt upgrade',description=__doc__)
+    parser=argparse.ArgumentParser(prog='db-sync-alt upgrade',description=__doc__+'\n\nA store written before epoch parameters reads every stored epoch\'s '
+                                   'max_tx_size twice from --source-service, or else from Blockfrost (2 requests per stored epoch).')
     parser.add_argument('--service',required=True)
-    parser.add_argument('--source-service',help='read-only cardano-db-sync of the same network for missing ledger ordinals; requires --source-attestation')
+    parser.add_argument('--source-service',help='read-only cardano-db-sync of the same network for missing ledger ordinals and epoch parameters; requires --source-attestation')
     parser.add_argument('--source-attestation',type=Path,help='truthful version/retention JSON, as for acquire; requires --source-service')
     args=parser.parse_args(argv)
     try:
         if bool(args.source_service)!=bool(args.source_attestation):raise Refusal('source_attestation_pair_required')
-        with PgStore(args.service) as store:
+        with PgStore(args.service,allow_legacy=True) as store:
             source=None
             if args.source_service:
                 from db_sync_alt.contract import Profile
                 from db_sync_alt.resources import profile_dir
                 from db_sync_alt.sources.dbsync.reader import SQLSource
                 source=SQLSource(args.source_service,Profile(profile_dir(store.network.network),store.network.network),json.loads(args.source_attestation.read_text()))
-            result=upgrade_store(store,source)
+            epochs=epoch_source(store.network,source) if store.legacy_format else None
+            result=upgrade_store(store,source,epochs)
         print(json.dumps(result,sort_keys=True,default=str))
-    except Refusal as e:parser.exit(2,json.dumps({'error':e.code})+'\n')
+    except Refusal as e:
+        body={'error':e.code}
+        if e.code=='epoch_parameters_source_required':body['required']=EPOCH_SOURCE_REQUIRED
+        parser.exit(2,json.dumps(body)+'\n')
     except Exception:parser.exit(2,'{"error":"schema_upgrade_failed"}\n')

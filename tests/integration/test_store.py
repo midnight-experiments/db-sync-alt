@@ -295,7 +295,7 @@ print('postgres-only-runtime-ok')
         with PgStore(conninfo=conninfo) as store:
             self.membership_reference_views(store);before_views=self.assert_view_equality(store)
             previous=store.generation();target=previous['target_height']+1;witness=target+2160
-            manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'required_epochs':[0,1,2],'capabilities':{'bridge_qualified':False,'candidates_empty':True},'anchors':{n:{'height':height,'hash':block(height,True)['hash'].hex()} for n,height in [('start',START),('target',target),('witness',witness)]}}
+            manifest={'identity':PROFILE.identity,'contracts':digest(PROFILE.contract),'required_epochs':[0,1,2],'capabilities':{'bridge_qualified':False,'candidates_empty':True,'epoch_max_tx_size_v1':True},'anchors':{n:{'height':height,'hash':block(height,True)['hash'].hex()} for n,height in [('start',START),('target',target),('witness',witness)]}}
             manifest.update(source_identity={'adapter':'db-sync-direct-pg-v1'},parent_digest=digest(previous['manifest']['digests']),acquisition={'version':1,'window_blocks':1000})
             gen=store.begin_generation(source='cardano-db-sync-postgresql',start=PROFILE.start,target=target,witness=witness,manifest=manifest,parent=2)
             with self.assertRaises(Refusal):store.publish(gen,manifest)

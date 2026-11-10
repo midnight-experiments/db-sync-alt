@@ -213,6 +213,11 @@ def verify_checkpoint(store,g,computed,checkpoint,*,require_ready=True):
 def verify_store(store,generation=None,*,require_ready=True):
     from db_sync_alt.store.incremental import incremental,compute_proof,validate_completion_v2,integrity_base
     g=store.generation(generation);gen=g['id'];m=g['manifest']
+    record=getattr(store,'epoch_upgrade',None)
+    if record is not None and gen>=record['generation']:
+        # Sizes the epoch parameter upgrade added to epochs sealed before it.
+        from db_sync_alt.store.epoch_parameters import verify_record
+        verify_record(store)
     verify_structure(store,g,require_ready=require_ready)
     computed=store.digests(gen)
     base,checkpoint=integrity_base(store) if store.supports_incremental else (None,None)
