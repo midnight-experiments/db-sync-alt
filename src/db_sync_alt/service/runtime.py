@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 
+from db_sync_alt import __version__
 from db_sync_alt.service.health import (BoundedDatabaseProbe, ChainPoint, HealthHTTPServer,
                        HealthPolicy, HealthState)
 
@@ -107,7 +108,7 @@ class ServiceConfig:
     sync: dict = field(default_factory=dict)
     network: str | None = None
     profile: str | None = None
-    service_version: str = '0.4.1'
+    service_version: str = __version__
     http_host: str = '127.0.0.1'
     http_port: int = 18080
     http_allow_external: bool = False

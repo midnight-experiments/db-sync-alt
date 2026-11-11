@@ -9,6 +9,7 @@ import sys
 import threading
 from types import SimpleNamespace
 import psycopg
+from db_sync_alt import __version__
 from db_sync_alt.networks import names as network_names
 from db_sync_alt.resources import profile_dir
 from db_sync_alt.contract import Profile, Refusal, canonical
@@ -42,7 +43,7 @@ def blockfrost_once(store, profile, *, target_height=None, request_budget=None,
     day=dt.datetime.now(dt.timezone.utc).date().isoformat()
     poll=store.sync_job('provider-poll-'+day)
     if poll:options['daily_poll_request_budget']=poll['budget']
-    health=HealthState(service_version='0.4.3',schema_version=1,network=profile.network.network,profile=profile.identity['config_sha256'])
+    health=HealthState(service_version=__version__,schema_version=1,network=profile.network.network,profile=profile.identity['config_sha256'])
     serial=store.state()['publication_serial']
     if store.supports_incremental:store.certify_ready_full()
     SyncDriver(SimpleNamespace(sync=options),client=client,profile=profile,fixed_target=target_height).run_once(store,health,stop_event)

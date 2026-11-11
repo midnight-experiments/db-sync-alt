@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `/status` and `/health` report the package's version as `service_version`.
+  0.4.2 and 0.4.3 reported `0.4.1` there, while `db-sync-alt --version` was
+  correct. The service and the one-shot Blockfrost acquire take the version
+  from the package, and a unit test keeps `pyproject.toml` equal to it.
 - The way back from an upgrade is documented as a `db-sync-alt backup` taken
   with the earlier release before the upgrade and restored with that release's
   `db-sync-alt restore`. A copy made with plain `pg_dump` and `pg_restore` into
