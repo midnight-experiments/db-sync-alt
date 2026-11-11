@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 from db_sync_alt.contract import TABLES, KEYS, Refusal, digest, canonical, jsonable
 from db_sync_alt.sources.dbsync.reader import SQLSource
 from db_sync_alt.verify.completion import SQL_ADAPTER, SQL_VALIDATION, validate_completion
-from db_sync_alt.verify.limits import check, verification
+from db_sync_alt.verify.limits import analyze_chain, check, verification
 from db_sync_alt.verify.store import verify_store
 from db_sync_alt.verify.prerequisites import acquisition_version,prerequisite_coverage,chunk_receipt,seal_receipt
 from db_sync_alt.verify.sql_receipt import admit_receipt_size
@@ -398,6 +398,8 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
         _anchors(source,store,generation)
         store.progress('sql_epoch',generation=generation,epoch=epoch)
     _stop(stop_event)
+    # The generation's facts were just bulk-loaded: verify them with current planner statistics.
+    analyze_chain(store.db)
     report = verify_store(store, generation, require_ready=False)
     independent = _independent(source, store, generation, ranges, epoch_list, stop_event)
     _anchors(source,store,generation); _stop(stop_event)
