@@ -166,6 +166,9 @@ def restore(archive,manifest,destination_service=None,*,conninfo='',reserve_chec
         # Transfer ownership to PgStore without dropping the fencing session.
         store=PgStore.__new__(PgStore);store.db=db;store._writer=True;store.readonly=False;store.reserve_check=reserve_check;store.progress_callback=None
         if type(body.get('canonical_ready')) is not int:raise Refusal('invalid_backup_canonical')
+        # A restore carries no planner statistics: gather the chain tables' before verifying them.
+        from db_sync_alt.verify.limits import analyze_chain
+        analyze_chain(db)
         if store.meta('profile')!=profile or store.network!=network or format_reports(store,body['format'],body['canonical_ready'])!=body.get('generations') or physical_inventory(store)!=body.get('physical_inventory'):raise Refusal('restored_database_mismatch')
         # Explicit one-shot polling may create a poll policy even on schema 1;
         # jobs without a policy marker are left unchanged (the helper skips them).

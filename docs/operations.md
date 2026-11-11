@@ -272,6 +272,17 @@ written (`integrity`). A database whose base is still its first generation
 written once a newer update is published and the interval has passed, or at the
 next start.
 
+Each verification statement whose work grows with the history runs under its
+own limit of one hour; every other statement of db-sync-alt keeps 30 seconds.
+One hour covers about 10 million rows per statement at 100 times the measured
+cost of these checks. The statements that sort or hash the whole history write
+temporary files while they run, for example about 440 bytes per block for the
+block-header check (375 MB for 890,000 blocks). Keep that much free space for
+PostgreSQL's temporary files, and do not set `temp_file_limit` below it. If
+PostgreSQL cancels a verification statement, db-sync-alt logs
+`verification_statement_canceled` with the statement's plan and its tables'
+estimated row counts before it stops.
+
 ## Provider configuration
 
 `db-sync-alt run` configures the provider itself. The service reads these

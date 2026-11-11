@@ -236,10 +236,12 @@ def rebind_pending_witness(store,generation):
 def delta_rows(store,table,gen):
     """The facts `gen` added, with the columns it was sealed over."""
     from db_sync_alt.store.database import logical_row
+    from db_sync_alt.verify.limits import verification
     columns=store.sealed_tables(gen)[table]
-    with store.db.transaction():
+    query='SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE first_generation=%s ORDER BY '+','.join(KEYS[table])
+    with verification(store.db,query,(gen,)):
         with store.db.cursor(name='delta_'+table) as cur:
-            cur.execute('SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE first_generation=%s ORDER BY '+','.join(KEYS[table]),(gen,))
+            cur.execute(query,(gen,))
             for row in cur:yield logical_row(table,dict(zip(columns,row)))
 
 def inventory(rows):
@@ -256,7 +258,8 @@ def _membership_inventory(store,gen,*,removed=False):
         # Normal path uses the verified current index; audit can reconstruct history.
         if store.state()['canonical_ready']==g['parent']:query="SELECT height,encode(hash,'hex') FROM chain.current_membership WHERE height>%s ORDER BY height";args=(reuse[0],)
     else:query="SELECT m.height,encode(m.hash,'hex'),to_jsonb(b)-'id'-'first_generation' FROM chain.membership_delta m JOIN chain.blocks b USING(hash) WHERE m.generation=%s ORDER BY m.height";args=(gen,)
-    return inventory(store.db.execute(query,args))
+    from db_sync_alt.verify.limits import check_all
+    return inventory(check_all(store.db,query,args))
 
 def compute_proof(store,g):
     gen=g['id'];m=g['manifest'];parent=store.generation(g['parent']);reuse=store.db.execute('SELECT through_height,receipt FROM chain.generation_reuse WHERE generation=%s',(gen,)).fetchone()
