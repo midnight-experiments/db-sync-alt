@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 from db_sync_alt.contract import TABLES, KEYS, Refusal, digest, canonical, jsonable
 from db_sync_alt.sources.dbsync.reader import SQLSource
 from db_sync_alt.verify.completion import SQL_ADAPTER, SQL_VALIDATION, validate_completion
-from db_sync_alt.verify.limits import analyze_chain, check, verification
+from db_sync_alt.verify.limits import ANALYZE_TIMEOUT, analyze_chain, check, verification
 from db_sync_alt.verify.store import verify_store
 from db_sync_alt.verify.prerequisites import acquisition_version,prerequisite_coverage,chunk_receipt,seal_receipt
 from db_sync_alt.verify.sql_receipt import admit_receipt_size
@@ -104,23 +104,29 @@ def _select(source, store, manifest, stop_event, generation):
     (issue 00040). Each window then takes its rows with `_window_ids`. A TEMP table: it never persists, and a
     resumed acquisition selects again."""
     store.db.execute('DROP TABLE IF EXISTS pg_temp.sql_selection')
-    store.db.execute('CREATE TEMP TABLE sql_selection(family text NOT NULL,id bigint NOT NULL,height integer,PRIMARY KEY(family,id))')
+    # The windows' lookup key is the primary key, maintained by each bounded COPY: no statement afterwards
+    # grows with the selection (issue 00042). A row without a height never falls into a window.
+    store.db.execute('CREATE TEMP TABLE sql_selection(family text NOT NULL,height integer NOT NULL,id bigint NOT NULL,PRIMARY KEY(family,height,id))')
     rows = []; total = 0
     def flush():
         with store.db.cursor() as cursor:
-            with cursor.copy('COPY sql_selection(family,id,height) FROM STDIN') as copy:
-                for row in rows:
-                    copy.write_row(row)
+            with cursor.copy('COPY sql_selection(family,height,id) FROM STDIN') as copy:
+                for family, id, height in rows:
+                    copy.write_row((family, height, id))
         rows.clear()
     with source.snapshot():
         source.check_anchors(manifest)
         for row in source.selection():
-            _stop(stop_event); rows.append(row); total += 1
+            _stop(stop_event)
+            if row[2] is None:
+                continue
+            rows.append(row); total += 1
             if len(rows) >= SELECTION_COPY_ROWS:
                 flush(); store.progress('sql_selection', generation=generation, rows=total)
         flush()
-    store.db.execute('CREATE INDEX ON sql_selection(family,height,id)')
-    store.db.execute('ANALYZE sql_selection')
+    with store.db.transaction():
+        store.db.execute("SET LOCAL statement_timeout='" + ANALYZE_TIMEOUT + "'")
+        store.db.execute('ANALYZE sql_selection')
     store.progress('sql_selection', generation=generation, rows=total, complete=True)
 
 
