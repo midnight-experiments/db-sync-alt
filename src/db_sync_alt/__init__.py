@@ -1,7 +1,7 @@
 """db-sync-alt: Cardano data for Midnight's main-chain follower, kept in PostgreSQL."""
 import sys
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 
 # A Plutus integer is unbounded: one datum integer can fill a transaction (16 KiB is about 39,500
 # decimal digits), and cardano-db-sync stores it exactly. Python converts at most 4,300 digits

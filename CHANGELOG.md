@@ -1,9 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
-- **BREAKING: schema 5, fact format v2 and backup format v4.** Every epoch fact
-  carries the epoch's maximum transaction size, served as
+- **BREAKING: schema 5, fact format v2 and backup format v4.** Upgrade a
+  database of 0.2.x or 0.3.x in place, once, with the service and the node
+  stopped: `db-sync-alt upgrade --service <name>`. The upgrade reads every
+  stored epoch's parameters twice, from Blockfrost with the service's settings
+  (2 requests per stored epoch) or from a cardano-db-sync given with
+  `--source-service` and `--source-attestation`. 0.3.x and earlier refuse an
+  upgraded database with `unsupported_database_identity`, and there is no
+  downgrade: keep a `pg_dump` of the stopped database to go back. A database
+  written by an unreleased build of `main` must be rebuilt with 0.4.0.
+- Every epoch fact carries the epoch's maximum transaction size, served as
   `epoch_param.max_tx_size`. midnight-node 2.1.101 reads
   `MAX(epoch_param.max_tx_size)` of the cursor block's epoch on its cost-based
   cNIGHT observation path and stops cNIGHT observations without it. The same
