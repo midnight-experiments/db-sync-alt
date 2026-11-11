@@ -141,8 +141,14 @@ and stop it when `db-sync-alt status` shows no pending generation.
 
 There is no downgrade: db-sync-alt 0.3.x and earlier refuse a schema-5 database
 and 0.1.x refuses schema 4, both with `unsupported_database_identity`
-(`invalid_identity` in the service). To go back, keep a `pg_dump` of the database
-taken with the service stopped before the upgrade, and restore it.
+(`invalid_identity` in the service). To go back, take a backup with the
+release that serves the database before the upgrade (`db-sync-alt backup`, with
+the service stopped), and restore it with that release's `db-sync-alt restore`
+into an empty database. A copy made with plain `pg_dump` and `pg_restore` into a
+new database or onto another server does not serve until the next UTC day: each
+day's polling job is bound to the database that created it, only
+`db-sync-alt restore` binds it to a new one, and the service refuses the copy
+with `invalid_sync_job`.
 With the Compose deployment, run the same command in the image
 ([Compose](docker.md#upgrade)).
 A database whose inputs and output assets were stored without their
