@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from db_sync_alt.contract import TABLES, KEYS, Refusal, digest, canonical, jsonable
 from db_sync_alt.sources.dbsync.reader import SQLSource
 from db_sync_alt.verify.completion import SQL_ADAPTER, SQL_VALIDATION, validate_completion
+from db_sync_alt.verify.limits import check, verification
 from db_sync_alt.verify.store import verify_store
 from db_sync_alt.verify.prerequisites import acquisition_version,prerequisite_coverage,chunk_receipt,seal_receipt
 from db_sync_alt.verify.sql_receipt import admit_receipt_size
@@ -207,19 +208,20 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
                         if actual is None or bytes(actual['hash']) != bytes(row['hash']):
                             raise Refusal('independent_membership_mismatch')
     # A newly bound old physical block must also have a source dependency.
-    if store.db.execute("""SELECT 1 FROM chain.generation_blocks gb
+    if check(store.db, """SELECT 1 FROM chain.generation_blocks gb
         LEFT JOIN sql_expected e ON e.family='blocks'
           AND e.key=jsonb_build_array(encode(gb.hash,'hex'))
           AND (e.row->>'height')::bigint=gb.height
-        WHERE gb.generation=%s AND e.key IS NULL LIMIT 1""",(generation,)).fetchone():
+        WHERE gb.generation=%s AND e.key IS NULL LIMIT 1""",(generation,)):
         raise Refusal('independent_membership_extra')
     # Every newly stored natural fact must have an independently discovered
     # matching source row. Presence/content of all expected rows checked above.
     from db_sync_alt.store.database import logical_row
     for table, columns in TABLES.items():
-        with store.db.transaction():
+        query = 'SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE first_generation=%s'
+        with verification(store.db, query, (generation,)):
             with store.db.cursor(name='new_'+table) as cursor:
-                cursor.execute('SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE first_generation=%s', (generation,))
+                cursor.execute(query, (generation,))
                 while batch := cursor.fetchmany(5000):
                     _stop(stop_event)
                     values = [jsonable(logical_row(table, dict(zip(columns, raw)))) for raw in batch]
@@ -234,9 +236,10 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
     inventory = {}
     for table in TABLES:
         h = hashlib.sha256(); count = 0
-        with store.db.transaction():
+        query = 'SELECT row FROM sql_expected WHERE family=%s ORDER BY key'
+        with verification(store.db, query, (table,)):
             with store.db.cursor(name='expected_'+table) as cursor:
-                cursor.execute('SELECT row FROM sql_expected WHERE family=%s ORDER BY key', (table,))
+                cursor.execute(query, (table,))
                 for (row,) in cursor:
                     _stop(stop_event)
                     h.update((canonical(row)+'\n').encode()); count += 1
