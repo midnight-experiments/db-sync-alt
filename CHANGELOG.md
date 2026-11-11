@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- A SQL bootstrap and the upgrade that follows it no longer run any destination statement whose cost grows with the history under the store's 30 s statement limit.
+  - **Before:** 0.4.2's Mainnet bootstrap stopped after its selection was staged. It built the selection's index in one statement (about 5 million rows), which was cancelled at 30 s, and acquire exited with `invalid_configuration_or_database`.
+  - **Now, the selection:** the lookup key is the session table's primary key, maintained by each bounded COPY, so no index is built afterwards. Its ANALYZE runs under the ANALYZE limit.
+  - **Now, the upgrade:** the served tables are built in ranges of 10,000 block heights (or 100,000 ids), each block's transactions and facts found by index. Every whole-table statement that cannot be split runs under a documented limit of its own (`BULK_TIMEOUT`, one hour): the membership projection and its foreign key, the per-family `first_generation` indexes, the ordinal constraints, the served-table indexes, and the schema-5 script. That replaces the earlier 120 s, 600 s and 30 s limits.
+  - Facts, digests, receipts, served rows, schema and formats are unchanged; `serve.verify` still compares every served row with the stored facts after the build.
+- Upgrading from 0.4.2 is an image swap.
+
 ## 0.4.2
 
 - A SQL bootstrap from a Mainnet cardano-db-sync now completes.
