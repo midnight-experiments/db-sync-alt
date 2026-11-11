@@ -2,16 +2,18 @@
 import copy
 import datetime as dt
 import hashlib
+import json
 import time
 import uuid
 
 from db_sync_alt.contract import Refusal
 from db_sync_alt.sources.blockfrost.adapter import OPENAPI, ProviderClient, bounded_answer, input_cut
-from db_sync_alt.sources.blockfrost.provider import UTXOS
+from db_sync_alt.sources.blockfrost.provider import UTXOS, ProviderError
 from fixtures.networks import PREPROD
 
 
 POOL='pool13m26ky08vz205232k20u8ft5nrg8u68klhn0xfsk9m4gsqsc44v'
+NOT_FOUND=object()  # a route the provider answers with HTTP 404
 
 
 def pool_id(raw):
@@ -38,24 +40,31 @@ class Fake:
         self.calls.append(p)
         if p not in self.routes:raise RuntimeError('secret error must not leak')
         r=self.routes[p]
-        return r() if callable(r) else copy.deepcopy(r)
+        if r is NOT_FOUND:raise ProviderError('provider_request_failed_counted',http_status=404)
+        if callable(r):return r()
+        try:return copy.deepcopy(r)
+        except RecursionError:return json.loads(json.dumps(r))  # answers nested past Python's recursion limit
 
 
 class CountingProvider(ProviderClient):
     """Budgeted provider over a fake client: counts attempts and keeps compact receipts, like the service's accounted
-    provider. With `profile`, an oversized `/utxos` answer is cut as the service cuts it."""
+    provider; `get_optional` gives None for HTTP 404. With `profile`, an oversized `/utxos` answer is cut as the
+    service cuts it."""
     def __init__(self,budget,client,profile=None):
         if type(budget) is not int or not 1<=budget<=50000:raise Refusal('invalid_request_budget')
         self.budget=budget;self.job_id=uuid.uuid4().hex;self.attempts=0;self.receipts=[];self.metrics_day=None;self.metrics_at=0;self.metrics_count=0
         self.client=client;self.profile=profile
-    def get(self,path):
+    def get_optional(self,path):return self.get(path,missing_ok=True)
+    def get(self,path,*,missing_ok=False):
         if not isinstance(path,str) or not path.startswith('/') or path.startswith('//') or any(c in path for c in ('#','\\','\n','\r')):raise Refusal('invalid_provider_path')
         day=dt.datetime.now(dt.timezone.utc).date().isoformat()
         if path!='/metrics' and (self.metrics_day!=day or time.monotonic()-self.metrics_at>=600 or self.attempts-self.metrics_count>=1000):self.get('/metrics')
         if self.attempts>=self.budget:raise Refusal('request_budget_exhausted')
         self.attempts+=1
         try:result=self.client.get(path,purpose='fixture:'+self.job_id)
-        except Exception:raise Refusal('provider_request_failed_counted') from None
+        except Exception as error:
+            if missing_ok and (getattr(error,'http_status',None)==404 or str(error).startswith('HTTP 404;')):return None
+            raise Refusal('provider_request_failed_counted') from None
         result,encoded=bounded_answer(result,input_cut(self.profile) if self.profile is not None and UTXOS.fullmatch(path) else None)
         self.receipts.append({'endpoint':path,'sha256':hashlib.sha256(encoded).hexdigest(),'bytes':len(encoded),'attempt':self.attempts,'at':dt.datetime.now(dt.timezone.utc).isoformat()})
         if len(self.receipts)>20000:raise Refusal('provider_receipt_unit_limit')

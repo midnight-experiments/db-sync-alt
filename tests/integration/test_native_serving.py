@@ -507,14 +507,18 @@ class PublicationInvariantTests(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, 'epoch_end_missing'):
             make_store(self.database(), before_seal=drop_end)
 
-    def test_the_registered_candidates_address_stays_empty(self):
+    def test_an_output_at_the_registered_candidates_address_is_served(self):
         candidate = PROFILE.configs['registered-candidates-addresses']['committee_candidates_address']
 
         def candidate_output(store, generation):
             if generation == 0:
                 store.insert('outputs', {'tx_hash': h('origin'), 'output_index': 1, 'address': candidate, 'value': '1', 'datum_hash': None}, 0)
-        with self.assertRaisesRegex(Refusal, 'unsupported_candidate_activity'):
-            make_store(self.database(), before_seal=candidate_output)
+        dsn = self.database()
+        make_store(dsn, before_seal=candidate_output)
+        with PgStore(conninfo=dsn) as store:
+            upgrade_store(store)
+            verify_store(store)
+            self.assertEqual(store.db.execute('SELECT count(*) FROM serve.tx_out WHERE address=%s', (candidate,)).fetchone()[0], 1)
 
     def test_a_served_generation_has_at_least_one_spend(self):
         dsn = self.database()

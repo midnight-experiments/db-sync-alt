@@ -18,6 +18,18 @@ class Tag:
 class MapEntries:
     pairs: list
 
+_NO_KEY=object()
+
+class _TagParts(list):
+    """A tag being read: its number, then its content."""
+
+def _attach(frame,value):
+    built=frame[0]
+    if isinstance(built,MapEntries):
+        if frame[2] is _NO_KEY:frame[2]=value
+        else:built.pairs.append((frame[2],value));frame[2]=_NO_KEY
+    else:built.append(value)
+
 class Decoder:
     def __init__(self, data, *, max_bytes=4*1024*1024, max_depth=64, max_items=200000, maps_as_pairs=False):
         if len(data)>max_bytes: raise Refusal('cbor_size_limit')
@@ -110,6 +122,33 @@ class Decoder:
                 if n*(2 if m==5 else 1)>self.remaining:raise Refusal('cbor_item_limit')
                 todo.append(n*(2 if m==5 else 1))
         return start,self.pos
+    def value(self):
+        """Read one item of any depth and build it, with an explicit stack.
+
+        For Plutus data, which may nest to any depth below the transaction size
+        and repeat map keys: maps keep every pair in order (`MapEntries`), and
+        neither depth nor keys refuse. Leaves go through `item`, as in `skip`.
+        """
+        holder=[];frames=[[holder,1,_NO_KEY]]  # per open container: [built value, items left or None until a break, pending map key]
+        while True:
+            frame=frames[-1];built,left,key=frame
+            if left==0 or left is None and key is _NO_KEY and self.data[self.pos:self.pos+1]==b'\xff':
+                if left is None:self.pos+=1
+                frames.pop()
+                if not frames:return holder[0]
+                _attach(frames[-1],Tag(built[0],built[1]) if isinstance(built,_TagParts) else built);continue
+            if left is not None:frame[1]=left-1
+            at=self.pos;self.remaining-=1
+            if self.remaining<0:raise Refusal('cbor_item_limit')
+            m,n=self.head()
+            if m in (4,5):
+                if n is not None and n*(2 if m==5 else 1)>self.remaining:raise Refusal('cbor_item_limit')
+                frames.append([[] if m==4 else MapEntries([]),None if n is None else n*(2 if m==5 else 1),_NO_KEY])
+            elif m==6:
+                if n is None:raise Refusal('cbor_invalid_tag')
+                frames.append([_TagParts([n]),1,_NO_KEY])
+            else:
+                self.pos=at;self.remaining+=1;_attach(frame,self.item())
 
 def key_identity(v):
     if type(v) in (int,bytes,str):return (type(v).__name__,v)
@@ -279,22 +318,47 @@ def _recipient(raw):
     return None
 
 
+# cardano-db-sync 13.8 stores a datum's JSON as NULL when it nests deeper than this, counting one
+# level per object or array (`jsonbNestingLimit`, `jsonbNestingExceeded`).
+DATUM_JSON_NESTING_LIMIT=2000
+
 def decode_datum(raw):
-    d=Decoder(raw,maps_as_pairs=True);value=d.item()
+    """cardano-db-sync's `datum.value` for the Plutus data `raw`: its detailed-schema JSON, or None
+    (SQL NULL) when that JSON nests deeper than DATUM_JSON_NESTING_LIMIT.
+
+    The ledger accepts Plutus data of any depth and maps that repeat a key, so neither refuses;
+    malformed CBOR and shapes that are not Plutus data do. Built bottom-up with explicit stacks.
+    """
+    d=Decoder(raw);value=d.value()
     if d.pos!=len(raw):raise Refusal('cbor_datum_trailing_bytes')
-    def convert(x):
-        if type(x) is int:return {'int':x}
-        if isinstance(x,bytes):return {'bytes':x.hex()}
-        if isinstance(x,list):return {'list':[convert(v) for v in x]}
-        if isinstance(x,MapEntries):return {'map':[{'k':convert(k),'v':convert(v)} for k,v in x.pairs]}
-        if isinstance(x,Tag):
+    work=[(None,value)];done=[]  # (None, item) to convert; (kind, count) to assemble the last `count` results
+    while work:
+        kind,x=work.pop()
+        if kind=='list':
+            parts=_take(done,x);done.append(({'list':[p for p,_ in parts]},2+max((n for _,n in parts),default=0)))
+        elif kind=='map':
+            parts=_take(done,2*x);pairs=[{'k':parts[i][0],'v':parts[i+1][0]} for i in range(0,len(parts),2)]
+            done.append(({'map':pairs},3+max(n for _,n in parts) if parts else 2))
+        elif kind is not None:
+            parts=_take(done,x[1]);done.append(({'constructor':x[0],'fields':[p for p,_ in parts]},2+max((n for _,n in parts),default=0)))
+        elif type(x) is int:done.append(({'int':x},1))
+        elif isinstance(x,bytes):done.append(({'bytes':x.hex()},1))
+        elif isinstance(x,list):work.append(('list',len(x)));work.extend((None,v) for v in reversed(x))
+        elif isinstance(x,MapEntries):
+            work.append(('map',len(x.pairs)))
+            for k,v in reversed(x.pairs):work.append((None,v));work.append((None,k))
+        elif isinstance(x,Tag):
             if x.number in (2,3) and isinstance(x.value,bytes):
-                n=int.from_bytes(x.value,'big');return {'int':n if x.number==2 else -1-n}
+                n=int.from_bytes(x.value,'big');done.append(({'int':n if x.number==2 else -1-n},1));continue
             if 121<=x.number<=127:constructor=x.number-121;fields=x.value
             elif 1280<=x.number<=1400:constructor=x.number-1280+7;fields=x.value
             elif x.number==102 and isinstance(x.value,list) and len(x.value)==2:constructor,fields=x.value
             else:raise Refusal('cbor_datum_tag')
             if not uint(constructor) or not isinstance(fields,list):raise Refusal('cbor_datum_constructor')
-            return {'constructor':constructor,'fields':[convert(v) for v in fields]}
-        raise Refusal('cbor_datum_shape')
-    return convert(value)
+            work.append(('constructor',(constructor,len(fields))));work.extend((None,v) for v in reversed(fields))
+        else:raise Refusal('cbor_datum_shape')
+    json_value,nesting=done[0]
+    return None if nesting>DATUM_JSON_NESTING_LIMIT else json_value
+
+def _take(stack,count):
+    parts=stack[len(stack)-count:];del stack[len(stack)-count:];return parts

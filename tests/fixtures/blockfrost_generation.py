@@ -11,18 +11,19 @@ from db_sync_alt.resources import profile_dir
 from db_sync_alt.sources.blockfrost.adapter import block_row, update
 from db_sync_alt.contract import Profile, digest, generation_capabilities
 from fixtures import synthetic
-from fixtures.blockfrost import CountingProvider, Fake
-from fixtures.cbor import tx
+from fixtures.blockfrost import CountingProvider, Fake, NOT_FOUND
+from fixtures.cbor import Tag, tx
 
 
 OFFSET=4500187
 PROFILE=Profile(profile_dir('preprod'))
 POLICY=bytes.fromhex(PROFILE.night[:56]);NAME=bytes.fromhex(PROFILE.night[56:])
 
-def block(h,fork=0,transition=False,unrelated=0):
+def block(h,fork=0,transition=False,added=None):
+    """Block h; `added` maps heights to the number of transactions added to that block."""
     # Fork is confined above committed height 10; old ready witness is immutable.
     bh=lambda n:(n+fork*10000 if n>10 else n).to_bytes(32,'big').hex()
-    return {'hash':bh(h),'height':OFFSET+h,'previous_block':bh(h-1),'epoch':(0 if h==8 else 1 if h==9 else 3 if transition and h>=12 else 2),'slot':h*20,'time':1700000000+h,'tx_count':5 if h==10 else 1+unrelated if h==12 else 1 if h==11 else 0}
+    return {'hash':bh(h),'height':OFFSET+h,'previous_block':bh(h-1),'epoch':(0 if h==8 else 1 if h==9 else 3 if transition and h>=12 else 2),'slot':h*20,'time':1700000000+h,'tx_count':(5 if h==10 else 1 if h in (11,12) else 0)+(added or {}).get(h,0)}
 
 def out(index=0):return {'output_index':index,'address':'relevant','amount':[{'unit':'lovelace','quantity':'100'},{'unit':PROFILE.night,'quantity':'3'}],'data_hash':None}
 # Prerequisite spend before the start cursor (block h=10, indexes 0 and 1; the cursor is index 4).
@@ -44,10 +45,26 @@ def unrelated_tx(index,auxiliary=b'\xf6',witness=b'\xa0'):
     if auxiliary!=b'\xf6':body[7]=hashlib.blake2b(auxiliary,digest_size=32).digest()
     return tx(body,auxiliary=auxiliary,witness=witness)
 
-def fixtures(fork=0,transition=False,auxiliary=(),witnesses=()):
-    """Provider routes; each `auxiliary` or `witnesses` entry adds one unrelated transaction carrying it after the relevant one in block h=12."""
+def payment_tx(index,payment):
+    """A transaction paying to `payment.address` with its datum (fixtures.datums.Payment)."""
+    option=[1,Tag(24,payment.datum)] if payment.inline else [0,payment.hash]
+    value=[5,{POLICY:{NAME:1}}] if payment.night else 5
+    return tx({0:[],1:[{0:payment.address.encode(),1:value,2:option}],2:200+index})
+
+def payment_output(payment):
+    amount=[{'unit':'lovelace','quantity':'5'}]+([{'unit':PROFILE.night,'quantity':'1'}] if payment.night else [])
+    return {'output_index':0,'address':payment.address,'amount':amount,'data_hash':payment.hash.hex(),
+            'inline_datum':payment.datum.hex() if payment.inline else None}
+
+def fixtures(fork=0,transition=False,auxiliary=(),witnesses=(),payments=(),spends=()):
+    """Provider routes. Each `auxiliary` or `witnesses` entry adds one unrelated transaction carrying it after the relevant one
+    in block h=12; each `payments` entry (fixtures.datums.Payment) a transaction in its block; each `spends` entry (an index
+    into `payments`) a transaction in block h=12 spending that payment's output."""
     unrelated=[unrelated_tx(i,auxiliary=a) for i,a in enumerate(auxiliary,1)]+[unrelated_tx(i,witness=w) for i,w in enumerate(witnesses,len(auxiliary)+1)]
-    at=lambda h:block(h,fork,transition,len(unrelated))
+    paid=[payment_tx(i,p) for i,p in enumerate(payments)];spent=[tx({0:[[bytes.fromhex(paid[k][1]),0]],1:[],2:300+j}) for j,k in enumerate(spends)]
+    added={12:len(unrelated)+len(spent)}
+    for p in payments:added[p.height]=added.get(p.height,0)+1
+    at=lambda h:block(h,fork,transition,added)
     original=tx({0:[],1:[[b'a',100]],2:3});spend=tx({0:[[bytes.fromhex(original[1]),0]],1:[],2:3});mint=tx({0:[],1:[],2:3,9:{b'q'*28:{b'other':22},POLICY:{NAME:9,b'incidental':33}}})
     route={'/metrics':[],'/genesis':{'network_magic':1},'/blocks/latest':at(2172)}
     for h in range(8,2173):
@@ -62,6 +79,18 @@ def fixtures(fork=0,transition=False,auxiliary=(),witnesses=()):
     for raw,th in unrelated:
         route['/blocks/'+at(12)['hash']+'/txs/cbor?count=100&page=1&order=asc'].append({'tx_hash':th,'cbor':raw})
         route['/txs/'+th+'/utxos']={'hash':th,'inputs':[],'outputs':[]}
+    def place(h,raw,th,inputs,outputs):
+        page=route['/blocks/'+at(h)['hash']+'/txs/cbor?count=100&page=1&order=asc'];page.append({'tx_hash':th,'cbor':raw})
+        route['/txs/'+th]={'hash':th,'block':at(h)['hash'],'block_height':OFFSET+h,'index':len(page)-1,'valid_contract':True}
+        route['/txs/'+th+'/cbor']={'cbor':raw};route['/txs/'+th+'/utxos']={'hash':th,'inputs':inputs,'outputs':outputs}
+        route['/txs/'+th+'/metadata']=[]  # no metadata: read for a transaction with an output at the ICS address
+    for payment,(raw,th) in zip(payments,paid):
+        place(payment.height,raw,th,[],[payment_output(payment)])
+        if not payment.inline:route['/scripts/datum/'+payment.hash.hex()+'/cbor']={'cbor':payment.datum.hex()} if payment.on_chain else NOT_FOUND
+        # Blockfrost serves db-sync's NULL value as {}, and numbers rounded to doubles.
+        if payment.on_chain:route['/scripts/datum/'+payment.hash.hex()]={'json_value':{} if payment.served is None else payment.answered or payment.served}
+    for k,(raw,th) in zip(spends,spent):
+        place(12,raw,th,[dict(payment_output(payments[k]),tx_hash=paid[k][1],reference=False,collateral=False)],[])
     b=at(10)
     for index,((raw,th),inputs,outputs) in enumerate([(PRE_ORIGIN,[],[out()]),(PRE_SPEND,[dict(out(),tx_hash=PRE_ORIGIN[1],reference=False,collateral=False)],[])]):
         route['/txs/'+th+'/cbor']={'cbor':raw};route['/txs/'+th+'/utxos']={'hash':th,'inputs':inputs,'outputs':outputs}
@@ -102,8 +131,8 @@ def baseline(conninfo,transition=False):
     return s
 
 
-def advance(s,routes,budget=200,hooks=None):
-    """Run the full Blockfrost update (`adapter.update`) on store `s` up to OFFSET+12 with the fake `routes`."""
+def advance(s,routes,budget=200,hooks=None,client=None):
+    """Run the full Blockfrost update (`adapter.update`) on store `s` up to OFFSET+12 with the fake `routes`, or through `client`."""
     from fixtures.blockfrost import FixtureHooks
     with contextlib.redirect_stdout(io.StringIO()):
-        return update(s,CountingProvider(budget,Fake(routes)),PROFILE,OFFSET+12,hooks=hooks or FixtureHooks())
+        return update(s,CountingProvider(budget,client or Fake(routes)),PROFILE,OFFSET+12,hooks=hooks or FixtureHooks())

@@ -100,6 +100,22 @@ class SQLTests(unittest.TestCase):
             self.assertEqual(store.generation()['source'],'cardano-db-sync-postgresql');verify_store(store)
             seal=validate_completion(store,store.generation(),result['digests'],require_seal=True);self.assertIsNotNone(seal)
             self.assertLess(result['queries'],300)
+    def test_datum_without_preimage_and_null_value_are_kept_as_the_source_has_them(self):
+        """A relevant output whose datum hash has no datum row keeps the hash; a datum the source stores as NULL stays NULL."""
+        dsn,service=self.database()
+        with psycopg.connect(dsn,autocommit=True) as c:
+            self.fill(c)
+            c.execute('INSERT INTO datum VALUES(2,%s,NULL)',(H('deep'),))
+            c.execute('INSERT INTO tx_out(id,tx_id,index,address,value,data_hash,inline_datum_id) VALUES(4,6,0,%s,2000000,%s,NULL),(5,6,1,%s,2000000,%s,2)',
+                      (self.profile.mapping,H('dangling'),self.profile.mapping,H('deep')))
+        with self.owner() as store:
+            acquire(CountedSQLSource(service,self.profile,copy.deepcopy(ATTEST)),store,self.profile,target_height=T,window_blocks=10000)
+            outputs=store.db.execute('SELECT data_hash FROM public.tx_out WHERE address=%s ORDER BY data_hash',(self.profile.mapping,)).fetchall()
+            self.assertEqual(sorted(bytes(h) for h, in outputs),sorted([H('datum'),H('dangling'),H('deep')]))
+            served=dict(store.db.execute('SELECT hash,value FROM public.datum').fetchall())
+            self.assertEqual({bytes(h):v for h,v in served.items()},{H('datum'):{'int':7},H('deep'):None})
+            verify_store(store)
+
     def test_interrupted_checkpoint_and_sealed_resume_preserve_manifest(self):
         with self.owner() as store:
             stop=threading.Event()
@@ -278,6 +294,27 @@ raise SystemExit(pg_acquire.main(sys.argv[1:]))
             receipts=store.checkpoint_rows(generation=0,phase='metadata')
             self.assertTrue(all(r['receipt']['hi']-r['receipt']['lo']+1<=600 for r in receipts))
             verify_store(store)
+    def test_outputs_at_the_registered_candidates_address_do_not_refuse_the_bootstrap(self):
+        # Not a profile address: a payment of ADA with a datum there is not selected, NIGHT there is, as at any address.
+        candidates=self.profile.configs['registered-candidates-addresses']['committee_candidates_address']
+        with self.owner() as store:self.run_acquire(store,T);expected=store.digests(0)
+        dsn,service=self.database()
+        with psycopg.connect(dsn,autocommit=True) as c:
+            self.fill(c)
+            c.execute('INSERT INTO datum VALUES(2,%s,%s)',(H('candidate-datum'),'{"constructor":0,"fields":[]}'))
+            c.execute('INSERT INTO tx VALUES(8,%s,%s,1,true)',(H('tx8'),S+1))
+            c.execute('INSERT INTO tx_out(id,tx_id,index,address,value,data_hash) VALUES(4,8,0,%s,1000000,%s)',(candidates,H('candidate-datum')))
+        source=lambda:CountedSQLSource(service,self.profile,copy.deepcopy(ATTEST))
+        with self.owner() as store:
+            acquire(source(),store,self.profile,target_height=T,window_blocks=10000)
+            self.assertEqual(store.digests(0),expected);verify_store(store)
+        with psycopg.connect(dsn,autocommit=True) as c:
+            c.execute('INSERT INTO tx VALUES(9,%s,%s,1,true)',(H('tx9'),S+2))
+            c.execute('INSERT INTO tx_out(id,tx_id,index,address,value,data_hash) VALUES(5,9,0,%s,1500000,NULL)',(candidates,))
+            c.execute('INSERT INTO ma_tx_out VALUES(3,5,5,1)')
+        with self.owner() as store:
+            acquire(source(),store,self.profile,target_height=T,window_blocks=10000);verify_store(store)
+            self.assertEqual(store.db.execute('SELECT tx_hash,output_index FROM chain.outputs WHERE address=%s',(candidates,)).fetchall(),[(H('tx9'),0)])
 
     def test_blockfrost_per_pool_epoch_stake_equals_the_sql_path(self):
         """The Blockfrost epoch stage reads stake per pool; for the same cardano-db-sync rows its facts equal the

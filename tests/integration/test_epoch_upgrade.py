@@ -199,6 +199,10 @@ class EpochUpgradeTests(CheckpointFixture):
         g = store.generation()
         self.assertEqual((g['id'], g['manifest']['capabilities']['epoch_max_tx_size_v1'], g['manifest']['contracts']),
                          (2, True, digest(store.network.contract)))
+        # Generations sealed before the upgrade keep `candidates_empty`; new ones say registered candidates are not served.
+        self.assertEqual([m['capabilities'] for _, m in manifests], [{'bridge_qualified': False, 'candidates_empty': True}] * 2)
+        self.assertIs(g['manifest']['capabilities']['registered_candidates_unserved'], True)
+        self.assertNotIn('candidates_empty', g['manifest']['capabilities'])
         # The first update after the upgrade is covered; the coverage start stays where the upgrade put it.
         self.assertIs(g['manifest']['capabilities']['bridge_metadata_v1'], True)
         self.assertEqual(store.status()['bridge']['coverage_start'], OFFSET + 13)
@@ -312,6 +316,24 @@ class EpochUpgradeTests(CheckpointFixture):
         self.assertEqual(self.inventory(dsn), before)
         result, client = self.upgrade(dsn)
         self.assertEqual((len(client.calls), result['epoch_parameters']['provider_requests']), (8, 8))
+
+    def test_upgrade_takes_datums_as_cardano_db_sync_stores_them(self):
+        """The earlier release's datum columns (a value never NULL, an output datum hash that references a datum)
+        take a NULL value and a hash without a preimage after the upgrade, in its one migration."""
+        dsn = self.legacy()
+
+        def constraints():
+            with PgStore(conninfo=dsn, readonly=True, allow_legacy=True) as store:
+                return store.db.execute(
+                    "SELECT (SELECT attnotnull FROM pg_attribute WHERE attrelid='chain.datums'::regclass AND attname='value'),"
+                    "(SELECT attnotnull FROM pg_attribute WHERE attrelid='serve.datum'::regclass AND attname='value'),"
+                    "EXISTS(SELECT 1 FROM pg_constraint WHERE conname='outputs_datum_hash_fkey' AND conrelid='chain.outputs'::regclass)").fetchone()
+        self.assertEqual(constraints(), (True, True, True))
+        self.upgrade(dsn)
+        self.assertEqual(constraints(), (False, False, False))
+        with PgStore(conninfo=dsn, readonly=True) as store:
+            self.assertEqual(store.state()['schema_version'], 5)
+            verify_store(store)
 
     def test_upgraded_store_is_refused_by_the_nonce_only_release(self):
         dsn = self.legacy()

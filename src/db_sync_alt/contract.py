@@ -13,6 +13,9 @@ EPOCH_CAPABILITY = 'epoch_max_tx_size_v1'
 # produce an output at the ICS address. A generation acquired with that metadata carries the capability.
 BRIDGE_METADATA_KEY = 6500973
 BRIDGE_CAPABILITY = 'bridge_metadata_v1'
+# Registered candidates are not served: the registered-candidates address is not a profile address, so the
+# node's registration RPCs read no registrations. Node 2.1.101 selects committees without registrations.
+CANDIDATES_CAPABILITY = 'registered_candidates_unserved'
 SCHEMA_VERSION = (15, 48, 6)
 PROFILE_FILES = ('cnight-config', 'federated-authority-config', 'permissioned-candidates-config',
                  'registered-candidates-addresses', 'ics-config', 'reserve-config')
@@ -91,9 +94,10 @@ def metadata_json(row):
     return value
 
 # Manifest capabilities of a generation: the nonce-only format had no epoch parameters and no bridge
-# metadata. `bridge_metadata_v1` is true exactly for a generation whose event range was acquired with
-# bridge metadata (Blockfrost); a cardano-db-sync acquisition never reads tx_metadata.
-CAPABILITIES={'candidates_empty':True,EPOCH_CAPABILITY:True,BRIDGE_CAPABILITY:False}
+# metadata, and its `candidates_empty` stated an empty registered-candidates address. `bridge_metadata_v1`
+# is true exactly for a generation whose event range was acquired with bridge metadata (Blockfrost); a
+# cardano-db-sync acquisition never reads tx_metadata.
+CAPABILITIES={CANDIDATES_CAPABILITY:True,EPOCH_CAPABILITY:True,BRIDGE_CAPABILITY:False}
 LEGACY_CAPABILITIES={'bridge_qualified':False,'candidates_empty':True}
 def generation_capabilities(*,legacy=False,bridge_metadata=False):
     out=dict(LEGACY_CAPABILITIES if legacy else CAPABILITIES)
@@ -145,8 +149,10 @@ class Profile:
         self.auth=bytes(raw)[1:29].hex()
         self.permissioned=self.configs['permissioned-candidates-config']['permissioned_candidates_policy_id'].removeprefix('0x')
         self.governance={v['policy_id'] for v in self.configs['federated-authority-config'].values()}
+        # The registered-candidates address is not a profile address: node 2.1.101 selects committees without
+        # registrations, so an output there is kept only for a profile asset, as at any other address.
         self.candidate=self.configs['registered-candidates-addresses']['committee_candidates_address']
-        self.addresses={self.mapping,self.candidate}|{v['address'] for v in self.configs['federated-authority-config'].values()}
+        self.addresses={self.mapping}|{v['address'] for v in self.configs['federated-authority-config'].values()}
         self.units={self.night,self.auth,self.permissioned}|self.governance
         for key,address in [('ics-config','illiquid_circulation_supply_validator_address'),('reserve-config','reserve_validator_address')]:
             c=self.configs[key];self.addresses.add(c[address]);self.units.add(c['asset']['policy_id'].removeprefix('0x')+c['asset']['asset_name'].encode().hex())
@@ -187,6 +193,8 @@ def contract_for(network,*,legacy=False):
               'datum':'canonical semantic JSON','schema_version':SCHEMA_VERSION}
     if legacy:contract['bridge_qualified']=False
     else:
+        contract['datum']=('canonical semantic JSON; NULL where cardano-db-sync 13.8 stores NULL (JSON nested deeper than 2000 levels);'
+                           ' an output datum hash without a preimage on chain has no datum')
         # The node reads MAX(max_tx_size) of the cursor block's epoch: every source row of the
         # epoch is validated and their maximum is the fact.
         contract['epoch_parameters']={'version':1,'capability':EPOCH_CAPABILITY,

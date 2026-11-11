@@ -131,8 +131,10 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     membership,args=store.membership_sql(gen) if delta else ('SELECT * FROM chain.membership(%s)',(gen,))
     scope='=' if delta else '<='
     if db.execute('SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1)) LIMIT 1',(*args,gen,g['target_height'])).fetchone():raise Refusal('transaction_coverage_invalid')
-    # Physical FK validity alone does not guarantee referenced facts belong to this prefix.
-    relationships=[('transactions','blocks','c.block_hash=p.hash'),('outputs','transactions','c.tx_hash=p.hash'),('outputs','datums','c.datum_hash=p.hash'),('inputs','transactions','c.tx_hash=p.hash'),('inputs','outputs','c.origin_hash=p.tx_hash AND c.origin_index=p.output_index'),('output_assets','outputs','c.tx_hash=p.tx_hash AND c.output_index=p.output_index'),('output_assets','assets','c.policy=p.policy AND c.name=p.name'),('mints','transactions','c.tx_hash=p.hash'),('mints','assets','c.policy=p.policy AND c.name=p.name')]
+    # Physical FK validity alone does not guarantee referenced facts belong to this prefix. A datum
+    # has no such order: like cardano-db-sync, it is stored when its preimage is first seen, which may
+    # be when a later generation spends the output.
+    relationships=[('transactions','blocks','c.block_hash=p.hash'),('outputs','transactions','c.tx_hash=p.hash'),('inputs','transactions','c.tx_hash=p.hash'),('inputs','outputs','c.origin_hash=p.tx_hash AND c.origin_index=p.output_index'),('output_assets','outputs','c.tx_hash=p.tx_hash AND c.output_index=p.output_index'),('output_assets','assets','c.policy=p.policy AND c.name=p.name'),('mints','transactions','c.tx_hash=p.hash'),('mints','assets','c.policy=p.policy AND c.name=p.name')]
     for child,parent,join in relationships:
         if db.execute('SELECT 1 FROM chain.'+child+' c JOIN chain.'+parent+' p ON '+join+' WHERE c.first_generation'+scope+'%s AND p.first_generation>c.first_generation LIMIT 1',(gen,)).fetchone():raise Refusal('dependency_generation_invalid')
     if not delta and db.execute('SELECT 1 FROM chain.inputs WHERE first_generation<=%s GROUP BY origin_hash,origin_index HAVING count(*)>1 LIMIT 1',(gen,)).fetchone():raise Refusal('contradictory_ordinary_spend')
@@ -165,9 +167,6 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
         if delta and epoch in delta_parent['manifest']['required_epochs']:continue
         if store.epoch_nonce(epoch,gen) is None or not db.execute('SELECT 1 FROM chain.epoch_stakes WHERE epoch=%s AND first_generation<=%s',(epoch,gen)).fetchone():raise Refusal('epoch_incomplete')
         if not store.checkpoint_rows(phase='epochs',unit=epoch,before=gen+1):raise Refusal('epoch_receipt_missing')
-    # The candidates capability serves an empty registered-candidates address: nothing may be stored there.
-    candidate=identity['configs']['registered-candidates-addresses']['committee_candidates_address']
-    if db.execute('SELECT 1 FROM chain.outputs WHERE address=%s AND first_generation<=%s LIMIT 1',(candidate,gen)).fetchone():raise Refusal('unsupported_candidate_activity')
     # Preserve the old serving projection's admission check: an epoch-end
     # receipt only enables state queries when its retained canonical header
     # matches both epoch and hash. Pre-S endpoints need not include a successor.
@@ -283,14 +282,12 @@ def validate_prior_answers(store,generation):
     if db.execute(spending,(pid,night_policy,night_name,pid,generation,generation,*start,end,mapping,night_policy,night_name)).fetchone():raise Refusal('historical_selected_event_changed')
     permissioned=bytes.fromhex(configs['permissioned-candidates-config']['permissioned_candidates_policy_id'].removeprefix('0x'))
     gov=[(v['address'],bytes.fromhex(v['policy_id'])) for v in configs['federated-authority-config'].values()]
-    candidate=configs['registered-candidates-addresses']['committee_candidates_address']
     for address,policy in [(None,permissioned),*gov]:
         selector='a.policy=%s'+(' AND o.address=%s' if address else '')
         params=(policy,address) if address else (policy,)
         base=' FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE '+selector
         if db.execute('SELECT 1'+base+' AND b.height<=%s AND (a.first_generation>%s OR o.first_generation>%s) AND a.first_generation<=%s LIMIT 1',(*params,end,pid,pid,generation)).fetchone():raise Refusal('historical_state_changed')
         if db.execute('SELECT 1 FROM chain.inputs i JOIN chain.transactions spending ON spending.hash=i.tx_hash JOIN chain.blocks sb ON sb.hash=spending.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index JOIN chain.output_assets a ON a.tx_hash=o.tx_hash AND a.output_index=o.output_index WHERE '+selector+' AND sb.height<=%s AND i.first_generation>%s AND i.first_generation<=%s LIMIT 1',(*params,end,pid,generation)).fetchone():raise Refusal('historical_state_changed')
-    if db.execute('SELECT 1 FROM chain.outputs WHERE address=%s AND first_generation>%s AND first_generation<=%s LIMIT 1',(candidate,pid,generation)).fetchone():raise Refusal('unsupported_candidate_activity')
     for table in ('epoch_nonces','epoch_stakes'):
         if db.execute('SELECT 1 FROM chain.'+table+' WHERE epoch=ANY(%s) AND first_generation>%s AND first_generation<=%s LIMIT 1',(parent['manifest']['required_epochs'],pid,generation)).fetchone():raise Refusal('historical_epoch_changed')
 

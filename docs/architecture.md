@@ -80,8 +80,8 @@ Before a generation is published the verifier also requires what the node's
 queries rely on without being able to check it: the witness is the target plus
 the network's k, headers are contiguous from the start cursor to the witness,
 events and prerequisites are complete, every required epoch has its nonce and
-`max_tx_size`, at least one stake row and (once completed) its end block, the registered-candidates
-address holds nothing, and at least one spend is served. A generation acquired
+`max_tx_size`, at least one stake row and (once completed) its end block, and
+at least one spend is served. A generation acquired
 from Blockfrost also holds the bridge metadata of every transaction with an
 output at the ICS address in its new blocks, and no other, and every asset of the
 ICS and reserve outputs it stores
@@ -96,6 +96,15 @@ The IDs the node bounds its event queries with are
 [positional](glossary.md#positional-id): their order is the chain order, so an
 older fact discovered late still falls inside the node's bounds. Assets, datums
 and pools keep the stable IDs of the stored facts.
+
+Datums are stored as cardano-db-sync 13.8 stores them, from the datum's CBOR
+(bound to its hash), never from a provider's JSON. `datum.value` is the
+detailed-schema JSON with exact integers, or NULL when that JSON nests deeper
+than 2000 levels; Plutus data of any depth and with repeated map keys is
+accepted. An
+output whose datum preimage is not on chain keeps its `data_hash` and has no
+`datum` row; the row is added when a transaction db-sync-alt reads carries the
+preimage, such as the spend of that output.
 
 ## Query boundary
 

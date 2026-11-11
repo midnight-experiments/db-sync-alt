@@ -412,7 +412,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(failure_code(LifecycleFailure('provider_metadata_gap')), 'internal_error')
         for code in ('historical_selected_event_changed', 'historical_state_changed', 'historical_epoch_changed'):
             self.assertEqual(failure_code(RuntimeError(code)), 'canonical_conflict')
-        self.assertEqual(failure_code(RuntimeError('unsupported_candidate_activity')), 'unsupported_capability')
+        self.assertEqual(failure_code(RuntimeError('unsupported_source_kind')), 'unsupported_capability')
         pg_error = type('OperationalError', (Exception,), {'__module__': 'psycopg'})
         self.assertEqual(failure_code(pg_error('secret connection string')), 'database_unavailable')
         shutdown_error=type('AdminShutdown',(pg_error,),{'__module__':'psycopg.errors'})

@@ -186,7 +186,7 @@ class SyncTests(unittest.TestCase):
         with self.assertRaisesRegex(LifecycleFailure,'canonical_conflict'):self.run_once()
         self.assertTrue(self.store.revoked);self.assertFalse(self.update.calls)
     def test_fatal_conflict_and_unsupported_capability_are_durably_revoked(self):
-        for code,public in [('historical_selected_event_changed','canonical_conflict'),('unsupported_nonempty_candidates','unsupported_capability')]:
+        for code,public in [('historical_selected_event_changed','canonical_conflict'),('unsupported_capabilities','unsupported_capability')]:
             with self.subTest(code=code):
                 self.store=Store();self.client.confirmed=101;self.update.error=Refusal(code)
                 with self.assertRaisesRegex(LifecycleFailure,public):self.run_once()

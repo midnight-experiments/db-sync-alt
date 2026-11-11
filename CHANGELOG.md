@@ -121,6 +121,34 @@
   lists with lovelace only, and at an output to a pointer address encoded with
   redundant zero groups, which the ledger and cardano-db-sync re-serialise
   minimally. Anyone can submit either; full mode was not affected.
+- Fix every update stopping at a payment to the registered-candidates address.
+  Anyone can make one. Blockfrost acquisition and follow refused the block
+  (`unsupported_nonempty_candidates`), verification refused a database holding
+  such an output (`unsupported_candidate_activity`) and a cardano-db-sync
+  bootstrap refused a source holding one (`candidates_unsupported`); none of
+  them refuses now. The address is no longer one of the profile's addresses: an
+  output there is kept only when it carries one of the profile's assets, as at
+  any other address. midnight-node 2.1.101 selects committees without
+  registrations, and a test fails if the packaged node sources query them
+  again. The node's registration RPCs and subcommands
+  (`sidechain_getRegistrations`, `sidechain_getAriadneParameters`,
+  `systemParameters_getAriadneParameters`, `registration-status`,
+  `ariadne-parameters`) return no registrations, and fail when an output there
+  carries a profile asset and its transaction spends no output db-sync-alt
+  holds. Serving registrations is future work (midnight-node#1761). Updates of
+  the current format carry the capability `registered_candidates_unserved`;
+  updates sealed in the nonce-only format keep `candidates_empty`.
+- Fix Blockfrost acquisition and follow stopping at a relevant output (at a
+  profile address such as ICS, reserve, cNIGHT mapping or governance, or at any
+  address when it carries cNIGHT) whose datum is nested deeper than 64 levels,
+  repeats a map key, holds an integer beyond 2^53 (which Blockfrost rounds), or
+  has no preimage on chain. Datums are now stored as cardano-db-sync 13.8 stores
+  them, from the datum's own CBOR with exact integers: the served `datum.value`
+  is NULL when its JSON nests deeper than 2000 levels, and an output whose
+  preimage is not on chain keeps its `data_hash` without a `datum` row until a
+  transaction carrying the preimage is read. A cardano-db-sync source is
+  accepted with such outputs too. Schema 5 makes `datum.value` nullable; see
+  [limitations](docs/limitations.md) for the datums db-sync-alt cannot see.
 - Fix Blockfrost following stopping for good once one update had spent its
   request budget (10,000 requests by default; `request_budget_exhausted`).
   Anyone can fill an update's blocks with cheap transactions: full mode reads

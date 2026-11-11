@@ -15,11 +15,19 @@
 - **Not a db-sync replacement.** db-sync-alt keeps only the Cardano data the
   profile selects in the relations the pinned Midnight queries read. Other
   assets or addresses and ranges outside the [coverage](glossary.md#coverage)
-  are not held; the reader login can read nothing else. Candidate registrations
-  are not covered; a database that would need them is refused
-  (`unsupported_capability`). A phase-2-invalid transaction is held as
-  cardano-db-sync holds it: its collateral inputs and collateral return, with
-  `valid_contract` false.
+  are not held; the reader login can read nothing else. A phase-2-invalid
+  transaction is held as cardano-db-sync holds it: its collateral inputs and
+  collateral return, with `valid_contract` false.
+- **No candidate registrations.** The node's registration queries for
+  operators, the RPC methods `sidechain_getRegistrations`,
+  `sidechain_getAriadneParameters` and `systemParameters_getAriadneParameters`
+  and the `registration-status` and `ariadne-parameters` subcommands, return no
+  registrations. They fail instead when an output at the registered-candidates
+  address carries one of the profile's assets and its transaction spends no
+  output db-sync-alt holds. Committee selection in midnight-node 2.1.101 does
+  not read registrations
+  ([registered candidates](connect-a-node.md#registered-candidates)). Serving
+  them as cardano-db-sync does is future work.
 - **Bridge data from the coverage start only.** The token bridge's metadata is
   stored forward only, from the first update acquired from Blockfrost after the
   newest update without it (a cardano-db-sync bootstrap or catch-up, or an
@@ -40,6 +48,16 @@
   the same bounded decoder. Bridge metadata that deep is stored as NULL, as
   cardano-db-sync stores nesting beyond 2,000. An external client that decodes
   answers without the standard `json` module's `loads` keeps its own limits.
+- **Datums db-sync-alt cannot see.** A datum row is added when db-sync-alt reads
+  a transaction that carries the preimage: the output's own transaction or a
+  spend of it. cardano-db-sync also adds the row when the preimage appears only in
+  an unrelated transaction while the output is unspent; db-sync-alt does not.
+  The node reads such rows only for registration, governance and D-parameter
+  outputs, which carry tokens only their minting policies create. Through
+  Blockfrost, a datum hash that matches only some redeemer's data also gets a
+  row (Blockfrost answers both kinds), and a preimage already on chain when the
+  output is read is stored with it. From a cardano-db-sync source, datums are
+  copied as that source stores them.
 - **PostgreSQL 17 only**, server and client tools.
 - **Initial data is required.** An empty database is filled from a snapshot or
   backup, or from your own db-sync; a Blockfrost key alone cannot fill it.
