@@ -535,7 +535,8 @@ class PgStore:
         columns=self.sealed_tables(generation)[table]
         query='SELECT '+','.join(columns)+' FROM chain.'+table+' WHERE '+where+' ORDER BY '+','.join(KEYS[table])
         # Named cursors bound memory; transaction scope belongs to this iterator.
-        with self.db.transaction():
+        from db_sync_alt.verify.limits import verification
+        with verification(self.db,query,args):
             with self.db.cursor(name='rows_'+uuid.uuid4().hex) as cur:
                 cur.itersize=batch;cur.execute(query,args)
                 for row in cur:yield logical_row(table,dict(zip(columns,row)))

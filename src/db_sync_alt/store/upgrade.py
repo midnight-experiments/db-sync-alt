@@ -175,6 +175,7 @@ def upgrade_store(store,ordinal_source=None,epoch_source=None):
     refused before anything is read or changed. The full verification that starts the upgrade also
     writes the next integrity checkpoint of a store whose facts are already complete."""
     from db_sync_alt.verify.store import verify_store
+    from db_sync_alt.verify.limits import analyze_chain
     from db_sync_alt.store.incremental import certify_checkpoint
     store.require_writer()
     state=store.state();legacy=store.legacy_generation(None)
@@ -183,6 +184,8 @@ def upgrade_store(store,ordinal_source=None,epoch_source=None):
     if legacy:
         from db_sync_alt.store.epoch_parameters import admit
         admit(store,epoch_source)
+    # The store may come from a bulk load or a restore without planner statistics.
+    analyze_chain(store.db)
     if state['schema_version']==1:
         # Schema 2 makes the verified canonical generation the integrity base: nothing to checkpoint.
         report=verify_store(store);checkpoint=None
@@ -204,6 +207,8 @@ def upgrade_store(store,ordinal_source=None,epoch_source=None):
         written=_upgrade_v5(store,state,checkpoint) or written
     from db_sync_alt.store import serve
     from db_sync_alt.bridge import report as bridge_report
+    # The upgrade steps loaded projection, ordinal and parameter rows.
+    analyze_chain(store.db)
     serve.verify(store,store.state()['canonical_ready'])
     # Bridge metadata coverage starts after the upgraded generation: the next Blockfrost generation is the first covered.
     result={'schema_version':LATEST,'changed':True,'base_generation':store.integrity()['base'],'checkpoint_generation':written,'full_verification':report,**served,'bridge':bridge_report(store)}

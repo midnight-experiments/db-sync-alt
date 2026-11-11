@@ -21,6 +21,7 @@ are written in ID order (chain order) when built and grow by appends at each pub
 the publication transaction.
 """
 from db_sync_alt.contract import Refusal
+from db_sync_alt.verify.limits import check
 
 HEIGHT_LIMIT = 1 << 27
 FIELD = 4096
@@ -165,8 +166,9 @@ def verify(store, generation):
         if table == 'block':
             mismatch = _blocks_differ(db)
         else:
+            # One statement over the whole history: it runs under the verification statement limit.
             query, params = expected(table, generation, db=db)
-            mismatch = _differ(db, table, 'serve.' + table, query, params)
+            mismatch = check(db, _difference(db, table, 'serve.' + table, query), params) is not None
         if mismatch:
             raise Refusal('serve_rows_mismatch')
         store.progress('serve_verification', generation=generation, family=table)
@@ -178,13 +180,17 @@ def verify(store, generation):
         raise Refusal('node_index_names_invalid')
 
 
-def _differ(db, table, served, query, params):
+def _difference(db, table, served, query):
+    """A statement whose first row shows that `served` and the rows of `query` differ."""
     key, cols = KEYS[table], columns(db, table)
     left = 'ROW(' + ','.join('s.' + c for c in cols) + ')'
     right = 'ROW(' + ','.join('e.' + c for c in cols) + ')'
-    return db.execute('SELECT 1 FROM ' + served + ' s FULL JOIN (' + query + ') e ON e.' + key + '=s.' + key
-                      + ' WHERE s.' + key + ' IS NULL OR e.' + key + ' IS NULL OR ' + left + ' IS DISTINCT FROM ' + right
-                      + ' LIMIT 1', params).fetchone() is not None
+    return ('SELECT 1 FROM ' + served + ' s FULL JOIN (' + query + ') e ON e.' + key + '=s.' + key
+            + ' WHERE s.' + key + ' IS NULL OR e.' + key + ' IS NULL OR ' + left + ' IS DISTINCT FROM ' + right + ' LIMIT 1')
+
+
+def _differ(db, table, served, query, params):
+    return db.execute(_difference(db, table, served, query), params).fetchone() is not None
 
 
 def _blocks_differ(db):
@@ -203,9 +209,9 @@ def _blocks_differ(db):
 
 def verify_ordinals(db, generation):
     """Stored ordinals follow ledger order: inputs by (origin hash, index), assets by (policy, name)."""
-    if db.execute('SELECT 1 FROM (SELECT ordinal,lag(ordinal) OVER (PARTITION BY tx_hash ORDER BY origin_hash,origin_index) AS previous'
-                  ' FROM chain.inputs WHERE first_generation<=%s) x WHERE ordinal<=previous LIMIT 1', (generation,)).fetchone():
+    if check(db, 'SELECT 1 FROM (SELECT ordinal,lag(ordinal) OVER (PARTITION BY tx_hash ORDER BY origin_hash,origin_index) AS previous'
+             ' FROM chain.inputs WHERE first_generation<=%s) x WHERE ordinal<=previous LIMIT 1', (generation,)):
         raise Refusal('ordinal_order_invalid')
-    if db.execute('SELECT 1 FROM (SELECT ordinal,lag(ordinal) OVER (PARTITION BY tx_hash,output_index ORDER BY policy,name) AS previous'
-                  ' FROM chain.output_assets WHERE first_generation<=%s) x WHERE ordinal<=previous LIMIT 1', (generation,)).fetchone():
+    if check(db, 'SELECT 1 FROM (SELECT ordinal,lag(ordinal) OVER (PARTITION BY tx_hash,output_index ORDER BY policy,name) AS previous'
+             ' FROM chain.output_assets WHERE first_generation<=%s) x WHERE ordinal<=previous LIMIT 1', (generation,)):
         raise Refusal('ordinal_order_invalid')

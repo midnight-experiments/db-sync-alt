@@ -193,6 +193,20 @@
   one row at a time, up to 128 MiB; with the shared adapter the external
   client still reads it whole before db-sync-alt cuts it. Answers up to
   32 MiB are unchanged.
+- Full verification no longer fails on a long history because one of its
+  checks needs more than 30 seconds. This covers startup, the periodic
+  integrity checkpoint, `verify`, `acquire`, `upgrade`, `backup` and `restore`.
+  Each verification statement whose work grows with the history runs under
+  its own limit of one hour; every other statement keeps 30 seconds. Results
+  and refusals are unchanged. `restore`, which had no statement limit at
+  all, now bounds these statements too.
+- `acquire` from cardano-db-sync, `restore` and `upgrade` analyze the chain
+  tables before they verify, so PostgreSQL plans the checks with the loaded
+  rows. A failed analysis is logged (`advisory_analyze_failed`) and never
+  fails the command.
+- When PostgreSQL cancels a verification statement, the log line
+  `verification_statement_canceled` gives the statement's plan and its
+  tables' estimated row counts. The command then ends as before.
 
 ## 0.3.0
 

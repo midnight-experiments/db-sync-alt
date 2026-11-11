@@ -1,6 +1,7 @@
 """PostgreSQL integrity, inherited completeness, and immutable answer-domain checks."""
 from db_sync_alt.contract import FORMAT, LEGACY_FORMAT, Refusal, digest, required_epochs, generation_capabilities, epoch_size
 from db_sync_alt.networks import for_identity
+from db_sync_alt.verify.limits import check, check_all, verification
 
 
 def verify_projection(store,generation):
@@ -9,17 +10,18 @@ def verify_projection(store,generation):
     Tagged rows share a single cursor/snapshot even for read-only callers while
     another session publishes. Pairing also rejects duplicate canonical heights;
     EXCEPT would silently remove identical duplicates. Memory stays bounded by
-    the cursor batch, and the ordinary statement timeout remains unchanged.
+    the cursor batch; the stream runs under the verification statement limit.
     """
     import uuid
     store.progress('projection_verification',generation=generation,rows=0)
     count=0;previous=None
-    with store.db.transaction():
+    query='''SELECT height::integer,hash::bytea,0 AS side FROM chain.membership(%s)
+             UNION ALL SELECT height::integer,hash::bytea,1 AS side FROM chain.current_membership
+             ORDER BY 1,3,2'''
+    with verification(store.db,query,(generation,)):
         with store.db.cursor(name='projection_'+uuid.uuid4().hex) as cur:
             cur.itersize=1000
-            cur.execute('''SELECT height::integer,hash::bytea,0 AS side FROM chain.membership(%s)
-                           UNION ALL SELECT height::integer,hash::bytea,1 AS side FROM chain.current_membership
-                           ORDER BY 1,3,2''',(generation,))
+            cur.execute(query,(generation,))
             rows=iter(cur)
             for expected in rows:
                 actual=next(rows,None)
@@ -95,14 +97,14 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     for name,height in expected_anchors.items():
         if anchors[name].get('height')!=height or not isinstance(anchors[name].get('hash'),str) or len(anchors[name]['hash'])!=64:raise Refusal('anchor_bounds_mismatch')
     if not delta and db.execute("SELECT 1 FROM chain.generations WHERE id<%s AND status!='ready'",(gen,)).fetchone():raise Refusal('invalid_lineage')
-    if not delta and db.execute('SELECT height FROM chain.membership(%s) GROUP BY height HAVING count(*)<>1 LIMIT 1',(gen,)).fetchone():raise Refusal('conflicting_inherited_membership')
+    if not delta and check(db,'SELECT height FROM chain.membership(%s) GROUP BY height HAVING count(*)<>1 LIMIT 1',(gen,)):raise Refusal('conflicting_inherited_membership')
     expected=g['start_height'];previous=None
     metadata_query='SELECT height,hash FROM chain.membership(%s)';metadata_args=(gen,)
     if delta:
         reuse=db.execute('SELECT through_height FROM chain.generation_reuse WHERE generation=%s',(gen,)).fetchone()
         if not reuse:raise Refusal('metadata_reuse_missing')
-        if db.execute('SELECT 1 FROM chain.membership_delta d JOIN chain.current_membership c USING(height) WHERE d.generation=%s AND c.height<=%s LIMIT 1',(gen,reuse[0])).fetchone():raise Refusal('conflicting_inherited_membership')
-        if db.execute('SELECT 1 FROM chain.membership_delta d JOIN chain.blocks b USING(hash) WHERE d.generation=%s AND d.height<>b.height LIMIT 1',(gen,)).fetchone():raise Refusal('metadata_gap_or_parent_conflict')
+        if check(db,'SELECT 1 FROM chain.membership_delta d JOIN chain.current_membership c USING(height) WHERE d.generation=%s AND c.height<=%s LIMIT 1',(gen,reuse[0])):raise Refusal('conflicting_inherited_membership')
+        if check(db,'SELECT 1 FROM chain.membership_delta d JOIN chain.blocks b USING(hash) WHERE d.generation=%s AND d.height<>b.height LIMIT 1',(gen,)):raise Refusal('metadata_gap_or_parent_conflict')
         expected=reuse[0]+1;previous=store.block_at(gen,reuse[0])['hash']
         metadata_query,metadata_args=store.membership_sql(gen)
     # The full path materializes the lineage membership and the block headers before the join. Inlined into the
@@ -113,9 +115,10 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     if delta:query='SELECT m.height,b.hash,b.parent_hash,b.height FROM ('+metadata_query+') m LEFT JOIN chain.blocks b ON b.hash=m.hash WHERE m.height BETWEEN %s AND %s ORDER BY m.height'
     else:query='WITH m AS MATERIALIZED ('+metadata_query+'), b AS MATERIALIZED (SELECT hash,parent_hash,height FROM chain.blocks) SELECT m.height,b.hash,b.parent_hash,b.height FROM m LEFT JOIN b ON b.hash=m.hash WHERE m.height BETWEEN %s AND %s ORDER BY m.height'
     # Bounded stream, not fetchall of full history.
-    with db.transaction():
+    params=(*metadata_args,expected,g['witness_height'])
+    with verification(db,query,params):
         with db.cursor(name='verify_metadata') as cur:
-            cur.execute(query,(*metadata_args,expected,g['witness_height']))
+            cur.execute(query,params)
             for height,h,parent,actual in cur:
                 if height!=expected or actual!=height or h is None or (previous is not None and parent!=previous):raise Refusal('metadata_gap_or_parent_conflict')
                 previous=h;expected+=1
@@ -130,14 +133,14 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     if first is None or target is None or m.get('required_epochs')!=required_epochs(first['epoch'],target['epoch']):raise Refusal('epoch_bounds_mismatch')
     membership,args=store.membership_sql(gen) if delta else ('SELECT * FROM chain.membership(%s)',(gen,))
     scope='=' if delta else '<='
-    if db.execute('SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1)) LIMIT 1',(*args,gen,g['target_height'])).fetchone():raise Refusal('transaction_coverage_invalid')
+    if check(db,'SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1)) LIMIT 1',(*args,gen,g['target_height'])):raise Refusal('transaction_coverage_invalid')
     # Physical FK validity alone does not guarantee referenced facts belong to this prefix. A datum
     # has no such order: like cardano-db-sync, it is stored when its preimage is first seen, which may
     # be when a later generation spends the output.
     relationships=[('transactions','blocks','c.block_hash=p.hash'),('outputs','transactions','c.tx_hash=p.hash'),('inputs','transactions','c.tx_hash=p.hash'),('inputs','outputs','c.origin_hash=p.tx_hash AND c.origin_index=p.output_index'),('output_assets','outputs','c.tx_hash=p.tx_hash AND c.output_index=p.output_index'),('output_assets','assets','c.policy=p.policy AND c.name=p.name'),('mints','transactions','c.tx_hash=p.hash'),('mints','assets','c.policy=p.policy AND c.name=p.name')]
     for child,parent,join in relationships:
-        if db.execute('SELECT 1 FROM chain.'+child+' c JOIN chain.'+parent+' p ON '+join+' WHERE c.first_generation'+scope+'%s AND p.first_generation>c.first_generation LIMIT 1',(gen,)).fetchone():raise Refusal('dependency_generation_invalid')
-    if not delta and db.execute('SELECT 1 FROM chain.inputs WHERE first_generation<=%s GROUP BY origin_hash,origin_index HAVING count(*)>1 LIMIT 1',(gen,)).fetchone():raise Refusal('contradictory_ordinary_spend')
+        if check(db,'SELECT 1 FROM chain.'+child+' c JOIN chain.'+parent+' p ON '+join+' WHERE c.first_generation'+scope+'%s AND p.first_generation>c.first_generation LIMIT 1',(gen,)):raise Refusal('dependency_generation_invalid')
+    if not delta and check(db,'SELECT 1 FROM chain.inputs WHERE first_generation<=%s GROUP BY origin_hash,origin_index HAVING count(*)>1 LIMIT 1',(gen,)):raise Refusal('contradictory_ordinary_spend')
     for checkpoint in store.checkpoint_rows(generation=gen):
         phase=checkpoint['phase'];receipt=checkpoint['receipt']
         if phase=='relevance' and checkpoint['unit']=='anchor':
@@ -192,7 +195,7 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     if delta:
         # A new binding of an existing pre-S physical header is still a delta;
         # it must belong to an actual retained transaction or epoch-end closure.
-        for height,h in db.execute('SELECT height,hash FROM chain.membership_delta WHERE generation=%s AND (height<%s OR height>%s)',(gen,g['start_height'],g['witness_height'])):
+        for height,h in check_all(db,'SELECT height,hash FROM chain.membership_delta WHERE generation=%s AND (height<%s OR height>%s)',(gen,g['start_height'],g['witness_height'])):
             if height>g['witness_height']:raise Refusal('unexpected_membership')
             tx=db.execute('SELECT 1 FROM chain.transactions WHERE block_hash=%s AND first_generation<=%s LIMIT 1',(h,gen)).fetchone()
             epochs=store.checkpoint_rows(generation=gen,phase='epochs')
@@ -277,19 +280,19 @@ def validate_prior_answers(store,generation):
     start=(parent['start_height'],parent['start_index']);end=parent['target_height']
     interval='(b.height,t.tx_index)>=(%s,%s) AND b.height<=%s'
     creation="""SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE (a.first_generation>%s OR o.first_generation>%s OR t.first_generation>%s) AND a.first_generation<=%s AND """+interval+""" AND ((a.policy=%s AND a.name=%s) OR (o.address=%s AND o.datum_hash IS NOT NULL AND a.policy=%s AND a.name=''::bytea AND a.quantity=1)) LIMIT 1"""
-    if db.execute(creation,(pid,pid,pid,generation,*start,end,night_policy,night_name,mapping,auth_policy)).fetchone():raise Refusal('historical_selected_event_changed')
+    if check(db,creation,(pid,pid,pid,generation,*start,end,night_policy,night_name,mapping,auth_policy)):raise Refusal('historical_selected_event_changed')
     spending="""SELECT 1 FROM chain.inputs i JOIN chain.transactions t ON t.hash=i.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index WHERE (i.first_generation>%s OR EXISTS(SELECT 1 FROM chain.output_assets changed WHERE changed.tx_hash=o.tx_hash AND changed.output_index=o.output_index AND changed.policy=%s AND changed.name=%s AND changed.first_generation>%s AND changed.first_generation<=%s)) AND i.first_generation<=%s AND """+interval+""" AND ((o.address=%s AND o.datum_hash IS NOT NULL) OR EXISTS(SELECT 1 FROM chain.output_assets a WHERE a.tx_hash=o.tx_hash AND a.output_index=o.output_index AND a.policy=%s AND a.name=%s)) LIMIT 1"""
-    if db.execute(spending,(pid,night_policy,night_name,pid,generation,generation,*start,end,mapping,night_policy,night_name)).fetchone():raise Refusal('historical_selected_event_changed')
+    if check(db,spending,(pid,night_policy,night_name,pid,generation,generation,*start,end,mapping,night_policy,night_name)):raise Refusal('historical_selected_event_changed')
     permissioned=bytes.fromhex(configs['permissioned-candidates-config']['permissioned_candidates_policy_id'].removeprefix('0x'))
     gov=[(v['address'],bytes.fromhex(v['policy_id'])) for v in configs['federated-authority-config'].values()]
     for address,policy in [(None,permissioned),*gov]:
         selector='a.policy=%s'+(' AND o.address=%s' if address else '')
         params=(policy,address) if address else (policy,)
         base=' FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE '+selector
-        if db.execute('SELECT 1'+base+' AND b.height<=%s AND (a.first_generation>%s OR o.first_generation>%s) AND a.first_generation<=%s LIMIT 1',(*params,end,pid,pid,generation)).fetchone():raise Refusal('historical_state_changed')
-        if db.execute('SELECT 1 FROM chain.inputs i JOIN chain.transactions spending ON spending.hash=i.tx_hash JOIN chain.blocks sb ON sb.hash=spending.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index JOIN chain.output_assets a ON a.tx_hash=o.tx_hash AND a.output_index=o.output_index WHERE '+selector+' AND sb.height<=%s AND i.first_generation>%s AND i.first_generation<=%s LIMIT 1',(*params,end,pid,generation)).fetchone():raise Refusal('historical_state_changed')
+        if check(db,'SELECT 1'+base+' AND b.height<=%s AND (a.first_generation>%s OR o.first_generation>%s) AND a.first_generation<=%s LIMIT 1',(*params,end,pid,pid,generation)):raise Refusal('historical_state_changed')
+        if check(db,'SELECT 1 FROM chain.inputs i JOIN chain.transactions spending ON spending.hash=i.tx_hash JOIN chain.blocks sb ON sb.hash=spending.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index JOIN chain.output_assets a ON a.tx_hash=o.tx_hash AND a.output_index=o.output_index WHERE '+selector+' AND sb.height<=%s AND i.first_generation>%s AND i.first_generation<=%s LIMIT 1',(*params,end,pid,generation)):raise Refusal('historical_state_changed')
     for table in ('epoch_nonces','epoch_stakes'):
-        if db.execute('SELECT 1 FROM chain.'+table+' WHERE epoch=ANY(%s) AND first_generation>%s AND first_generation<=%s LIMIT 1',(parent['manifest']['required_epochs'],pid,generation)).fetchone():raise Refusal('historical_epoch_changed')
+        if check(db,'SELECT 1 FROM chain.'+table+' WHERE epoch=ANY(%s) AND first_generation>%s AND first_generation<=%s LIMIT 1',(parent['manifest']['required_epochs'],pid,generation)):raise Refusal('historical_epoch_changed')
 
 
 def physical_inventory(store):
@@ -305,11 +308,12 @@ def physical_inventory(store):
     result={}
     for table,key in order.items():
         hasher=hashlib.sha256();count=0
-        with store.db.transaction():
+        query='SELECT to_jsonb(t) FROM '+(table if '.' in table else 'chain.'+table)+' t ORDER BY '+key
+        with verification(store.db,query):
             # Timestamps with a time zone serialize the same on every server.
             store.db.execute("SET LOCAL TimeZone='UTC'")
             with store.db.cursor(name='physical_'+table.replace('.','_')) as cur:
-                cur.execute('SELECT to_jsonb(t) FROM '+(table if '.' in table else 'chain.'+table)+' t ORDER BY '+key)
+                cur.execute(query)
                 for row, in cur:
                     hasher.update((canonical(row)+'\n').encode());count+=1
                     if count%10000==0:store.progress('physical_inventory',family=table,rows=count)
