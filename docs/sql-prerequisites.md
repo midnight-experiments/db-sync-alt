@@ -40,6 +40,35 @@ Retain that database and its backup, check capacity, then acquire into a fresh
 destination using an admissible window and the verified source. Do not edit
 the stored window, discard history or raise the completion-size limit.
 
-## Performance remains a measured gate
+## Selecting the relevant history once per pass
 
-The global independent address/asset `MATERIALIZED` selection is unchanged. More windows can repeat its fixed cost, so chunking is not proof that a real Mainnet unit fits its deadline. After the actual source is loaded, indexed and analyzed, benchmark normal and independent selectors/facts in representative prerequisite/event windows, preserving all timeouts/caps and independent semantics. Select an admitted supported window before starting a generation; resume retains its stored setting. If even a single-block selector fails because global materialization dominates, refuse and request a separately scoped optimization. Fixture results are not Mainnet throughput estimates.
+The independent address/asset selector covers the whole history: every output holding a profile asset or at
+a profile address, every input spending one, and every transaction minting a profile asset. A bootstrap
+reads it **once per pass**, not once per window. The prerequisite windows of the main pass read it once,
+and the independent verification pass reads it once more, fresh. Each window then takes its own rows. The
+selector work of a bootstrap is therefore proportional to the selection plus the windows, whatever
+`window_blocks` is.
+
+Every source statement stays bounded:
+- The selection is read as id streams of 500 rows per statement.
+- Ids are resolved to their block heights in statements of at most 1,000 ids. A statement the source cancels
+  is retried as two halves, down to one id.
+- An epoch's stake distribution is streamed and summed per pool in the same way.
+
+Nothing is written on the source. The selection is kept in a session-local table of the destination.
+
+What an operator should expect:
+- **One read-only snapshot per selection.** On the Mainnet db-sync 13.8 source of 2026-11 (about 2.6 million
+  relevant outputs, mostly cNIGHT), with the source limited to 8 MiB/s reads, one selection held one snapshot
+  for about 25 minutes. On a live cardano-db-sync, that snapshot holds back vacuum on the source for the same
+  time; schedule the bootstrap accordingly. A source with unthrottled storage needs minutes.
+- **An interrupted run selects again when it resumes.** The session-local table does not survive the
+  process, so a resumed run pays one more selection: about 25 minutes on that source. Committed windows
+  are not repeated.
+- **Run `ANALYZE` on a restored source first.** A db-sync restored from a snapshot or a selective restore may
+  lack planner statistics. Without them PostgreSQL plans full table scans for the selection and the windows.
+  A live db-sync is analyzed by autovacuum.
+
+The windows' own statements keep their limits: at most 100,000 ids of one family per window, bisected on
+`source_timeout` or `work_unit_too_dense`. If even a single-block window fails, refuse and request a
+separately scoped optimization. Fixture results are not Mainnet throughput estimates.

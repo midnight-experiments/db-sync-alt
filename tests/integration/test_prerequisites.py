@@ -8,6 +8,8 @@ import threading
 from pathlib import Path
 from db_sync_alt.contract import TABLES,KEYS
 from db_sync_alt.store.database import PgStore
+from unittest import mock
+import db_sync_alt.sources.dbsync.acquire as acquire_module
 from db_sync_alt.sources.dbsync.acquire import acquire
 from db_sync_alt.verify.store import verify_store
 from db_sync_alt.verify.prerequisites import prerequisite_coverage
@@ -82,11 +84,10 @@ class DensityTests(SQLFixture,unittest.TestCase):
   print('DENSITY_CANDIDATE '+json.dumps({'selected_prestart_outputs':100003,'outputs':saved['outputs']['count'],'facts':sum(v['count'] for v in saved.values()),'before_commit_rollback':True,'after_commit_resume':True,'independent_source_reference':True,'uninterrupted_match':True,'seconds':time.monotonic()-started}),flush=True)
  def test_irreducible_one_block_refuses(self):
   c=self.source_db;c.execute('UPDATE tx SET block_id=%s,block_index=id+200000 WHERE id>=1000',(S-100,))
-  source=self.source();old=source.select_ids;calls=[]
-  def measured(lo,hi,**kw):calls.append((lo,hi));return old(lo,hi,**kw)
-  source.select_ids=measured
+  source=self.source();old=acquire_module._window_ids;calls=[]
+  def measured(store,lo,hi):calls.append((lo,hi));return old(store,lo,hi)
   try:
-   with self.owner() as store:
+   with self.owner() as store,mock.patch.object(acquire_module,'_window_ids',measured):
     with self.assertRaisesRegex(Refusal,'work_unit_too_dense'):acquire(source,store,self.profile,target_height=T,window_blocks=10000)
     self.assertIn((S-100,S-100),calls);self.assertIsNone(store.meta('canonical_ready'));self.assertFalse(store.completed(0,'prerequisites','complete'))
   finally:c.execute('UPDATE tx SET block_id=CASE id%%3 WHEN 0 THEN %s WHEN 1 THEN %s ELSE %s END,block_index=(id/3)+10 WHERE id>=1000',(S-100,S-50,S-1))

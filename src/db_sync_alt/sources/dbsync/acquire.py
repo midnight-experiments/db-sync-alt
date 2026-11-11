@@ -33,6 +33,12 @@ class CountedSQLSource(SQLSource):
             self.rows_read += 1
             yield row
 
+    def rows(self, query, params=()):
+        self.queries += 1
+        rows = super().rows(query, params)
+        self.rows_read += len(rows)
+        return rows
+
 
 def physical_identity(db):
     row = db.execute('SELECT system_identifier::text FROM pg_control_system()').fetchone()
@@ -87,8 +93,53 @@ def _anchors(source, store, generation):
         raise
 
 
-def _facts(source, lo, hi, independent):
-    return source.facts(*source.select_ids(lo, hi, independent=independent))
+# Rows per COPY into the session's selection table; each COPY stays far below the writer's statement limit.
+SELECTION_COPY_ROWS = 50000
+# Ids of one family in one window above which the window bisects, as in `SQLSource.select_ids`.
+WINDOW_IDS = 100000
+
+
+def _select(source, store, manifest, stop_event, generation):
+    """Read the independent selection once, in one fresh source snapshot, into this session's `sql_selection`
+    (issue 00040). Each window then takes its rows with `_window_ids`. A TEMP table: it never persists, and a
+    resumed acquisition selects again."""
+    store.db.execute('DROP TABLE IF EXISTS pg_temp.sql_selection')
+    store.db.execute('CREATE TEMP TABLE sql_selection(family text NOT NULL,id bigint NOT NULL,height integer,PRIMARY KEY(family,id))')
+    rows = []; total = 0
+    def flush():
+        with store.db.cursor() as cursor:
+            with cursor.copy('COPY sql_selection(family,id,height) FROM STDIN') as copy:
+                for row in rows:
+                    copy.write_row(row)
+        rows.clear()
+    with source.snapshot():
+        source.check_anchors(manifest)
+        for row in source.selection():
+            _stop(stop_event); rows.append(row); total += 1
+            if len(rows) >= SELECTION_COPY_ROWS:
+                flush(); store.progress('sql_selection', generation=generation, rows=total)
+        flush()
+    store.db.execute('CREATE INDEX ON sql_selection(family,height,id)')
+    store.db.execute('ANALYZE sql_selection')
+    store.progress('sql_selection', generation=generation, rows=total, complete=True)
+
+
+def _window_ids(store, lo, hi):
+    """The selection's outputs, spends and mints of blocks `lo`..`hi`, each in id order."""
+    out = []
+    for family in ('outputs', 'spends', 'mints'):
+        ids = [r[0] for r in store.db.execute('SELECT id FROM sql_selection WHERE family=%s AND height BETWEEN %s AND %s ORDER BY id LIMIT %s',
+                                              (family, lo, hi, WINDOW_IDS+1))]
+        if len(ids) > WINDOW_IDS:
+            raise Refusal('work_unit_too_dense')
+        out.append(ids)
+    return out
+
+
+def _facts(source, store, lo, hi, independent):
+    """A window's facts: selected block-led from the source, or, for the independent selector, the window's
+    rows of the selection `_select` read into the session."""
+    return source.facts(*(_window_ids(store, lo, hi) if independent else source.select_ids(lo, hi)))
 
 
 def _put(store, generation, facts, stop_event):
@@ -169,6 +220,9 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
     reuse is checked by value, while canonical membership is checked separately.
     """
     g = store.generation(generation)
+    if any(phase != 'metadata' for phase, _, _ in ranges):
+        # A fresh selection: the independent pass never reads the main pass's.
+        _select(source, store, g['manifest'], stop_event, generation)
     store.db.execute('DROP TABLE IF EXISTS pg_temp.sql_expected')
     store.db.execute('CREATE TEMP TABLE sql_expected(family text,key jsonb,row jsonb,PRIMARY KEY(family,key))')
     def unit(phase, lo, hi):
@@ -176,7 +230,7 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
         try:
             with source.snapshot():
                 source.check_anchors(g['manifest'])
-                facts = (('blocks', row) for row in source.blocks(lo, hi)) if phase == 'metadata' else _facts(source, lo, hi, True)
+                facts = (('blocks', row) for row in source.blocks(lo, hi)) if phase == 'metadata' else _facts(source, store, lo, hi, True)
                 with store.atomic():
                     count = 0; headers = []
                     for table, row in facts:
@@ -245,6 +299,7 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
                     h.update((canonical(row)+'\n').encode()); count += 1
         inventory[table] = {'count': count, 'sha256': h.hexdigest()}
     store.db.execute('DROP TABLE sql_expected')
+    store.db.execute('DROP TABLE IF EXISTS pg_temp.sql_selection')
     return {'version': 1, 'scope': 'independent-new-facts-and-membership-with-certified-parent',
             'parent_digest': g['manifest']['parent_digest'], 'ranges': ranges,
             'epochs': epochs, 'inventory': inventory}
@@ -253,6 +308,24 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
 def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
             stop_event=None, progress=None):
     """One fixed target, create/bootstrap or resume/increment, then one publish."""
+    try:
+        return _acquire(source, store, profile, target_height=target_height, window_blocks=window_blocks,
+                        stop_event=stop_event, progress=progress)
+    finally:
+        _drop_session_tables(store)
+
+
+def _drop_session_tables(store):
+    """Drop the session's selection and expectation tables now, so closing the session stays quick and its
+    writer lock is free for the next session at once. Best effort: never hides the run's own outcome."""
+    import psycopg
+    try:
+        store.db.execute('DROP TABLE IF EXISTS pg_temp.sql_selection, pg_temp.sql_expected')
+    except psycopg.Error:
+        pass
+
+
+def _acquire(source, store, profile, *, target_height, window_blocks, stop_event, progress):
     stop_event = stop_event or threading.Event()
     if type(window_blocks) is not int or not 1 <= window_blocks <= 10000:
         raise Refusal('invalid_window')
@@ -345,7 +418,7 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
         try:
             with source.snapshot() as snapshot:
                 source.check_anchors(m)
-                facts = (('blocks', row) for row in source.blocks(lo, hi)) if phase == 'metadata' else _facts(source, lo, hi, phase == 'prerequisites')
+                facts = (('blocks', row) for row in source.blocks(lo, hi)) if phase == 'metadata' else _facts(source, store, lo, hi, phase == 'prerequisites')
                 with store.atomic():
                     count = _put(store, generation, facts, stop_event)
                     if phase == 'metadata' and count != hi-lo+1:raise Refusal('source_metadata_gap')
@@ -369,6 +442,10 @@ def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
             if state['position']!=g['start_height']:raise Refusal('prerequisites_incomplete')
             store.checkpoint(generation,'prerequisites','complete',seal_receipt(g,state['chunks']))
         prerequisite_state['complete']=True
+    if (not prerequisite_state['complete'] and prerequisite_state['position']<g['start_height']
+            and any(phase=='prerequisites' for phase,_,_ in ranges)):
+        # The prerequisite windows take their facts from one selection of the whole history (issue 00040).
+        _select(source,store,m,stop_event,generation)
     for phase,lo,hi in ranges:
         if phase!='prerequisites':seal_prerequisites()
         unit(phase,lo,hi)
