@@ -167,7 +167,8 @@ requests per stored epoch; `status` shows the count) and refuses unless both
 reads agree; a cardano-db-sync of the network can be given instead with
 `--source-service` and `--source-attestation`. Then start the service with this
 version, then the node. There is no downgrade: 0.3.x refuses an upgraded database, so take a
-`pg_dump` of the stopped database first if you may need to go back. See
+`db-sync-alt backup` with the earlier version first if you may need to go back,
+and go back with that version's `db-sync-alt restore`. See
 [upgrade to schema 5](docs/recovery.md#upgrade-to-schema-5).
 
 ## Connect a Midnight node

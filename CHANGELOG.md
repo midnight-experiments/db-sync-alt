@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The way back from an upgrade is documented as a `db-sync-alt backup` taken
+  with the earlier release before the upgrade and restored with that release's
+  `db-sync-alt restore`. A copy made with plain `pg_dump` and `pg_restore` into
+  a new database or onto another server is refused with `invalid_sync_job`
+  until the next UTC day, because each day's polling job is bound to the
+  database that created it; troubleshooting names this cause.
+
 ## 0.4.3
 
 - A SQL bootstrap and the upgrade that follows it no longer run any destination statement whose cost grows with the history under the store's 30 s statement limit.
