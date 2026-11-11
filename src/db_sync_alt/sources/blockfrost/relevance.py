@@ -12,9 +12,17 @@ from db_sync_alt.contract import TABLES, KEYS, Refusal, canonical, digest, jsona
 
 KIND='independent-cbor-relevance-v1'
 MAX_KEYS=200000
-MAX_PROOF=2*1024*1024
+# One block's proof, derived from the ledger so that every valid block fits it. Each proof key comes from bytes of the
+# block body, and a kept asset entry has the highest ratio: an empty name costs 2 body bytes and a 1-byte name 3,
+# a policy adds 33 (its 28 bytes and map headers) and holds 1 empty and 256 one-byte names. Each entry adds an
+# output_assets key (at most 137 bytes) and a new assets key (64 + 2 per name byte): at most 66 proof bytes per
+# body byte. Outputs, inputs, datums and transactions add fewer than 5 per byte; mints match assets. MAX_BLOCK_BODY
+# is Conway's maxBlockBodySize (follow it if governance raises it); 64 KiB covers the proof's fixed fields.
+MAX_BLOCK_BODY=90112
+MAX_PROOF=66*MAX_BLOCK_BODY+64*1024
 # Every inventory key takes at least 63 bytes of its block's proof (an asset key with an empty name), so one block
-# adds at most MAX_PROOF // 63 keys: a generation of at most MAX_BLOCKS blocks can never pass MAX_KEYS.
+# adds at most MAX_PROOF // 63 keys (fewer than MAX_KEYS: a maximal block fits a one-block generation), and a
+# generation of at most MAX_BLOCKS blocks can never pass MAX_KEYS.
 MAX_BLOCKS=MAX_KEYS//(MAX_PROOF//63)
 _QUALIFIED=weakref.WeakKeyDictionary()
 ALPHABET='qpzry9x8gf2tvdw0s3jn54khce6mua7l'

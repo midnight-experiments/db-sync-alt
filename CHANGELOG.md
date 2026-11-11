@@ -155,7 +155,7 @@
   one `/txs/{h}/utxos` answer per transaction, relevance filtering two per
   selected one. Each new update is now sized to the transaction counts of its
   blocks: as many blocks as fit three quarters of its budget, at least one.
-  With relevance filtering it counts both reads and holds at most six blocks,
+  With relevance filtering it counts both reads and holds at most two blocks,
   so its 200,000-key limit can no longer be reached
   (`relevance_work_unit_limit`). An update that still spends its budget waits
   for the next UTC day (`quota_wait`) and then continues where it stopped
@@ -163,8 +163,17 @@
   is kept. Every request is still counted before it is sent, no count is
   reset, and the daily request ceiling is unchanged. A filtered update resumed
   in the same process no longer reads its committed blocks again. A one-shot
-  `acquire --relevance` target more than six blocks ahead is refused before
+  `acquire --relevance` target more than two blocks ahead is refused before
   any request (`invalid_sync_configuration`).
+- Fix relevance filtering stopping for good at one block whose relevance
+  proof passes 2 MiB (`relevance_work_unit_limit`). Anyone can build one: an
+  output at the ICS address keeps every asset, so 12 outputs of 1,304
+  self-minted assets each in one block (about 275 ADA) give a 2.2 MB proof.
+  The bound is now derived from the ledger: one valid block body (Conway's
+  `maxBlockBodySize`, 90,112 bytes) yields at most 66 proof bytes per body byte,
+  so a block's proof may reach 5.73 MiB. An update with filtering holds at
+  most two blocks (was six), so it still never passes its 200,000-key limit.
+  Full mode was not affected.
 - Fix Blockfrost acquisition and following stopping at a transaction whose
   `/txs/{h}/utxos` answer passes 32 MiB (`provider_request_rejected` with
   db-sync-alt's client, `invalid_coverage` with the shared adapter). Anyone can

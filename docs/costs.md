@@ -44,7 +44,7 @@ reached the service waits for the next UTC day (`quota_exhausted`).
 
 Each update is sized to its blocks: it takes as many blocks as fit three
 quarters of its budget at one request per transaction (two with relevance
-filtering, which also holds at most six blocks per update), and at least one.
+filtering, which also holds at most two blocks per update), and at least one.
 An update that still uses up its budget waits for the next UTC day
 (`request_budget_exhausted`) and then continues where it stopped, under a new
 job record that carries the earlier count. All

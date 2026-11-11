@@ -310,7 +310,7 @@ def job_target(store, ready, limit, budget, *, relevance):
     The ready generation stores its provisional headers through its witness, so each candidate block's
     transaction count is known without a request: full mode reads `n // 100 + 1` inventory pages of a block of
     n > 0 transactions (the last one short) and one `/utxos` per transaction; relevance mode reads both twice (acquisition and independent pass) and may
-    select every transaction. Relevance generations hold at most `relevance.MAX_BLOCKS` blocks, so their known
+    select every transaction. Relevance generations hold at most `relevance.MAX_BLOCKS` (2) blocks, so their known
     fact keys can never pass the limit. The estimate only sizes the job; an exhausted job waits and continues.
     """
     first = ready['target_height'] + 1
