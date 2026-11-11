@@ -84,6 +84,7 @@ class LargeSelectionTests(Fixture, unittest.TestCase):
                       (500000 + 2000, S - 1, S + 2, 500000, 500000, 500000 + 2499))
             c.execute('INSERT INTO tx_in(id,tx_in_id,tx_out_id,tx_out_index) SELECT n,n,n-500000+%s,0 FROM generate_series(%s,%s) n',
                       (FIRST, 500000, 500000 + 2499))
+            c.execute('UPDATE block SET tx_count=4000 WHERE block_no IN (%s,%s)', (S - 1, S + 2))
 
     def test_one_selection_per_pass_with_bounded_statements_and_the_same_facts(self):
         with self.owner() as store:
@@ -112,7 +113,7 @@ class SelectionTests(Fixture, unittest.TestCase):
             c.execute("INSERT INTO tx_out(id,tx_id,index,address,value,data_hash) VALUES(8,8,0,'prefix-token',2000000,NULL)")
             c.execute('INSERT INTO ma_tx_out VALUES(3,1000,8,1)')
             c.execute('INSERT INTO pool_hash VALUES(2,%s),(3,%s),(4,%s)', (b'b' * 28, b'a' * 28, b'c' * 28))
-            c.execute('INSERT INTO epoch_stake VALUES(900,2,1,275),(901,2,2,275),(902,3,99999999999999999999,275),(903,3,1,275),(904,4,0,275),(905,1,7,275)')
+            c.execute('INSERT INTO epoch_stake VALUES(900,2,1,275),(901,2,2,275),(902,3,9223372036854775808,275),(903,3,1,275),(904,4,0,275),(905,1,7,275)')
 
     def run_acquire(self, store, source=None, **kw):
         kw.setdefault('window_blocks', 10000)
@@ -127,7 +128,7 @@ class SelectionTests(Fixture, unittest.TestCase):
                 streamed = [row for table, row in source.epochs(epoch, T) if table == 'epoch_stakes']
                 grouped = [dict(r, pool_hash=bytes(r['pool_hash'])) for r in source.rows(old, (epoch,))]
             self.assertEqual(streamed, grouped, epoch)
-        self.assertEqual([r['amount'] for r in streamed], ['100000000000000000000', '3', '0', '123463'])
+        self.assertEqual([r['amount'] for r in streamed], ['9223372036854775809', '3', '0', '123463'])
 
     def test_a_selection_omitted_by_the_main_pass_is_refused_by_the_independent_pass(self):
         with self.owner() as store:

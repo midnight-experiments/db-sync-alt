@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.2
+## Unreleased
 
 - A SQL bootstrap from a Mainnet cardano-db-sync now completes.
   - **Before:** the independent selector chose the relevant outputs of the whole history again for every window. On the 2026-11 Mainnet source that is about 2.6 million outputs, mostly cNIGHT. Each choice took minutes, so the first window was cancelled at the source's 15 s statement limit and the bootstrap stopped with `source_timeout` at any window size.

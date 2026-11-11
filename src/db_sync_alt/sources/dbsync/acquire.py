@@ -308,6 +308,24 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
 def acquire(source, store, profile, *, target_height=None, window_blocks=1000,
             stop_event=None, progress=None):
     """One fixed target, create/bootstrap or resume/increment, then one publish."""
+    try:
+        return _acquire(source, store, profile, target_height=target_height, window_blocks=window_blocks,
+                        stop_event=stop_event, progress=progress)
+    finally:
+        _drop_session_tables(store)
+
+
+def _drop_session_tables(store):
+    """Drop the session's selection and expectation tables now, so closing the session stays quick and its
+    writer lock is free for the next session at once. Best effort: never hides the run's own outcome."""
+    import psycopg
+    try:
+        store.db.execute('DROP TABLE IF EXISTS pg_temp.sql_selection, pg_temp.sql_expected')
+    except psycopg.Error:
+        pass
+
+
+def _acquire(source, store, profile, *, target_height, window_blocks, stop_event, progress):
     stop_event = stop_event or threading.Event()
     if type(window_blocks) is not int or not 1 <= window_blocks <= 10000:
         raise Refusal('invalid_window')
