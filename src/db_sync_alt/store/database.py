@@ -15,6 +15,9 @@ from db_sync_alt.contract import TABLES, LEGACY_TABLES, KEYS, FORMAT, LEGACY_FOR
 
 POSTGRES_MAJOR = 17
 SCHEMA_VERSION = 5
+# Every store session's statement limit: node-facing, serving, poller and writer work. Statements whose cost
+# grows with the history run in chunks below it or under a documented limit of their own (verify/limits.py).
+WRITER_TIMEOUT = '30s'
 SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4, 5)
 # Metadata key of the immutable record `db-sync-alt upgrade` writes when it adds the epoch
 # parameters to a nonce-only store (see store/upgrade.py).
@@ -139,7 +142,7 @@ class PgStore:
         self.readonly=readonly;self._writer=False;self.reserve_check=reserve_check;self.progress_callback=progress_callback
         self.db=connect(service,conninfo=conninfo)
         try:
-            self.db.execute("SET statement_timeout='30s'");self.db.execute("SET lock_timeout='2s'")
+            self.db.execute("SET statement_timeout='"+WRITER_TIMEOUT+"'");self.db.execute("SET lock_timeout='2s'")
             if not readonly:
                 if not self.db.execute('SELECT pg_try_advisory_lock(%s,%s)',WRITER_LOCK).fetchone()[0]:raise Refusal('writer_busy')
                 self._writer=True

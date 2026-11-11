@@ -8,22 +8,27 @@ LATEST=5
 
 def _upgrade_v2(store,state):
     from db_sync_alt.store.database import SERVING_LOCK,apply_privileges
+    from db_sync_alt.verify.limits import bulk
     with store.atomic():
-        # One-time indexed projection/FK construction over the verified base.
-        # Transaction-local: normal 30 s queries and rollback retain their limit.
-        store.db.execute("SET LOCAL statement_timeout='120s'")
+        # One-time indexed projection/FK construction over the verified base. Each whole-table statement runs
+        # under the documented BULK_TIMEOUT; every other statement keeps the session limit (issue 00042).
         store.db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
         if store.state()!=state:raise Refusal('upgrade_state_changed')
         store.db.execute(Path(__file__).with_name('schema_v2.sql').read_text())
         store.db.execute('INSERT INTO chain.integrity_state(id,base_generation,projection_generation) VALUES(1,%s,%s)',(state['canonical_ready'],state['canonical_ready']))
-        store.db.execute('INSERT INTO chain.current_membership SELECT * FROM chain.membership(%s)',(state['canonical_ready'],))
+        with bulk(store.db):
+            store.db.execute('INSERT INTO chain.current_membership SELECT * FROM chain.membership(%s)',(state['canonical_ready'],))
+            # The served blocks are later built in height ranges of this table.
+            store.db.execute('ANALYZE chain.current_membership')
         # Bulk validation preserves the exact final FK without 859k individual
         # trigger lookups during initial projection construction.
-        store.db.execute('ALTER TABLE chain.current_membership ADD CONSTRAINT current_membership_hash_fkey FOREIGN KEY(hash) REFERENCES chain.blocks(hash)')
+        with bulk(store.db):
+            store.db.execute('ALTER TABLE chain.current_membership ADD CONSTRAINT current_membership_hash_fkey FOREIGN KEY(hash) REFERENCES chain.blocks(hash)')
         # The fact families this store has: a store written before bridge metadata has no tx_metadata yet.
         families=tuple(store.physical_tables)
         for table in families:
-            store.db.execute(sql.SQL('CREATE INDEX {} ON chain.{}(first_generation)').format(sql.Identifier('delta_'+table),sql.Identifier(table)))
+            with bulk(store.db):
+                store.db.execute(sql.SQL('CREATE INDEX {} ON chain.{}(first_generation)').format(sql.Identifier('delta_'+table),sql.Identifier(table)))
         for table in (*families,'generations','generation_blocks','checkpoints','provenance','metadata','generation_reuse','membership_delta','pools'):
             store.db.execute(sql.SQL('CREATE TRIGGER immutable_guard BEFORE INSERT OR UPDATE OR DELETE ON chain.{} FOR EACH ROW EXECUTE FUNCTION chain.guard_immutable()').format(sql.Identifier(table)))
         store.db.execute('UPDATE chain.service_state SET schema_version=2 WHERE id=1')
@@ -89,24 +94,29 @@ def _upgrade_v3(store,state,ordinal_source=None):
         found=ordinal_source.ordinals(missing['inputs'],missing['output_assets'],{k:g['manifest']['anchors'][k] for k in ('start','target')})
         if any(set(found[t])!=set(missing[t]) for t in missing):raise Refusal('ordinal_source_incomplete')
         if any(type(v) is not int or not 0<=v<ORDINAL_LIMIT for t in found for v in found[t].values()):raise Refusal('invalid_ordinal')
+    from db_sync_alt.verify.limits import bulk
     with store.atomic():
-        # One-time build of the served tables from the verified projection.
-        store.db.execute("SET LOCAL statement_timeout='600s'")
+        # One-time build of the served tables from the verified projection: the served rows in bounded ranges
+        # under the session limit, each whole-table statement under the documented BULK_TIMEOUT (issue 00042).
         store.db.execute('SELECT pg_advisory_xact_lock(%s,%s)',SERVING_LOCK)
         if store.state()!=state:raise Refusal('upgrade_state_changed')
         store.db.execute('SELECT set_config(%s,%s,true)',(PROJECTION_WRITE,'on'))
         for table in ORDINAL_KEYS:
             store.db.execute(sql.SQL('ALTER TABLE chain.{} ADD COLUMN IF NOT EXISTS ordinal smallint').format(sql.Identifier(table)))
-        _fill_ordinals(store.db,found)
+        with bulk(store.db):
+            _fill_ordinals(store.db,found)
         for table,constraints in ORDINAL_CONSTRAINTS.items():
-            store.db.execute(sql.SQL('ALTER TABLE chain.{} ALTER COLUMN ordinal SET NOT NULL').format(sql.Identifier(table)))
+            with bulk(store.db):
+                store.db.execute(sql.SQL('ALTER TABLE chain.{} ALTER COLUMN ordinal SET NOT NULL').format(sql.Identifier(table)))
             for name,body in constraints:
                 if not store.db.execute('SELECT 1 FROM pg_constraint WHERE conname=%s AND conrelid=%s::regclass',(name,'chain.'+table)).fetchone():
-                    store.db.execute(sql.SQL('ALTER TABLE chain.{} ADD CONSTRAINT {} '+body).format(sql.Identifier(table),sql.Identifier(name)))
+                    with bulk(store.db):
+                        store.db.execute(sql.SQL('ALTER TABLE chain.{} ADD CONSTRAINT {} '+body).format(sql.Identifier(table),sql.Identifier(name)))
         _normalize_v3(store.db)
         store.db.execute(Path(__file__).with_name('schema_v3.sql').read_text())
         counts=serve.build(store.db,state['canonical_ready'])
-        store.db.execute(Path(__file__).with_name('schema_v3_after_load.sql').read_text())
+        with bulk(store.db):
+            store.db.execute(Path(__file__).with_name('schema_v3_after_load.sql').read_text())
         store.db.execute('UPDATE chain.service_state SET schema_version=3 WHERE id=1')
         apply_privileges(store.db)
     return {'served_rows':counts,'ordinals_from_source':{t:len(v) for t,v in found.items()}}
@@ -144,7 +154,10 @@ def _relevance_guard_v5(db):
 def _schema_v5(store):
     """Inside the caller's gated transaction: served epoch parameters, gate and ready view of schema 5."""
     from db_sync_alt.store.database import apply_privileges
-    store.db.execute(Path(__file__).with_name('schema_v5.sql').read_text())
+    from db_sync_alt.verify.limits import bulk
+    # It validates every stored transaction and copies the stored bridge metadata: whole-table statements.
+    with bulk(store.db):
+        store.db.execute(Path(__file__).with_name('schema_v5.sql').read_text())
     _relevance_guard_v5(store.db)
     store.db.execute('UPDATE chain.service_state SET schema_version=5 WHERE id=1')
     apply_privileges(store.db)

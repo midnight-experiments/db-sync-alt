@@ -17,6 +17,12 @@ import logging
 import psycopg
 
 VERIFICATION_TIMEOUT = '3600s'
+# BULK_TIMEOUT: one-time whole-table DDL of a schema upgrade that cannot be split into smaller statements:
+# an index build, a constraint that validates every row, the first membership projection. On the Mainnet
+# store (2026-11: about 1 M membership blocks and 2.6 M relevant outputs) each takes seconds to minutes on
+# write-limited storage; the limit is one hour, like VERIFICATION_TIMEOUT, so a runaway statement still ends.
+# Every other upgrade statement runs in bounded chunks under the store's 30 s session limit (issue 00042).
+BULK_TIMEOUT = '3600s'
 # ANALYZE samples about 30,000 rows per table whatever its size: seconds on a large store.
 ANALYZE_TIMEOUT = '600s'
 
@@ -38,6 +44,17 @@ def verification(db, query, params=None):
     except psycopg.errors.QueryCanceled:
         _diagnose(db, query, params)
         raise
+
+
+@contextmanager
+def bulk(db):
+    """Run the block's statements under BULK_TIMEOUT, inside the caller's transaction (a savepoint), and
+    restore the previous limit when they end, so no other statement runs under it."""
+    with db.transaction():
+        previous = db.execute("SELECT current_setting('statement_timeout')").fetchone()[0]
+        db.execute("SET LOCAL statement_timeout='" + BULK_TIMEOUT + "'")
+        yield
+        db.execute("SELECT set_config('statement_timeout',%s,true)", (previous,))
 
 
 def check(db, query, params=None):

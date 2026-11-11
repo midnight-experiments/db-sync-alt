@@ -430,7 +430,8 @@ class IncrementalTests(SyncFixture):
             self.assertEqual(execute('SHOW statement_timeout').fetchone()[0],'30s')
             def cancel_projection(query,*args,**kwargs):
                 if isinstance(query,str) and query.startswith('INSERT INTO chain.current_membership SELECT'):
-                    self.assertEqual(execute('SHOW statement_timeout').fetchone()[0],'2min')
+                    # The membership projection runs under the documented bulk limit (BULK_TIMEOUT, issue 00042).
+                    self.assertEqual(execute('SHOW statement_timeout').fetchone()[0],'1h')
                     execute("SET LOCAL statement_timeout='1ms'")
                     execute('SELECT pg_sleep(0.05)')
                 return execute(query,*args,**kwargs)

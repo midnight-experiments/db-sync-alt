@@ -38,28 +38,28 @@ TX = '(b.height::bigint*4096+t.tx_index)'
 # Expected rows of each served table, from the stored facts of generations `{scope}` the given one.
 EXPECTED = {
     'tx': 'SELECT ' + TX + ' AS id,t.hash,b.height::bigint AS block_id,t.tx_index AS block_index,t.valid=1 AS valid_contract'
-          ' FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash WHERE t.first_generation{scope}%(g)s',
+          ' FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash WHERE t.first_generation{scope}%(g)s{range}',
     'tx_out': 'SELECT ' + TX + '*4096+o.output_index AS id,' + TX + ' AS tx_id,o.output_index AS index,o.address,o.value,'
               'o.datum_hash AS data_hash,NULL::bigint AS consumed_by_tx_id FROM chain.outputs o JOIN chain.transactions t ON t.hash=o.tx_hash'
-              ' JOIN chain.blocks b ON b.hash=t.block_hash WHERE o.first_generation{scope}%(g)s',
+              ' JOIN chain.blocks b ON b.hash=t.block_hash WHERE o.first_generation{scope}%(g)s{range}',
     'tx_in': 'SELECT (sb.height::bigint*4096+st.tx_index)*4096+i.ordinal AS id,sb.height::bigint*4096+st.tx_index AS tx_in_id,'
              'ob.height::bigint*4096+ot.tx_index AS tx_out_id,i.origin_index AS tx_out_index FROM chain.inputs i'
              ' JOIN chain.transactions st ON st.hash=i.tx_hash JOIN chain.blocks sb ON sb.hash=st.block_hash'
              ' JOIN chain.transactions ot ON ot.hash=i.origin_hash JOIN chain.blocks ob ON ob.hash=ot.block_hash'
-             ' WHERE i.first_generation{scope}%(g)s',
+             ' WHERE i.first_generation{scope}%(g)s{range}',
     'ma_tx_out': 'SELECT (' + TX + '*4096+a.output_index)*4096+a.ordinal AS id,a.quantity,' + TX + '*4096+a.output_index AS tx_out_id,'
                  'm.id AS ident FROM chain.output_assets a JOIN chain.transactions t ON t.hash=a.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash'
-                 ' JOIN chain.assets m ON m.policy=a.policy AND m.name=a.name WHERE a.first_generation{scope}%(g)s',
-    'multi_asset': 'SELECT id,policy,name FROM chain.assets WHERE first_generation{scope}%(g)s',
-    'datum': 'SELECT id,hash,value FROM chain.datums WHERE first_generation{scope}%(g)s',
-    'epoch_param': 'SELECT epoch AS epoch_no,nonce{sizes} FROM chain.epoch_nonces WHERE first_generation{scope}%(g)s',
+                 ' JOIN chain.assets m ON m.policy=a.policy AND m.name=a.name WHERE a.first_generation{scope}%(g)s{range}',
+    'multi_asset': 'SELECT id,policy,name FROM chain.assets WHERE first_generation{scope}%(g)s{range}',
+    'datum': 'SELECT id,hash,value FROM chain.datums WHERE first_generation{scope}%(g)s{range}',
+    'epoch_param': 'SELECT epoch AS epoch_no,nonce{sizes} FROM chain.epoch_nonces WHERE first_generation{scope}%(g)s{range}',
     'pool_hash': 'SELECT p.id,p.pool_hash AS hash_raw FROM chain.pools p WHERE EXISTS(SELECT 1 FROM chain.epoch_stakes s'
-                 ' WHERE s.pool_hash=p.pool_hash AND s.first_generation{scope}%(g)s)',
+                 ' WHERE s.pool_hash=p.pool_hash AND s.first_generation{scope}%(g)s){range}',
     'epoch_stake': 'SELECT s.id,p.id AS pool_id,s.amount,s.epoch AS epoch_no FROM chain.epoch_stakes s JOIN chain.pools p USING(pool_hash)'
-                   ' WHERE s.first_generation{scope}%(g)s',
+                   ' WHERE s.first_generation{scope}%(g)s{range}',
     'tx_metadata': 'SELECT ' + TX + ' AS id,6500973::public.word64type AS key,' + TX + ' AS tx_id,m.json FROM chain.tx_metadata m'
                    ' JOIN chain.transactions t ON t.hash=m.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash'
-                   ' WHERE m.present=1 AND m.first_generation{scope}%(g)s',
+                   ' WHERE m.present=1 AND m.first_generation{scope}%(g)s{range}',
 }
 COLUMNS = {
     'block': ('id', 'hash', 'epoch_no', 'slot_no', 'block_no', 'time', 'tx_count'),
@@ -73,6 +73,52 @@ COLUMNS = {
     'pool_hash': ('id', 'hash_raw'),
     'epoch_stake': ('id', 'pool_id', 'amount', 'epoch_no'),
     'tx_metadata': ('id', 'key', 'tx_id', 'json'),
+}
+# A build writes each served table in ranges: the positional tables by the height of their block, the others
+# by their stable id (epoch for epoch_param). Each statement then stays small whatever the length of the
+# chain, under the store's session limit (issue 00042).
+BUILD_HEIGHTS = 10000
+BUILD_IDS = 100000
+# (relation, column, step) whose stored values the ranges of a table cover.
+RANGE = {'block': ('chain.current_membership', 'height', BUILD_HEIGHTS), 'tx': ('chain.blocks', 'height', BUILD_HEIGHTS),
+         'tx_out': ('chain.blocks', 'height', BUILD_HEIGHTS), 'tx_in': ('chain.blocks', 'height', BUILD_HEIGHTS),
+         'ma_tx_out': ('chain.blocks', 'height', BUILD_HEIGHTS), 'tx_metadata': ('chain.blocks', 'height', BUILD_HEIGHTS),
+         'multi_asset': ('chain.assets', 'id', BUILD_IDS), 'datum': ('chain.datums', 'id', BUILD_IDS), 'pool_hash': ('chain.pools', 'id', BUILD_IDS),
+         'epoch_stake': ('chain.epoch_stakes', 'id', BUILD_IDS), 'epoch_param': ('chain.epoch_nonces', 'epoch', BUILD_IDS)}
+# The id-keyed tables add a range of their id to their EXPECTED query: one index range of one table.
+ID_RANGE = {'multi_asset': 'id', 'datum': 'id', 'pool_hash': 'p.id', 'epoch_stake': 's.id', 'epoch_param': 'epoch'}
+# The positional tables are built from one height range of blocks at a time, each block's transactions and
+# their facts found by index (LATERAL ... OFFSET 0 keeps that order whatever the planner estimates: the
+# relevant facts are not spread evenly over the chain). The same rows as EXPECTED, which serve.verify checks.
+_TXS = ' CROSS JOIN LATERAL (SELECT hash,tx_index,valid FROM chain.transactions t WHERE t.block_hash=b.hash OFFSET 0) t'
+BUILD = {
+    'block': 'SELECT m.height::bigint AS id,b.hash,b.epoch AS epoch_no,b.slot AS slot_no,b.height AS block_no,b.time,b.tx_count'
+             ' FROM chain.current_membership m CROSS JOIN LATERAL (SELECT hash,epoch,slot,height,time,tx_count FROM chain.blocks b'
+             ' WHERE b.hash=m.hash OFFSET 0) b WHERE m.height BETWEEN %(lo)s AND %(hi)s',
+    'tx': 'SELECT ' + TX + ' AS id,t.hash,b.height::bigint AS block_id,t.tx_index AS block_index,t.valid=1 AS valid_contract FROM chain.blocks b'
+          ' CROSS JOIN LATERAL (SELECT hash,tx_index,valid FROM chain.transactions t WHERE t.block_hash=b.hash AND t.first_generation<=%(g)s OFFSET 0) t'
+          ' WHERE b.height BETWEEN %(lo)s AND %(hi)s',
+    'tx_out': 'SELECT ' + TX + '*4096+o.output_index AS id,' + TX + ' AS tx_id,o.output_index AS index,o.address,o.value,'
+              'o.datum_hash AS data_hash,NULL::bigint AS consumed_by_tx_id FROM chain.blocks b' + _TXS +
+              ' CROSS JOIN LATERAL (SELECT output_index,address,value,datum_hash FROM chain.outputs o WHERE o.tx_hash=t.hash'
+              ' AND o.first_generation<=%(g)s OFFSET 0) o WHERE b.height BETWEEN %(lo)s AND %(hi)s',
+    'tx_in': 'SELECT (sb.height::bigint*4096+st.tx_index)*4096+i.ordinal AS id,sb.height::bigint*4096+st.tx_index AS tx_in_id,'
+             'ob.height::bigint*4096+ot.tx_index AS tx_out_id,i.origin_index AS tx_out_index FROM chain.blocks sb'
+             ' CROSS JOIN LATERAL (SELECT hash,tx_index FROM chain.transactions st WHERE st.block_hash=sb.hash OFFSET 0) st'
+             ' CROSS JOIN LATERAL (SELECT ordinal,origin_hash,origin_index FROM chain.inputs i WHERE i.tx_hash=st.hash'
+             ' AND i.first_generation<=%(g)s OFFSET 0) i'
+             ' CROSS JOIN LATERAL (SELECT tx_index,block_hash FROM chain.transactions ot WHERE ot.hash=i.origin_hash OFFSET 0) ot'
+             ' CROSS JOIN LATERAL (SELECT height FROM chain.blocks ob WHERE ob.hash=ot.block_hash OFFSET 0) ob'
+             ' WHERE sb.height BETWEEN %(lo)s AND %(hi)s',
+    'ma_tx_out': 'SELECT (' + TX + '*4096+a.output_index)*4096+a.ordinal AS id,a.quantity,' + TX + '*4096+a.output_index AS tx_out_id,'
+                 'm.id AS ident FROM chain.blocks b' + _TXS +
+                 ' CROSS JOIN LATERAL (SELECT output_index,ordinal,quantity,policy,name FROM chain.output_assets a WHERE a.tx_hash=t.hash'
+                 ' AND a.first_generation<=%(g)s OFFSET 0) a'
+                 ' CROSS JOIN LATERAL (SELECT id FROM chain.assets m WHERE m.policy=a.policy AND m.name=a.name OFFSET 0) m'
+                 ' WHERE b.height BETWEEN %(lo)s AND %(hi)s',
+    'tx_metadata': 'SELECT ' + TX + ' AS id,6500973::public.word64type AS key,' + TX + ' AS tx_id,m.json FROM chain.blocks b' + _TXS +
+                   ' CROSS JOIN LATERAL (SELECT json FROM chain.tx_metadata m WHERE m.tx_hash=t.hash AND m.present=1'
+                   ' AND m.first_generation<=%(g)s OFFSET 0) m WHERE b.height BETWEEN %(lo)s AND %(hi)s',
 }
 BLOCKS = ('SELECT m.height::bigint AS id,b.hash,b.epoch AS epoch_no,b.slot AS slot_no,b.height AS block_no,b.time,b.tx_count'
           ' FROM ({source}) m JOIN chain.blocks b ON b.hash=m.hash')
@@ -107,7 +153,28 @@ def expected(table, generation, *, only_new=False, db=None):
     if table == 'block':
         return BLOCKS.format(source=CURRENT), {}
     served = ',max_tx_size' if table == 'epoch_param' and (db is None or sizes(db)) else ''
-    return EXPECTED[table].format(scope='=' if only_new else '<=', sizes=served), {'g': generation}
+    return EXPECTED[table].format(scope='=' if only_new else '<=', sizes=served, range=''), {'g': generation}
+
+
+def built(table, generation, bounds, db):
+    """SQL and parameters of one build range of `table` for `generation`: the rows of `expected` whose block
+    height (positional tables) or id (the others) lies in `bounds`, a (low, high) pair."""
+    params = {'g': generation, 'lo': bounds[0], 'hi': bounds[1]}
+    if table in BUILD:
+        return BUILD[table], params
+    served = ',max_tx_size' if table == 'epoch_param' and sizes(db) else ''
+    ranged = ' AND ' + ID_RANGE[table] + ' BETWEEN %(lo)s AND %(hi)s'
+    return EXPECTED[table].format(scope='<=', sizes=served, range=ranged), params
+
+
+def ranges(db, table):
+    """The build ranges of `table`: consecutive (low, high) pairs covering every stored value of its column."""
+    relation, column, step = RANGE[table]
+    low, high = db.execute('SELECT min(' + column + '),max(' + column + ') FROM ' + relation).fetchone()
+    if low is None:
+        return []
+    first = low - low % step
+    return [(start, start + step - 1) for start in range(first, high + 1, step)]
 
 
 def _insert(db, table, query, params):
@@ -117,11 +184,20 @@ def _insert(db, table, query, params):
 
 
 def build(db, generation):
-    """Fill the empty served tables for `generation` (the current projection), in chain order."""
+    """Fill the empty served tables for `generation` (the current projection), in chain order, one range per
+    statement."""
     counts = {}
+    # A range's plan cost follows the planner's estimate, not the range: relevant facts are not spread evenly
+    # over the chain, so a small range can look large. JIT would then compile every small statement; it is
+    # off for the build's own statements (transaction-local, the previous setting restored).
+    previous = db.execute("SELECT current_setting('jit')").fetchone()[0]
+    db.execute("SELECT set_config('jit','off',true)")
     for table in tables(db):
-        query, params = expected(table, generation, db=db)
-        counts[table] = _insert(db, table, query, params)
+        counts[table] = 0
+        for bounds in ranges(db, table):
+            query, params = built(table, generation, bounds, db)
+            counts[table] += _insert(db, table, query, params)
+    db.execute("SELECT set_config('jit',%s,true)", (previous,))
     _mark(db, generation)
     return counts
 

@@ -2,8 +2,11 @@
 import threading
 import unittest
 
+from unittest import mock
+
 import psycopg
 
+import db_sync_alt.sources.dbsync.acquire as acquire_module
 import db_sync_alt.sources.dbsync.reader as reader_module
 from db_sync_alt.contract import TABLES, KEYS, Refusal
 from db_sync_alt.sources.dbsync.acquire import acquire
@@ -166,6 +169,26 @@ class SelectionTests(Fixture, unittest.TestCase):
             source = self.source(); calls = self.counted(source)
             self.assertEqual(self.run_acquire(store, source)['digests'], expected)
             self.assertEqual(calls['selection'], 2); verify_store(store)
+
+    def test_the_selection_is_written_in_bounded_copies_with_no_index_build(self):
+        """Every destination statement of `_select` stays bounded (issue 00042): COPY chunks, no index build."""
+        real_select = acquire_module._select; statements = []; copies = []
+        def recorded(source, store, manifest, stop_event, generation):
+            execute = store.db.execute
+            store.db.execute = lambda query, *a, **k: (statements.append(str(query)), execute(query, *a, **k))[1]
+            try:
+                return real_select(source, store, manifest, stop_event, generation)
+            finally:
+                del store.db.execute
+        def progress(phase, **fields):
+            if phase == 'sql_selection' and not fields.get('complete'):copies.append(fields['rows'])
+        with self.owner() as store, mock.patch.object(acquire_module, '_select', recorded), mock.patch.object(acquire_module, 'SELECTION_COPY_ROWS', 2):
+            store.progress_callback = progress
+            self.run_acquire(store)
+            verify_store(store)
+        self.assertGreaterEqual(len(copies), 4)
+        self.assertFalse([q for q in statements if 'CREATE INDEX' in q.upper()])
+        self.assertTrue([q for q in statements if 'PRIMARY KEY(family,height,id)' in q])
 
     def test_a_cancelled_resolution_statement_is_retried_in_halves(self):
         source = self.source(); real = source.rows; seen = []
