@@ -52,6 +52,18 @@ def check_all(db, query, params=None):
         return db.execute(query, params).fetchall()
 
 
+def any_row(db, query, params=None):
+    """Whether a violation query returns any row, under VERIFICATION_TIMEOUT.
+
+    Its rows are counted instead of fetching the first. Under LIMIT 1, PostgreSQL expects a filter such as
+    `a IS NULL OR b IS DISTINCT FROM c` to match early and plans a nested loop that stops at the first match;
+    on a sound store nothing matches, so that loop compares every pair of rows. A count is planned for the
+    whole result, with hash or merge joins."""
+    counted = 'SELECT count(*) FROM (' + query + ') found'
+    with verification(db, counted, params):
+        return db.execute(counted, params).fetchone()[0] > 0
+
+
 def _relations(node):
     own = [(node['Schema'], node['Relation Name'])] if 'Relation Name' in node and 'Schema' in node else []
     return own + [r for child in node.get('Plans', []) for r in _relations(child)]

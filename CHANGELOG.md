@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Full verification no longer takes quadratic time on stores of tens to
+  hundreds of thousands of blocks. Transaction coverage, the served-table and
+  served-header comparisons, and the prior-answer and bridge checks of
+  selected assets used to ask for a first violation; PostgreSQL then planned
+  them as loops that compare every pair of rows when nothing is wrong (seconds
+  at 20,000 blocks, minutes at 100,000). They now count violations, which
+  PostgreSQL plans with hash or merge joins. Results and refusals are unchanged.
+
 ## 0.4.0
 
 - **BREAKING: schema 5, fact format v2 and backup format v4.** Upgrade a

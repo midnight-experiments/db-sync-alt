@@ -131,6 +131,69 @@ class IncrementalTests(SyncFixture):
             self.assertEqual(verify_store(restored)['digests'],expected['digests'])
             restored.certify_ready_full()
 
+    def test_violation_checks_count_instead_of_stopping_at_a_first_match(self):
+        """On a store of 20,000 membership blocks with a transaction every fourth block, the first-match form
+        (LIMIT 1) of transaction coverage and of the served-table and served-header comparisons exceeds a 1 s statement limit;
+        the counted checks verify the same store under it and still refuse one planted defect of each kind."""
+        from db_sync_alt.store import serve
+        from db_sync_alt.verify.store import verify_structure
+        class Rollback(Exception):pass
+        H="decode(md5('b'||n)||md5('c'||n),'hex')";T="decode(md5('t'||n)||md5('u'||n),'hex')"
+        dsn=self.make(transition=True)
+        with PgStore(conninfo=dsn) as store:
+            upgrade_store(store);store.certify_ready_full()
+            gen,expected,receipt=self.prepared_transition(store,transition=True)
+            ticket=store.verify_pending_incremental(gen)
+            store.finalize_pending_incremental(gen,store.generation(gen)['manifest'],receipt,ticket);store.publish_incremental(gen,ticket)
+            # Pre-start history of generation 0: one transaction (2 outputs, 1 input, 1 asset) every 4th block.
+            low,high=gen_fixture.OFFSET-20000,gen_fixture.OFFSET-1
+            policy,name=store.db.execute('SELECT policy,name FROM chain.assets ORDER BY id LIMIT 1').fetchone()
+            with store.atomic():
+                store.db.execute("SET LOCAL session_replication_role='replica'")
+                store.db.execute(f"INSERT INTO chain.blocks(hash,height,parent_hash,epoch,slot,time,tx_count,first_generation) SELECT {H},n,NULL,0,n,'2026-01-01',CASE WHEN n%%4=0 THEN 1 ELSE 0 END,0 FROM generate_series(%s,%s) n",(low,high))
+                for table in ('generation_blocks','current_membership'):
+                    store.db.execute('INSERT INTO chain.'+table+' SELECT '+('0,' if table=='generation_blocks' else '')+'height,hash FROM chain.blocks WHERE height BETWEEN %s AND %s',(low,high))
+                store.db.execute(f"INSERT INTO chain.transactions(hash,block_hash,tx_index,valid,first_generation) SELECT {T},{H},0,1,0 FROM generate_series(%s,%s) n WHERE n%%4=0",(low,high))
+                store.db.execute(f"INSERT INTO chain.outputs(tx_hash,output_index,address,value,datum_hash,first_generation) SELECT {T},i,'addr_test1qpadding',1000000,NULL,0 FROM generate_series(%s,%s) n,generate_series(0,1) i WHERE n%%4=0",(low,high))
+                store.db.execute(f"INSERT INTO chain.inputs(tx_hash,origin_hash,origin_index,first_generation,ordinal) SELECT {T},{T.replace('n)','(n-4))')},1,0,0 FROM generate_series(%s,%s) n WHERE n%%4=0",(low+4,high))
+                store.db.execute(f"INSERT INTO chain.output_assets(tx_hash,output_index,policy,name,quantity,first_generation,ordinal) SELECT {T},0,%s,%s,1,0,0 FROM generate_series(%s,%s) n WHERE n%%4=0",(policy,name,low,high))
+                for table in reversed(serve.tables(store.db)):store.db.execute('TRUNCATE serve.'+table+' CASCADE')
+                serve.build(store.db,gen)
+            store.db.execute('ANALYZE')
+            first_match={'coverage':('SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN (SELECT * FROM chain.membership(%s)) m ON m.hash=b.hash WHERE t.first_generation<=%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1)) LIMIT 1',
+                                     (gen,gen,store.generation(gen)['target_height']))}
+            for table in ('tx_out','tx_in','ma_tx_out'):
+                query,params=serve.expected(table,gen,db=store.db)
+                first_match[table]=(serve._difference(store.db,table,'serve.'+table,query)+' LIMIT 1',params)
+            # One window of the served-header comparison, which runs under the session's own limit.
+            window=serve.BLOCKS.format(source=serve.CURRENT+' WHERE height>=%(lo)s AND height<%(hi)s')
+            first_match['block']=(serve._difference(store.db,'block','(SELECT * FROM serve.block WHERE id>=%(lo)s AND id<%(hi)s)',window)+' LIMIT 1',
+                                  {'lo':low,'hi':low+serve.BLOCK_RANGE})
+            for check,(query,params) in first_match.items():
+                with self.subTest(first_match=check),self.assertRaises(psycopg.errors.QueryCanceled):
+                    with store.db.transaction():
+                        store.db.execute("SET LOCAL statement_timeout='1s'")
+                        store.db.execute(query,params).fetchone()
+            with patch('db_sync_alt.verify.limits.VERIFICATION_TIMEOUT','1s'):
+                verify_structure(store,store.generation(gen));serve.verify(store,gen)
+                defects=[('coverage: transaction in a block outside the membership','transaction_coverage_invalid',
+                          "INSERT INTO chain.blocks(hash,height,parent_hash,epoch,slot,time,tx_count,first_generation) VALUES(decode(repeat('ab',32),'hex'),%s,NULL,0,0,'2026-01-01',1,0);"
+                          "INSERT INTO chain.transactions(hash,block_hash,tx_index,valid,first_generation) VALUES(decode(repeat('cd',32),'hex'),decode(repeat('ab',32),'hex'),0,1,0)" % (low-1)),
+                         ('tx_out: differing column','serve_rows_mismatch','UPDATE serve.tx_out SET value=value+1 WHERE id=(SELECT min(id) FROM serve.tx_out)'),
+                         ('tx_out: value instead of NULL','serve_rows_mismatch',"UPDATE serve.tx_out SET data_hash=decode(repeat('ef',32),'hex') WHERE id=(SELECT min(id) FROM serve.tx_out WHERE data_hash IS NULL)"),
+                         ('tx_in: missing row','serve_rows_mismatch','DELETE FROM serve.tx_in WHERE id=(SELECT max(id) FROM serve.tx_in)'),
+                         ('ma_tx_out: extra row','serve_rows_mismatch','INSERT INTO serve.ma_tx_out(id,quantity,tx_out_id,ident) SELECT id+1,quantity,tx_out_id,ident FROM serve.ma_tx_out WHERE id=(SELECT max(id) FROM serve.ma_tx_out)'),
+                         ('block: differing column','serve_rows_mismatch','UPDATE serve.block SET tx_count=tx_count+1 WHERE id=(SELECT min(id) FROM serve.block)')]
+                for defect,code,statement in defects:
+                    with self.subTest(defect=defect),self.assertRaises(Rollback):
+                        with store.atomic():
+                            store.db.execute("SET LOCAL session_replication_role='replica'")
+                            store.db.execute(statement)
+                            with self.assertRaisesRegex(Refusal,code):
+                                (verify_structure(store,store.generation(gen)) if code=='transaction_coverage_invalid' else serve.verify(store,gen))
+                            raise Rollback()
+                verify_structure(store,store.generation(gen));serve.verify(store,gen)
+
     def test_full_metadata_verification_hash_joins_materialized_membership_and_blocks(self):
         """Full verification materializes the lineage membership and the block headers and hash-joins the
         two scans, with the rows of the direct join against chain.blocks; a broken parent link or a member
