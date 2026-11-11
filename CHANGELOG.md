@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.2
+
+- A SQL bootstrap from a Mainnet cardano-db-sync now completes.
+  - **Before:** the independent selector chose the relevant outputs of the whole history again for every window. On the 2026-11 Mainnet source that is about 2.6 million outputs, mostly cNIGHT. Each choice took minutes, so the first window was cancelled at the source's 15 s statement limit and the bootstrap stopped with `source_timeout` at any window size.
+  - **Now:** the selection is read once for the prerequisite windows and once for the independent verification pass. Each window takes its own rows from the destination. Selector work is proportional to the selection plus the windows.
+  - Every source statement is short: id streams of 500 rows, then batches of at most 1,000 ids that are retried in halves if the source cancels one.
+  - An epoch's stake distribution is now streamed and summed per pool, instead of one statement grouping about 1.3 million Mainnet rows.
+  - Facts, digests, receipts, refusals and the independent verification are unchanged. Nothing is written on the source.
+  - See `docs/sql-prerequisites.md` for what to expect: one long read-only snapshot per selection, one more selection after a resumed run, and `ANALYZE` on a restored source.
+- Upgrading from 0.4.1 is an image swap: no schema, format or backup change.
+
 ## 0.4.1
 
 - Full verification no longer takes quadratic time on stores of tens to
