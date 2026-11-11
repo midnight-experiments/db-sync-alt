@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.3
 
 - A SQL bootstrap and the upgrade that follows it no longer run any destination statement whose cost grows with the history under the store's 30 s statement limit.
   - **Before:** 0.4.2's Mainnet bootstrap stopped after its selection was staged. It built the selection's index in one statement (about 5 million rows), which was cancelled at 30 s, and acquire exited with `invalid_configuration_or_database`.
