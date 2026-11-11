@@ -194,13 +194,15 @@ class LifecycleTests(unittest.TestCase):
             sync.block.set()
 
     def test_transient_and_quota_retry_keep_coverage_without_polling_provider(self):
-        for code in ('provider_unavailable', 'quota_exhausted'):
+        for code, pause in (('provider_unavailable', 'backoff'), ('quota_exhausted', 'quota_wait'),
+                            ('request_budget_exhausted', 'quota_wait')):
             with self.subTest(code=code):
                 runtime = Runtime()
                 sync = Sync(runtime)
                 sync.error = TransientSyncFailure(code, retry_at=time.time() + 1)
                 service, _, _ = self.make(runtime=runtime, sync=sync)
-                eventually(lambda: service.health.snapshot()['sync'] in {'backoff', 'quota_wait'})
+                eventually(lambda: service.health.snapshot()['sync'] == pause)
+                self.assertEqual(service.health.snapshot()['error_code'], code)
                 eventually(lambda: service.health.health()[0] == 200)
                 before = sync.calls
                 for _ in range(5):

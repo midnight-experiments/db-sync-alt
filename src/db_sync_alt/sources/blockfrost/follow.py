@@ -4,6 +4,7 @@ Event, CBOR and epoch acquisition use the same enumeration as the full update in
 `adapter.update`. Only source continuity, provisional metadata reuse and the
 certified-parent proof publication differ.
 """
+import contextlib
 import copy
 import weakref
 from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, BlockfrostSource, block_row,
@@ -12,6 +13,48 @@ from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, BlockfrostSource, b
 from db_sync_alt.contract import Refusal, digest, required_epochs, generation_capabilities
 
 _QUALIFIED = weakref.WeakKeyDictionary()
+# Per writer store: the relevance source of its pending generation, with the height through which this
+# process re-derived (or acquired) its discovery state from the provider.
+_REBUILT = weakref.WeakKeyDictionary()
+
+
+def _relevance_source(store, provider, profile, gen, parent_capability, *, hooks, coverage, relevance_enabled, parent_target):
+    """The pending generation's acquisition source and the height its discovery state reaches.
+
+    A relevance resume re-reads every committed block from the provider: the stored candidate is never its
+    own coverage proof. Within one writer session the state re-derived so far is kept, so a resume after a
+    wait (request budget, quota, provider backoff) continues instead of reading those blocks again. That is
+    sound by provenance in this process: every block through `through` was derived here by both independent
+    traversals, or re-derived from fresh reads and compared with its receipt; a block that stopped midway is
+    rolled back (`_unit`), and a stop after its keys were recorded drops the entry. A new process, another
+    parent or another pending generation starts over.
+    """
+    entry = _REBUILT.get(store)
+    if (entry is not None and entry['generation'] == gen and entry['capability']() is parent_capability
+            and entry['coverage'] == coverage and entry['identity'] == digest(profile.identity)):
+        entry['source'].rebind(provider, hooks.stopped)
+        return entry
+    _REBUILT.pop(store, None)
+    source = BlockfrostSource(provider, profile, store, gen, stop_requested=hooks.stopped,
+                              relevance_enabled=relevance_enabled, coverage=coverage)
+    entry = {'generation': gen, 'capability': weakref.ref(parent_capability), 'coverage': copy.deepcopy(coverage),
+             'identity': digest(profile.identity), 'source': source, 'through': parent_target}
+    if source.coverage is not None:
+        _REBUILT[store] = entry
+    return entry
+
+
+@contextlib.contextmanager
+def _unit(store, entry):
+    """One block's work on the discovery state; a block that stops is rolled back to its start."""
+    source = entry['source']
+    source.begin_unit()
+    try:
+        yield
+    except BaseException:
+        if not source.rollback_unit() and _REBUILT.get(store) is entry:
+            del _REBUILT[store]
+        raise
 
 
 def _observation_rows(observation, target, network, maximum=120):
@@ -254,19 +297,23 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
                 if actual['hash']!=base['hash']:raise Refusal('pending_suffix_base_changed')
         suffix=_fetch_suffix(provider,store,base,g['witness_height'],hooks=hooks)
         processed_rows=_store_suffix(store,provider,gen,suffix,hooks=hooks)
-    source=BlockfrostSource(provider,profile,store,gen,stop_requested=hooks.stopped,relevance_enabled=relevance_enabled,coverage=coverage)
+    entry=_relevance_source(store,provider,profile,gen,parent_capability,hooks=hooks,coverage=coverage,
+                         relevance_enabled=relevance_enabled,parent_target=ready['target_height'])
+    source=entry['source']
     committed_events=store.last_event_height(gen)
     hooks.update(phase='events',committed=max(ready['target_height'],committed_events or ready['target_height']))
     for height in range(ready['target_height']+1,g['target_height']+1):
         if store.completed(gen,'events',height):
-            if source.coverage is not None:
+            if source.coverage is not None and height>entry['through']:
                 # Rebuild both discovery streams from fresh provider inventories;
                 # an unsealed pending candidate is never its own coverage proof.
-                facts,stats=source.block_facts(store.block_at(gen,height))
-                old=store.checkpoint_rows(generation=gen,phase='events',unit=height)
-                if len(old)!=1 or old[0]['receipt'].get('relevance')!=stats.get('relevance'):raise Refusal('independent_provider_mismatch')
-                from db_sync_alt.sources.blockfrost.relevance import verify_inventory
-                verify_inventory(store,gen,stats['relevance']['inventory'])
+                with _unit(store,entry):
+                    facts,stats=source.block_facts(store.block_at(gen,height))
+                    old=store.checkpoint_rows(generation=gen,phase='events',unit=height)
+                    if len(old)!=1 or old[0]['receipt'].get('relevance')!=stats.get('relevance'):raise Refusal('independent_provider_mismatch')
+                    from db_sync_alt.sources.blockfrost.relevance import verify_inventory
+                    verify_inventory(store,gen,stats['relevance']['inventory'])
+                entry['through']=height
             continue
         if hooks.stopped():raise Refusal('interrupted')
         hooks.check_space(store)
@@ -275,21 +322,23 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
         block=store.block_at(gen,height)
         if block is None:raise Refusal('provider_metadata_missing')
         try:
-            facts,stats=source.block_facts(block)
-            # Fact order is dependency ordered at commit, with outputs before spends.
-            order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs','tx_metadata']
-            diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'])
-            with store.atomic():
-                for table in order:
-                    for t,f in facts:
-                        if t==table:
-                            diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'],transaction_hash=f.get('tx_hash',f.get('hash') if t=='transactions' else None),transaction_index=f.get('tx_index'))
-                            store.insert(t,f,gen)
-                            if t=='blocks':store.bind_block(gen,f['height'],f['hash'])
-                store.checkpoint(gen,'events',height,{'lo':height,'hi':height,'source_kind':'blockfrost-cardano',**stats,'provider':provider.drain()})
+            with _unit(store,entry):
+                facts,stats=source.block_facts(block)
+                # Fact order is dependency ordered at commit, with outputs before spends.
+                order=['blocks','transactions','datums','assets','outputs','output_assets','mints','inputs','tx_metadata']
+                diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'])
+                with store.atomic():
+                    for table in order:
+                        for t,f in facts:
+                            if t==table:
+                                diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'],transaction_hash=f.get('tx_hash',f.get('hash') if t=='transactions' else None),transaction_index=f.get('tx_index'))
+                                store.insert(t,f,gen)
+                                if t=='blocks':store.bind_block(gen,f['height'],f['hash'])
+                    store.checkpoint(gen,'events',height,{'lo':height,'hi':height,'source_kind':'blockfrost-cardano',**stats,'provider':provider.drain()})
         except Refusal as exc:
             if exc.code in ('provider_origin_conflict','provider_origin_asset_conflict','immutable_fact_conflict','canonical_block_conflict'):store.mark_conflict()
             raise
+        entry['through']=height
         processed_rows+=len(facts)
         hooks.sample(store,phase='events',committed=height,rows=processed_rows)
     store.block_at(gen,g['target_height'])['epoch']  # the target header must be stored
@@ -342,6 +391,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
     hooks.before_publish()
     diagnostic_context(provider,'publication')
     result=store.publish_incremental(gen,transition,stop_requested=hooks.stopped)
+    _REBUILT.pop(store,None)
     _QUALIFIED[store]={'parent':gen,'capability':weakref.ref(store.current_verified_parent()),'identity':copy.deepcopy(profile.identity)}
     hooks.sample(store,phase='complete',waiting=False,committed=g['target_height'],rows=processed_rows)
     return result

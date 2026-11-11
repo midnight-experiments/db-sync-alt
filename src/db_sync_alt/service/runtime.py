@@ -561,7 +561,7 @@ class Service:
                     if error.retry_at <= time.time():
                         raise LifecycleFailure('internal_error')
                     self.health.set_error(error.code)
-                    self.health.pause('quota_wait' if error.code == 'quota_exhausted' else 'backoff',
+                    self.health.pause('quota_wait' if error.code in ('quota_exhausted', 'request_budget_exhausted') else 'backoff',
                                       resume_at=error.retry_at)
                     self._wait_with_writer(store,error.retry_at)
                     continue

@@ -13,6 +13,9 @@ from db_sync_alt.contract import TABLES, KEYS, Refusal, canonical, digest, jsona
 KIND='independent-cbor-relevance-v1'
 MAX_KEYS=200000
 MAX_PROOF=2*1024*1024
+# Every inventory key takes at least 63 bytes of its block's proof (an asset key with an empty name), so one block
+# adds at most MAX_PROOF // 63 keys: a generation of at most MAX_BLOCKS blocks can never pass MAX_KEYS.
+MAX_BLOCKS=MAX_KEYS//(MAX_PROOF//63)
 _QUALIFIED=weakref.WeakKeyDictionary()
 ALPHABET='qpzry9x8gf2tvdw0s3jn54khce6mua7l'
 

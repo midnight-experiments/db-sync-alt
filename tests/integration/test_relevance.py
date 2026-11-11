@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from db_sync_alt.contract import Refusal
+from db_sync_alt.store.database import PgStore
 from db_sync_alt.verify.store import verify_store
 from db_sync_alt.sources.blockfrost.relevance import qualified_parent
 from fixtures import relevance as f
@@ -119,6 +120,9 @@ class RelevancePGTests(unittest.TestCase):
                 if fields.get('phase')=='events':self.done=True
             def stopped(self):return self.done
         with self.assertRaisesRegex(Refusal,'interrupted'):f.SQLFixture.follow(store,routes,f.S+2,Stop())
+        # A new writer session replays the committed block from fresh provider inventories (the same session
+        # keeps what it already re-derived: integration.test_work_limits).
+        dsn=store.db.info.dsn;store.close();store=PgStore(conninfo=dsn);self.addCleanup(store.close);store.certify_ready_full()
         _,calls=f.SQLFixture.follow(store,routes,f.S+2);self.assertEqual(sum('/blocks/'+f.H(f.S+1).hex()+'/txs/cbor?' in p for p in calls),2);verify_store(store)
     def test_full_scan_reference_semantics_and_ordinals_match(self):
         from db_sync_alt.sources.blockfrost.adapter import update

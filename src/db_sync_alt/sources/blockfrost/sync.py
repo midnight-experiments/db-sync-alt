@@ -3,8 +3,10 @@
 
 Only the accounted client of the profile's network sends authenticated requests. Tests
 inject a deterministic accounted client. A job reservation commits before every
-attempt, including metrics/failures; restarts and day changes cannot reset an
-acquisition budget. Polling has an explicit independent UTC-day budget.
+attempt, including metrics/failures; restarts and day changes never reset a job's count.
+An update (acquisition job) is sized to its blocks and spends at most its budget per
+UTC day: an exhausted update waits for the next UTC day and continues under a new job
+record that carries the earlier count. Polling has an explicit independent UTC-day budget.
 """
 import datetime as dt
 import hashlib
@@ -15,8 +17,9 @@ import time
 import uuid
 
 from db_sync_alt.resources import profile_dir
-from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, ProviderClient, block_row, update)
-from db_sync_alt.contract import Profile, Refusal, canonical
+from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, ProviderClient, block_row, bounded_answer, input_cut, update)
+from db_sync_alt.sources.blockfrost.provider import UTXOS
+from db_sync_alt.contract import Profile, Refusal
 from db_sync_alt.service.health import ChainPoint, PendingProgress, QuotaStatus
 from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure, CooperativeStop
 from db_sync_alt.verify.completion import COMPLETION_ERRORS, validate_completion
@@ -301,6 +304,32 @@ def local_usage(client):
         raise LifecycleFailure('provider_accounting_unavailable') from None
 
 
+def job_target(store, ready, limit, budget, *, relevance):
+    """The highest target <= `limit` whose blocks' estimated requests fit 3/4 of `budget`, at least one block.
+
+    The ready generation stores its provisional headers through its witness, so each candidate block's
+    transaction count is known without a request: full mode reads `n // 100 + 1` inventory pages of a block of
+    n > 0 transactions (the last one short) and one `/utxos` per transaction; relevance mode reads both twice (acquisition and independent pass) and may
+    select every transaction. Relevance generations hold at most `relevance.MAX_BLOCKS` blocks, so their known
+    fact keys can never pass the limit. The estimate only sizes the job; an exhausted job waits and continues.
+    """
+    first = ready['target_height'] + 1
+    if relevance:
+        from db_sync_alt.sources.blockfrost.relevance import MAX_BLOCKS
+        limit = min(limit, ready['target_height'] + MAX_BLOCKS)
+    target, spent = first, 0
+    for height in range(first, min(limit, ready['witness_height']) + 1):
+        row = store.block_at(ready['id'], height)
+        if row is None:
+            break
+        count = row['tx_count']
+        spent += ((count // 100 + 1 if count else 0) + count) * (2 if relevance else 1)
+        if spent > budget * 3 // 4 and height > first:
+            break
+        target = height
+    return target
+
+
 def validate_job(job, *, kind=None, security=None):
     """Fail closed on corrupted counters; never normalize a spent budget.
 
@@ -316,11 +345,14 @@ def validate_job(job, *, kind=None, security=None):
             or job.get('kind') not in {'poll', 'acquire'}
             or (kind is not None and job['kind'] != kind)):
         raise LifecycleFailure('invalid_sync_job')
-    for field in ('created_at', 'reserved_at', 'metrics_at', 'retry_at', 'completed_at'):
+    for field in ('created_at', 'reserved_at', 'metrics_at', 'retry_at', 'completed_at', 'exhausted_at'):
         if field in job and (isinstance(job[field], bool) or not isinstance(job[field], (int, float))
                              or not math.isfinite(job[field]) or job[field] < 0):
             raise LifecycleFailure('invalid_sync_job')
-    for field in ('failure_count', 'metrics_count'):
+    if 'resumes' in job and (job['kind'] != 'acquire' or not isinstance(job['resumes'], str)
+                             or re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', job['resumes']) is None):
+        raise LifecycleFailure('invalid_sync_job')
+    for field in ('failure_count', 'metrics_count', 'prior_attempts'):
         if field in job and (type(job[field]) is not int or job[field] < 0):
             raise LifecycleFailure('invalid_sync_job')
     if job.get('metrics_count', 0) > job['attempts'] or job.get('failure_count', 0) > 20:
@@ -336,10 +368,12 @@ def validate_job(job, *, kind=None, security=None):
 
 
 class AccountedProvider(ProviderClient):
-    def __init__(self, store, key, job, client, health, stop_event, *, network, clock=time.time):
+    def __init__(self, store, key, job, client, health, stop_event, *, network, clock=time.time, profile=None):
         # The job row carries budget, attempts and identity; there is no per-invocation budget.
         validate_job(job, security=network.security)
         self.network = network
+        # With the acquisition profile, an oversized `/utxos` answer is cut (`adapter.input_cut`) instead of refused.
+        self.profile = profile
         self.store, self.key, self.job, self.client = store, key, dict(job), client
         self.health, self.stop_event, self.clock = health, stop_event, clock
         self.job_id, self.budget, self.attempts = job['job_id'], job['budget'], job['attempts']
@@ -433,20 +467,27 @@ class AccountedProvider(ProviderClient):
                 or now - last_metrics >= 600 or self.attempts - self.job.get('metrics_count', 0) >= 1000):
             self.get('/metrics')
         if self.attempts >= self.budget:
-            # This job is terminal until explicit operator action. Never mint a
-            # replacement acquisition job to evade its cumulative cap.
-            self.job.update(state='exhausted', error_code='request_budget_exhausted')
-            self.save()
+            # The job never spends more than its budget. A poll job waits for the next UTC day's
+            # job; an acquisition job waits for the next UTC day, when the driver continues its
+            # update under a new job record (`SyncDriver._continue`), never by resetting this one.
             if self.job.get('kind') == 'poll':
+                self.job.update(state='exhausted', error_code='request_budget_exhausted')
+                self.save()
                 self._wait('quota_exhausted', quota=True)
-            raise LifecycleFailure('request_budget_exhausted')
+            retry = next_day(now)
+            self.job.update(state='exhausted', exhausted_at=now, retry_at=retry, error_code='request_budget_exhausted')
+            self.save()
+            raise TransientSyncFailure('request_budget_exhausted', retry_at=retry)
         self.attempts += 1
         self.job['reserved_at'] = self.clock()
         self.save()  # durable reservation BEFORE shared request, including failure
         self.health.end_operation()
         self.health.begin_operation('provider')
+        cut = input_cut(self.profile) if self.profile is not None and UTXOS.fullmatch(path) else None
         try:
-            result = self.client.get(path, purpose='db-sync-alt:' + self.job_id)
+            # db-sync-alt's own client reads an oversized `/utxos` answer row by row; another client's parsed answer is cut below.
+            extra = {'cut': cut} if cut is not None and getattr(self.client, 'reads_by_row', False) else {}
+            result = self.client.get(path, purpose='db-sync-alt:' + self.job_id, **extra)
         except Exception as error:
             usage = self._quota()
             text = str(error)  # classify known shared machine text, never serialize it
@@ -469,9 +510,7 @@ class AccountedProvider(ProviderClient):
             self.health.end_operation()
             self.health.begin_operation('verification')
         self._quota()
-        encoded = canonical(result).encode()
-        if len(encoded) > 32 * 1024 * 1024:
-            raise Refusal('provider_response_size_limit')
+        result, encoded = bounded_answer(result, cut)
         self.receipts.append({'endpoint': path, 'sha256': hashlib.sha256(encoded).hexdigest(),
                               'bytes': len(encoded), 'attempt': self.attempts,
                               'at': dt.datetime.fromtimestamp(self.clock(), dt.timezone.utc).isoformat()})
@@ -613,11 +652,24 @@ class SyncDriver:
         else:store.save_sync_job(key, value)
         return value
 
+    def _continue(self, store, old):
+        """The next UTC day's job of an exhausted update: the same parent, target and witness under a new
+        allotment, every earlier attempt carried in `prior_attempts`. The exhausted record is kept unchanged
+        under its own key first, so a crash in between repeats both writes."""
+        from db_sync_alt.store.database import ARCHIVE
+        store.save_sync_job(ARCHIVE + old['job_id'], old)
+        new = dict(job_id=uuid.uuid4().hex, attempts=0, budget=self.options['acquisition_request_budget'], state='active',
+                   kind='acquire', parent=old['parent'], target=old['target'], witness=old['witness'],
+                   created_at=self.clock(), retry_at=0, failure_count=0, resumes=old['job_id'],
+                   prior_attempts=old.get('prior_attempts', 0) + old['attempts'])
+        store.save_sync_job('provider-active', new)
+        return new
+
     def _provider(self, store, key, job, health, stop_event):
         if self._client is None:
             self._client = shared_client(self.profile.network)
         provider = AccountedProvider(store, key, job, self._client, health, stop_event, clock=self.clock,
-                                     network=self.profile.network)
+                                     network=self.profile.network, profile=self.profile)
         self._diagnostic_provider = provider
         return provider
 
@@ -726,8 +778,17 @@ class SyncDriver:
                         or active['witness'] != pending.get('witness_height')
                         or active['parent'] != pending.get('parent')):
             raise LifecycleFailure('pending_job_missing')
+        if self.fixed_target is not None and self.options['relevance_enabled'] and (not active or active['state'] == 'completed'):
+            from db_sync_alt.sources.blockfrost.relevance import MAX_BLOCKS
+            # A relevance generation of more blocks could pass the key limit and never publish.
+            if self.fixed_target - ready['target_height'] > MAX_BLOCKS:
+                raise LifecycleFailure('invalid_sync_configuration')
         if active and active['state'] == 'exhausted':
-            raise LifecycleFailure('request_budget_exhausted')
+            from db_sync_alt.store.database import exhausted_at
+            resume = next_day(exhausted_at(active))
+            if self.clock() < resume:
+                raise TransientSyncFailure('request_budget_exhausted', retry_at=resume)
+            active = self._continue(store, active)
         if active and active['state'] != 'completed' and active.get('retry_at', 0) > self.clock():
             raise TransientSyncFailure(active.get('error_code', 'provider_unavailable'), retry_at=active['retry_at'])
         if not pending and self._checkpoint(store, health):
@@ -784,8 +845,6 @@ class SyncDriver:
             self._eligible_at = None
             return  # Cheap idle: never verify full history or perform handoff.
         if active and active['state'] != 'completed':
-            if active['state'] == 'exhausted':
-                raise LifecycleFailure('request_budget_exhausted')
             target = active['target']
         else:
             # Near tip use the configured spacing after durable job completion.
@@ -801,7 +860,11 @@ class SyncDriver:
                         and self.clock() - self._eligible_at < self.options['follow_max_wait_seconds']):
                     return
             self._eligible_at = None
-            target = self.fixed_target if self.fixed_target is not None else min(confirmed_height, ready['target_height'] + self.options['max_batch_blocks'])
+            if self.fixed_target is not None:
+                target = self.fixed_target
+            else:
+                target = job_target(store, ready, min(confirmed_height, ready['target_height'] + self.options['max_batch_blocks']),
+                                    self.options['acquisition_request_budget'], relevance=self.options['relevance_enabled'])
             active = dict(job_id=uuid.uuid4().hex, attempts=0,
                           budget=self.options['acquisition_request_budget'], state='active', kind='acquire',
                           parent=ready['id'], target=target, witness=target + self.profile.security,

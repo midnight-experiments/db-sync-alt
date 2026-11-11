@@ -11,6 +11,7 @@ import logging
 import re
 from urllib.parse import urlencode
 from db_sync_alt.sources.blockfrost.cbor import decode_transaction, decode_datum
+from db_sync_alt.sources.blockfrost.provider import MAX_BYTES, CutAnswer
 from db_sync_alt.sources.blockfrost import metadata
 from db_sync_alt.bridge import covered as bridge_covered
 from db_sync_alt.contract import TABLES, Refusal, canonical, digest, jsonable, required_epochs, epoch_size, generation_capabilities
@@ -106,14 +107,42 @@ def output_value(row):
         if datum is None or hashlib.blake2b(raw,digest_size=32).digest()!=datum:raise Refusal('provider_inline_datum_hash_mismatch')
     return {'address':row['address'],'value':value,'datum_hash':datum},assets
 
+def input_cut(profile):
+    """The cut of one `/utxos` input row: `amount` keeps lovelace and the profile's units, or every unit at an ICS
+    or reserve address. That is all a fact or relevance decision reads from an input row (`relevant`,
+    `kept_assets`). A malformed row is returned whole, so it refuses where it would have refused whole."""
+    def cut(row):
+        try:
+            amounts(row)
+            if not isinstance(row.get('address'),str):return row
+        except Refusal:return row
+        if row['address'] in profile.bridge_addresses:return row
+        kept=[x for x in row['amount'] if x['unit']=='lovelace' or profile.required(bytes.fromhex(x['unit'][:56]),bytes.fromhex(x['unit'][56:]))]
+        return {**row,'amount':kept}
+    return cut
+
+def bounded_answer(result,cut=None):
+    """`(answer, canonical encoding)` of a provider answer of at most MAX_BYTES. A `/utxos` answer above it (`cut`
+    given) has its input rows cut first (`CutAnswer`); the outputs stay whole."""
+    encoded=canonical(result).encode()
+    if len(encoded)>MAX_BYTES and cut is not None and isinstance(result,dict) and isinstance(result.get('inputs'),list):
+        result=CutAnswer(result,inputs=[cut(row) for row in result['inputs']]);encoded=canonical(result).encode()
+    if len(encoded)>MAX_BYTES:raise Refusal('provider_response_size_limit')
+    return result,encoded
+
+def answer_cut(response,profile):
+    """The cut applied to `response`'s input rows, or None when they are whole."""
+    return input_cut(profile) if isinstance(response,CutAnswer) else None
+
 def ledger_ordinals(keys):
     """Position of each key in ledger order: inputs by (origin hash, index), output assets by
     (policy, name), both bytewise; equal to cardano-db-sync's row order. Pass ALL inputs of the
     transaction or ALL assets of the output, not only the stored ones."""
     return {key:position for position,key in enumerate(sorted(keys))}
 
-def classify_inputs(rows,decoded,resolve_origin=None):
-    """Validate exact body membership, including same outpoint ordinary+collateral."""
+def classify_inputs(rows,decoded,resolve_origin=None,cut=None):
+    """Validate exact body membership, including same outpoint ordinary+collateral. Rows of a cut answer
+    (`cut`) are compared with the original output under the same cut."""
     if not isinstance(rows,list):raise Refusal('provider_bad_inputs')
     roles={k:set(decoded[k]) for k in ('ordinary','collateral','reference')};union=set().union(*roles.values());seen={k:set() for k in roles};logical={};role_rows=set()
     for r in rows:
@@ -143,7 +172,7 @@ def classify_inputs(rows,decoded,resolve_origin=None):
             # infer that permission from a mismatch alone: prove the complete
             # ordinary/reference row against the original output first.
             if resolve_origin is None or 'collateral' not in records:raise Refusal('provider_conflicting_input_rows')
-            original=output_value(resolve_origin(*k))
+            original=resolve_origin(*k);original=output_value(cut(original) if cut else original)
             for role,(value,assets,_) in records.items():
                 if value!=original[0] or (assets!=original[1] and not (role=='collateral' and assets=={})):raise Refusal('provider_conflicting_input_rows')
     return {k:logical[k]['ordinary'][2] for k in roles['ordinary']}
@@ -200,13 +229,14 @@ def collateral_return(rows,decoded):
     return list(rows)
 
 
-def ledger_effects(response,decoded,resolve_origin=None):
+def ledger_effects(response,decoded,resolve_origin=None,cut=None):
     """What a transaction did on chain, from its `/txs/{hash}/utxos` rows checked against its CBOR: the
     outputs it spent (outpoint to row), the outputs it created (rows) and its mint. A phase-2-invalid
     transaction spent only its collateral and created only its collateral return; its body inputs, outputs
-    and mint never took effect, and cardano-db-sync stores none of them."""
+    and mint never took effect, and cardano-db-sync stores none of them. `cut`: the cut of the answer's input
+    rows (`answer_cut`), or None."""
     if decoded['valid']:
-        return classify_inputs(response.get('inputs'),decoded,resolve_origin),ordinary_outputs(response.get('outputs'),decoded),decoded['mints']
+        return classify_inputs(response.get('inputs'),decoded,resolve_origin,cut),ordinary_outputs(response.get('outputs'),decoded),decoded['mints']
     return collateral_inputs(response.get('inputs'),decoded),collateral_return(response.get('outputs'),decoded),()
 
 
@@ -369,6 +399,20 @@ class BlockfrostSource:
             self.known=known;self.store=CertifiedReadView(store,parent,known)
             self.discovery=Discovery(store,profile,parent,independent=audit)
             if not audit:self.auditor=BlockfrostSource(provider,profile,store,generation,stop_requested,audit=True,coverage=self.coverage,known=known,relevance_enabled=True)
+    def rebind(self,provider,stop_requested):
+        """Continue with another pass's provider; the discovery state stays."""
+        for source in (self,self.auditor):
+            if source is not None:source.provider=provider;source.stop_requested=stop_requested
+    def _discoveries(self):return [d for d in (self.discovery,self.auditor.discovery if self.auditor else None) if d is not None]
+    def begin_unit(self):
+        """Mark the discovery state before one block's work (see `rollback_unit`)."""
+        for d in self._discoveries():d.block_created=set()
+        self.unit_keys=sum(map(len,self.known.values())) if self.discovery else 0
+    def rollback_unit(self):
+        """Undo the discovery additions of a block whose work stopped. False when its keys already reached `known`:
+        then the state cannot be rolled back."""
+        for d in self._discoveries():d.created-=d.block_created;d.block_created=set()
+        return not self.discovery or sum(map(len,self.known.values()))==self.unit_keys
     def add(self,table,row):self.facts.append((table,row))
     def has(self,table,where,params):return self.store.fact(table,params) is not None
     def block(self,h):
@@ -408,7 +452,7 @@ class BlockfrostSource:
         ordinals=ledger_ordinals(assets)
         for (p,n),q in self.profile.kept_assets(val['address'],assets,covered=self.bridge).items():
             self.add('assets',{'policy':p,'name':n});self.add('output_assets',{'tx_hash':h,'output_index':idx,'policy':p,'name':n,'quantity':str(q),'ordinal':ordinals[(p,n)]})
-    def origin(self,h,index,observed):
+    def origin(self,h,index,observed,cut=None):
         old=self.store.fact('outputs',(h,index))
         if old:
             val,assets=output_value(observed)
@@ -425,7 +469,8 @@ class BlockfrostSource:
         if response.get('hash')!=h.hex():raise Refusal('provider_origin_hash_mismatch')
         # A created output: a valid transaction's collateral return (listed as collateral) never exists.
         matches=[x for x in response.get('outputs',[]) if x.get('output_index')==index]
-        if len(matches)!=1 or matches[0].get('collateral') is True or output_value(matches[0])!=output_value(observed):raise Refusal('provider_origin_conflict')
+        if (len(matches)!=1 or matches[0].get('collateral') is True
+                or output_value(cut(matches[0]) if cut else matches[0])!=output_value(observed)):raise Refusal('provider_origin_conflict')
         self.output(h,matches[0])
     def _collect(self,block):
         self.cache={};self.facts=[];txs=inventory(self.provider,block)
@@ -437,7 +482,8 @@ class BlockfrostSource:
             if self.discovery and not self.discovery.select(decoded):continue
             response=self.provider.get('/txs/'+h.hex()+'/utxos')
             if response.get('hash')!=h.hex():raise Refusal('provider_utxo_hash_mismatch')
-            spent,created,minted=ledger_effects(response,decoded,lambda origin,index:fetch_original_output(self.provider,origin,index))
+            cut=answer_cut(response,self.profile)
+            spent,created,minted=ledger_effects(response,decoded,lambda origin,index:fetch_original_output(self.provider,origin,index),cut)
             if self.discovery:
                 from db_sync_alt.sources.blockfrost.relevance import compare_outputs
                 compare_outputs(decoded,response['outputs'],self.profile.network.network)
@@ -451,7 +497,7 @@ class BlockfrostSource:
             for x in relevant_out:self.output(h,x)
             ordinals=ledger_ordinals(spent)
             for (origin,oi),x in relevant_in:
-                self.origin(origin,oi,x);self.add('inputs',{'tx_hash':h,'origin_hash':origin,'origin_index':oi,'ordinal':ordinals[(origin,oi)]})
+                self.origin(origin,oi,x,cut);self.add('inputs',{'tx_hash':h,'origin_hash':origin,'origin_index':oi,'ordinal':ordinals[(origin,oi)]})
             for p,n,q in mints:
                 self.add('assets',{'policy':p,'name':n});self.add('mints',{'tx_hash':h,'policy':p,'name':n,'quantity':str(q)})
             # The bridge query reads the metadata of transactions with an output at the ICS address.
@@ -512,7 +558,7 @@ def handoff_overlap(provider,store,profile,parent):
         raw=provider.get('/txs/'+h.hex()+'/cbor');decoded=decode_transaction(raw.get('cbor'),h.hex())
         u=provider.get('/txs/'+h.hex()+'/utxos')
         if u.get('hash')!=h.hex() or decoded['valid']!=(valid==1):raise Refusal('provider_handoff_fact_conflict')
-        spent,created,minted=ledger_effects(u,decoded,lambda origin,index:fetch_original_output(provider,origin,index))
+        spent,created,minted=ledger_effects(u,decoded,lambda origin,index:fetch_original_output(provider,origin,index),answer_cut(u,profile))
         expected={};covered={}
         for out in store.transaction_outputs(h,parent['id']):
             assets={(bytes(r['policy']),bytes(r['name'])):int(r['quantity']) for r in store.output_assets(h,out['output_index'],parent['id'])}
