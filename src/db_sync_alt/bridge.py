@@ -54,7 +54,7 @@ def verify_assets(store, g, units, governance, identity, *, delta=False):
 
     Assets outside the profile are few (the assets table is small): they are found first and only
     their rows are checked, through the (policy, name) indexes."""
-    from db_sync_alt.verify.limits import check, check_all
+    from db_sync_alt.verify.limits import any_row, check, check_all
     gen, db, scope = g['id'], store.db, '=' if delta else '<='
     outside = check_all(db, "SELECT policy,name,first_generation FROM chain.assets WHERE first_generation<=%s"
                         " AND encode(policy,'hex')||encode(name,'hex')<>ALL(%s::text[]) AND encode(policy,'hex')<>ALL(%s::text[])",
@@ -69,10 +69,10 @@ def verify_assets(store, g, units, governance, identity, *, delta=False):
             raise Refusal('selected_asset_outside_profile')
         if check(db, 'SELECT 1 FROM chain.mints WHERE policy=%s AND name=%s AND first_generation' + scope + '%s LIMIT 1', (policy, name, gen)):
             raise Refusal('selected_asset_outside_profile')
-        if check(db, 'SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index'
-                 ' WHERE a.policy=%s AND a.name=%s AND a.first_generation' + scope + '%s AND NOT (o.address=ANY(%s::text[])'
-                 ' AND o.first_generation=a.first_generation AND a.first_generation=ANY(%s::bigint[])) LIMIT 1',
-                 (policy, name, gen, bridge, covered_ids)):
+        if any_row(db, 'SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index'
+                   ' WHERE a.policy=%s AND a.name=%s AND a.first_generation' + scope + '%s AND NOT (o.address=ANY(%s::text[])'
+                   ' AND o.first_generation=a.first_generation AND a.first_generation=ANY(%s::bigint[]))',
+                   (policy, name, gen, bridge, covered_ids)):
             raise Refusal('selected_asset_outside_profile')
 
 
@@ -93,13 +93,13 @@ def verify_family(store, g, identity, *, delta=False):
     missing = ('SELECT 1 FROM chain.outputs o JOIN chain.transactions t ON t.hash=o.tx_hash' + joins +
                ' WHERE o.address=%(ics)s AND t.first_generation=ANY(%(covered)s::bigint[]) AND ' + EVENT_RANGE +
                ' AND NOT EXISTS(SELECT 1 FROM chain.tx_metadata m WHERE m.tx_hash=t.hash AND m.first_generation=t.first_generation) LIMIT 1')
-    from db_sync_alt.verify.limits import check
+    from db_sync_alt.verify.limits import any_row, check
     if check(store.db, missing, params):
         raise Refusal('bridge_metadata_incomplete')
     extra = ('SELECT 1 FROM chain.tx_metadata m JOIN chain.transactions t ON t.hash=m.tx_hash' + joins +
              ' WHERE m.first_generation' + scope + '%(g)s AND NOT (m.first_generation=ANY(%(covered)s::bigint[]) AND t.first_generation=m.first_generation'
-             ' AND ' + EVENT_RANGE + ' AND EXISTS(SELECT 1 FROM chain.outputs o WHERE o.tx_hash=t.hash AND o.address=%(ics)s)) LIMIT 1')
-    if check(store.db, extra, params):
+             ' AND ' + EVENT_RANGE + ' AND EXISTS(SELECT 1 FROM chain.outputs o WHERE o.tx_hash=t.hash AND o.address=%(ics)s))')
+    if any_row(store.db, extra, params):
         raise Refusal('bridge_metadata_unexpected')
 
 

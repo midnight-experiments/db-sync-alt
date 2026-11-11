@@ -1,7 +1,7 @@
 """PostgreSQL integrity, inherited completeness, and immutable answer-domain checks."""
 from db_sync_alt.contract import FORMAT, LEGACY_FORMAT, Refusal, digest, required_epochs, generation_capabilities, epoch_size
 from db_sync_alt.networks import for_identity
-from db_sync_alt.verify.limits import check, check_all, verification
+from db_sync_alt.verify.limits import any_row, check, check_all, verification
 
 
 def verify_projection(store,generation):
@@ -133,7 +133,7 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     if first is None or target is None or m.get('required_epochs')!=required_epochs(first['epoch'],target['epoch']):raise Refusal('epoch_bounds_mismatch')
     membership,args=store.membership_sql(gen) if delta else ('SELECT * FROM chain.membership(%s)',(gen,))
     scope='=' if delta else '<='
-    if check(db,'SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1)) LIMIT 1',(*args,gen,g['target_height'])):raise Refusal('transaction_coverage_invalid')
+    if any_row(db,'SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1))',(*args,gen,g['target_height'])):raise Refusal('transaction_coverage_invalid')
     # Physical FK validity alone does not guarantee referenced facts belong to this prefix. A datum
     # has no such order: like cardano-db-sync, it is stored when its preimage is first seen, which may
     # be when a later generation spends the output.
@@ -279,17 +279,17 @@ def validate_prior_answers(store,generation):
     auth_policy=mapping_policy(mapping)
     start=(parent['start_height'],parent['start_index']);end=parent['target_height']
     interval='(b.height,t.tx_index)>=(%s,%s) AND b.height<=%s'
-    creation="""SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE (a.first_generation>%s OR o.first_generation>%s OR t.first_generation>%s) AND a.first_generation<=%s AND """+interval+""" AND ((a.policy=%s AND a.name=%s) OR (o.address=%s AND o.datum_hash IS NOT NULL AND a.policy=%s AND a.name=''::bytea AND a.quantity=1)) LIMIT 1"""
-    if check(db,creation,(pid,pid,pid,generation,*start,end,night_policy,night_name,mapping,auth_policy)):raise Refusal('historical_selected_event_changed')
-    spending="""SELECT 1 FROM chain.inputs i JOIN chain.transactions t ON t.hash=i.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index WHERE (i.first_generation>%s OR EXISTS(SELECT 1 FROM chain.output_assets changed WHERE changed.tx_hash=o.tx_hash AND changed.output_index=o.output_index AND changed.policy=%s AND changed.name=%s AND changed.first_generation>%s AND changed.first_generation<=%s)) AND i.first_generation<=%s AND """+interval+""" AND ((o.address=%s AND o.datum_hash IS NOT NULL) OR EXISTS(SELECT 1 FROM chain.output_assets a WHERE a.tx_hash=o.tx_hash AND a.output_index=o.output_index AND a.policy=%s AND a.name=%s)) LIMIT 1"""
-    if check(db,spending,(pid,night_policy,night_name,pid,generation,generation,*start,end,mapping,night_policy,night_name)):raise Refusal('historical_selected_event_changed')
+    creation="""SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE (a.first_generation>%s OR o.first_generation>%s OR t.first_generation>%s) AND a.first_generation<=%s AND """+interval+""" AND ((a.policy=%s AND a.name=%s) OR (o.address=%s AND o.datum_hash IS NOT NULL AND a.policy=%s AND a.name=''::bytea AND a.quantity=1))"""
+    if any_row(db,creation,(pid,pid,pid,generation,*start,end,night_policy,night_name,mapping,auth_policy)):raise Refusal('historical_selected_event_changed')
+    spending="""SELECT 1 FROM chain.inputs i JOIN chain.transactions t ON t.hash=i.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index WHERE (i.first_generation>%s OR EXISTS(SELECT 1 FROM chain.output_assets changed WHERE changed.tx_hash=o.tx_hash AND changed.output_index=o.output_index AND changed.policy=%s AND changed.name=%s AND changed.first_generation>%s AND changed.first_generation<=%s)) AND i.first_generation<=%s AND """+interval+""" AND ((o.address=%s AND o.datum_hash IS NOT NULL) OR EXISTS(SELECT 1 FROM chain.output_assets a WHERE a.tx_hash=o.tx_hash AND a.output_index=o.output_index AND a.policy=%s AND a.name=%s))"""
+    if any_row(db,spending,(pid,night_policy,night_name,pid,generation,generation,*start,end,mapping,night_policy,night_name)):raise Refusal('historical_selected_event_changed')
     permissioned=bytes.fromhex(configs['permissioned-candidates-config']['permissioned_candidates_policy_id'].removeprefix('0x'))
     gov=[(v['address'],bytes.fromhex(v['policy_id'])) for v in configs['federated-authority-config'].values()]
     for address,policy in [(None,permissioned),*gov]:
         selector='a.policy=%s'+(' AND o.address=%s' if address else '')
         params=(policy,address) if address else (policy,)
         base=' FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE '+selector
-        if check(db,'SELECT 1'+base+' AND b.height<=%s AND (a.first_generation>%s OR o.first_generation>%s) AND a.first_generation<=%s LIMIT 1',(*params,end,pid,pid,generation)):raise Refusal('historical_state_changed')
+        if any_row(db,'SELECT 1'+base+' AND b.height<=%s AND (a.first_generation>%s OR o.first_generation>%s) AND a.first_generation<=%s',(*params,end,pid,pid,generation)):raise Refusal('historical_state_changed')
         if check(db,'SELECT 1 FROM chain.inputs i JOIN chain.transactions spending ON spending.hash=i.tx_hash JOIN chain.blocks sb ON sb.hash=spending.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index JOIN chain.output_assets a ON a.tx_hash=o.tx_hash AND a.output_index=o.output_index WHERE '+selector+' AND sb.height<=%s AND i.first_generation>%s AND i.first_generation<=%s LIMIT 1',(*params,end,pid,generation)):raise Refusal('historical_state_changed')
     for table in ('epoch_nonces','epoch_stakes'):
         if check(db,'SELECT 1 FROM chain.'+table+' WHERE epoch=ANY(%s) AND first_generation>%s AND first_generation<=%s LIMIT 1',(parent['manifest']['required_epochs'],pid,generation)):raise Refusal('historical_epoch_changed')

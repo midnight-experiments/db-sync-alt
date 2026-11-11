@@ -21,7 +21,7 @@ are written in ID order (chain order) when built and grow by appends at each pub
 the publication transaction.
 """
 from db_sync_alt.contract import Refusal
-from db_sync_alt.verify.limits import check
+from db_sync_alt.verify.limits import any_row, check
 
 HEIGHT_LIMIT = 1 << 27
 FIELD = 4096
@@ -168,7 +168,7 @@ def verify(store, generation):
         else:
             # One statement over the whole history: it runs under the verification statement limit.
             query, params = expected(table, generation, db=db)
-            mismatch = check(db, _difference(db, table, 'serve.' + table, query), params) is not None
+            mismatch = any_row(db, _difference(db, table, 'serve.' + table, query), params)
         if mismatch:
             raise Refusal('serve_rows_mismatch')
         store.progress('serve_verification', generation=generation, family=table)
@@ -181,16 +181,17 @@ def verify(store, generation):
 
 
 def _difference(db, table, served, query):
-    """A statement whose first row shows that `served` and the rows of `query` differ."""
+    """A statement whose rows show where `served` and the rows of `query` differ (none: they are equal)."""
     key, cols = KEYS[table], columns(db, table)
     left = 'ROW(' + ','.join('s.' + c for c in cols) + ')'
     right = 'ROW(' + ','.join('e.' + c for c in cols) + ')'
     return ('SELECT 1 FROM ' + served + ' s FULL JOIN (' + query + ') e ON e.' + key + '=s.' + key
-            + ' WHERE s.' + key + ' IS NULL OR e.' + key + ' IS NULL OR ' + left + ' IS DISTINCT FROM ' + right + ' LIMIT 1')
+            + ' WHERE s.' + key + ' IS NULL OR e.' + key + ' IS NULL OR ' + left + ' IS DISTINCT FROM ' + right)
 
 
 def _differ(db, table, served, query, params):
-    return db.execute(_difference(db, table, served, query), params).fetchone() is not None
+    # Counted, not LIMIT 1, for the reason given at limits.any_row.
+    return db.execute('SELECT count(*) FROM (' + _difference(db, table, served, query) + ') found', params).fetchone()[0] > 0
 
 
 def _blocks_differ(db):
