@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -112,6 +113,33 @@ class PgCoreTests(unittest.TestCase):
             self.assertEqual(store.db.execute('SELECT count(*) FROM public.block').fetchone()[0],0)
         self.assert_code('incomplete_owned_destination',lambda:PgStore(conninfo=conninfo))
         self.assert_code('destination_not_empty',lambda:make_store(conninfo))
+
+    def hold_outputs_after_metadata(self,store,conninfo,seconds):
+        """When verification reports its metadata check, another session holds chain.outputs for `seconds`:
+        the next statement that reads it, the dependency check outputs→transactions, waits that long."""
+        locker=psycopg.connect(conninfo,autocommit=True);held=[]
+        def hold(phase,**fields):
+            if phase=='verify_metadata_complete' and not held:
+                locker.execute('BEGIN');locker.execute('LOCK TABLE chain.outputs IN ACCESS EXCLUSIVE MODE')
+                timer=threading.Timer(seconds,locker.execute,('COMMIT',));timer.start();held.append(timer)
+        store.progress_callback=hold
+        return locker,held
+
+    def test_verification_statements_run_under_their_own_limit(self):
+        """A full-history verification statement delayed past the session's statement limit completes under the
+        verification limit; every other statement of the session keeps the session's limit."""
+        conninfo,_=self.stored()
+        with PgStore(conninfo=conninfo) as store:
+            before=store.generation(2)['manifest']['digests']
+            # Test-only: the session limit stands in for the 30 s one.
+            store.db.execute("SET statement_timeout='300ms'")
+            locker,held=self.hold_outputs_after_metadata(store,conninfo,0.8)
+            with locker:
+                self.assertEqual(verify_store(store,2)['digests'],before)
+                held[0].join()
+            store.progress_callback=None
+            self.assertEqual(store.db.execute('SHOW statement_timeout').fetchone()[0],'300ms')
+            with self.assertRaises(psycopg.errors.QueryCanceled):store.db.execute('SELECT pg_sleep(0.6)')
 
     def test_backup_restore_all_physical_rows_and_ids_without_test_fixtures(self):
         conninfo,_=self.stored();folder=Path(self.tmp.name)/uuid.uuid4().hex;folder.mkdir()
