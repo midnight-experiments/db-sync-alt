@@ -107,7 +107,7 @@ class ServiceConfig:
     sync: dict = field(default_factory=dict)
     network: str | None = None
     profile: str | None = None
-    service_version: str = '0.4.0'
+    service_version: str = '0.4.1'
     http_host: str = '127.0.0.1'
     http_port: int = 18080
     http_allow_external: bool = False

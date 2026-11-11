@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - Full verification no longer takes quadratic time on stores of tens to
   hundreds of thousands of blocks. Transaction coverage, the served-table and
