@@ -43,11 +43,14 @@ db-sync-alt acquire --source blockfrost --network preprod \
   --destination-service db_sync_alt --target-height HEIGHT --relevance
 ```
 
-Use your actual private service name and a confirmed target at most six blocks
+Use your actual private service name and a confirmed target at most two blocks
 after the ready one (a further target is refused before any request with
-`invalid_sync_configuration`). An update with filtering holds at most six blocks:
-one block's proof is at most 2 MiB, so six blocks can never pass the update's
-200,000-key limit. Filtering applies to Blockfrost following, not SQL bootstrap.
+`invalid_sync_configuration`). An update with filtering holds at most two blocks.
+One block's relevance proof may be up to 5.73 MiB, the most a valid block body
+(Conway's `maxBlockBodySize` of 90,112 bytes) can produce, so any valid block is
+accepted and two blocks can never pass the update's 200,000-key limit. If
+governance raises `maxBlockBodySize`, this bound must follow before such blocks
+appear. Filtering applies to Blockfrost following, not SQL bootstrap.
 
 Check fresh `/health` and `/status` responses. When filtering is active,
 `relevance.requested` and `relevance.effective` are both `relevance`; the reason is

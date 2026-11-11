@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import psycopg
 
+from db_sync_alt.contract import canonical
 from db_sync_alt.errors import TransientSyncFailure
 from db_sync_alt.networks import network_profile
 from db_sync_alt.sources.blockfrost import adapter, provider, sync
@@ -335,8 +336,9 @@ class RelevanceModeTests(unittest.TestCase):
             pauses = drive(store, real.AccountedFake(routes), rf.PROFILE, rf.T + 10, sync_options={'relevance_enabled': True})
             verify_store(store)
         self.assertEqual(pauses, [])
-        self.assertEqual([t - rf.T for t, _ in generations(store)[1:]], [6, 10])
-        self.assertEqual(store.generation()['manifest']['relevance_coverage']['range'], [rf.T + 7, rf.T + 10])
+        cap = relevance.MAX_BLOCKS
+        self.assertEqual([t - rf.T for t, _ in generations(store)[1:]], list(range(cap, 10, cap)) + [10])
+        self.assertEqual(store.generation()['manifest']['relevance_coverage']['range'], [rf.T + 10 - (10 - 1) % cap, rf.T + 10])
         digests = store.digests(store.generation()['id'])
         self.assertGreaterEqual(digests['outputs']['count'], 11000)
         self.assertEqual(digests, self.full_follow(transactions, rf.T + 10, routes))
@@ -382,6 +384,41 @@ class RelevanceModeTests(unittest.TestCase):
                 self.assertEqual([len(pages(client.calls, b)) for b in (3, 4)], [2, 2])
                 verify_store(store)
                 self.assertEqual(store.digests(store.generation()['id']), self.full_follow(transactions, rf.T + 4, routes))
+
+    def test_one_block_whose_proof_passes_the_former_limit_ingests_on_both_adapters(self):
+        rf = self.rf
+        from db_sync_alt.sources.blockfrost.relevance import address_bytes
+        mainnet = network_profile('mainnet')
+        # The release review's case: 1,304 self-minted assets in each of 12 outputs to the ICS address, which keeps
+        # every asset, in one block (4 transactions of 3). Its relevance proof is 2,229,536 bytes, over the former
+        # 2 MiB bound; the bound derived from the block body admits it.
+        ics = address_bytes(rf.PROFILE.ics, 'mainnet')
+        dust = [23000000, {hashlib.blake2b(b'ics-dust', digest_size=28).digest(): {name: 1 for name in NAMES}}]
+        self.assertLessEqual(len(enc(dust)), 5000)
+        transactions = [[rf.make_tx(9000 + i, outputs=[[ics, dust]] * 3) for i in range(4)]]
+        store, routes = self.prepare(transactions)
+        for t in transactions[0]:
+            self.assertLessEqual(len(t['cbor']) // 2, 16384)
+            routes['/txs/' + t['tx_hash'] + '/metadata'] = []
+        ledger = self.enterContext(tempfile.TemporaryDirectory())
+        now = [time.time()]
+        built_in = provider.PortableClient('mainnet' + 'synthetic0000000000000000', Path(ledger) / 'accounting', network=mainnet,
+                                           transport=Raw(routes), clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s))
+        shared = provider.SharedClient(str(shared_root(routes, self.enterContext(tempfile.TemporaryDirectory()), 'mainnet', mainnet)),
+                                       'mainnet', network=mainnet)
+        results = {}
+        for name, client in (('built-in', built_in), ('shared', shared)):
+            with self.subTest(adapter=name):
+                store, _ = self.prepare(transactions)
+                drive(store, client, rf.PROFILE, rf.T + 1, sync_options={'relevance_enabled': True})
+                self.assertIsNotNone(store.generation()['manifest'].get('relevance_coverage'))
+                proof = store.checkpoint_rows(generation=store.generation()['id'], phase='events', unit=rf.T + 1)[0]['receipt']['relevance']
+                self.assertGreater(len(canonical(proof).encode()), 2 * 1024 * 1024)
+                verify_store(store)
+                results[name] = store.digests(store.generation()['id'])
+        expected = self.full_follow(transactions, rf.T + 1, routes)
+        self.assertEqual(expected['output_assets']['count'] - store.digests(0)['output_assets']['count'], 12 * len(NAMES))
+        self.assertEqual(results, {'built-in': expected, 'shared': expected})
 
     def spend_in_block(self):
         """Block 1: a relevant transaction. Block 2: a transaction creating a relevant output and one spending it,

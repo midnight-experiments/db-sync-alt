@@ -157,18 +157,25 @@ class SyncTests(unittest.TestCase):
         from db_sync_alt.sources.blockfrost.sync import job_target
         ready=self.store.generation();top=ready['target_height']
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+100)
-        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+6)
-        self.store.tx_counts.update({h:1000 for h in range(top+1,top+101)})
-        # 2 x (11 pages + 1,000 /utxos) per block: three blocks fit 7,500.
-        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+3)
-        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+7)
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+2)
+        self.store.tx_counts.update({h:2000 for h in range(top+1,top+101)})
+        # 2 x (21 pages + 2,000 /utxos) per block: one block fits 7,500 (full mode: three).
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+1)
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+3)
+    def test_one_maximal_block_fits_a_relevance_generation(self):
+        from db_sync_alt.sources.blockfrost import relevance
+        # One block adds at most MAX_PROOF // 63 keys: a maximal block's keys fit one generation's limit.
+        self.assertEqual(relevance.MAX_PROOF,66*90112+64*1024)
+        self.assertLess(relevance.MAX_PROOF//63,relevance.MAX_KEYS)
+        self.assertEqual(relevance.MAX_BLOCKS,2)
+        self.assertLessEqual(relevance.MAX_BLOCKS*(relevance.MAX_PROOF//63),relevance.MAX_KEYS)
     def test_sizing_ends_at_the_stored_witness(self):
         from db_sync_alt.sources.blockfrost.sync import job_target
         store=Store(security=3);ready=store.generation()
         self.assertEqual(job_target(store,ready,ready['target_height']+100,10000,relevance=False),ready['target_height']+3)
-    def test_fixed_relevance_target_beyond_six_blocks_is_refused_before_any_request(self):
+    def test_fixed_relevance_target_beyond_the_relevance_cap_is_refused_before_any_request(self):
         self.config.sync={'relevance_enabled':True}
-        driver=SyncDriver(self.config,client=self.client,profile=PREPROD_PROFILE,clock=self.clock,update_fn=self.update,fixed_target=107)
+        driver=SyncDriver(self.config,client=self.client,profile=PREPROD_PROFILE,clock=self.clock,update_fn=self.update,fixed_target=103)
         driver._check_relevance=lambda *a:None
         with self.assertRaisesRegex(LifecycleFailure,'invalid_sync_configuration'):driver.run_once(self.store,self.health,self.stop)
         self.assertEqual(self.client.calls,[])
