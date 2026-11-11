@@ -1,6 +1,7 @@
 """Fixed, parameterized queries for supported full-history core db-sync sources. Every session is read-only.
 
 The source must report the profile's `meta.network_name`; k comes from the profile."""
+from array import array
 import contextlib
 import datetime
 import re
@@ -12,6 +13,23 @@ BLOCK_COLUMNS='b.hash,b.block_no AS height,p.hash AS parent_hash,b.epoch_no AS e
 # asset among all assets of its output: db-sync's row order, which is ledger order.
 INPUT_ORDINAL='(SELECT count(*) FROM tx_in j WHERE j.tx_in_id=i.tx_in_id AND j.id<i.id)::integer'
 ASSET_ORDINAL='(SELECT count(*) FROM ma_tx_out k WHERE k.tx_out_id=m.tx_out_id AND k.id<m.id)::integer'
+# Ids per statement when `selection` resolves ids to block heights. On the Mainnet source a statement of 1,000
+# ids takes about 0.02 s warm; a statement the source cancels is retried as two halves.
+SELECTION_BATCH=1000
+# An output's block and every input spending it with its block; a minting transaction's block.
+OUTPUT_HEIGHTS=('SELECT o.id,b.block_no AS height,i.id AS spend_id,sb.block_no AS spend_height FROM tx_out o '
+                'JOIN tx t ON t.id=o.tx_id JOIN block b ON b.id=t.block_id '
+                'LEFT JOIN tx_in i ON i.tx_out_id=o.tx_id AND i.tx_out_index=o.index '
+                'LEFT JOIN tx st ON st.id=i.tx_in_id LEFT JOIN block sb ON sb.id=st.block_id WHERE o.id=ANY(%s::bigint[])')
+MINT_HEIGHTS='SELECT t.id,b.block_no AS height FROM tx t JOIN block b ON b.id=t.block_id WHERE t.id=ANY(%s::bigint[])'
+
+def unique(ids):
+    """`ids` sorted, each once."""
+    out=[];last=None
+    for value in sorted(ids):
+        if value!=last:out.append(value);last=value
+    return out
+
 
 class SQLSource:
     def __init__(self,service,profile,attestation=None):
@@ -45,6 +63,8 @@ class SQLSource:
         r=self.conn.execute(query,params).fetchone()
         if r is None:raise Refusal('source_row_missing')
         return dict(r)
+    def rows(self,query,params=()):
+        return [dict(r) for r in self.conn.execute(query,params).fetchall()]
     def stream(self,query,params=(),batch=500):
         self.serial+=1
         with self.conn.cursor(name='read_'+str(self.serial)) as cur:
@@ -169,6 +189,47 @@ class SQLSource:
         mq='SELECT DISTINCT t.id FROM multi_asset a JOIN ma_tx_mint m ON m.ident=a.id JOIN tx t ON t.id=m.tx_id JOIN block b ON b.id=t.block_id WHERE '+ap+' AND b.block_no BETWEEN %s AND %s ORDER BY t.id'
         mints=ids(mq,(*self.asset_params(),lo,hi))
         return outputs,spends,mints
+    def selection(self):
+        """The independent asset/address-led inventory of the whole history, for all windows at once.
+
+        Yields ('outputs', id, height), ('spends', id, height) and ('mints', id, height): every output holding
+        a profile asset or at a profile address, every input spending one of them and every transaction
+        minting a profile asset, with the height of the block of the output's, the spending and the minting
+        transaction (None for a block without a height). A window's rows are exactly what
+        `select_ids(lo, hi, independent=True)` selects for it; reading them once instead of once per window
+        keeps a bootstrap's selector work proportional to the selection plus the windows (issue 00040).
+
+        Every statement is bounded: three id streams, fetched 500 rows per statement, then `bounded_rows`
+        batches. Run it inside `snapshot`."""
+        addresses,assets=self.output_params()
+        outputs=array('q');mints=array('q')
+        for r in self.stream('SELECT ma.tx_out_id AS id FROM ma_tx_out ma WHERE ma.ident=ANY(%s::bigint[])',(assets,)):outputs.append(r['id'])
+        for r in self.stream('SELECT o.id FROM tx_out o WHERE o.address=ANY(%s::text[])',(addresses,)):outputs.append(r['id'])
+        for r in self.stream('SELECT m.tx_id AS id FROM ma_tx_mint m WHERE m.ident=ANY(%s::bigint[])',(assets,)):mints.append(r['id'])
+        last=None
+        for r in self.bounded_rows(OUTPUT_HEIGHTS,unique(outputs)):
+            if r['id']!=last:
+                last=r['id'];yield 'outputs',r['id'],r['height']
+            if r['spend_id'] is not None:yield 'spends',r['spend_id'],r['spend_height']
+        for r in self.bounded_rows(MINT_HEIGHTS,unique(mints)):yield 'mints',r['id'],r['height']
+    def bounded_rows(self,query,ids):
+        """Rows of `query` (one bigint[] parameter) for the sorted `ids`, in id order, at most SELECTION_BATCH
+        ids per statement. A statement the source cancels is rolled back to its own savepoint and retried as
+        two halves, down to one id, whose cancellation is raised."""
+        import psycopg
+        def run(part):
+            self.conn.execute('SAVEPOINT bounded_rows')
+            try:
+                rows=self.rows(query,(part,))
+            except psycopg.errors.QueryCanceled:
+                self.conn.execute('ROLLBACK TO SAVEPOINT bounded_rows');self.conn.execute('RELEASE SAVEPOINT bounded_rows')
+                if len(part)==1:raise
+                middle=len(part)//2
+                yield from run(part[:middle]);yield from run(part[middle:])
+                return
+            self.conn.execute('RELEASE SAVEPOINT bounded_rows')
+            yield from sorted(rows,key=lambda r:r['id'])
+        for start in range(0,len(ids),SELECTION_BATCH):yield from run(ids[start:start+SELECTION_BATCH])
     def facts(self,outputs,spends,mints):
         # Dependency closure expands only selected sparse IDs. Fixed parameter arrays, no dynamic values in SQL.
         allout=set(outputs);txids=set(mints)
@@ -215,10 +276,18 @@ class SQLSource:
     def epochs(self,epoch,target):
         if self.one('SELECT completed FROM epoch_stake_progress WHERE epoch_no=%s',(epoch,))['completed'] is not True:raise Refusal('epoch_stake_not_complete')
         yield 'epoch_nonces',self.epoch_parameters(epoch)
-        count=0
-        for r in self.stream('SELECT s.epoch_no AS epoch,p.hash_raw AS pool_hash,sum(s.amount)::text AS amount FROM epoch_stake s JOIN pool_hash p ON p.id=s.pool_id WHERE s.epoch_no=%s GROUP BY s.epoch_no,p.hash_raw ORDER BY p.hash_raw',(epoch,)):
-            count+=1;yield 'epoch_stakes',r
-        if not count:raise Refusal('epoch_stake_unavailable')
+        # The per-pool sums of the epoch's distribution, ordered by pool hash. The rows are streamed and summed
+        # here: one GROUP BY statement over a Mainnet epoch (about 1.3 million rows) runs close to the source's
+        # statement limit, and an epoch has no smaller unit to retry.
+        by_pool={}
+        for r in self.stream('SELECT s.pool_id,s.amount::text AS amount FROM epoch_stake s WHERE s.epoch_no=%s',(epoch,)):
+            by_pool[r['pool_id']]=by_pool.get(r['pool_id'],0)+int(r['amount'])
+        sums={}
+        if by_pool:
+            for r in self.stream('SELECT id,hash_raw FROM pool_hash WHERE id=ANY(%s::bigint[])',(sorted(by_pool),)):
+                pool=bytes(r['hash_raw']);sums[pool]=sums.get(pool,0)+by_pool[r['id']]
+        if not sums:raise Refusal('epoch_stake_unavailable')
+        for pool in sorted(sums):yield 'epoch_stakes',{'epoch':epoch,'pool_hash':pool,'amount':str(sums[pool])}
         # Exact historical epoch-end anchors only when completed, never current epoch's moving tip.
         end=self.one('SELECT max(block_no) AS height FROM block WHERE epoch_no=%s',(epoch,))['height']
         if end is None:raise Refusal('epoch_blocks_unavailable')
