@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.4
 
 - The epochs phase of a SQL bootstrap no longer slows down as the source tip
   moves past the epochs it reads: each epoch's last block is found among that
@@ -16,6 +16,8 @@
   a new database or onto another server is refused with `invalid_sync_job`
   until the next UTC day, because each day's polling job is bound to the
   database that created it; troubleshooting names this cause.
+- Upgrading from 0.4.3 is an image swap: no schema, format or backup change. A
+  pending generation started on 0.4.3 resumes on 0.4.4.
 
 ## 0.4.3
 
