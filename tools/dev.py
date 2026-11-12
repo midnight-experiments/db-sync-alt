@@ -47,7 +47,7 @@ WEIGHTS = {
     'test_manifest_kinds': 180, 'test_status_summaries': 120,
     'test_relevance': 600, 'test_relevance_checkpoint': 900, 'test_relevance_recovery': 120,
     'test_epoch_upgrade': 150, 'test_bridge_metadata': 120, 'test_candidates_address': 90, 'test_work_limits': 600,
-    'test_global_selection': 700, 'test_bounded_writes': 600,
+    'test_global_selection': 700, 'test_bounded_writes': 600, 'test_epoch_end_anchor': 10,
 }
 
 

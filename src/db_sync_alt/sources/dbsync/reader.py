@@ -22,6 +22,8 @@ OUTPUT_HEIGHTS=('SELECT o.id,b.block_no AS height,i.id AS spend_id,sb.block_no A
                 'LEFT JOIN tx_in i ON i.tx_out_id=o.tx_id AND i.tx_out_index=o.index '
                 'LEFT JOIN tx st ON st.id=i.tx_in_id LEFT JOIN block sb ON sb.id=st.block_id WHERE o.id=ANY(%s::bigint[])')
 MINT_HEIGHTS='SELECT t.id,b.block_no AS height FROM tx t JOIN block b ON b.id=t.block_id WHERE t.id=ANY(%s::bigint[])'
+# OFFSET 0 fences the subquery: without it PostgreSQL walks idx_block_block_no back from the source tip.
+EPOCH_END='SELECT max(block_no) AS height FROM (SELECT block_no FROM block WHERE epoch_no=%s OFFSET 0) s'
 
 def unique(ids):
     """`ids` sorted, each once."""
@@ -289,7 +291,7 @@ class SQLSource:
         if not sums:raise Refusal('epoch_stake_unavailable')
         for pool in sorted(sums):yield 'epoch_stakes',{'epoch':epoch,'pool_hash':pool,'amount':str(sums[pool])}
         # Exact historical epoch-end anchors only when completed, never current epoch's moving tip.
-        end=self.one('SELECT max(block_no) AS height FROM block WHERE epoch_no=%s',(epoch,))['height']
+        end=self.one(EPOCH_END,(epoch,))['height']
         if end is None:raise Refusal('epoch_blocks_unavailable')
         if end<=target:
             for b in self.blocks(end,end):yield 'blocks',b

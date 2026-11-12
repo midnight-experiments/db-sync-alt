@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The epochs phase of a SQL bootstrap no longer slows down as the source tip
+  moves past the epochs it reads: each epoch's last block is found among that
+  epoch's own blocks. On a throttled source it no longer stops with
+  `source_timeout` (0.4.3 did on Mainnet at epoch 647, 19 epochs behind the tip).
 - `/status` and `/health` report the package's version as `service_version`.
   0.4.2 and 0.4.3 reported `0.4.1` there, while `db-sync-alt --version` was
   correct. The service and the one-shot Blockfrost acquire take the version
