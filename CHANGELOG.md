@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.7
 
 - Each relevance update makes one provider request fewer. It takes the witness
   header (the block k above its target) from the header suffix it fetches
@@ -19,6 +19,8 @@
     counted before it is sent, and quota decisions use that count. A provider
     HTTP 402 still ends the day at once.
 - No format, schema, manifest or refusal change.
+- Upgrading from 0.4.6 is an image swap: no schema, format or backup change. A
+  pending generation started on 0.4.6 resumes on 0.4.7.
 
 ## 0.4.6
 
