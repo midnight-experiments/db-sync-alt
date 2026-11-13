@@ -283,6 +283,16 @@ PostgreSQL cancels a verification statement, db-sync-alt logs
 `verification_statement_canceled` with the statement's plan and its tables'
 estimated row counts before it stops.
 
+The served tables are written in ranges of block heights or ids, each in one
+statement under the 30-second limit. On a slow disk, or for very dense blocks or
+large datums, a range can take longer: db-sync-alt then rolls that statement
+back, logs `serve_range_split` with the table and the range, and writes the range
+as two halves, down to one block or one id. A publication whose new facts take
+longer than the limit in one statement (a long cardano-db-sync update) is
+written the same way, in the ranges that hold them, after a
+`serve_advance_ranged` log line. The rows are the same. Many such lines mean the
+disk is slower than the data needs.
+
 ## Provider configuration
 
 `db-sync-alt run` configures the provider itself. The service reads these
