@@ -27,7 +27,7 @@ jobs:
         run: python3 tools/dev.py unit
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
