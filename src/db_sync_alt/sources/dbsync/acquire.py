@@ -95,6 +95,11 @@ def _anchors(source, store, generation):
 
 # Rows per COPY into the session's selection table; each COPY stays far below the writer's statement limit.
 SELECTION_COPY_ROWS = 50000
+# The independent pass's expected rows. Every newly stored fact is looked up by key in batches of
+# EXPECTED_BATCH: a primary-key lookup, whose work is bounded by the batch whatever the table's size.
+EXPECTED_TABLE = 'CREATE TEMP TABLE sql_expected(family text,key jsonb,row jsonb,PRIMARY KEY(family,key))'
+EXPECTED_LOOKUP = 'SELECT key,row FROM sql_expected WHERE family=%s AND key=ANY(%s)'
+EXPECTED_BATCH = 5000
 # Ids of one family in one window above which the window bisects, as in `SQLSource.select_ids`.
 WINDOW_IDS = 100000
 
@@ -230,7 +235,7 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
         # A fresh selection: the independent pass never reads the main pass's.
         _select(source, store, g['manifest'], stop_event, generation)
     store.db.execute('DROP TABLE IF EXISTS pg_temp.sql_expected')
-    store.db.execute('CREATE TEMP TABLE sql_expected(family text,key jsonb,row jsonb,PRIMARY KEY(family,key))')
+    store.db.execute(EXPECTED_TABLE)
     def unit(phase, lo, hi):
         _stop(stop_event); store.check_space()
         try:
@@ -282,12 +287,12 @@ def _independent(source, store, generation, ranges, epochs, stop_event):
         with verification(store.db, query, (generation,)):
             with store.db.cursor(name='new_'+table) as cursor:
                 cursor.execute(query, (generation,))
-                while batch := cursor.fetchmany(5000):
+                while batch := cursor.fetchmany(EXPECTED_BATCH):
                     _stop(stop_event)
                     values = [jsonable(logical_row(table, dict(zip(columns, raw)))) for raw in batch]
                     keys = [[value[k] for k in KEYS[table]] for value in values]
                     expected = {canonical(key): row for key, row in store.db.execute(
-                        'SELECT key,row FROM sql_expected WHERE family=%s AND key=ANY(%s)', (table, [Jsonb(key) for key in keys]))}
+                        EXPECTED_LOOKUP, (table, [Jsonb(key) for key in keys]))}
                     for key, value in zip(keys, values):
                         row = expected.get(canonical(key))
                         if row is None or digest(row) != digest(value):

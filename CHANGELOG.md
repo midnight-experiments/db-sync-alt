@@ -1,6 +1,27 @@
 # Changelog
 
-## 0.4.4
+## Unreleased
+
+- `db-sync-alt upgrade` of a Mainnet-sized store no longer fails on a slow disk
+  while it builds the served tables.
+  - **Before:** 0.4.4 wrote `serve.datum` in ranges of 100,000 ids, about
+    90 MiB of datum values per statement on Mainnet. On a destination writing
+    16 MiB/s, the range of ids 1,000,000–1,099,999 was cancelled by the 30 s
+    statement limit after 20 minutes of work, and the upgrade rolled back with
+    `schema_upgrade_failed`.
+  - **Now:** datums are written in ranges of 10,000 ids (about 9 MiB). Each
+    range of every served table runs under a savepoint: a range the limit
+    cancels is rolled back and written as two halves, down to one block height
+    or one id, with a `serve_range_split` warning. One height or id that still
+    cannot be written fails the upgrade as before.
+- A publication writes its served rows the same way when one statement would
+  pass the limit: a long cardano-db-sync update onto a serving store wrote each
+  table's new rows in one statement, which a few days of dense Mainnet blocks
+  could take past 30 s. Such a table is now written in the build's ranges that
+  hold the new rows, after a `serve_advance_ranged` warning. Ordinary
+  publications run the same statements as before.
+- The served rows, their order and `serve.verify` are unchanged. No format,
+  schema, manifest or refusal change.
 
 - The epochs phase of a SQL bootstrap no longer slows down as the source tip
   moves past the epochs it reads: each epoch's last block is found among that
