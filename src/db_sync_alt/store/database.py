@@ -60,6 +60,24 @@ def continues(old, body):
             and since is not None and day is not None and day > since)
 
 
+# The provider `/metrics` marker (`sources.blockfrost.sync.metrics_counted`), shared by the poller and the writer.
+METRICS_MARKER = 'provider-metrics'
+
+
+def metrics_marker(db):
+    row = db.execute('SELECT body FROM chain.sync_jobs WHERE id=%s', (METRICS_MARKER,)).fetchone()
+    return row[0] if row else None
+
+
+def save_metrics_marker(db, body, expected=None):
+    """Replace the marker, or with `expected`, write it only if it still holds `expected`."""
+    if expected is None:
+        db.execute('INSERT INTO chain.sync_jobs VALUES(%s,%s) ON CONFLICT(id) DO UPDATE SET body=excluded.body',
+                   (METRICS_MARKER, Jsonb(body)))
+    else:
+        db.execute('UPDATE chain.sync_jobs SET body=%s WHERE id=%s AND body=%s', (Jsonb(body), METRICS_MARKER, Jsonb(expected)))
+
+
 def connect(service=None, *, conninfo='', **kwargs):
     if service is not None:
         if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}',service):raise Refusal('invalid_destination_service')
@@ -621,6 +639,11 @@ class PgStore:
             elif body['attempts']<old['attempts'] or body['budget']!=old['budget']:raise Refusal('sync_job_budget_reset')
             elif old.get('state') in ('completed','exhausted') and body['state']=='active':raise Refusal('sync_job_reopen_refused')
         self.db.execute('INSERT INTO chain.sync_jobs VALUES(%s,%s) ON CONFLICT(id) DO UPDATE SET body=excluded.body',(job_id,Jsonb(body)))
+    def metrics_marker(self):return metrics_marker(self.db)
+    def save_metrics_marker(self,body,expected=None):
+        self.require_writer()
+        if self.db.info.transaction_status!=psycopg.pq.TransactionStatus.IDLE:raise Refusal('sync_job_requires_durable_autocommit')
+        save_metrics_marker(self.db,body,expected)
     def check_space(self):
         if self.reserve_check:self.reserve_check()
     def progress(self,phase,**fields):

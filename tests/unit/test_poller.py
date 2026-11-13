@@ -90,7 +90,8 @@ class PollTests(unittest.TestCase):
         update=sync_fakes.FixtureUpdate();driver=SyncDriver(SimpleNamespace(sync={}),client=self.client,
                     profile=PREPROD_PROFILE,clock=self.clock,update_fn=update);driver._poller=self.poller
         before=len(self.client.calls);driver.run_once(self.store,self.health,self.stop)
-        self.assertEqual([x[0] for x in self.client.calls[before:]],['/metrics','/unit'])
+        # The poll's first request reconciled `/metrics` (no marker yet); the update's new job needs none.
+        self.assertEqual([x[0] for x in self.client.calls[before:]],['/unit'])
         self.client.confirmed=131;self.clock.now+=1;self.poller.tick(self.store,self.client)
         snap=self.poller.snapshot;self.poller.snapshot=type(snap)(**{**snap.__dict__,'observed_mono':time.monotonic()})
         driver.run_once(self.store,self.health,self.stop)

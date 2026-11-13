@@ -304,6 +304,33 @@ def local_usage(client):
         raise LifecycleFailure('provider_accounting_unavailable') from None
 
 
+# The client counts every attempt before it is sent, so its count is the estimate every quota decision uses.
+# `/metrics` adds only what the provider saw from elsewhere (other hosts or clients on the same key): it runs once
+# this many requests have been counted for the profile since the last one, across jobs, restarts and UTC days.
+METRICS_EVERY_REQUESTS = 10000
+
+
+def metrics_counted(marker, day, used):
+    """The `/metrics` marker advanced to the client's count `used` on UTC `day`, or None when `/metrics` is due anyway.
+
+    The marker (`store.metrics_marker()`) holds the requests counted since the last `/metrics` (`counted`) and the
+    client's count at its last observation (`day`, `used`), made before each request. The client's count restarts
+    each UTC day: on a later day the count so far is added whole, and the earlier day's requests after its last
+    observation (the last request or two) are left out. None means no marker yet (a fresh store), an unreadable
+    one, or a count that went back within a day (another ledger).
+    """
+    if (not isinstance(marker, dict) or marker.get('version') != 1 or not isinstance(marker.get('day'), str)
+            or any(type(marker.get(k)) is not int or marker[k] < 0 for k in ('used', 'counted'))):
+        return None
+    if day < marker['day']:
+        return marker
+    if day == marker['day']:
+        if used < marker['used']:
+            return None
+        return dict(marker, used=used, counted=marker['counted'] + used - marker['used'])
+    return dict(marker, day=day, used=used, counted=marker['counted'] + used)
+
+
 def job_target(store, ready, limit, budget, *, relevance):
     """The highest target <= `limit` whose blocks' estimated requests fit 3/4 of `budget`, at least one block.
 
@@ -462,9 +489,7 @@ class AccountedProvider(ProviderClient):
         if isinstance(cooldown, (int, float)) and cooldown > now:
             self._wait('provider_unavailable', minimum=cooldown)
         day = dt.datetime.fromtimestamp(now, dt.timezone.utc).date().isoformat()
-        last_metrics = self.job.get('metrics_at', 0)
-        if path != '/metrics' and (self.job.get('metrics_day') != day or now < last_metrics
-                or now - last_metrics >= 600 or self.attempts - self.job.get('metrics_count', 0) >= 1000):
+        if path != '/metrics' and self._metrics_due(day, usage['budget_used']):
             self.get('/metrics')
         if self.attempts >= self.budget:
             # The job never spends more than its budget. A poll job waits for the next UTC day's
@@ -509,18 +534,29 @@ class AccountedProvider(ProviderClient):
         finally:
             self.health.end_operation()
             self.health.begin_operation('verification')
-        self._quota()
+        usage = self._quota()
         result, encoded = bounded_answer(result, cut)
         self.receipts.append({'endpoint': path, 'sha256': hashlib.sha256(encoded).hexdigest(),
                               'bytes': len(encoded), 'attempt': self.attempts,
                               'at': dt.datetime.fromtimestamp(self.clock(), dt.timezone.utc).isoformat()})
         if len(self.receipts) > 20000:
             raise Refusal('provider_receipt_unit_limit')
-        if path == '/metrics':
-            self.job.update(metrics_day=day, metrics_at=self.clock(), metrics_count=self.attempts)
         self.job.update(retry_at=0, error_code=None)
         self.save()
+        if path == '/metrics':
+            self.store.save_metrics_marker(dict(version=1, day=day, used=usage['budget_used'], counted=0,
+                                                reconciled_at=self.clock()))
         return result
+
+    def _metrics_due(self, day, used):
+        marker = self.store.metrics_marker()
+        advanced = metrics_counted(marker, day, used)
+        if advanced is None:
+            return True
+        if advanced != marker:
+            # Skipped if the other writer (poller or acquisition) advanced it meanwhile: the next request counts these too.
+            self.store.save_metrics_marker(advanced, expected=marker)
+        return advanced['counted'] >= METRICS_EVERY_REQUESTS
 
     def drain(self):
         value = {'source': 'blockfrost-cardano', 'shared_profile': self.network.network,

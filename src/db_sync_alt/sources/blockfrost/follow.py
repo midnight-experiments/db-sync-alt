@@ -223,7 +223,6 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
         # provider head now below its witness is a shorter tip: wait, never refuse.
         if target>head['height']-profile.security:provider._wait('provider_unavailable')
         targetrow=_fresh(provider,target,cached)
-        witnessrow=cached[witness] if witness in cached else _tip_row(provider,witness)
         old_w=_fresh(provider,ready['witness_height'],cached)
         if old_w['hash']==store.block_at(ready['id'],ready['witness_height'])['hash']:
             cutoff=ready['witness_height']
@@ -235,6 +234,9 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
         # exists and stored right after it, with no provider call in between.
         suffix=_fetch_suffix(provider,store,base,witness,hooks=hooks)
         if hooks.stopped():raise Refusal('interrupted')
+        # The suffix ends at the witness: unless the poll's head is the witness, its last row is the provider's
+        # witness header, parent-linked, so the witness needs no request of its own.
+        witnessrow=cached[witness] if witness in cached else suffix[-1][1][-1]
         startepoch=store.block_at(ready['id'],ready['start_height'])['epoch']
         manifest={'identity_sha256':digest(profile.identity),'contracts':digest(profile.contract),'source_identity':source_identity,
                   'anchors':{'start':ready['manifest']['anchors']['start'],

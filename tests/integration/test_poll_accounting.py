@@ -11,6 +11,8 @@ from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 from db_sync_alt.sources.blockfrost.poller import HeadPoller, PollBudgetStore, PollDayChanged, day_at, owner_binding, _admission, bind_restored_poll_policy, identity
 from db_sync_alt.errors import LifecycleFailure
+from db_sync_alt.sources.blockfrost.sync import METRICS_EVERY_REQUESTS
+from db_sync_alt.store.database import METRICS_MARKER
 import fixtures.sync as sync_fakes
 from fixtures.networks import PREPROD
 
@@ -96,3 +98,34 @@ class PollAccountingPGTests(unittest.TestCase):
         before=self.db.execute('SELECT key,value FROM chain.metadata ORDER BY key').fetchall()
         with self.assertRaises(LifecycleFailure):bind_restored_poll_policy(self.owner,'a'*64)
         self.assertEqual(self.db.execute('SELECT key,value FROM chain.metadata ORDER BY key').fetchall(),before)
+
+    def test_metrics_marker_is_a_row_kept_across_restarts_and_days(self):
+        """`/metrics` on the first request of a fresh store, then once per METRICS_EVERY_REQUESTS requests counted for
+        the profile: the marker is a database row, kept across processes (here: a new poll store per tick) and UTC days."""
+        client=sync_fakes.Client(self.clock)
+        def tick():
+            p=self.connect_poll();self.addCleanup(p.close)
+            before=len(client.calls)
+            HeadPoller(lambda:p,lambda:client,sync_fakes.health(),threading.Event(),clock=self.clock,network=PREPROD).tick(p,client)
+            p.close();self.poll=None
+            return [path for path,_ in client.calls[before:]]
+        marker=lambda:self.db.execute('SELECT body FROM chain.sync_jobs WHERE id=%s',(METRICS_MARKER,)).fetchone()[0]
+        self.assertEqual(tick(),['/metrics','/blocks/latest','/blocks/100'])
+        self.assertEqual({k:v for k,v in marker().items() if k!='reconciled_at'},{'version':1,'day':day_at(self.clock()),'used':2,'counted':1})
+        self.assertEqual(tick(),['/blocks/latest','/blocks/100'])
+        # Requests the ledger counted elsewhere bring the count to the limit at the next observation: one `/metrics`.
+        m=marker();client.used+=METRICS_EVERY_REQUESTS-m['counted']-(client.used-m['used'])
+        self.assertEqual(tick(),['/metrics','/blocks/latest','/blocks/100'])
+        self.assertEqual(marker()['counted'],1)
+        # A new UTC day (the ledger's count restarts) is no reason to reconcile.
+        self.clock.now+=86400;client.used=0
+        self.assertEqual(tick(),['/blocks/latest','/blocks/100'])
+        self.assertEqual((marker()['day'],marker()['counted']),(day_at(self.clock()),2))
+        # A write that advances a marker someone else changed meanwhile is skipped; without `expected` it replaces it.
+        p=self.connect_poll();current=marker()
+        p.save_metrics_marker({**current,'counted':99},expected={**current,'counted':0})
+        self.assertEqual(marker(),current)
+        p.save_metrics_marker({**current,'counted':5},expected=current)
+        self.assertEqual(marker()['counted'],5)
+        p.save_metrics_marker({'version':1,'day':current['day'],'used':0,'counted':0})
+        self.assertEqual(marker(),{'version':1,'day':current['day'],'used':0,'counted':0})

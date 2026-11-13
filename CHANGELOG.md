@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Each relevance update makes one provider request fewer. It takes the witness
+  header (the block k above its target) from the header suffix it fetches
+  anyway, instead of reading `/blocks/{target+k}` separately first. The
+  manifest records the same witness height and hash. The witness observation
+  before publication is unchanged.
+- The Blockfrost usage check `/metrics` runs once per 10,000 requests counted
+  in the key's ledger, instead of at the start of every job.
+  - **Before:** each new job (every update and every day's polling) called
+    `/metrics` first, and again after 600 s, 1,000 requests or a UTC day
+    change. On the Mainnet relevance follow that was one request per update,
+    about one request in twenty.
+  - **Now:** the database keeps the requests counted since the last check
+    (`chain.sync_jobs` row `provider-metrics`), across jobs, restarts and UTC
+    days. A new database checks on its first request. Every attempt is still
+    counted before it is sent, and quota decisions use that count. A provider
+    HTTP 402 still ends the day at once.
+- No format, schema, manifest or refusal change.
+
 ## 0.4.6
 
 - Following the chain no longer slows down as the store's history grows: the

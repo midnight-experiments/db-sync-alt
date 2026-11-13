@@ -108,7 +108,8 @@ class FollowSourcePGTests(unittest.TestCase):
         from db_sync_alt.backup import backup,restore
         from db_sync_alt.sources.blockfrost.poller import day_at
         dsn,store,routes=self.prepare()
-        blockfrost_once(store,self.profile,target_height=gen_fixture.OFFSET+11,client=real.AccountedFake(routes))
+        ledger=real.AccountedFake(routes)  # one key's ledger: the one-shot and the managed poll share it
+        blockfrost_once(store,self.profile,target_height=gen_fixture.OFFSET+11,client=ledger)
         key='provider-poll-'+day_at(time.time());before=copy.deepcopy(store.sync_job(key))
         poll=PollBudgetStore(None,owner_binding(store),conninfo=dsn)
         try:
@@ -117,7 +118,7 @@ class FollowSourcePGTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception,'writer_busy'):
                 blockfrost_once(store,self.profile,target_height=gen_fixture.OFFSET+12,client=blocked)
             self.assertEqual(blocked.calls,[])
-            client=real.AccountedFake(routes);health=self.state()
+            client=ledger;health=self.state()
             HeadPoller(lambda:poll,lambda:client,health,threading.Event(),network=PREPROD).tick(poll,client)
             advanced=poll.sync_job(key)
             self.assertEqual(advanced['job_id'],before['job_id'])
@@ -244,18 +245,31 @@ class FollowSourcePGTests(unittest.TestCase):
 
     def test_two_successors_reuse_handoff_and_do_not_run_full_verifier(self):
         dsn,store,routes=self.prepare()
-        first,_=self.run_follow(store,dsn,routes,gen_fixture.OFFSET+11)
+        ledger=real.AccountedFake(routes)  # one key's ledger for both follows
+        first,_=self.run_follow(store,dsn,routes,gen_fixture.OFFSET+11,client=ledger)
         self.assertIn('/genesis',first.calls)
+        # The witness h=2171 is below the poll's head h=2172: it comes from the header suffix, so its one read is
+        # the final observation, after the suffix page.
+        first=list(first.calls)
+        witness='/blocks/'+str(gen_fixture.OFFSET+2171);suffix=[i for i,p in enumerate(first) if '/next?' in p]
+        self.assertEqual((first.count(witness),len(suffix)),(1,1))
+        self.assertGreater(first.index(witness),suffix[0])
+        self.assertEqual(first.count('/metrics'),1)  # the poll's first request on a new store
+        g=store.generation();receipt=store.checkpoint_rows(generation=g['id'],phase='final-anchors',unit='complete')[0]['receipt']
+        self.assertEqual(g['manifest']['anchors']['witness'],{'height':gen_fixture.OFFSET+2171,'hash':routes[witness]['hash']})
+        self.assertEqual(receipt['provisional']['witness']['manifest_initial'],routes[witness]['hash'])
         with patch('db_sync_alt.verify.store.verify_store',side_effect=AssertionError('unexpected full history verification')):
-            second,_=self.run_follow(store,dsn,routes,gen_fixture.OFFSET+12)
-        self.assertNotIn('/genesis',second.calls)
-        self.assertFalse(any(p.endswith('/cbor') for p in second.calls))
-        self.assertEqual(len([p for p in second.calls if '/next?' in p]),1)
-        acquisition=second.calls[2:]  # Existing poll journal needs no second metric.
-        self.assertEqual(second.calls[:2],['/blocks/latest','/blocks/'+str(gen_fixture.OFFSET+12)])
-        fixed=[p for p in acquisition if p=='/metrics' or '/next?' in p or
+            calls=len(ledger.calls);self.run_follow(store,dsn,routes,gen_fixture.OFFSET+12,client=ledger)
+        second=ledger.calls[calls:]
+        self.assertNotIn('/genesis',second)
+        self.assertFalse(any(p.endswith('/cbor') for p in second))
+        self.assertEqual(len([p for p in second if '/next?' in p]),1)
+        acquisition=second[2:]
+        self.assertEqual(second[:2],['/blocks/latest','/blocks/'+str(gen_fixture.OFFSET+12)])
+        self.assertNotIn('/metrics',second)  # reconciled by the first follow's poll; the marker is in the store
+        fixed=[p for p in acquisition if '/next?' in p or
                p in {'/blocks/'+str(gen_fixture.OFFSET+n) for n in (11,12,2171,2172)}]
-        self.assertEqual(len(fixed),6)  # metric + four fresh anchors + suffix page.
+        self.assertEqual(len(fixed),5)  # four fresh anchors + suffix page.
         self.assertEqual(store.generation()['target_height'],gen_fixture.OFFSET+12)
         verify_store(store)
 

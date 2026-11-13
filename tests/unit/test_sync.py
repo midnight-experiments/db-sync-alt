@@ -97,13 +97,14 @@ class SyncTests(unittest.TestCase):
         self.assertGreater(new['attempts'],job['attempts']);self.assertEqual(new['budget'],job['budget'])
         self.assertEqual(self.update.calls[-1],(101,140))
     def test_exhausted_update_waits_for_the_next_utc_day_then_continues_its_target(self):
-        # Each allotment of 3 requests holds one usage check and two committed blocks of a 5-block update.
-        self.config.sync={'acquisition_request_budget':3};self.client.confirmed=105;self.update=BlockUpdate()
+        # Each allotment of 3 requests holds three committed blocks of a 7-block update (the poll's first request
+        # reconciled `/metrics`; no later job does).
+        self.config.sync={'acquisition_request_budget':3};self.client.confirmed=107;self.update=BlockUpdate()
         with self.assertRaises(TransientSyncFailure) as error:self.run_once()
         self.assertEqual((error.exception.code,error.exception.retry_at),('request_budget_exhausted',next_day(self.clock.now)))
         first=copy.deepcopy(self.store.jobs['provider-active'])
-        self.assertEqual((first['state'],first['attempts'],first['target'],first['exhausted_at']),('exhausted',3,105,self.clock.now))
-        self.assertEqual(self.update.done,2)
+        self.assertEqual((first['state'],first['attempts'],first['target'],first['exhausted_at']),('exhausted',3,107,self.clock.now))
+        self.assertEqual(self.update.done,3)
         # Later the same UTC day: no request and no change.
         calls=len(self.client.calls);self.clock.now=next_day(self.clock.now)-1
         with self.assertRaises(TransientSyncFailure) as error:self.run_once()
@@ -115,13 +116,13 @@ class SyncTests(unittest.TestCase):
         second=copy.deepcopy(self.store.jobs['provider-active'])
         self.assertEqual(self.store.jobs['provider-acquire-'+first['job_id']],first)
         self.assertEqual((second['resumes'],second['prior_attempts'],second['target'],second['witness'],second['parent']),
-                         (first['job_id'],3,105,first['witness'],first['parent']))
-        self.assertEqual((second['state'],second['attempts'],self.update.done),('exhausted',3,4))
+                         (first['job_id'],3,107,first['witness'],first['parent']))
+        self.assertEqual((second['state'],second['attempts'],self.update.done),('exhausted',3,6))
         self.clock.now=next_day(self.clock.now)+1;self.run_once()
         third=self.store.jobs['provider-active']
         self.assertEqual(self.store.jobs['provider-acquire-'+second['job_id']],second)
-        self.assertEqual((third['resumes'],third['prior_attempts'],third['state'],third['target']),(second['job_id'],6,'completed',105))
-        self.assertEqual((self.store.target,self.update.calls),(105,[(101,105)]*3))
+        self.assertEqual((third['resumes'],third['prior_attempts'],third['state'],third['target']),(second['job_id'],6,'completed',107))
+        self.assertEqual((self.store.target,self.update.calls),(107,[(101,107)]*3))
     def test_continuation_rule_never_resets_or_retargets(self):
         from db_sync_alt.store.database import continues
         old={'job_id':'a','kind':'acquire','state':'exhausted','attempts':10,'budget':10,'parent':0,'target':105,'witness':2265,
@@ -185,9 +186,11 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(error.exception.code,'quota_exhausted')
         oldkey=next(k for k in self.store.jobs if k.startswith('provider-poll-'))
         old=copy.deepcopy(self.store.jobs[oldkey]);self.clock.now=next_day(self.clock.now)+1
-        with self.assertRaises(TransientSyncFailure):self.run_once()
+        # The new day's job has its own budget; `/metrics` was reconciled on the first day, so the poll fits it.
+        self.run_once()
         keys=[k for k in self.store.jobs if k.startswith('provider-poll-')]
         self.assertEqual(len(keys),2);self.assertEqual(self.store.jobs[oldkey],old)
+        self.assertEqual(self.store.jobs[max(keys)]['attempts'],2)
     def test_committed_hash_conflict_on_idle_revokes_without_acquisition(self):
         self.client.bad_hash=True
         with self.assertRaisesRegex(LifecycleFailure,'canonical_conflict'):self.run_once()
