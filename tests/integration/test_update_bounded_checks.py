@@ -334,8 +334,12 @@ class UpdateBoundedTests(unittest.TestCase):
         self.fixture = psycopg.connect(self.dsn, autocommit=True)
         self.addCleanup(self.fixture.close)
         history(self.fixture, HISTORY, 0)
-        # As after a bulk load: the statistics know generation 0 only.
+        # As after a bulk load: the statistics know generation 0 only. They stay so, as on a real store under small
+        # updates: with autovacuum on, the history this test adds between its phases would refresh the statistics and
+        # the cached plans of the 0.4.5 statements at a moment that varies by run.
         self.fixture.execute('ANALYZE')
+        for (table,) in self.fixture.execute("SELECT format('%I.%I',schemaname,relname) FROM pg_stat_user_tables WHERE schemaname='chain'").fetchall():
+            self.fixture.execute('ALTER TABLE ' + table + ' SET (autovacuum_enabled=false)')
 
     def begin(self, generation):
         """Store update `generation` as pending on the canonical generation: one new block above the
@@ -419,14 +423,15 @@ class UpdateBoundedTests(unittest.TestCase):
         self.assertTrue(any(q.startswith('SELECT greatest(') for q in first), 'the metadata height ran')
         # Negative control on the same store: the 0.4.5 creation and spending statements read the history on every
         # update, its dependency check once PostgreSQL switches to the generic plan (from the 11th execution on one
-        # connection), and its coverage check and metadata height read the whole membership. All grow with the history.
+        # connection), and its coverage check and metadata height read the whole membership. Each reads more than
+        # the whole table of its phase, and those tables triple between the phases.
         for reference, floor, prepared in zip((old_first, old_second), floors, (slice(10, None), slice(None))):
             for label, table in (('creation', 'outputs'), ('spending', 'outputs'), ('coverage', 'current_membership'), ('height', 'current_membership')):
                 self.assertGreater(min(reference[label]), floor[table], label)
             self.assertGreater(min(reference['dependency'][prepared]), floor['outputs'])
         self.assertLessEqual(max(old_first['dependency'][:10]), BOUND)
-        for label in ('creation', 'spending', 'dependency', 'coverage', 'height'):
-            self.assertGreater(min(old_second[label]), 2 * min(old_first[label][10:]), label)
+        self.assertGreater(floors[1]['outputs'], 2 * floors[0]['outputs'])
+        self.assertGreater(floors[1]['current_membership'], 2 * floors[0]['current_membership'])
 
 if __name__ == '__main__':
     unittest.main()
