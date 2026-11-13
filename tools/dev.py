@@ -118,9 +118,11 @@ def integration(image, shard, token):
     try:
         # The server runs beside a keep-alive loop so a test-requested restart keeps the container
         # (and the test container's network namespace) alive.
+        # Its data directory is tmpfs inside the container's memory limit, and recycled WAL stays there:
+        # max_wal_size keeps WAL to an eighth of the limit (the 1 GB default took half of it).
         docker('run', '--detach', '--name', pg, '--network', 'none', *LIMITS, '--tmpfs', '/var/lib/postgresql/data:rw',
                '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', '--entrypoint', 'bash', PG_IMAGE,
-               '-c', 'docker-entrypoint.sh postgres & while :; do sleep 1; done', stdout=subprocess.DEVNULL)
+               '-c', 'docker-entrypoint.sh postgres -c max_wal_size=256MB & while :; do sleep 1; done', stdout=subprocess.DEVNULL)
         started = True
         wait_ready(pg)
         controller = threading.Thread(target=restart_controller, args=(pg, control, stop), daemon=True)
