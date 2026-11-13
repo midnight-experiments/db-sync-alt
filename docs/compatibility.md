@@ -1,6 +1,6 @@
 # Compatibility
 
-What db-sync-alt 0.4.4 supports. Anything not listed is refused at startup or
+What db-sync-alt 0.4.5 supports. Anything not listed is refused at startup or
 treated as unsupported.
 
 | Component | Supported | Notes |
