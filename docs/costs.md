@@ -42,6 +42,13 @@ Every attempt is counted before it is sent, including failures and usage
 checks. Restarting the process never resets a count. When the daily ceiling is
 reached the service waits for the next UTC day (`quota_exhausted`).
 
+Quota decisions use the ledger's count. Once per 10,000 requests counted in the
+ledger, and on the first request of a new database, the service asks Blockfrost
+for the key's usage (`/metrics`). That adds the requests other hosts made with
+the same key. The database keeps the count since the last check, across
+restarts and UTC days. Between checks, requests from other hosts show only when
+Blockfrost answers HTTP 402, which ends the day at once (`quota_exhausted`).
+
 Each update is sized to its blocks: it takes as many blocks as fit three
 quarters of its budget at one request per transaction (two with relevance
 filtering, which also holds at most two blocks per update), and at least one.

@@ -185,7 +185,8 @@ class ProviderTests(unittest.TestCase):
             with self.subTest(code=code),tempfile.TemporaryDirectory() as tmp:
                 client=p.PortableClient(KEY,tmp,network=PREPROD,transport=lambda path,code=code:(code,{},b'{}'),clock=lambda:self.now[0],sleep=lambda seconds:None)
                 store=Store();day=dt.datetime.fromtimestamp(self.now[0],dt.timezone.utc).date().isoformat()
-                job={'job_id':'synthetic','attempts':0,'budget':10,'state':'active','kind':'poll','created_at':self.now[0],'metrics_at':self.now[0],'metrics_day':day,'metrics_count':0}
+                store.metrics={'version':1,'day':day,'used':0,'counted':0}  # reconciled already: no /metrics first
+                job={'job_id':'synthetic','attempts':0,'budget':10,'state':'active','kind':'poll','created_at':self.now[0]}
                 provider=AccountedProvider(store,'job',job,client,health(),threading.Event(),clock=lambda:self.now[0],network=PREPROD)
                 with self.assertRaises(exception):provider.get(path)
                 self.assertEqual(client.status()['budget_used'],1);self.assertEqual(store.jobs['job']['attempts'],1)
@@ -196,8 +197,9 @@ class ProviderTests(unittest.TestCase):
         from db_sync_alt.errors import TransientSyncFailure,LifecycleFailure
         day=dt.datetime.fromtimestamp(self.now[0],dt.timezone.utc).date().isoformat()
         def accounted(client):
-            job={'job_id':'synthetic','attempts':0,'budget':10,'state':'active','kind':'poll','created_at':self.now[0],'metrics_at':self.now[0],'metrics_day':day,'metrics_count':0}
-            store=Store();return store,AccountedProvider(store,'job',job,client,health(),threading.Event(),clock=lambda:self.now[0],network=PREPROD)
+            job={'job_id':'synthetic','attempts':0,'budget':10,'state':'active','kind':'poll','created_at':self.now[0]}
+            store=Store();store.metrics={'version':1,'day':day,'used':0,'counted':0}  # reconciled already: no /metrics first
+            return store,AccountedProvider(store,'job',job,client,health(),threading.Event(),clock=lambda:self.now[0],network=PREPROD)
         class StatusOnly:
             """Raises the provider client's error with an HTTP status and no machine text."""
             def __init__(self,code):self.code=code;self.calls=[]
@@ -228,8 +230,9 @@ class ProviderTests(unittest.TestCase):
                 def fail(path):raise exception
                 c=p.PortableClient(KEY,tmp,network=PREPROD,transport=fail,clock=lambda:self.now[0])
                 day=dt.datetime.fromtimestamp(self.now[0],dt.timezone.utc).date().isoformat()
-                job={'job_id':'synthetic','attempts':0,'budget':10,'state':'active','kind':'poll','created_at':self.now[0],'metrics_at':self.now[0],'metrics_day':day,'metrics_count':0}
-                store=Store();provider=AccountedProvider(store,'job',job,c,health(),threading.Event(),clock=lambda:self.now[0],network=PREPROD)
+                job={'job_id':'synthetic','attempts':0,'budget':10,'state':'active','kind':'poll','created_at':self.now[0]}
+                store=Store();store.metrics={'version':1,'day':day,'used':0,'counted':0}  # reconciled already: no /metrics first
+                provider=AccountedProvider(store,'job',job,c,health(),threading.Event(),clock=lambda:self.now[0],network=PREPROD)
                 with self.assertRaises(TransientSyncFailure) as error:provider.get('/blocks/latest')
                 self.assertEqual(store.jobs['job']['error_code'],expected);self.assertNotIn(KEY,str(error.exception))
         shared=object.__new__(p.SharedClient)

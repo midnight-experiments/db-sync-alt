@@ -15,7 +15,7 @@ import uuid
 
 from db_sync_alt.contract import canonical, Refusal
 from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure
-from db_sync_alt.store.database import connect
+from db_sync_alt.store.database import connect, metrics_marker, save_metrics_marker
 from psycopg.types.json import Jsonb
 
 POLL_LOCK = (36, 3)
@@ -230,6 +230,13 @@ class PollBudgetStore:
         if changed != 1:
             raise LifecycleFailure('invalid_sync_job')
         self.previous[key] = copy.deepcopy(body)
+
+    def metrics_marker(self):
+        return metrics_marker(self.db)
+
+    def save_metrics_marker(self, body, expected=None):
+        self._owner()
+        save_metrics_marker(self.db, body, expected)
 
     def close(self):
         self.db.close()

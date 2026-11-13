@@ -18,7 +18,7 @@ def health():
 class Store:
     def __init__(self,security=2160):
         self.jobs={};self.target=100;self.gid=0;self._pending=None;self.revoked=False;self.saved=[];self.security=security
-        self.tx_counts={}
+        self.tx_counts={};self.metrics=None
     def generation(self):
         return {'id':self.gid,'target_height':self.target,'witness_height':self.target+self.security,
                 'manifest':{'anchors':{'target':{'height':self.target,'hash':block(self.target)['hash']}}}}
@@ -35,6 +35,9 @@ class Store:
         elif old and old['state']!='completed' and not (continues(old,body) and self.jobs.get(ARCHIVE+old['job_id'])==old):
             raise AssertionError('nonterminal_rollover')
         self.jobs[key]=copy.deepcopy(body);self.saved.append((key,copy.deepcopy(body)))
+    def metrics_marker(self):return copy.deepcopy(self.metrics)
+    def save_metrics_marker(self,body,expected=None):
+        if expected is None or self.metrics==expected:self.metrics=copy.deepcopy(body)
     def mark_conflict(self):self.revoked=True
 
 class Client:

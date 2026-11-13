@@ -130,7 +130,9 @@ this check and the owner's observations reach the database the writer holds.
 
 Every Blockfrost request is reserved in a durable ledger before it is sent,
 including failures. The ledger enforces the daily ceiling and the request rate;
-the database keeps a per-job budget for polling and for each update. The poller
+the database keeps a per-job budget for polling and for each update, and the
+ledger count since the last Blockfrost usage check (`/metrics`), which runs once
+per 10,000 counted requests. The poller
 observes the chain tip every 20 seconds, independently of acquisition; health
 reports gaps and missed ticks. No health request ever calls the provider. See
 [costs](costs.md).
