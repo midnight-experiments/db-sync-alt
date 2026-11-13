@@ -352,17 +352,24 @@ class PgStore:
         from db_sync_alt.store.incremental import publish_incremental
         return publish_incremental(self,generation,ticket,stop_requested=stop_requested)
     def membership_sql(self,generation):
+        parts=self.membership_parts(generation)
+        return ' UNION ALL '.join(query for query,_ in parts),tuple(arg for _,args in parts for arg in args)
+    def membership_parts(self,generation):
+        """`generation`'s block bindings as (query, args) parts, each of height and hash; their UNION ALL is
+        `membership_sql`. PostgreSQL does not flatten a UNION ALL member with a WHERE clause, so a statement
+        that must reach a part's height or hash index uses the parts one by one."""
         if self.supports_incremental:
             current=self.state()['canonical_ready']
-            if generation==current:return 'SELECT height,hash FROM chain.current_membership',()
+            if generation==current:return [('SELECT height,hash FROM chain.current_membership',())]
             reuse=self.db.execute('SELECT through_height FROM chain.generation_reuse WHERE generation=%s',(generation,)).fetchone()
             if reuse and self.generation(generation)['parent']==current:
-                return 'SELECT height,hash FROM chain.current_membership WHERE height<=%s UNION ALL SELECT height,hash FROM chain.membership_delta WHERE generation=%s',(reuse[0],generation)
-            return 'SELECT height,hash FROM chain.membership(%s)',(generation,)
-        return '''WITH RECURSIVE lineage(id,ceiling) AS (
+                return [('SELECT height,hash FROM chain.current_membership WHERE height<=%s',(reuse[0],)),
+                        ('SELECT height,hash FROM chain.membership_delta WHERE generation=%s',(generation,))]
+            return [('SELECT height,hash FROM chain.membership(%s)',(generation,))]
+        return [('''WITH RECURSIVE lineage(id,ceiling) AS (
           SELECT id,witness_height FROM chain.generations WHERE id=%s UNION ALL
           SELECT p.id,p.target_height FROM lineage l JOIN chain.generations c ON c.id=l.id JOIN chain.generations p ON p.id=c.parent
-        ) SELECT gb.height,gb.hash FROM lineage l JOIN chain.generation_blocks gb ON gb.generation=l.id AND gb.height<=l.ceiling''',(generation,)
+        ) SELECT gb.height,gb.hash FROM lineage l JOIN chain.generation_blocks gb ON gb.generation=l.id AND gb.height<=l.ceiling''',(generation,))]
     def iter_block_membership(self,generation):
         with self.db.cursor(name='membership_'+uuid.uuid4().hex,withhold=True) as cur:
             cur.execute('SELECT height,hash FROM chain.membership(%s) ORDER BY height',(generation,))
@@ -642,7 +649,10 @@ class PgStore:
         return None if row is None else row[0]
     def last_metadata_height(self,generation):
         if self.supports_incremental and self.db.execute('SELECT 1 FROM chain.generation_reuse WHERE generation=%s',(generation,)).fetchone():
-            query,args=self.membership_sql(generation);return self.db.execute('SELECT max(height) FROM ('+query+') m',args).fetchone()[0]
+            # Each part's max() reads the top of its height index; one max() over their UNION ALL reads every inherited height.
+            parts=self.membership_parts(generation)
+            return self.db.execute('SELECT greatest('+','.join('(SELECT max(height) FROM ('+query+') m)' for query,_ in parts)+')',
+                                   tuple(arg for _,args in parts for arg in args)).fetchone()[0]
         return self.db.execute('SELECT max(height) FROM chain.generation_blocks WHERE generation=%s',(generation,)).fetchone()[0]
     def last_event_height(self,generation):return self.db.execute("SELECT max(unit::bigint) FROM chain.checkpoints WHERE generation=%s AND phase='events' AND unit~'^[0-9]+$'",(generation,)).fetchone()[0]
 

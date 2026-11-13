@@ -9,6 +9,12 @@ when the statement ends, so no other statement runs under it.
 VERIFICATION_TIMEOUT: these statements cost about 3 µs per row with a warm cache and up to about 35 µs
 per row when every row is a cold index lookup. One statement over 10 M rows at 100 times the warm cost
 (300 µs per row) takes 3,000 s; the limit is one hour. It stays bounded, so a runaway plan still ends.
+
+`check`, `check_all` and `any_row` run their statement unprepared, so PostgreSQL plans it with its
+parameters every time. A follow repeats the same checks for every update on one connection: psycopg
+prepares a statement on its fifth execution, and after five more PostgreSQL may switch to a generic
+plan that cannot see the generation number. For `first_generation=$1` that plan reads the whole
+table instead of the update's rows through `delta_<table>` (issue 00054).
 """
 from contextlib import contextmanager
 import json
@@ -60,13 +66,13 @@ def bulk(db):
 def check(db, query, params=None):
     """The first row of one verification statement run under VERIFICATION_TIMEOUT (None: no row)."""
     with verification(db, query, params):
-        return db.execute(query, params).fetchone()
+        return db.execute(query, params, prepare=False).fetchone()
 
 
 def check_all(db, query, params=None):
     """Every row of one verification statement run under VERIFICATION_TIMEOUT."""
     with verification(db, query, params):
-        return db.execute(query, params).fetchall()
+        return db.execute(query, params, prepare=False).fetchall()
 
 
 def any_row(db, query, params=None):
@@ -78,7 +84,7 @@ def any_row(db, query, params=None):
     whole result, with hash or merge joins."""
     counted = 'SELECT count(*) FROM (' + query + ') found'
     with verification(db, counted, params):
-        return db.execute(counted, params).fetchone()[0] > 0
+        return db.execute(counted, params, prepare=False).fetchone()[0] > 0
 
 
 def _relations(node):

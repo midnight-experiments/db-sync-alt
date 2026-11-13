@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Following the chain no longer slows down as the store's history grows: the
+  checks of each published update now read the update's own rows.
+  - **Before:** on the real Mainnet store, the relevance follow of 0.4.5
+    served 37.7 blocks per hour while Mainnet produced 181.5. About 175 s of
+    each 191 s update went to checks. The historical selected-event checks
+    re-read every block since the store's start, about 1 M blocks. From the
+    eleventh update of a process, PostgreSQL also switched the dependency
+    checks to generic plans, which scanned whole tables. The update's
+    transaction coverage check and the lookup of its last stored header read
+    the whole stored block membership.
+  - **Now:** each check starts from the rows the update added, through the
+    `delta_<table>` indexes. Verification statements are planned with their
+    parameters on every run. Membership lookups use the height and hash indexes
+    of each part of the membership. A check reads a few dozen buffers however
+    long the history is.
+- The checks give the same answers and refuse with the same codes. No format,
+  schema, manifest or refusal change.
+
 ## 0.4.5
 
 - `db-sync-alt upgrade` of a Mainnet-sized store no longer fails on a slow disk

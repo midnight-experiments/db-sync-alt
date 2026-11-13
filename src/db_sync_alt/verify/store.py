@@ -131,15 +131,7 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
     if not isinstance(m.get('required_epochs'),list) or any(type(e) is not int for e in m['required_epochs']):raise Refusal('epoch_bounds_mismatch')
     first=store.block_at(gen,g['start_height']);target=store.block_at(gen,g['target_height'])
     if first is None or target is None or m.get('required_epochs')!=required_epochs(first['epoch'],target['epoch']):raise Refusal('epoch_bounds_mismatch')
-    membership,args=store.membership_sql(gen) if delta else ('SELECT * FROM chain.membership(%s)',(gen,))
-    scope='=' if delta else '<='
-    if any_row(db,'SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN ('+membership+') m ON m.hash=b.hash WHERE t.first_generation'+scope+'%s AND (m.hash IS NULL OR b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1))',(*args,gen,g['target_height'])):raise Refusal('transaction_coverage_invalid')
-    # Physical FK validity alone does not guarantee referenced facts belong to this prefix. A datum
-    # has no such order: like cardano-db-sync, it is stored when its preimage is first seen, which may
-    # be when a later generation spends the output.
-    relationships=[('transactions','blocks','c.block_hash=p.hash'),('outputs','transactions','c.tx_hash=p.hash'),('inputs','transactions','c.tx_hash=p.hash'),('inputs','outputs','c.origin_hash=p.tx_hash AND c.origin_index=p.output_index'),('output_assets','outputs','c.tx_hash=p.tx_hash AND c.output_index=p.output_index'),('output_assets','assets','c.policy=p.policy AND c.name=p.name'),('mints','transactions','c.tx_hash=p.hash'),('mints','assets','c.policy=p.policy AND c.name=p.name')]
-    for child,parent,join in relationships:
-        if check(db,'SELECT 1 FROM chain.'+child+' c JOIN chain.'+parent+' p ON '+join+' WHERE c.first_generation'+scope+'%s AND p.first_generation>c.first_generation LIMIT 1',(gen,)):raise Refusal('dependency_generation_invalid')
+    verify_fact_placement(store,g,delta=delta)
     if not delta and check(db,'SELECT 1 FROM chain.inputs WHERE first_generation<=%s GROUP BY origin_hash,origin_index HAVING count(*)>1 LIMIT 1',(gen,)):raise Refusal('contradictory_ordinary_spend')
     for checkpoint in store.checkpoint_rows(generation=gen):
         phase=checkpoint['phase'];receipt=checkpoint['receipt']
@@ -200,6 +192,33 @@ def verify_structure(store,g,*,require_ready=False,delta_parent=None):
             tx=db.execute('SELECT 1 FROM chain.transactions WHERE block_hash=%s AND first_generation<=%s LIMIT 1',(h,gen)).fetchone()
             epochs=store.checkpoint_rows(generation=gen,phase='epochs')
             if not tx and not any(c['receipt'].get('epoch_end',{}).get('hash')==h.hex() for c in epochs):raise Refusal('unexpected_membership')
+
+
+# (child, parent, join): a fact and the fact it depends on.
+DEPENDENCIES=[('transactions','blocks','c.block_hash=p.hash'),('outputs','transactions','c.tx_hash=p.hash'),('inputs','transactions','c.tx_hash=p.hash'),('inputs','outputs','c.origin_hash=p.tx_hash AND c.origin_index=p.output_index'),('output_assets','outputs','c.tx_hash=p.tx_hash AND c.output_index=p.output_index'),('output_assets','assets','c.policy=p.policy AND c.name=p.name'),('mints','transactions','c.tx_hash=p.hash'),('mints','assets','c.policy=p.policy AND c.name=p.name')]
+
+
+def verify_fact_placement(store,g,*,delta):
+    """Every transaction of `g` (delta: of its update only) is in a block of its membership at or
+    below the target, and no fact was first stored before a fact it depends on."""
+    gen=g['id'];db=store.db
+    misplaced='b.height>%s OR t.tx_index>=b.tx_count OR t.valid NOT IN (0,1)'
+    if delta:
+        # The update's transactions, each looked up by hash in every membership part (see `membership_parts`).
+        parts=store.membership_parts(gen)
+        unbound=' AND '.join('NOT EXISTS(SELECT 1 FROM ('+query+') m WHERE m.hash=b.hash)' for query,_ in parts)
+        coverage=('SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash WHERE t.first_generation=%s AND (('+unbound+') OR '+misplaced+')',
+                  (gen,*(arg for _,args in parts for arg in args),g['target_height']))
+    else:
+        coverage=('SELECT 1 FROM chain.transactions t JOIN chain.blocks b ON b.hash=t.block_hash LEFT JOIN (SELECT * FROM chain.membership(%s)) m ON m.hash=b.hash WHERE t.first_generation<=%s AND (m.hash IS NULL OR '+misplaced+')',
+                  (gen,gen,g['target_height']))
+    if any_row(db,*coverage):raise Refusal('transaction_coverage_invalid')
+    scope='=' if delta else '<='
+    # Physical FK validity alone does not guarantee referenced facts belong to this prefix. A datum
+    # has no such order: like cardano-db-sync, it is stored when its preimage is first seen, which may
+    # be when a later generation spends the output.
+    for child,parent,join in DEPENDENCIES:
+        if check(db,'SELECT 1 FROM chain.'+child+' c JOIN chain.'+parent+' p ON '+join+' WHERE c.first_generation'+scope+'%s AND p.first_generation>c.first_generation LIMIT 1',(gen,)):raise Refusal('dependency_generation_invalid')
 
 
 def verify_checkpoint(store,g,computed,checkpoint,*,require_ready=True):
@@ -271,28 +290,63 @@ def validate_prior_answers(store,generation):
     selectors conservatively reject historical outputs/spends at supported
     governance/permissioned addresses/assets; no arbitrary pre-S ban.
     """
+    for code,query,params in prior_answer_checks(store,generation):
+        if any_row(store.db,query,params):raise Refusal(code)
+
+
+def prior_answer_checks(store,generation):
+    """The statements of `validate_prior_answers`, in order: (refusal code, query, params). A statement
+    that finds a row refuses with its code; a generation without a parent has none.
+
+    Each statement starts from the update's own rows, the rows first stored after the parent, which
+    `delta_<table>` finds: one UNION ALL branch per table whose row can be new. The parent's interval
+    and the selectors filter those rows, so a check costs the size of the update, not of the history it
+    guards (issue 00054)."""
     g=store.generation(generation)
-    if g['parent'] is None:return
-    parent=store.generation(g['parent']);pid=parent['id'];db=store.db
+    if g['parent'] is None:return []
+    parent=store.generation(g['parent']);pid=parent['id']
     configs=store.meta('profile')['configs'];cn=configs['cnight-config'];mapping=cn['addresses']['mapping_validator_address']
     night_policy=bytes.fromhex(cn['addresses']['cnight_policy_id']);night_name=cn['addresses']['cnight_asset_name'].encode()
     auth_policy=mapping_policy(mapping)
     start=(parent['start_height'],parent['start_index']);end=parent['target_height']
     interval='(b.height,t.tx_index)>=(%s,%s) AND b.height<=%s'
-    creation="""SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE (a.first_generation>%s OR o.first_generation>%s OR t.first_generation>%s) AND a.first_generation<=%s AND """+interval+""" AND ((a.policy=%s AND a.name=%s) OR (o.address=%s AND o.datum_hash IS NOT NULL AND a.policy=%s AND a.name=''::bytea AND a.quantity=1))"""
-    if any_row(db,creation,(pid,pid,pid,generation,*start,end,night_policy,night_name,mapping,auth_policy)):raise Refusal('historical_selected_event_changed')
-    spending="""SELECT 1 FROM chain.inputs i JOIN chain.transactions t ON t.hash=i.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index WHERE (i.first_generation>%s OR EXISTS(SELECT 1 FROM chain.output_assets changed WHERE changed.tx_hash=o.tx_hash AND changed.output_index=o.output_index AND changed.policy=%s AND changed.name=%s AND changed.first_generation>%s AND changed.first_generation<=%s)) AND i.first_generation<=%s AND """+interval+""" AND ((o.address=%s AND o.datum_hash IS NOT NULL) OR EXISTS(SELECT 1 FROM chain.output_assets a WHERE a.tx_hash=o.tx_hash AND a.output_index=o.output_index AND a.policy=%s AND a.name=%s))"""
-    if any_row(db,spending,(pid,night_policy,night_name,pid,generation,generation,*start,end,mapping,night_policy,night_name)):raise Refusal('historical_selected_event_changed')
+    # A selected creation in the parent's interval whose asset entry, output or transaction is new.
+    created=(' FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index'
+             ' JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash'
+             ' WHERE a.first_generation<=%s AND '+interval+" AND ((a.policy=%s AND a.name=%s) OR (o.address=%s"
+             " AND o.datum_hash IS NOT NULL AND a.policy=%s AND a.name=''::bytea AND a.quantity=1)) AND ")
+    args=(generation,*start,end,night_policy,night_name,mapping,auth_policy)
+    checks=[('historical_selected_event_changed',
+             ' UNION ALL '.join('SELECT 1'+created+new+'>%s' for new in ('a.first_generation','o.first_generation','t.first_generation')),
+             (*args,pid)*3)]
+    # A selected spend in the parent's interval whose input is new, or whose spent output has a new night entry.
+    spent=(' JOIN chain.transactions t ON t.hash=i.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash'
+           ' WHERE i.first_generation<=%s AND '+interval+' AND ((o.address=%s AND o.datum_hash IS NOT NULL)'
+           ' OR EXISTS(SELECT 1 FROM chain.output_assets a WHERE a.tx_hash=o.tx_hash AND a.output_index=o.output_index AND a.policy=%s AND a.name=%s)) AND ')
+    args=(generation,*start,end,mapping,night_policy,night_name)
+    checks.append(('historical_selected_event_changed',
+                   'SELECT 1 FROM chain.inputs i JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index'+spent+'i.first_generation>%s'
+                   ' UNION ALL SELECT 1 FROM chain.output_assets changed JOIN chain.outputs o ON o.tx_hash=changed.tx_hash AND o.output_index=changed.output_index'
+                   ' JOIN chain.inputs i ON i.origin_hash=o.tx_hash AND i.origin_index=o.output_index'+spent+
+                   'changed.policy=%s AND changed.name=%s AND changed.first_generation>%s AND changed.first_generation<=%s',
+                   (*args,pid,*args,night_policy,night_name,pid,generation)))
     permissioned=bytes.fromhex(configs['permissioned-candidates-config']['permissioned_candidates_policy_id'].removeprefix('0x'))
     gov=[(v['address'],bytes.fromhex(v['policy_id'])) for v in configs['federated-authority-config'].values()]
     for address,policy in [(None,permissioned),*gov]:
         selector='a.policy=%s'+(' AND o.address=%s' if address else '')
         params=(policy,address) if address else (policy,)
-        base=' FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash WHERE '+selector
-        if any_row(db,'SELECT 1'+base+' AND b.height<=%s AND (a.first_generation>%s OR o.first_generation>%s) AND a.first_generation<=%s',(*params,end,pid,pid,generation)):raise Refusal('historical_state_changed')
-        if check(db,'SELECT 1 FROM chain.inputs i JOIN chain.transactions spending ON spending.hash=i.tx_hash JOIN chain.blocks sb ON sb.hash=spending.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index JOIN chain.output_assets a ON a.tx_hash=o.tx_hash AND a.output_index=o.output_index WHERE '+selector+' AND sb.height<=%s AND i.first_generation>%s AND i.first_generation<=%s LIMIT 1',(*params,end,pid,generation)):raise Refusal('historical_state_changed')
+        held=('SELECT 1 FROM chain.output_assets a JOIN chain.outputs o ON o.tx_hash=a.tx_hash AND o.output_index=a.output_index'
+              ' JOIN chain.transactions t ON t.hash=o.tx_hash JOIN chain.blocks b ON b.hash=t.block_hash'
+              ' WHERE '+selector+' AND b.height<=%s AND a.first_generation<=%s AND ')
+        checks.append(('historical_state_changed',held+'a.first_generation>%s UNION ALL '+held+'o.first_generation>%s',(*params,end,generation,pid)*2))
+        checks.append(('historical_state_changed','SELECT 1 FROM chain.inputs i JOIN chain.transactions spending ON spending.hash=i.tx_hash'
+                       ' JOIN chain.blocks sb ON sb.hash=spending.block_hash JOIN chain.outputs o ON o.tx_hash=i.origin_hash AND o.output_index=i.origin_index'
+                       ' JOIN chain.output_assets a ON a.tx_hash=o.tx_hash AND a.output_index=o.output_index'
+                       ' WHERE '+selector+' AND sb.height<=%s AND i.first_generation>%s AND i.first_generation<=%s',(*params,end,pid,generation)))
     for table in ('epoch_nonces','epoch_stakes'):
-        if check(db,'SELECT 1 FROM chain.'+table+' WHERE epoch=ANY(%s) AND first_generation>%s AND first_generation<=%s LIMIT 1',(parent['manifest']['required_epochs'],pid,generation)):raise Refusal('historical_epoch_changed')
+        checks.append(('historical_epoch_changed','SELECT 1 FROM chain.'+table+' WHERE epoch=ANY(%s) AND first_generation>%s AND first_generation<=%s',
+                       (parent['manifest']['required_epochs'],pid,generation)))
+    return checks
 
 
 def physical_inventory(store):
