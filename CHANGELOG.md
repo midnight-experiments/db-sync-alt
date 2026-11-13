@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.5
 
 - `db-sync-alt upgrade` of a Mainnet-sized store no longer fails on a slow disk
   while it builds the served tables.
@@ -22,6 +22,8 @@
   publications run the same statements as before.
 - The served rows, their order and `serve.verify` are unchanged. No format,
   schema, manifest or refusal change.
+- Upgrading from 0.4.4 is an image swap: no schema, format or backup change. A
+  pending generation started on 0.4.4 resumes on 0.4.5.
 
 - The epochs phase of a SQL bootstrap no longer slows down as the source tip
   moves past the epochs it reads: each epoch's last block is found among that
