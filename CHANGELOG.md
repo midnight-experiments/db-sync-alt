@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.6
 
 - Following the chain no longer slows down as the store's history grows: the
   checks of each published update now read the update's own rows.
@@ -19,6 +19,8 @@
     long the history is.
 - The checks give the same answers and refuse with the same codes. No format,
   schema, manifest or refusal change.
+- Upgrading from 0.4.5 is an image swap: no schema, format or backup change. A
+  pending generation started on 0.4.5 resumes on 0.4.6.
 
 ## 0.4.5
 
