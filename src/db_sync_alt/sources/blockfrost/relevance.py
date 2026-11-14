@@ -19,11 +19,33 @@ MAX_KEYS=200000
 # body byte. Outputs, inputs, datums and transactions add fewer than 5 per byte; mints match assets. MAX_BLOCK_BODY
 # is Conway's maxBlockBodySize (follow it if governance raises it); 64 KiB covers the proof's fixed fields.
 MAX_BLOCK_BODY=90112
-MAX_PROOF=66*MAX_BLOCK_BODY+64*1024
-# Every inventory key takes at least 63 bytes of its block's proof (an asset key with an empty name), so one block
-# adds at most MAX_PROOF // 63 keys (fewer than MAX_KEYS: a maximal block fits a one-block generation), and a
-# generation of at most MAX_BLOCKS blocks can never pass MAX_KEYS.
-MAX_BLOCKS=MAX_KEYS//(MAX_PROOF//63)
+PROOF_PER_BODY_BYTE=66
+PROOF_FIXED=64*1024
+MAX_PROOF=PROOF_PER_BODY_BYTE*MAX_BLOCK_BODY+PROOF_FIXED
+# Every inventory key takes at least KEY_PROOF bytes of its block's proof (an asset key with an empty name), so one
+# block adds at most MAX_PROOF // KEY_PROOF keys (fewer than MAX_KEYS: a maximal block fits a one-block generation),
+# and MAX_BLOCKS maximal blocks never pass MAX_KEYS together.
+KEY_PROOF=63
+MAX_BLOCKS=MAX_KEYS//(MAX_PROOF//KEY_PROOF)
+
+
+def block_keys_bound(transactions,raw_bytes):
+    """At least the inventory keys one block can add to its generation, from its own transactions: 0 for an empty
+    block, else the MAX_PROOF derivation applied to `raw_bytes`, the bytes of the block's transaction CBOR (bodies,
+    witnesses, validity flags and auxiliary data, so at least its bodies' bytes)."""
+    return 0 if not transactions else (PROOF_PER_BODY_BYTE*raw_bytes+PROOF_FIXED)//KEY_PROOF
+
+
+def generation_blocks(bounds):
+    """How many blocks of `bounds` (each block's `block_keys_bound`, in height order) one generation holds: the
+    longest run from the first whose bounds sum to at most MAX_KEYS, and always the first block. The iteration
+    stops at the first block that does not fit, so a lazy `bounds` reads one block past the generation at most."""
+    total=count=0
+    for bound in bounds:
+        total+=bound
+        if count and total>MAX_KEYS:break
+        count+=1
+    return count
 _QUALIFIED=weakref.WeakKeyDictionary()
 ALPHABET='qpzry9x8gf2tvdw0s3jn54khce6mua7l'
 

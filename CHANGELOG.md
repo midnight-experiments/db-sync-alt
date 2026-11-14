@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- A relevance update holds as many blocks as its content allows, up to
+  `max_batch_blocks` (100), instead of at most two.
+  - **Before:** every update with filtering held at most two blocks, the static
+    bound that two maximal blocks can never pass the 200,000-key limit. On the
+    real Mainnet store each update paid its 6 fixed requests for two blocks,
+    and waited for the next 20 s head poll: about 9.9 update requests and 1.0
+    poll request per served block (10.9 in all, measured on 0.4.7), and about
+    357 served blocks per hour.
+  - **Now:** before it declares an update, the follower reads the candidate
+    blocks' transaction pages, which the update reads anyway, and bounds each
+    block's keys by ⌊(66 × its transaction bytes + 65,536) / 63⌋, the derivation
+    the per-block proof limit already uses (0 for an empty block). The update
+    holds the longest run whose bounds fit the key limit, and always one block.
+    The acquisition pass uses those pages; the independent pass reads its own.
+    The first block that does not fit starts the next update without another
+    read. No request is added. On the measured Mainnet blocks an update holds
+    about 20 blocks.
+- `follow_min_blocks` above 2 now sets the number of blocks per update at the
+  chain tip with filtering. `deploy/mainnet-relevance-sync.json` (3 blocks,
+  60 s) saves about 7,000 requests a day at the Mainnet tip.
+- A one-shot `acquire --relevance` target stays at most two blocks after the
+  ready one. Resuming a pending update through `acquire` is unchanged.
+- No format, schema, manifest or refusal change. Upgrading from 0.4.7 is an
+  image swap. Return to an earlier release only at a completed publication,
+  with no update in progress: an earlier release declares an unfinished update
+  job's whole target without sizing it.
+
 ## 0.4.7
 
 - Each relevance update makes one provider request fewer. It takes the witness

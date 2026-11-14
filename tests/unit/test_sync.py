@@ -154,11 +154,12 @@ class SyncTests(unittest.TestCase):
         self.config.sync={'acquisition_request_budget':100};self.client.confirmed=1000;self.store.tx_counts[101]=500
         self.run_once()
         self.assertEqual(self.update.calls,[(101,101)])
-    def test_sizing_counts_both_relevance_passes_and_caps_relevance_generations(self):
+    def test_sizing_counts_both_relevance_passes_and_leaves_the_relevance_limit_to_the_content(self):
         from db_sync_alt.sources.blockfrost.sync import job_target
         ready=self.store.generation();top=ready['target_height']
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+100)
-        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+2)
+        # The update sizes a relevance generation by its blocks' content; the job's target is only its limit.
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+100)
         self.store.tx_counts.update({h:2000 for h in range(top+1,top+101)})
         # 2 x (21 pages + 2,000 /utxos) per block: one block fits 7,500 (full mode: three).
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+1)
@@ -170,6 +171,35 @@ class SyncTests(unittest.TestCase):
         self.assertLess(relevance.MAX_PROOF//63,relevance.MAX_KEYS)
         self.assertEqual(relevance.MAX_BLOCKS,2)
         self.assertLessEqual(relevance.MAX_BLOCKS*(relevance.MAX_PROOF//63),relevance.MAX_KEYS)
+    def test_an_update_that_lowers_its_job_target_publishes_and_completes_there(self):
+        class Lowering(FixtureUpdate):
+            def __call__(self,store,provider,profile,target,*,hooks):
+                provider.retarget(target-27)
+                return super().__call__(store,provider,profile,target-27,hooks=hooks)
+        self.update=Lowering();self.client.confirmed=1000
+        self.run_once()
+        job=self.store.jobs['provider-active']
+        self.assertEqual(self.update.calls,[(101,173)])
+        self.assertEqual((job['target'],job['witness'],job['state']),(173,173+2160,'completed'))
+        # The lowered target was saved before the generation existed, under the same job.
+        saved=[body for key,body in self.store.saved if key=='provider-active' and body['job_id']==job['job_id']]
+        self.assertEqual([body['target'] for body in saved][:2],[200,173])
+        self.assertEqual(self.store.target,173)
+        self.run_once()
+        self.assertEqual(self.update.calls[-1],(174,246))
+    def test_a_job_target_is_never_raised_and_a_publication_must_be_at_the_job_target(self):
+        class Raising(FixtureUpdate):
+            def __call__(self,store,provider,profile,target,*,hooks):
+                provider.retarget(target+1)
+        self.update=Raising();self.client.confirmed=130
+        with self.assertRaisesRegex(LifecycleFailure,'invalid_sync_job'):self.run_once()
+        self.assertEqual((self.store.jobs['provider-active']['target'],self.store.target),(130,100))
+        class Elsewhere(FixtureUpdate):
+            def __call__(self,store,provider,profile,target,*,hooks):
+                return super().__call__(store,provider,profile,target-1,hooks=hooks)
+        self.store=Store();self.update=Elsewhere()
+        with self.assertRaisesRegex(LifecycleFailure,'invalid_coverage'):self.run_once()
+        self.assertEqual(self.store.jobs['provider-active']['state'],'active')
     def test_sizing_ends_at_the_stored_witness(self):
         from db_sync_alt.sources.blockfrost.sync import job_target
         store=Store(security=3);ready=store.generation()

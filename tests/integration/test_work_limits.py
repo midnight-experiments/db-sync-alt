@@ -328,17 +328,16 @@ class RelevanceModeTests(unittest.TestCase):
         from db_sync_alt.sources.blockfrost import relevance
         # 11 transactions of 100 cNIGHT outputs per block: about 2,200 known fact keys per block. The scenario of
         # 100 such blocks against the 200,000-key limit is scaled by 1/10 to fit the CI job time: 10 blocks
-        # (about 22,000 keys) against a 20,000-key limit. One update of all 10 blocks passes the limit; the
-        # driver's relevance cap (MAX_BLOCKS, derived from the real limits in the unit tests) keeps it out of reach.
+        # (about 22,000 keys) against a 20,000-key limit. One update of all 10 blocks passes the limit; each block's
+        # key bound from its bytes (about 54,000) is above the scaled limit, so every update holds one block.
         transactions = [[self.relevant_outputs(1000 + 11 * b + i) for i in range(11)] for b in range(10)]
         store, routes = self.prepare(transactions)
         with patch.object(relevance, 'MAX_KEYS', 20000):
             pauses = drive(store, real.AccountedFake(routes), rf.PROFILE, rf.T + 10, sync_options={'relevance_enabled': True})
             verify_store(store)
         self.assertEqual(pauses, [])
-        cap = relevance.MAX_BLOCKS
-        self.assertEqual([t - rf.T for t, _ in generations(store)[1:]], list(range(cap, 10, cap)) + [10])
-        self.assertEqual(store.generation()['manifest']['relevance_coverage']['range'], [rf.T + 10 - (10 - 1) % cap, rf.T + 10])
+        self.assertEqual([t - rf.T for t, _ in generations(store)[1:]], list(range(1, 11)))
+        self.assertEqual(store.generation()['manifest']['relevance_coverage']['range'], [rf.T + 10, rf.T + 10])
         digests = store.digests(store.generation()['id'])
         self.assertGreaterEqual(digests['outputs']['count'], 11000)
         self.assertEqual(digests, self.full_follow(transactions, rf.T + 10, routes))
@@ -381,7 +380,8 @@ class RelevanceModeTests(unittest.TestCase):
                 committed = [len(pages(client.calls, b)) for b in (1, 2)]
                 # Both passes (acquisition and independent) read each block's single page.
                 self.assertEqual(committed, [2, 2] if restart else [0, 0])
-                self.assertEqual([len(pages(client.calls, b)) for b in (3, 4)], [2, 2])
+                # The same process keeps the pages it read ahead for the acquisition pass of the blocks not committed yet.
+                self.assertEqual([len(pages(client.calls, b)) for b in (3, 4)], [2, 2] if restart else [1, 1])
                 verify_store(store)
                 self.assertEqual(store.digests(store.generation()['id']), self.full_follow(transactions, rf.T + 4, routes))
 
@@ -464,15 +464,15 @@ class RelevanceModeTests(unittest.TestCase):
         self.assertNotIn(key, independent)
         after = client.calls[client.failed_at:]
         page = lambda b: sum(c.startswith('/blocks/' + rf.H(rf.T + b).hex() + '/txs/cbor') for c in after)
-        self.assertEqual((page(1), page(2)), (0, 2))
+        # The acquisition pass takes block 2's page that the update read ahead; the independent pass reads it again.
+        self.assertEqual((page(1), page(2)), (0, 1))
         # Each pass reads both answers; the spent output is not stored yet, so each pass also reads the creating
         # transaction's answer as the spent output's origin, as an uninterrupted run does.
         self.assertEqual([after.count('/txs/' + t['tx_hash'] + '/utxos') for t in (created, spender)], [4, 2])
         uninterrupted, _ = self.prepare(transactions)
         reads = Fake(copy.deepcopy(routes))
         update_follow(uninterrupted, rf.Provider(50000, reads), rf.PROFILE, rf.T + 2, hooks=FixtureHooks(), relevance_enabled=True)
-        block = lambda calls: sorted(c for c in calls if c.startswith('/blocks/' + rf.H(rf.T + 2).hex() + '/txs/cbor')
-                                     or c in ('/txs/' + created['tx_hash'] + '/utxos', '/txs/' + spender['tx_hash'] + '/utxos'))
+        block = lambda calls: sorted(c for c in calls if c in ('/txs/' + created['tx_hash'] + '/utxos', '/txs/' + spender['tx_hash'] + '/utxos'))
         self.assertEqual(block(after), block(reads.calls))
         verify_store(store)
         self.assertEqual(store.digests(store.generation()['id']), self.full_follow(transactions, rf.T + 2, routes))
@@ -499,7 +499,9 @@ class RelevanceModeTests(unittest.TestCase):
         client = Fake(copy.deepcopy(routes))
         update_follow(store, rf.Provider(50000, client), rf.PROFILE, rf.T + 2, hooks=FixtureHooks(), relevance_enabled=True)
         page = lambda b: sum(c.startswith('/blocks/' + rf.H(rf.T + b).hex() + '/txs/cbor') for c in client.calls)
-        self.assertEqual((page(1), page(2)), (2, 2))
+        # The committed block is derived again from fresh reads by both passes; block 2's page, read ahead by this
+        # process, serves its acquisition pass, and its independent pass reads it again.
+        self.assertEqual((page(1), page(2)), (2, 1))
         verify_store(store)
         self.assertEqual(store.digests(store.generation()['id']), self.full_follow(transactions, rf.T + 2, routes))
 

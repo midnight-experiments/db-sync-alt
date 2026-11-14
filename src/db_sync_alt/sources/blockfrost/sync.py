@@ -337,13 +337,11 @@ def job_target(store, ready, limit, budget, *, relevance):
     The ready generation stores its provisional headers through its witness, so each candidate block's
     transaction count is known without a request: full mode reads `n // 100 + 1` inventory pages of a block of
     n > 0 transactions (the last one short) and one `/utxos` per transaction; relevance mode reads both twice (acquisition and independent pass) and may
-    select every transaction. Relevance generations hold at most `relevance.MAX_BLOCKS` (2) blocks, so their known
-    fact keys can never pass the limit. The estimate only sizes the job; an exhausted job waits and continues.
+    select every transaction. The estimate only sizes the job; an exhausted job waits and continues. In relevance mode
+    the result is a limit: `follow.update_follow` lowers the job's target to the blocks whose own content fits the
+    generation's key limit before it declares the generation.
     """
     first = ready['target_height'] + 1
-    if relevance:
-        from db_sync_alt.sources.blockfrost.relevance import MAX_BLOCKS
-        limit = min(limit, ready['target_height'] + MAX_BLOCKS)
     target, spent = first, 0
     for height in range(first, min(limit, ready['witness_height']) + 1):
         row = store.block_at(ready['id'], height)
@@ -448,6 +446,15 @@ class AccountedProvider(ProviderClient):
     def save(self):
         self.job['attempts'] = self.attempts
         self.store.save_sync_job(self.key, self.job)
+
+    def retarget(self, target):
+        """Lower the acquisition job's target (and its witness) to `target`, durably, before its generation is declared.
+        A job's target is never raised: the sizing that lowers it reads the same blocks again after a restart."""
+        if self.job.get('kind') != 'acquire' or type(target) is not int or not 0 <= target <= self.job['target']:
+            raise LifecycleFailure('invalid_sync_job')
+        if target != self.job['target']:
+            self.job.update(target=target, witness=target + self.network.security)
+            self.save()
 
     def _quota(self):
         value = local_usage(self.client)
@@ -816,7 +823,7 @@ class SyncDriver:
             raise LifecycleFailure('pending_job_missing')
         if self.fixed_target is not None and self.options['relevance_enabled'] and (not active or active['state'] == 'completed'):
             from db_sync_alt.sources.blockfrost.relevance import MAX_BLOCKS
-            # A relevance generation of more blocks could pass the key limit and never publish.
+            # A new one-shot relevance target holds at most MAX_BLOCKS blocks, which always fit one generation.
             if self.fixed_target - ready['target_height'] > MAX_BLOCKS:
                 raise LifecycleFailure('invalid_sync_configuration')
         if active and active['state'] == 'exhausted':
@@ -944,7 +951,8 @@ class SyncDriver:
         if stop_event.is_set():
             return
         provider.set_failure_context('completion')
-        if store.generation()['target_height'] != target:
+        # The update may have lowered the job's target before declaring its generation (relevance sizing).
+        if store.generation()['target_height'] != provider.job['target'] or provider.job['target'] > target:
             raise LifecycleFailure('invalid_coverage')
         provider.job.update(state='completed', completed_at=self.clock(), retry_at=0, failure_count=0)
         provider.save()

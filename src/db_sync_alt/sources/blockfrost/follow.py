@@ -8,7 +8,7 @@ import contextlib
 import copy
 import weakref
 from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, BlockfrostSource, block_row,
-    check_anchor, handoff_overlap, diagnostic_context, complete_inherited_epoch,
+    block_inventory, check_anchor, handoff_overlap, diagnostic_context, complete_inherited_epoch,
     epoch_facts)
 from db_sync_alt.contract import Refusal, digest, required_epochs, generation_capabilities
 
@@ -16,6 +16,13 @@ _QUALIFIED = weakref.WeakKeyDictionary()
 # Per writer store: the relevance source of its pending generation, with the height through which this
 # process re-derived (or acquired) its discovery state from the provider.
 _REBUILT = weakref.WeakKeyDictionary()
+# Per writer store: block inventories read by the look-ahead that sizes a relevance generation, by block hash, each
+# with the receipts of its requests, until the acquisition traversal commits that block.
+_LOOKAHEAD = weakref.WeakKeyDictionary()
+
+
+def _inventories(store):
+    return _LOOKAHEAD.setdefault(store, {})
 
 
 def _relevance_source(store, provider, profile, gen, parent_capability, *, hooks, coverage, relevance_enabled, parent_target):
@@ -36,7 +43,8 @@ def _relevance_source(store, provider, profile, gen, parent_capability, *, hooks
         return entry
     _REBUILT.pop(store, None)
     source = BlockfrostSource(provider, profile, store, gen, stop_requested=hooks.stopped,
-                              relevance_enabled=relevance_enabled, coverage=coverage)
+                              relevance_enabled=relevance_enabled, coverage=coverage,
+                              inventories=_inventories(store) if coverage is not None else None)
     entry = {'generation': gen, 'capability': weakref.ref(parent_capability), 'coverage': copy.deepcopy(coverage),
              'identity': digest(profile.identity), 'source': source, 'through': parent_target}
     if source.coverage is not None:
@@ -164,6 +172,41 @@ def _fetch_suffix(provider, store, base, witness, *, hooks):
     return pages
 
 
+def _trim_suffix(pages, witness):
+    """The suffix pages through `witness`, the last one cut there, and the receipts of the pages wholly above it.
+    A page's receipt stays whole: it covers more rows than the page stores, as at the witness of `_fetch_suffix`."""
+    kept=[(lo,[row for row in rows if row['height']<=witness],receipt) for lo,rows,receipt in pages if lo<=witness]
+    return kept,[receipt for lo,_,receipt in pages if lo>witness]
+
+
+def _size_generation(store, provider, ready, cutoff, pages, limit, *, hooks):
+    """The target of a relevance generation, decided before it is declared: the last of the heights
+    ready+1 ... `limit` whose blocks' key bounds (`relevance.block_keys_bound`) fit MAX_KEYS together, and at least
+    the first. A declared generation can never be shortened, so its keys must fit before it exists.
+
+    Each block's transaction inventory is read here once, with the acquisition traversal's own validated read, and
+    kept by block hash with the receipt of its requests: the acquisition traversal of the events loop takes it from
+    there, and the block's events receipt lists those requests. The first block that does not fit stays kept for the
+    next generation. Headers through the cutoff are the ready generation's; above it they are the fetched suffix's,
+    so a fork sizes the canonical blocks.
+    """
+    from db_sync_alt.sources.blockfrost.relevance import block_keys_bound, generation_blocks
+    fetched={row['height']:row for _,rows,_ in pages for row in rows}
+    headers=[store.block_at(ready['id'],h) if h<=cutoff else fetched[h] for h in range(ready['target_height']+1,limit+1)]
+    kept=_inventories(store)
+    for key in set(kept)-{bytes(row['hash']) for row in headers}:del kept[key]
+
+    def bounds():
+        for row in headers:
+            key=bytes(row['hash'])
+            if key not in kept:
+                if hooks.stopped():raise Refusal('interrupted')
+                transactions,raw=block_inventory(provider,row)
+                kept[key]={'transactions':transactions,'raw_bytes':raw,'requests':provider.drain()['requests']}
+            yield block_keys_bound(kept[key]['transactions'],kept[key]['raw_bytes'])
+    return ready['target_height']+generation_blocks(bounds())
+
+
 def _store_suffix(store, provider, gen, pages, *, hooks):
     """Store a complete fetched suffix in one transaction, one checkpoint per page."""
     if not pages:return 0
@@ -222,7 +265,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
         # A fixed job target comes from an earlier confirmed observation. A
         # provider head now below its witness is a shorter tip: wait, never refuse.
         if target>head['height']-profile.security:provider._wait('provider_unavailable')
-        targetrow=_fresh(provider,target,cached)
+        if coverage is None:targetrow=_fresh(provider,target,cached)
         old_w=_fresh(provider,ready['witness_height'],cached)
         if old_w['hash']==store.block_at(ready['id'],ready['witness_height'])['hash']:
             cutoff=ready['witness_height']
@@ -234,6 +277,21 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
         # exists and stored right after it, with no provider call in between.
         suffix=_fetch_suffix(provider,store,base,witness,hooks=hooks)
         if hooks.stopped():raise Refusal('interrupted')
+        if coverage is not None:
+            # The job's target is a limit: the generation holds the blocks whose own content fits its key limit.
+            # The job is lowered first, so a restart sizes the same blocks again and never declares more.
+            target=_size_generation(store,provider,ready,cutoff,suffix,target,hooks=hooks)
+            if hooks.stopped():raise Refusal('interrupted')
+            provider.retarget(target)
+            witness=target+profile.security
+            suffix,dropped=_trim_suffix(suffix,witness)
+            coverage=requested_coverage(store,profile,target,None,relevance_enabled)
+            cached=_observation_rows(observation,target,profile.network)
+            diagnostic_context(provider,'anchors',block_height=target)
+            targetrow=_fresh(provider,target,cached)
+            # Requests before the declaration that no block of the generation owns.
+            later=provider.drain()
+            prior=dict(later,requests=prior['requests']+[r for receipt in dropped for r in receipt['requests']]+later['requests'])
         # The suffix ends at the witness: unless the poll's head is the witness, its last row is the provider's
         # witness header, parent-linked, so the witness needs no request of its own.
         witnessrow=cached[witness] if witness in cached else suffix[-1][1][-1]
@@ -309,6 +367,7 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
             if source.coverage is not None and height>entry['through']:
                 # Rebuild both discovery streams from fresh provider inventories;
                 # an unsealed pending candidate is never its own coverage proof.
+                _inventories(store).pop(bytes(store.block_at(gen,height)['hash']),None)
                 with _unit(store,entry):
                     facts,stats=source.block_facts(store.block_at(gen,height))
                     old=store.checkpoint_rows(generation=gen,phase='events',unit=height)
@@ -336,10 +395,14 @@ def update_follow(store, provider, profile, target, *, hooks, observation=None, 
                                 diagnostic_context(provider,'events.commit',block_height=height,block_hash=block['hash'],transaction_hash=f.get('tx_hash',f.get('hash') if t=='transactions' else None),transaction_index=f.get('tx_index'))
                                 store.insert(t,f,gen)
                                 if t=='blocks':store.bind_block(gen,f['height'],f['hash'])
-                    store.checkpoint(gen,'events',height,{'lo':height,'hi':height,'source_kind':'blockfrost-cardano',**stats,'provider':provider.drain()})
+                    receipt=provider.drain()
+                    read=_inventories(store).get(bytes(block['hash'])) if source.coverage is not None else None
+                    if read is not None:receipt['requests']=read['requests']+receipt['requests']
+                    store.checkpoint(gen,'events',height,{'lo':height,'hi':height,'source_kind':'blockfrost-cardano',**stats,'provider':receipt})
         except Refusal as exc:
             if exc.code in ('provider_origin_conflict','provider_origin_asset_conflict','immutable_fact_conflict','canonical_block_conflict'):store.mark_conflict()
             raise
+        _inventories(store).pop(bytes(block['hash']),None)
         entry['through']=height
         processed_rows+=len(facts)
         hooks.sample(store,phase='events',committed=height,rows=processed_rows)

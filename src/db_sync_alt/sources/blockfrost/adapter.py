@@ -41,6 +41,9 @@ def integer(v,*,signed=False):
 
 class ProviderClient:
     """Provider base: subclasses implement `get(path)`, `get_optional(path)` (None for HTTP 404) and `drain()`; `pages` walks ascending pages."""
+    def retarget(self,target):
+        """Lower the target of the request job this provider spends, before its generation is declared. A provider
+        without a job record has nothing to change."""
     def pages(self,path):
         page=1
         while True:
@@ -241,8 +244,12 @@ def ledger_effects(response,decoded,resolve_origin=None,cut=None):
 
 
 def inventory(provider,block):
+    return block_inventory(provider,block)[0]
+
+def block_inventory(provider,block):
+    """The block's decoded transactions, checked against its header, and the bytes of their CBOR."""
     diagnostic_context(provider,'events.inventory',block_height=block.get('height'),block_hash=block.get('hash'))
-    if block['tx_count']==0:return []
+    if block['tx_count']==0:return [],0
     if block['tx_count']>10000:raise Refusal('provider_block_transaction_limit')
     txs=[];seen=set();body_bytes=0;raw_bytes=0
     for rows in provider.pages('/blocks/'+block['hash'].hex()+'/txs/cbor'):
@@ -259,7 +266,7 @@ def inventory(provider,block):
             if len(txs)>block['tx_count']:raise Refusal('provider_transaction_count_mismatch')
         diagnostic_context(provider,'events.inventory',block_height=block.get('height'),block_hash=block.get('hash'))
     if len(txs)!=block['tx_count']:raise Refusal('provider_transaction_count_mismatch')
-    return txs
+    return txs,raw_bytes
 
 # Retired pools can still hold stake in an epoch: its distribution is the snapshot taken one epoch earlier,
 # before that boundary reaps retiring pools. Pools retired at E - 2 or later are read for epoch E.
@@ -384,8 +391,11 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
     return first[1],[{'epoch':epoch,'pool_hash':k,'amount':str(v)} for k,v in sorted(pools.items())],first[2],{'max_tx_size':first[1]['max_tx_size'],'stake_source':source,'stake_pools':len(pools),'stake_digest':digest({k.hex():str(v) for k,v in pools.items()}),'active_stake':str(first[0]),'epoch_end':{'height':first[2]['height'],'hash':first[2]['hash'].hex()} if first[3] else None,'epoch_anchor':{'height':first[2]['height'],'hash':first[2]['hash'].hex(),'kind':'completed-end' if first[3] else 'confirmed-target'}}
 
 class BlockfrostSource:
-    def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False):
+    def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False,inventories=None):
         self.provider=provider;self.profile=profile;self.store=store;self.stop_requested=stop_requested;self.gen=generation
+        # Inventories read ahead of this traversal, by block hash (`follow.update_follow`'s look-ahead). Only the
+        # acquisition traversal takes them; the independent traversal always reads its own.
+        self.inventories=None if audit else inventories
         g=store.generation(generation);self.target=g['target_height']
         # A covered generation stores bridge metadata and every asset of its ICS and reserve outputs.
         self.bridge=bridge_covered(g['manifest'])
@@ -473,7 +483,8 @@ class BlockfrostSource:
                 or output_value(cut(matches[0]) if cut else matches[0])!=output_value(observed)):raise Refusal('provider_origin_conflict')
         self.output(h,matches[0])
     def _collect(self,block):
-        self.cache={};self.facts=[];txs=inventory(self.provider,block)
+        read=None if self.inventories is None else self.inventories.get(bytes(block['hash']))
+        self.cache={};self.facts=[];txs=inventory(self.provider,block) if read is None else read['transactions']
         if self.discovery:self.discovery.begin()
         for index,decoded in enumerate(txs):
             if self.stop_requested():raise Refusal('interrupted')
