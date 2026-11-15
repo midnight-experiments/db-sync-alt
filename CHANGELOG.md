@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.8
 
 - A relevance update holds as many blocks as its content allows, up to
   `max_batch_blocks` (100), instead of at most two.
@@ -46,10 +46,12 @@
   limit, and an HTTP 402 ends the day.
 - A one-shot `acquire --relevance` target stays at most two blocks after the
   ready one. Resuming a pending update through `acquire` is unchanged.
-- No format, schema, manifest or refusal change. Upgrading from 0.4.7 is an
-  image swap. Return to an earlier release only at a completed publication,
-  with no update in progress: an earlier release declares an unfinished update
-  job's whole target without sizing it.
+- No format, schema, manifest or refusal change.
+- Upgrading from 0.4.7 is an image swap: no schema, format or backup change. A
+  pending generation started on 0.4.7 resumes on 0.4.8. Return to an earlier
+  release only at a completed publication, with no update in progress: an
+  earlier release declares an unfinished update job's whole target without
+  sizing it.
 
 ## 0.4.7
 
