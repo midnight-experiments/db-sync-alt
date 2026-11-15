@@ -1,4 +1,5 @@
-"""The relevance proof bound holds for the largest proof a valid block can produce.
+"""The relevance proof bound holds for the largest proof a valid block can produce, and so does the per-block key
+bound that sizes a relevance generation.
 
 The block body is filled up to Conway's maxBlockBodySize with transactions of at most maxTxSize that pay the
 bridge-covered ICS address (every asset kept) values of at most maxValueSize, each asset new to the block, names
@@ -9,7 +10,8 @@ import unittest
 
 from db_sync_alt.contract import Profile, canonical, jsonable
 from db_sync_alt.resources import profile_dir
-from db_sync_alt.sources.blockfrost.relevance import KIND, MAX_BLOCK_BODY, MAX_KEYS, MAX_PROOF, address_bytes, inventory
+from db_sync_alt.sources.blockfrost.relevance import (KEY_PROOF, KIND, MAX_BLOCK_BODY, MAX_BLOCKS, MAX_KEYS, MAX_PROOF,
+                                                      address_bytes, block_keys_bound, inventory)
 from fixtures.cbor import enc
 
 MAX_TX, MAX_VALUE = 16384, 5000
@@ -28,8 +30,8 @@ def value(policies, per_policy):
 
 
 def block_proof(per_policy):
-    """(body bytes, keys, proof bytes) of a block filled with ICS outputs whose values hold as many policies of
-    `per_policy` cheapest names as maxValueSize allows."""
+    """(transaction bytes, keys, proof bytes) of a block filled with ICS outputs whose values hold as many policies of
+    `per_policy` cheapest names as maxValueSize allows. Each transaction's bytes are its body and `WITNESS`."""
     facts, used, txs, serial = [], 0, 0, 0
     while True:
         outputs = []
@@ -66,8 +68,12 @@ def block_proof(per_policy):
 
 
 class ProofBoundTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.results = {per_policy: block_proof(per_policy) for per_policy in (1, 257, 1304)}
+
     def test_the_largest_proof_of_a_valid_block_fits_the_bound(self):
-        results = {per_policy: block_proof(per_policy) for per_policy in (1, 257, 1304)}
+        results = self.results
         for per_policy, (used, keys, size) in results.items():
             with self.subTest(names_per_policy=per_policy):
                 self.assertLessEqual(used, MAX_BLOCK_BODY)
@@ -79,6 +85,24 @@ class ProofBoundTests(unittest.TestCase):
         self.assertEqual(worst, results[257])
         self.assertGreater(worst[2], 2 * 1024 * 1024)
         self.assertGreater(worst[2], MAX_PROOF * 0.85)
+
+    def test_the_block_key_bound_is_never_below_the_keys_a_block_adds(self):
+        self.assertEqual(block_keys_bound([], 66693), 0)
+        self.assertEqual(block_keys_bound(['tx'], 8949), (66 * 8949 + 65536) // 63)
+        self.assertEqual(block_keys_bound(['tx'], MAX_BLOCK_BODY), MAX_PROOF // KEY_PROOF)
+        for per_policy, (used, keys, _) in self.results.items():
+            with self.subTest(names_per_policy=per_policy):
+                self.assertLessEqual(keys, block_keys_bound(['tx'], used))
+        # The densest block's keys are above 55 % of its bound: a bound half as large would be below them.
+        used, keys, _ = self.results[257]
+        self.assertGreater(keys, 0.55 * block_keys_bound(['tx'], used))
+
+    def test_two_maximal_blocks_always_fit_one_generation(self):
+        self.assertEqual(MAX_BLOCKS, 2)
+        self.assertLessEqual(2 * block_keys_bound(['tx'], MAX_BLOCK_BODY), MAX_KEYS)
+        for per_policy, (used, _, _) in self.results.items():
+            with self.subTest(names_per_policy=per_policy):
+                self.assertLessEqual(2 * block_keys_bound(['tx'], used), MAX_KEYS)
 
 
 if __name__ == '__main__':

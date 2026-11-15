@@ -312,6 +312,13 @@ redirects, reserves each attempt before sending it, keeps provider cooldowns,
 does not retry behind your back and refuses a corrupt ledger. All programs that
 use one key must share one ledger.
 
+With either adapter, a request that fails in transport (a closed, reset or
+refused connection, an incomplete answer, a TLS or name-resolution failure, or
+a timeout) stays counted, and db-sync-alt sends it again after a wait
+(`provider_unavailable`, `provider_timeout`). The daily ceiling of the shared
+adapter is the limit its client reports for the profile, from 1 to 10,000,000
+requests; the built-in client's is 50,000.
+
 
 ### Older stores needing source ordinals
 

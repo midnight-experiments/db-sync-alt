@@ -107,6 +107,19 @@ class PollTests(unittest.TestCase):
         use();self.assertFalse(update.calls)
         self.clock.now+=40;self.poller.tick(self.store,self.client);use()
         self.assertEqual(update.calls,[(101,101)])
+    def test_relevance_follow_min_blocks_sets_the_generation_size_at_the_tip(self):
+        for minimum,expected in ((3,[(101,103),(104,106)]),(1,[(101,101),(102,102),(103,103),(104,104),(105,105),(106,106)])):
+            with self.subTest(follow_min_blocks=minimum):
+                self.setUp()
+                update=sync_fakes.FixtureUpdate()
+                driver=SyncDriver(SimpleNamespace(sync={'follow_min_blocks':minimum,'follow_max_wait_seconds':60,'relevance_enabled':True}),
+                                  client=self.client,profile=PREPROD_PROFILE,clock=self.clock,update_fn=update)
+                driver._poller=self.poller;driver._check_relevance=lambda *a:None
+                for confirmed in range(101,107):
+                    self.client.confirmed=confirmed;self.clock.now+=20;self.poller.tick(self.store,self.client)
+                    snap=self.poller.snapshot;self.poller.snapshot=type(snap)(**{**snap.__dict__,'observed_mono':time.monotonic()})
+                    driver.run_once(self.store,self.health,self.stop)
+                self.assertEqual(update.calls,expected)
     def test_managed_schema1_refuses_silent_slow_mode(self):
         d=SyncDriver(SimpleNamespace(sync={}),profile=PREPROD_PROFILE)
         with self.assertRaisesRegex(LifecycleFailure,'unsupported_follow_mode'):

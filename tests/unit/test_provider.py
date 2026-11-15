@@ -1,5 +1,6 @@
 """Public provider safety/accounting; fake transport only, never live credentials."""
 import concurrent.futures
+import contextlib
 import datetime as dt
 import json
 import multiprocessing
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest.mock import patch
 import db_sync_alt.sources.blockfrost.provider as p
@@ -256,5 +258,102 @@ class ProviderTests(unittest.TestCase):
         with patch.object(p,'external_module',return_value=module):
             c=p.SharedClient('/synthetic',network=PREPROD);self.assertEqual(c.client.profile,'preprod');self.assertEqual(c.status()['cooldown_until'],123);self.assertEqual(c.get('/metrics',purpose='test'),['/metrics','test'])
         self.assertEqual(c.client.root,Path('/synthetic'))
+
+    def shared(self,limit=50000):
+        """The shared adapter over an external client that reports a failed attempt as the shared client does:
+        `<exception name>; request counted, no automatic retry`, the attempt counted."""
+        class Reporting:
+            base=PREPROD.blockfrost_base;directory=Path('/synthetic')
+            def __init__(self,profile,root):self.used=0;self.failure=None
+            def status(self):return {'budget_used':self.used,'daily_limit':limit}
+            def _load(self):return {'cooldown_until':0}
+            def get(self,path,purpose):
+                self.used+=1
+                try:
+                    if isinstance(self.failure,str):error=self.failure
+                    elif self.failure is not None:raise self.failure
+                    else:return {'path':path}
+                except Exception as exc:error=type(exc).__name__
+                raise RuntimeError(f'{error}; request counted, no automatic retry')
+        module=types.SimpleNamespace(Client=Reporting,locked=lambda path:contextlib.nullcontext())
+        with patch.object(p,'external_module',return_value=module):return p.SharedClient('/synthetic',network=PREPROD)
+    def accounted(self,client):
+        from fixtures.sync import Store,health
+        from db_sync_alt.sources.blockfrost.sync import AccountedProvider
+        day=dt.datetime.fromtimestamp(self.now[0],dt.timezone.utc).date().isoformat()
+        job={'job_id':'synthetic','attempts':0,'budget':10,'state':'active','kind':'poll','created_at':self.now[0]}
+        store=Store();store.metrics={'version':1,'day':day,'used':0,'counted':0}  # reconciled already: no /metrics first
+        return store,AccountedProvider(store,'job',job,client,health(),threading.Event(),clock=lambda:self.now[0],network=PREPROD)
+    def test_shared_client_transport_failures_wait_and_are_retried(self):
+        import http.client
+        import socket
+        import ssl
+        import urllib.error
+        from db_sync_alt.errors import TransientSyncFailure,LifecycleFailure
+        # A broken, refused or timed-out connection: the counted attempt waits, then the same request is sent again.
+        transport=[http.client.RemoteDisconnected('Remote end closed connection without response'),
+                   ConnectionResetError(104,'reset'),ConnectionAbortedError(),ConnectionRefusedError(),BrokenPipeError(),
+                   http.client.IncompleteRead(b'['),http.client.BadStatusLine(''),http.client.HTTPException(),
+                   ssl.SSLError(),ssl.SSLEOFError(),ssl.SSLZeroReturnError(),socket.gaierror(),OSError(),
+                   urllib.error.URLError('down'),ConnectionError(),TimeoutError(),socket.timeout(),'timeout']
+        for failure in transport:
+            name=failure if isinstance(failure,str) else type(failure).__name__
+            with self.subTest(failure=name):
+                timeout=name in ('TimeoutError','timeout')
+                shared=self.shared();shared.client.failure=failure
+                with self.assertRaises(p.ProviderError) as raised:shared.get('/blocks/latest')
+                self.assertEqual(raised.exception.kind,'timeout' if timeout else 'connection')
+                store,provider=self.accounted(shared)
+                with self.assertRaises(TransientSyncFailure) as error:provider.get('/blocks/latest')
+                self.assertEqual(error.exception.code,'provider_timeout' if timeout else 'provider_unavailable')
+                retry=store.jobs['job']['retry_at'];self.assertGreater(retry,self.now[0])
+                self.assertEqual((shared.client.used,store.jobs['job']['attempts']),(2,1))
+                shared.client.failure=None;self.now[0]=retry
+                self.assertEqual(provider.get('/blocks/latest'),{'path':'/blocks/latest'})
+                self.assertEqual((shared.client.used,store.jobs['job']['attempts']),(3,2))
+                self.assertFalse(store.jobs['job']['retry_at'])
+        # Any other name keeps its classification: an invalid answer or an unknown error is never retried blindly.
+        for failure in ('HTTP 403','Invalid JSON response',ssl.SSLCertVerificationError(),ValueError(),KeyError()):
+            name=failure if isinstance(failure,str) else type(failure).__name__
+            with self.subTest(failure=name):
+                shared=self.shared();shared.client.failure=failure
+                with self.assertRaises(p.ProviderError) as raised:shared.get('/blocks/latest')
+                self.assertIsNone(raised.exception.kind)
+                store,provider=self.accounted(shared)
+                with self.assertRaises(LifecycleFailure) as error:provider.get('/blocks/latest')
+                self.assertNotIsInstance(error.exception,TransientSyncFailure)
+                self.assertEqual(error.exception.code,'provider_request_rejected')
+    def test_daily_limits_from_one_to_ten_million(self):
+        from db_sync_alt.errors import TransientSyncFailure,LifecycleFailure
+        # The built-in client: configured limit and ledger entry.
+        for limit in (0,10_000_001,-1,True,300000.0):
+            with self.subTest(limit=limit),self.assertRaisesRegex(p.ProviderError,'invalid_daily_limit'):self.client(limit=limit)
+        c=self.client(lambda path:(200,{},json.dumps([{'time':int(self.now[0]),'calls':299998}]).encode()),limit=300000)
+        c.get('/metrics');self.assertEqual((c.status()['budget_used'],c.status()['daily_limit']),(299999,300000))
+        c.transport=ok;c.get('/blocks/latest');self.assertEqual(c.status()['budget_used'],300000);self.assertTrue(c.status()['exhausted'])
+        with self.assertRaisesRegex(p.ProviderError,'daily_budget_exhausted'):c.get('/blocks/latest')
+        self.assertEqual(c.status()['budget_used'],300000)
+        self.assertEqual(self.client(limit=10_000_000).status()['daily_limit'],300000)  # a ledger keeps its lowest limit
+        for limit,valid in ((10_000_000,True),(10_000_001,False),(0,False)):
+            with self.subTest(ledger=limit):
+                data=json.loads(c.state.read_text());data['keys'][c.fingerprint]['limit']=limit;c.state.write_text(json.dumps(data))
+                if valid:self.assertEqual(self.client(limit=10_000_000).status()['daily_limit'],limit)
+                else:
+                    with self.assertRaisesRegex(p.ProviderError,'corrupt'):self.client(limit=10_000_000).status()
+        # The shared adapter: the limit its client reports is used, and enforced.
+        for limit in (300000,800000):
+            with self.subTest(shared=limit):
+                shared=self.shared(limit=limit);shared.client.used=50000
+                store,provider=self.accounted(shared);store.metrics['used']=50000  # usage checked at 50,000: no /metrics first
+                self.assertEqual(provider.get('/blocks/latest'),{'path':'/blocks/latest'});self.assertEqual(shared.client.used,50001)
+                self.assertEqual(provider.health.snapshot()['quota']['limit'],limit)
+                shared.client.used=limit
+                with self.assertRaises(TransientSyncFailure) as error:provider.get('/blocks/latest')
+                self.assertEqual(error.exception.code,'quota_exhausted');self.assertEqual(shared.client.used,limit)
+        for limit in (0,10_000_001):
+            with self.subTest(shared=limit):
+                shared=self.shared(limit=limit);store,provider=self.accounted(shared)
+                with self.assertRaises(LifecycleFailure) as error:provider.get('/blocks/latest')
+                self.assertEqual(error.exception.code,'provider_accounting_unavailable');self.assertEqual(shared.client.used,0)
 
 if __name__=='__main__':unittest.main()

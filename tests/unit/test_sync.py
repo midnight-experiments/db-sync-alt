@@ -154,11 +154,12 @@ class SyncTests(unittest.TestCase):
         self.config.sync={'acquisition_request_budget':100};self.client.confirmed=1000;self.store.tx_counts[101]=500
         self.run_once()
         self.assertEqual(self.update.calls,[(101,101)])
-    def test_sizing_counts_both_relevance_passes_and_caps_relevance_generations(self):
+    def test_sizing_counts_both_relevance_passes_and_leaves_the_relevance_limit_to_the_content(self):
         from db_sync_alt.sources.blockfrost.sync import job_target
         ready=self.store.generation();top=ready['target_height']
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=False),top+100)
-        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+2)
+        # The update sizes a relevance generation by its blocks' content; the job's target is only its limit.
+        self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+100)
         self.store.tx_counts.update({h:2000 for h in range(top+1,top+101)})
         # 2 x (21 pages + 2,000 /utxos) per block: one block fits 7,500 (full mode: three).
         self.assertEqual(job_target(self.store,ready,top+100,10000,relevance=True),top+1)
@@ -170,6 +171,35 @@ class SyncTests(unittest.TestCase):
         self.assertLess(relevance.MAX_PROOF//63,relevance.MAX_KEYS)
         self.assertEqual(relevance.MAX_BLOCKS,2)
         self.assertLessEqual(relevance.MAX_BLOCKS*(relevance.MAX_PROOF//63),relevance.MAX_KEYS)
+    def test_an_update_that_lowers_its_job_target_publishes_and_completes_there(self):
+        class Lowering(FixtureUpdate):
+            def __call__(self,store,provider,profile,target,*,hooks):
+                provider.retarget(target-27)
+                return super().__call__(store,provider,profile,target-27,hooks=hooks)
+        self.update=Lowering();self.client.confirmed=1000
+        self.run_once()
+        job=self.store.jobs['provider-active']
+        self.assertEqual(self.update.calls,[(101,173)])
+        self.assertEqual((job['target'],job['witness'],job['state']),(173,173+2160,'completed'))
+        # The lowered target was saved before the generation existed, under the same job.
+        saved=[body for key,body in self.store.saved if key=='provider-active' and body['job_id']==job['job_id']]
+        self.assertEqual([body['target'] for body in saved][:2],[200,173])
+        self.assertEqual(self.store.target,173)
+        self.run_once()
+        self.assertEqual(self.update.calls[-1],(174,246))
+    def test_a_job_target_is_never_raised_and_a_publication_must_be_at_the_job_target(self):
+        class Raising(FixtureUpdate):
+            def __call__(self,store,provider,profile,target,*,hooks):
+                provider.retarget(target+1)
+        self.update=Raising();self.client.confirmed=130
+        with self.assertRaisesRegex(LifecycleFailure,'invalid_sync_job'):self.run_once()
+        self.assertEqual((self.store.jobs['provider-active']['target'],self.store.target),(130,100))
+        class Elsewhere(FixtureUpdate):
+            def __call__(self,store,provider,profile,target,*,hooks):
+                return super().__call__(store,provider,profile,target-1,hooks=hooks)
+        self.store=Store();self.update=Elsewhere()
+        with self.assertRaisesRegex(LifecycleFailure,'invalid_coverage'):self.run_once()
+        self.assertEqual(self.store.jobs['provider-active']['state'],'active')
     def test_sizing_ends_at_the_stored_witness(self):
         from db_sync_alt.sources.blockfrost.sync import job_target
         store=Store(security=3);ready=store.generation()
@@ -251,6 +281,36 @@ class AccountingTests(unittest.TestCase):
         with self.assertRaisesRegex(Refusal,'provider_epoch_not_ready'):self.provider().get('/epochs/3')
         self.client.errors['/unit']='HTTP 403; request counted, no automatic retry'
         with self.assertRaisesRegex(LifecycleFailure,'provider_request_rejected'):self.provider().get('/unit')
+    def test_transport_failure_text_waits_and_unknown_text_is_rejected(self):
+        # A client's own text for a transport failure: a counted attempt that waits; the next attempt is sent after it.
+        for name in ('RemoteDisconnected','ConnectionResetError','ConnectionAbortedError','ConnectionRefusedError',
+                     'BrokenPipeError','IncompleteRead','BadStatusLine','HTTPException','SSLError','SSLEOFError',
+                     'SSLZeroReturnError','gaierror','OSError','URLError','ConnectionError','timeout','TimeoutError'):
+            with self.subTest(name=name):
+                self.store=Store();self.store.save_sync_job('provider-active',self.job);self.client.errors['/unit']=name+'; request counted, no automatic retry'
+                provider=self.provider()
+                with self.assertRaises(TransientSyncFailure) as error:provider.get('/unit')
+                self.assertEqual(error.exception.code,'provider_timeout' if name in ('timeout','TimeoutError') else 'provider_unavailable')
+                del self.client.errors['/unit'];self.clock.now=self.store.sync_job('provider-active')['retry_at']
+                self.assertEqual(provider.get('/unit'),{'fixture':True})
+        for text in ('SSLCertVerificationError; request counted, no automatic retry','ValueError; request counted, no automatic retry',
+                     'Invalid JSON response; request counted, no automatic retry','RemoteDisconnected'):
+            with self.subTest(text=text):
+                self.store=Store();self.store.save_sync_job('provider-active',self.job);self.client.errors['/unit']=text
+                with self.assertRaises(LifecycleFailure) as error:self.provider().get('/unit')
+                self.assertNotIsInstance(error.exception,TransientSyncFailure);self.assertEqual(error.exception.code,'provider_request_rejected')
+    def test_daily_limits_above_fifty_thousand_are_used(self):
+        self.client.limit=300000;self.client.used=50000
+        self.assertEqual(self.provider().get('/unit'),{'fixture':True})
+        self.assertEqual(self.health.snapshot()['quota']['limit'],300000)
+        self.client.used=300000;calls=len(self.client.calls)
+        with self.assertRaises(TransientSyncFailure) as error:self.provider().get('/unit')
+        self.assertEqual(error.exception.code,'quota_exhausted');self.assertEqual(len(self.client.calls),calls)
+        for limit in (0,10_000_001):
+            with self.subTest(limit=limit):
+                self.store=Store();self.store.save_sync_job('provider-active',self.job);self.client.limit=limit;self.client.used=0
+                with self.assertRaisesRegex(LifecycleFailure,'provider_accounting_unavailable'):self.provider().get('/unit')
+                self.assertEqual(len(self.client.calls),calls)
     def test_secret_error_is_never_persisted_or_serialized(self):
         self.client.errors['/unit']='https://secret-key@private-directory'
         with self.assertRaisesRegex(LifecycleFailure,'provider_request_rejected'):self.provider().get('/unit')

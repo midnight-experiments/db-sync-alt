@@ -48,9 +48,12 @@ def blockfrost_once(store, profile, *, target_height=None, request_budget=None,
     if store.supports_incremental:store.certify_ready_full()
     SyncDriver(SimpleNamespace(sync=options),client=client,profile=profile,fixed_target=target_height).run_once(store,health,stop_event)
     if stop_event.is_set():raise Refusal('interrupted')
-    if store.generation()['target_height'] != target_height or store.state()['publication_serial'] != serial+1:
+    # A relevance update may have lowered its job's target to the blocks that fit one generation.
+    published=store.generation()['target_height'];job=store.sync_job('provider-active') or {}
+    if (store.state()['publication_serial'] != serial+1 or published != job.get('target')
+            or not ready['target_height'] < published <= target_height):
         raise Refusal('publication_not_completed')
-    return {'source':'blockfrost','generation':store.generation()['id'],'target':target_height,
+    return {'source':'blockfrost','generation':store.generation()['id'],'target':published,
             'witness':store.generation()['witness_height'],'publication_serial':serial+1}
 
 

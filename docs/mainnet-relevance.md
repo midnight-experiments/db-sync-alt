@@ -45,12 +45,33 @@ db-sync-alt acquire --source blockfrost --network preprod \
 
 Use your actual private service name and a confirmed target at most two blocks
 after the ready one (a further target is refused before any request with
-`invalid_sync_configuration`). An update with filtering holds at most two blocks.
-One block's relevance proof may be up to 5.73 MiB, the most a valid block body
+`invalid_sync_configuration`); two blocks always fit one update.
+
+The service sizes each update with filtering by its blocks' own content, before
+it declares the update. It reads each candidate block's transactions (the pages
+the update reads anyway) and bounds the proof keys the block can add by
+⌊(66 × its transaction bytes + 65,536) / 63⌋, or 0 for an empty block. The update
+holds the longest run of blocks, up to `max_batch_blocks`, whose bounds sum to at
+most the update's 200,000-key limit, and always at least one block. The first
+block that does not fit starts the next update, without being read again. One
+block's relevance proof may be up to 5.73 MiB, the most a valid block body
 (Conway's `maxBlockBodySize` of 90,112 bytes) can produce, so any valid block is
-accepted and two blocks can never pass the update's 200,000-key limit. If
-governance raises `maxBlockBodySize`, this bound must follow before such blocks
-appear. Filtering applies to Blockfrost following, not SQL bootstrap.
+accepted and no update passes the key limit. If governance raises
+`maxBlockBodySize`, this bound must follow before such blocks appear. Filtering
+applies to Blockfrost following, not SQL bootstrap.
+
+On real Mainnet blocks an update of a catch-up holds about 20 blocks. At the chain
+tip an update holds the blocks confirmed since the previous one, so its fixed
+requests (about 5) are paid for one or two blocks. For Mainnet with filtering,
+`deploy/mainnet-relevance-sync.json` sets `follow_min_blocks` to 3 and
+`follow_max_wait_seconds` to 60: updates of about three blocks, about 42,000 to
+45,000 requests a day at the tip instead of about 49,000 to 52,000, for up to
+about a minute more before a block is served. Both settings stay below Mainnet's
+`serving_lag_max_blocks` of 9.
+
+To return to an earlier release, stop the writer while `/status` shows no update
+in progress and `db-sync-alt status` shows no pending generation. An earlier
+release declares an unfinished update job's whole target without sizing it.
 
 Check fresh `/health` and `/status` responses. When filtering is active,
 `relevance.requested` and `relevance.effective` are both `relevance`; the reason is

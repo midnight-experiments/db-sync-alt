@@ -24,6 +24,13 @@ epoch's parameters twice: 2 requests per stored epoch, once
 ([upgrade to schema 5](recovery.md#upgrade-to-schema-5)); `db-sync-alt status`
 shows the number before you start. With a cardano-db-sync source it needs none.
 
+With relevance filtering, an update makes about 6 fixed requests (the committed
+block, the previous witness, the target, one page of up to 100 headers, and the
+final target and witness), and each block costs about 3 to 7 more for its two
+independent passes (its transaction pages, and the answers of selected and
+relevant transactions). A Mainnet catch-up of about 20 blocks per update costs
+about 6.5 to 7.5 requests per block, plus about 1 per block for polling.
+
 Catching up after a pause costs more: every missed block needs its own requests,
 and history before the published snapshot is never fetched from Blockfrost (the
 snapshot or your own db-sync provides it). Blocks with many relevant
@@ -33,7 +40,7 @@ transactions need more requests than empty ones.
 
 | Limit | Default | Where it is kept |
 | --- | --- | --- |
-| Requests per UTC day for the key | 50,000 attempts | The request ledger, `accounting/usage.json` in the state directory |
+| Requests per UTC day for the key | 50,000 attempts; with the shared adapter, the limit its client reports (up to 10,000,000) | The request ledger, `accounting/usage.json` in the state directory |
 | Request rate | 8 per second | The same ledger |
 | One day's polling job | 10,000 attempts | The database (`chain.sync_jobs`) |
 | One update (acquisition job) | 10,000 attempts per UTC day | The database |
@@ -51,7 +58,9 @@ Blockfrost answers HTTP 402, which ends the day at once (`quota_exhausted`).
 
 Each update is sized to its blocks: it takes as many blocks as fit three
 quarters of its budget at one request per transaction (two with relevance
-filtering, which also holds at most two blocks per update), and at least one.
+filtering), and at least one. With relevance filtering the update then holds
+only the blocks whose content fits its key limit
+([relevance filtering](mainnet-relevance.md#enable-and-observe)).
 An update that still uses up its budget waits for the next UTC day
 (`request_budget_exhausted`) and then continues where it stopped, under a new
 job record that carries the earlier count. All

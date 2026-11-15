@@ -29,6 +29,16 @@ MAX_BYTES = 32 * 1024 * 1024
 # transaction can produce (a 16,384-byte transaction has at most about 455 inputs of at most about 114 KB each).
 UTXOS = re.compile('/txs/[0-9a-f]{64}/utxos')
 UTXOS_MAX_BYTES = 128 * 1024 * 1024
+# The largest daily request limit accepted from a client's status or configuration.
+MAX_DAILY_LIMIT = 10_000_000
+# The shared client reports a failed attempt as `<name>; request counted, no automatic retry`. These names are
+# transport failures: the connection broke, was refused or timed out before a whole answer arrived. The attempt
+# stays counted and is retried after a wait. Any other name keeps its own classification.
+TIMEOUT_FAILURES = frozenset({'TimeoutError', 'timeout'})
+CONNECTION_FAILURES = frozenset({
+    'URLError', 'ConnectionError', 'RemoteDisconnected', 'ConnectionResetError', 'ConnectionAbortedError',
+    'ConnectionRefusedError', 'BrokenPipeError', 'IncompleteRead', 'BadStatusLine', 'HTTPException',
+    'SSLError', 'SSLEOFError', 'SSLZeroReturnError', 'gaierror', 'OSError'})
 # Arrays and objects nested deeper than this in a provider answer are cut out. Python's JSON decoder and
 # encoder recurse in C and fail between 5,000 and 10,000 levels, and anyone can put metadata that deep on
 # chain. Every value cardano-db-sync stores as JSON (nesting up to 2,000) arrives whole.
@@ -134,6 +144,14 @@ def loads(raw):
     return json.loads(''.join(pieces), object_pairs_hook=_object)
 
 
+def transport_kind(text):
+    """'timeout' or 'connection' when `text` is the shared client's report of a transport failure, else None."""
+    name, separator, _ = text.partition(';')
+    if not separator:
+        return None
+    return 'timeout' if name in TIMEOUT_FAILURES else 'connection' if name in CONNECTION_FAILURES else None
+
+
 class ProviderError(RuntimeError):
     def __init__(self, code, *, http_status=None, kind=None):
         super().__init__(code)
@@ -210,7 +228,7 @@ class SharedClient:
             text=str(error)
             matched=re.match(r'HTTP (\d{3});',text)
             status=int(matched[1]) if matched else None
-            kind='timeout' if text.startswith('TimeoutError;') else 'connection' if text.startswith(('URLError;','ConnectionError;')) else 'cooldown' if text.startswith(('Provider cooldown active','Shared rate-limit cooldown')) else None
+            kind=transport_kind(text) or ('cooldown' if text.startswith(('Provider cooldown active','Shared rate-limit cooldown')) else None)
             raise ProviderError('provider_request_failed_counted',http_status=status,kind=kind) from None
 
 def _private(path, directory=False):
@@ -237,7 +255,7 @@ class PortableClient:
         if not network.valid_key(key):
             raise ProviderError('credential_network_mismatch')
         self.host, self.base = network.blockfrost_host, network.blockfrost_base
-        if type(limit) is not int or not 1 <= limit <= 50000:raise ProviderError('invalid_daily_limit')
+        if type(limit) is not int or not 1 <= limit <= MAX_DAILY_LIMIT:raise ProviderError('invalid_daily_limit')
         self.key, self.root, self.limit = key, Path(root), limit
         self.clock, self.sleep, self.transport = clock, sleep, transport or self._https
         self.fingerprint = hashlib.sha256(key.encode()).hexdigest()
@@ -265,7 +283,7 @@ class PortableClient:
             if type(value['next_request']) not in (int,float) or not math.isfinite(value['next_request']) or value['next_request'] < 0:raise ValueError()
             for fingerprint, entry in value['keys'].items():
                 if not re.fullmatch('[0-9a-f]{64}',fingerprint):raise ValueError()
-                if type(entry['limit']) is not int or not 1 <= entry['limit'] <= 50000:raise ValueError()
+                if type(entry['limit']) is not int or not 1 <= entry['limit'] <= MAX_DAILY_LIMIT:raise ValueError()
                 if type(entry['cooldown']) not in (int,float) or not math.isfinite(entry['cooldown']) or entry['cooldown'] < 0:raise ValueError()
                 if not isinstance(entry['days'],dict):raise ValueError()
                 for day, count in entry['days'].items():
