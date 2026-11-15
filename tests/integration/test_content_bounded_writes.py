@@ -88,6 +88,10 @@ class ContentBoundedWriteTests(unittest.TestCase):
         make_store(cls.dsn)
         with PgStore(conninfo=cls.dsn) as store:
             upgrade_store(store)
+        # Each test's rolled-back facts leave dead rows; autovacuum would refresh the statistics behind the plan assertions at a moment that varies by run.
+        with psycopg.connect(cls.dsn, autocommit=True) as db:
+            for (table,) in db.execute("SELECT format('%I.%I',schemaname,relname) FROM pg_stat_user_tables WHERE schemaname='chain'").fetchall():
+                db.execute('ALTER TABLE ' + table + ' SET (autovacuum_enabled=false)')
 
     @classmethod
     def tearDownClass(cls):
