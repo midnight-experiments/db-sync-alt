@@ -40,7 +40,7 @@ transactions need more requests than empty ones.
 
 | Limit | Default | Where it is kept |
 | --- | --- | --- |
-| Requests per UTC day for the key | 50,000 attempts | The request ledger, `accounting/usage.json` in the state directory |
+| Requests per UTC day for the key | 50,000 attempts; with the shared adapter, the limit its client reports (up to 10,000,000) | The request ledger, `accounting/usage.json` in the state directory |
 | Request rate | 8 per second | The same ledger |
 | One day's polling job | 10,000 attempts | The database (`chain.sync_jobs`) |
 | One update (acquisition job) | 10,000 attempts per UTC day | The database |

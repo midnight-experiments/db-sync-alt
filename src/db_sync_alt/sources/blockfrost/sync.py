@@ -18,7 +18,7 @@ import uuid
 
 from db_sync_alt.resources import profile_dir
 from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, ProviderClient, block_row, bounded_answer, input_cut, update)
-from db_sync_alt.sources.blockfrost.provider import UTXOS
+from db_sync_alt.sources.blockfrost.provider import MAX_DAILY_LIMIT, UTXOS, transport_kind
 from db_sync_alt.contract import Profile, Refusal
 from db_sync_alt.service.health import ChainPoint, PendingProgress, QuotaStatus
 from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure, CooperativeStop
@@ -459,7 +459,7 @@ class AccountedProvider(ProviderClient):
     def _quota(self):
         value = local_usage(self.client)
         used, limit = value.get('budget_used'), value.get('daily_limit')
-        if type(used) is not int or used < 0 or type(limit) is not int or not 1 <= limit <= 50000:
+        if type(used) is not int or used < 0 or type(limit) is not int or not 1 <= limit <= MAX_DAILY_LIMIT:
             raise LifecycleFailure('provider_accounting_unavailable')
         self.health.update(quota=QuotaStatus(used, limit, next_day(self.clock())))
         return value
@@ -524,7 +524,7 @@ class AccountedProvider(ProviderClient):
             usage = self._quota()
             text = str(error)  # classify known shared machine text, never serialize it
             status = getattr(error, 'http_status', None)
-            kind = getattr(error, 'kind', None)
+            kind = getattr(error, 'kind', None) or transport_kind(text)
             if usage.get('exhausted') or usage['budget_used'] >= usage['daily_limit'] or text.startswith('Daily request budget exhausted') or text.startswith('HTTP 402;') or status == 402:
                 self._wait('quota_exhausted', quota=True)
             if status in (418, 429) or kind == 'cooldown' or text.startswith(('HTTP 418;', 'HTTP 429;', 'Provider cooldown active', 'Shared rate-limit cooldown')):
@@ -533,7 +533,7 @@ class AccountedProvider(ProviderClient):
                 return None
             if (status == 404 or text.startswith('HTTP 404;')) and path.startswith('/epochs/'):
                 raise Refusal('provider_epoch_not_ready') from None
-            if status in (500,502,503,504) or kind in ('timeout','connection') or text.startswith(('HTTP 500;', 'HTTP 502;', 'HTTP 503;', 'HTTP 504;', 'URLError;', 'TimeoutError;', 'ConnectionError;')):
+            if status in (500,502,503,504) or kind in ('timeout','connection') or text.startswith(('HTTP 500;', 'HTTP 502;', 'HTTP 503;', 'HTTP 504;')):
                 self._wait('provider_timeout' if kind == 'timeout' or 'Timeout' in text else 'provider_unavailable')
             # Authentication, invalid JSON, unexpected HTTP statuses and unknown
             # errors are not blindly retried and never expose raw exception text.

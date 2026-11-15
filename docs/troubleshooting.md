@@ -76,7 +76,7 @@ Shown as `error_code` in `/status`, or printed when the service exits.
 | `unsupported_postgres_version` | PostgreSQL is not major version 17 | Use PostgreSQL 17 |
 | `postgres_backup_tool_unavailable`, `postgres_backup_tool_version_mismatch` | `pg_dump`/`pg_restore` 17 is missing from `PATH` or has another version | Install the PostgreSQL 17 client tools |
 | `storage_low` | A checked volume has less free space than its configured reserve | Free space on that volume, then restart |
-| `provider_unavailable`, `provider_timeout` | Blockfrost failed or timed out; the request was counted | Temporary: db-sync-alt waits and retries by itself |
+| `provider_unavailable`, `provider_timeout` | Blockfrost failed, or the connection broke or timed out; the request was counted | Temporary: db-sync-alt waits and retries by itself |
 | `quota_exhausted` | The daily request ceiling is reached | db-sync-alt waits for the next UTC day; see [costs](costs.md) |
 | `request_budget_exhausted` | A job used up its own request budget for the UTC day (10,000 requests by default) | Temporary: db-sync-alt waits for the next UTC day (`quota_wait`). Polling continues with that day's job; an update continues where it stopped under a new job record (`provider-active`) that carries the earlier count (`prior_attempts`), and the exhausted record is kept as `provider-acquire-<job id>`. Never reset accounting |
 | `provider_request_rejected` | Blockfrost refused a request (for example a wrong key or network) | Check the key file and that it is a key of the configured network |

@@ -22,6 +22,28 @@
 - `follow_min_blocks` above 2 now sets the number of blocks per update at the
   chain tip with filtering. `deploy/mainnet-relevance-sync.json` (3 blocks,
   60 s) saves about 7,000 requests a day at the Mainnet tip.
+- A request that fails in transport now waits and is sent again with the
+  shared adapter (`DBSYNC_PROVIDER_ADAPTER=shared`).
+  - **Before:** only the external client's `URLError`, `ConnectionError` and
+    `TimeoutError` reports counted as transport failures. Any other, such as
+    `RemoteDisconnected` when Blockfrost closed the connection without an
+    answer, stopped the follower with `provider_request_rejected` until it was
+    started again.
+  - **Now:** a closed, reset, aborted or refused connection, a broken pipe, an
+    incomplete or malformed status line, a TLS or name-resolution failure, any
+    other connection error and a timeout (`RemoteDisconnected`,
+    `ConnectionResetError`, `ConnectionAbortedError`, `ConnectionRefusedError`,
+    `BrokenPipeError`, `IncompleteRead`, `BadStatusLine`, `HTTPException`,
+    `SSLError`, `SSLEOFError`, `SSLZeroReturnError`, `gaierror`, `OSError`,
+    `timeout`, `TimeoutError`) wait and retry (`provider_unavailable` or
+    `provider_timeout`), as the built-in client's do. The attempt stays
+    counted. HTTP statuses, invalid answers and unknown failures are handled as
+    before.
+- A daily request limit up to 10,000,000 is accepted (was at most 50,000), for
+  Blockfrost plans with a larger allowance. With the shared adapter the limit
+  is the one its client reports for the profile. The built-in client's limit
+  stays 50,000. The other quota rules are unchanged: requests stop at the
+  limit, and an HTTP 402 ends the day.
 - A one-shot `acquire --relevance` target stays at most two blocks after the
   ready one. Resuming a pending update through `acquire` is unchanged.
 - No format, schema, manifest or refusal change. Upgrading from 0.4.7 is an

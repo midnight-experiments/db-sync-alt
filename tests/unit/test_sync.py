@@ -281,6 +281,36 @@ class AccountingTests(unittest.TestCase):
         with self.assertRaisesRegex(Refusal,'provider_epoch_not_ready'):self.provider().get('/epochs/3')
         self.client.errors['/unit']='HTTP 403; request counted, no automatic retry'
         with self.assertRaisesRegex(LifecycleFailure,'provider_request_rejected'):self.provider().get('/unit')
+    def test_transport_failure_text_waits_and_unknown_text_is_rejected(self):
+        # A client's own text for a transport failure: a counted attempt that waits; the next attempt is sent after it.
+        for name in ('RemoteDisconnected','ConnectionResetError','ConnectionAbortedError','ConnectionRefusedError',
+                     'BrokenPipeError','IncompleteRead','BadStatusLine','HTTPException','SSLError','SSLEOFError',
+                     'SSLZeroReturnError','gaierror','OSError','URLError','ConnectionError','timeout','TimeoutError'):
+            with self.subTest(name=name):
+                self.store=Store();self.store.save_sync_job('provider-active',self.job);self.client.errors['/unit']=name+'; request counted, no automatic retry'
+                provider=self.provider()
+                with self.assertRaises(TransientSyncFailure) as error:provider.get('/unit')
+                self.assertEqual(error.exception.code,'provider_timeout' if name in ('timeout','TimeoutError') else 'provider_unavailable')
+                del self.client.errors['/unit'];self.clock.now=self.store.sync_job('provider-active')['retry_at']
+                self.assertEqual(provider.get('/unit'),{'fixture':True})
+        for text in ('SSLCertVerificationError; request counted, no automatic retry','ValueError; request counted, no automatic retry',
+                     'Invalid JSON response; request counted, no automatic retry','RemoteDisconnected'):
+            with self.subTest(text=text):
+                self.store=Store();self.store.save_sync_job('provider-active',self.job);self.client.errors['/unit']=text
+                with self.assertRaises(LifecycleFailure) as error:self.provider().get('/unit')
+                self.assertNotIsInstance(error.exception,TransientSyncFailure);self.assertEqual(error.exception.code,'provider_request_rejected')
+    def test_daily_limits_above_fifty_thousand_are_used(self):
+        self.client.limit=300000;self.client.used=50000
+        self.assertEqual(self.provider().get('/unit'),{'fixture':True})
+        self.assertEqual(self.health.snapshot()['quota']['limit'],300000)
+        self.client.used=300000;calls=len(self.client.calls)
+        with self.assertRaises(TransientSyncFailure) as error:self.provider().get('/unit')
+        self.assertEqual(error.exception.code,'quota_exhausted');self.assertEqual(len(self.client.calls),calls)
+        for limit in (0,10_000_001):
+            with self.subTest(limit=limit):
+                self.store=Store();self.store.save_sync_job('provider-active',self.job);self.client.limit=limit;self.client.used=0
+                with self.assertRaisesRegex(LifecycleFailure,'provider_accounting_unavailable'):self.provider().get('/unit')
+                self.assertEqual(len(self.client.calls),calls)
     def test_secret_error_is_never_persisted_or_serialized(self):
         self.client.errors['/unit']='https://secret-key@private-directory'
         with self.assertRaisesRegex(LifecycleFailure,'provider_request_rejected'):self.provider().get('/unit')
