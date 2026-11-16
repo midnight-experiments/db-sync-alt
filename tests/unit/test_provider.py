@@ -81,6 +81,27 @@ class ProviderTests(unittest.TestCase):
         # Without the bound the external client fails the counted request on the deep answer.
         with patch.object(p,'bounded_json',lambda:json):plain=p.SharedClient(str(root),'preprod',network=PREPROD)
         with self.assertRaises(p.ProviderError):plain.get('/deep')
+    def test_shared_adapter_ledger_stays_exact_with_four_requests_in_flight(self):
+        import hashlib
+        import shutil
+        from fixtures.sync import Store,health
+        from db_sync_alt.sources.blockfrost.adapter import prefetch_scope
+        from db_sync_alt.sources.blockfrost.prefetch import Dispatcher
+        from db_sync_alt.sources.blockfrost.sync import AccountedProvider
+        root=self.root/'shared';(root/'answers').mkdir(parents=True)
+        shutil.copy(Path(__file__).resolve().parents[1]/'fixtures'/'shared_client'/'client.py',root/'client.py')
+        (root/'profiles.json').write_text(json.dumps({'preprod':{'base_url':PREPROD.blockfrost_base}}))
+        paths=['/blocks/%d'%i for i in range(200)]
+        for path in paths:(root/'answers'/hashlib.sha256(path.encode()).hexdigest()).write_text(json.dumps({'path':path}))
+        shared=p.SharedClient(str(root),'preprod',network=PREPROD)
+        day=dt.datetime.fromtimestamp(self.now[0],dt.timezone.utc).date().isoformat()
+        job={'job_id':'synthetic','attempts':0,'budget':10000,'state':'active','kind':'poll','created_at':self.now[0]}
+        store=Store();store.metrics={'version':1,'day':day,'used':0,'counted':0}
+        provider=AccountedProvider(store,'job',job,shared,health(),threading.Event(),clock=lambda:self.now[0],network=PREPROD,dispatcher=Dispatcher(4))
+        with prefetch_scope(provider,paths):
+            self.assertEqual([provider.get(path) for path in paths],[{'path':path} for path in paths])
+        self.assertEqual((shared.status()['budget_used'],store.jobs['job']['attempts']),(200,200))
+        self.assertEqual([r['endpoint'] for r in provider.receipts],paths)
     def test_status_offline_and_failure_charged_no_retry(self):
         calls=[]
         def fail(path):calls.append(path);raise RuntimeError(KEY)

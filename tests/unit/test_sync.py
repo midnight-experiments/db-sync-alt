@@ -204,6 +204,22 @@ class SyncTests(unittest.TestCase):
         from db_sync_alt.sources.blockfrost.sync import job_target
         store=Store(security=3);ready=store.generation()
         self.assertEqual(job_target(store,ready,ready['target_height']+100,10000,relevance=False),ready['target_height']+3)
+    def test_requests_in_flight_and_their_pace_are_checked_options(self):
+        driver=self.driver()
+        self.assertEqual(driver.options['provider_concurrency'],1);self.assertNotIn('provider_max_requests_per_hour',driver.options)
+        for value in range(1,9):
+            self.config.sync={'provider_concurrency':value}
+            self.assertEqual(self.driver().options['provider_concurrency'],value)
+        for value in (1,16000,28800):
+            self.config.sync={'provider_max_requests_per_hour':value}
+            self.assertEqual(self.driver().options['provider_max_requests_per_hour'],value)
+        for key,value in (('provider_concurrency',0),('provider_concurrency',9),('provider_concurrency',True),('provider_concurrency','4'),
+                          ('provider_concurrency',4.0),('provider_concurrency',None),('provider_max_requests_per_hour',0),
+                          ('provider_max_requests_per_hour',28801),('provider_max_requests_per_hour','x'),
+                          ('provider_max_requests_per_hour',None),('provider_max_requests_per_hour',True),('provider_max_requests_per_hour',16000.0)):
+            with self.subTest(key=key,value=value):
+                self.config.sync={key:value}
+                with self.assertRaisesRegex(LifecycleFailure,'invalid_sync_configuration'):self.driver()
     def test_fixed_relevance_target_beyond_the_relevance_cap_is_refused_before_any_request(self):
         self.config.sync={'relevance_enabled':True}
         driver=SyncDriver(self.config,client=self.client,profile=PREPROD_PROFILE,clock=self.clock,update_fn=self.update,fixed_target=103)

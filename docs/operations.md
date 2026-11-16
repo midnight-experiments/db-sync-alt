@@ -319,6 +319,46 @@ a timeout) stays counted, and db-sync-alt sends it again after a wait
 adapter is the limit its client reports for the profile, from 1 to 10,000,000
 requests; the built-in client's is 50,000.
 
+### Requests in flight
+
+An update sends one Blockfrost request at a time by default. Two options of the
+`sync` section in `service.json` change that; the tip poll always sends one at a
+time.
+
+| Option | Default | Values | Effect |
+| --- | --- | --- | --- |
+| `provider_concurrency` | 1 | 1 to 8 | Requests of an update in flight at once |
+| `provider_max_requests_per_hour` | absent: no pace of its own | 1 to 28,800 | The update's requests leave at least 3,600 / value seconds apart |
+
+Any other value stops the service at start with `invalid_sync_configuration`.
+
+With `provider_concurrency` above 1, an update still uses and checks the answers
+one by one, in the same order, and publishes the same data. Up to
+`provider_concurrency` − 1 requests whose paths it already knows go out ahead
+of their turn: the transaction pages of the blocks it sizes, the
+`/txs/{hash}/utxos` requests of the transactions a block's selection can take,
+the independent pass's pages and transactions, and the per-pool stake requests
+of an epoch. Each is counted, and the update's job attempt for it saved, before
+it is sent, under the same checks as any request (stop, wait, daily limit,
+cooldown, the update's budget). A request sent ahead that the update does not
+use stays counted and its answer is dropped: the pages of blocks after the last
+one that fits an update, a transaction the selection skips, and the requests
+after a failure, which are sent again after the wait. A stop abandons the
+requests in flight; they stay counted.
+
+The built-in client sends one request at a time whatever the setting: its
+ledger lock covers each whole request. With the shared adapter, requests overlap
+only if the external client lets several requests of one key be in flight.
+
+Each request in flight can hold an answer in memory. A `/txs/{hash}/utxos`
+answer is accepted up to 128 MiB, so leave the default on small containers.
+
+To keep a whole day under the key's daily limit, set
+`provider_max_requests_per_hour` so that 24 times it, plus the day's polls
+(about 8,700 at the default 20-second poll), stays below the limit with room for
+the key's other users. Before starting an earlier release, remove both options:
+0.4.8 and earlier refuse them.
+
 
 ### Older stores needing source ordinals
 

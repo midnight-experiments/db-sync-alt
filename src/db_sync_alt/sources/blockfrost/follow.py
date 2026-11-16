@@ -9,7 +9,7 @@ import copy
 import weakref
 from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, BlockfrostSource, block_row,
     block_inventory, check_anchor, handoff_overlap, diagnostic_context, complete_inherited_epoch,
-    epoch_facts)
+    epoch_facts, inventory_paths, prefetch_scope)
 from db_sync_alt.contract import Refusal, digest, required_epochs, generation_capabilities
 
 _QUALIFIED = weakref.WeakKeyDictionary()
@@ -204,7 +204,9 @@ def _size_generation(store, provider, ready, cutoff, pages, limit, *, hooks):
                 transactions,raw=block_inventory(provider,row)
                 kept[key]={'transactions':transactions,'raw_bytes':raw,'requests':provider.drain()['requests']}
             yield block_keys_bound(kept[key]['transactions'],kept[key]['raw_bytes'])
-    return ready['target_height']+generation_blocks(bounds())
+    # Every candidate's pages are hinted; those of the blocks after the first that does not fit are dropped.
+    with prefetch_scope(provider, (path for row in headers if bytes(row['hash']) not in kept for path in inventory_paths(row))):
+        return ready['target_height']+generation_blocks(bounds())
 
 
 def _store_suffix(store, provider, gen, pages, *, hooks):

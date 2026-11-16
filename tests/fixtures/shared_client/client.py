@@ -9,6 +9,10 @@ import contextlib
 import hashlib
 import json
 from pathlib import Path
+import threading
+
+# Test support for several requests in flight: one read or update of the count at a time within the process.
+_COUNT = threading.RLock()
 
 
 @contextlib.contextmanager
@@ -25,15 +29,17 @@ class Client:
 
     def _load(self):
         usage = self.directory / 'usage.json'
-        return json.loads(usage.read_text()) if usage.exists() else {'used': 0}
+        with _COUNT:
+            return json.loads(usage.read_text()) if usage.exists() else {'used': 0}
 
     def status(self):
         return {'budget_used': self._load()['used'], 'daily_limit': 50000}
 
     def get(self, path, purpose='db-sync-alt'):
-        usage = self._load()
-        usage['used'] += 1
-        (self.directory / 'usage.json').write_text(json.dumps(usage))
+        with _COUNT:
+            usage = self._load()
+            usage['used'] += 1
+            (self.directory / 'usage.json').write_text(json.dumps(usage))
         answer = self.root / 'answers' / hashlib.sha256(path.encode()).hexdigest()
         if not answer.exists():
             raise RuntimeError('HTTP 404; not found')

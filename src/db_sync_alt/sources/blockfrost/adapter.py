@@ -4,6 +4,7 @@ OpenAPI contract pin: 1d4d5d8bac8f0c641eea5c6f7b1f3fbbed8d1505. The adapter iden
 stored with each generation comes from the network profile.
 Requests go through an accounted provider (`sources.blockfrost.sync.AccountedProvider`).
 """
+import contextlib
 import copy
 import datetime as dt
 import hashlib
@@ -39,6 +40,22 @@ def integer(v,*,signed=False):
     if not signed and r<0:raise Refusal('provider_negative_quantity')
     return r
 
+def prefetch(provider,paths):
+    """Hint inside a `prefetch_scope`: `paths` (an iterable, read only by a provider that sends requests ahead,
+    `sync.AccountedProvider`) are exact paths requested next, in that order; each is still requested, and its answer
+    consumed, in turn. Other providers ignore it."""
+    hint=getattr(provider,'prefetch',None)
+    if hint is not None:hint(paths)
+
+def prefetch_scope(provider,paths=()):
+    """A block of work that hints `paths` (and every `prefetch` inside it): the hinted paths it did not request are
+    dropped at its end."""
+    scope=getattr(provider,'prefetch_scope',None)
+    return contextlib.nullcontext() if scope is None else scope(paths)
+
+def page_path(path,page):
+    return path+'?'+urlencode({'count':100,'page':page,'order':'asc'})
+
 class ProviderClient:
     """Provider base: subclasses implement `get(path)`, `get_optional(path)` (None for HTTP 404) and `drain()`; `pages` walks ascending pages."""
     def retarget(self,target):
@@ -47,7 +64,7 @@ class ProviderClient:
     def pages(self,path):
         page=1
         while True:
-            rows=self.get(path+'?'+urlencode({'count':100,'page':page,'order':'asc'}))
+            rows=self.get(page_path(path,page))
             if not isinstance(rows,list) or len(rows)>100:raise Refusal('provider_bad_page')
             yield rows
             if len(rows)<100:return
@@ -246,6 +263,11 @@ def ledger_effects(response,decoded,resolve_origin=None,cut=None):
 def inventory(provider,block):
     return block_inventory(provider,block)[0]
 
+def inventory_paths(block):
+    """The page paths `block_inventory` reads for `block`, from its header: `tx_count // 100 + 1`, none for an empty block."""
+    if not 0<block['tx_count']<=10000:return []
+    return [page_path('/blocks/'+block['hash'].hex()+'/txs/cbor',page) for page in range(1,block['tx_count']//100+2)]
+
 def block_inventory(provider,block):
     """The block's decoded transactions, checked against its header, and the bytes of their CBOR."""
     diagnostic_context(provider,'events.inventory',block_height=block.get('height'),block_hash=block.get('hash'))
@@ -308,19 +330,22 @@ def current_pool_stakes(provider, epoch, *, stake_prefix):
         for r in rows:
             if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
             _add(pools, r.get('pool_id'), integer(r.get('active_stake')))
-    for pool_id in retired_pools(provider, epoch):
-        if pool_hash(pool_id) in pools:continue  # retired, then registered again
-        r = provider.get('/pools/' + pool_id)
-        if not isinstance(r, dict) or r.get('pool_id') != pool_id:raise Refusal('provider_duplicate_or_invalid_stake')
-        _add(pools, pool_id, integer(r.get('active_stake')))
+    retired = retired_pools(provider, epoch)
+    with prefetch_scope(provider, dict.fromkeys('/pools/' + pool_id for pool_id in retired if pool_hash(pool_id) not in pools)):
+        for pool_id in retired:
+            if pool_hash(pool_id) in pools:continue  # retired, then registered again
+            r = provider.get('/pools/' + pool_id)
+            if not isinstance(r, dict) or r.get('pool_id') != pool_id:raise Refusal('provider_duplicate_or_invalid_stake')
+            _add(pools, pool_id, integer(r.get('active_stake')))
     out = {}
-    for key, (pool_id, amount) in pools.items():
-        if amount == 0:
-            rows = _pool_rows(provider.get('/epochs/' + str(epoch) + '/stakes/' + pool_id + '?count=1&page=1'))
-            if not rows:continue
-            if not isinstance(rows[0], dict) or not isinstance(rows[0].get('stake_address'), str) or not rows[0]['stake_address'].startswith(stake_prefix):
-                raise Refusal('provider_duplicate_or_invalid_stake')
-        out[key] = amount
+    with prefetch_scope(provider, ('/epochs/' + str(epoch) + '/stakes/' + pool_id + '?count=1&page=1' for pool_id, amount in pools.values() if amount == 0)):
+        for key, (pool_id, amount) in pools.items():
+            if amount == 0:
+                rows = _pool_rows(provider.get('/epochs/' + str(epoch) + '/stakes/' + pool_id + '?count=1&page=1'))
+                if not rows:continue
+                if not isinstance(rows[0], dict) or not isinstance(rows[0].get('stake_address'), str) or not rows[0]['stake_address'].startswith(stake_prefix):
+                    raise Refusal('provider_duplicate_or_invalid_stake')
+            out[key] = amount
     return out
 
 
@@ -334,19 +359,23 @@ def historical_pool_stakes(provider, epoch):
     for pool_id in retired_pools(provider, epoch):
         if pool_hash(pool_id) not in candidates:_add(candidates, pool_id, None)
     out = {}
-    for key, (pool_id, _) in sorted(candidates.items()):
-        for page in range(1, 10001):
-            rows = _pool_rows(provider.get('/pools/' + pool_id + '/history?' + urlencode({'count': 100, 'page': page, 'order': 'desc'})))
-            done = len(rows) < 100
-            for r in rows:
-                if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
-                row_epoch = integer(r.get('epoch'))
-                if row_epoch == epoch:
-                    if integer(r.get('delegators_count')) < 1:raise Refusal('provider_duplicate_or_invalid_stake')
-                    out[key] = integer(r.get('active_stake'))
-                if row_epoch <= epoch:done = True;break
-            if done:break
-        else:raise Refusal('provider_page_limit')
+    history = lambda pool_id, page: '/pools/' + pool_id + '/history?' + urlencode({'count': 100, 'page': page, 'order': 'desc'})
+    candidates = sorted(candidates.items())
+    # Each pool's first page is read; a later page only for a pool with a hundred epochs after `epoch`.
+    with prefetch_scope(provider, (history(pool_id, 1) for _, (pool_id, _) in candidates)):
+        for key, (pool_id, _) in candidates:
+            for page in range(1, 10001):
+                rows = _pool_rows(provider.get(history(pool_id, page)))
+                done = len(rows) < 100
+                for r in rows:
+                    if not isinstance(r, dict):raise Refusal('provider_duplicate_or_invalid_stake')
+                    row_epoch = integer(r.get('epoch'))
+                    if row_epoch == epoch:
+                        if integer(r.get('delegators_count')) < 1:raise Refusal('provider_duplicate_or_invalid_stake')
+                        out[key] = integer(r.get('active_stake'))
+                    if row_epoch <= epoch:done = True;break
+                if done:break
+            else:raise Refusal('provider_page_limit')
     return out
 
 
@@ -392,7 +421,7 @@ def epoch_facts(provider,epoch,target=None,*,stake_prefix):
 
 class BlockfrostSource:
     def __init__(self,provider,profile,store,generation,stop_requested,*,audit=False,coverage=None,known=None,relevance_enabled=False,inventories=None):
-        self.provider=provider;self.profile=profile;self.store=store;self.stop_requested=stop_requested;self.gen=generation
+        self.provider=provider;self.profile=profile;self.store=store;self.stop_requested=stop_requested;self.gen=generation;self.audit=audit
         # Inventories read ahead of this traversal, by block hash (`follow.update_follow`'s look-ahead). Only the
         # acquisition traversal takes them; the independent traversal always reads its own.
         self.inventories=None if audit else inventories
@@ -433,6 +462,9 @@ class BlockfrostSource:
         self.add('blocks',r);return r
     def transaction(self,h,expected_block=None,expected_index=None,expected_valid=None):
         if h in self.cache:return self.cache[h]
+        # The independent traversal reads the same transaction next: hinted twice, this read takes one hint and the
+        # other is sent beside it.
+        if self.auditor is not None:prefetch(self.provider,['/txs/'+h.hex()]*2)
         r=self.provider.get('/txs/'+h.hex())
         if r.get('hash')!=h.hex() or type(r.get('valid_contract')) is not bool or (expected_valid is not None and r['valid_contract']!=expected_valid):raise Refusal('provider_transaction_mismatch')
         block=self.block(hexbytes(r.get('block'),32));index=integer(r.get('index'))
@@ -486,6 +518,7 @@ class BlockfrostSource:
         read=None if self.inventories is None else self.inventories.get(bytes(block['hash']))
         self.cache={};self.facts=[];txs=inventory(self.provider,block) if read is None else read['transactions']
         if self.discovery:self.discovery.begin()
+        if not self.audit:prefetch(self.provider,self._ahead(block,txs))
         for index,decoded in enumerate(txs):
             if self.stop_requested():raise Refusal('interrupted')
             h=decoded['hash']
@@ -516,22 +549,32 @@ class BlockfrostSource:
             if self.bridge and any(output_value(x)[0]['address']==self.profile.ics for x in relevant_out):
                 self.add('tx_metadata',metadata.fetch(self.provider,decoded) if decoded['valid'] else metadata.fact(h,False,None))
         return self.facts,{'transactions_scanned':len(txs),'facts':len(self.facts)},txs
-    def block_facts(self,block):
-        facts,stats,txs=self._collect(block)
+    def _ahead(self,block,txs):
+        """The paths this block's traversals read next, in their order: `/utxos` of each transaction the selection can
+        take from the state at the block's start (each traversal reads its own) and, between them, the independent
+        traversal's inventory pages."""
+        selected=['/txs/'+d['hash'].hex()+'/utxos' for d in (txs if self.discovery is None else self.discovery.may_select(txs))]
+        yield from selected
         if self.auditor is not None:
-            from db_sync_alt.sources.blockfrost.relevance import inventory as fact_inventory,KIND,MAX_KEYS,MAX_PROOF
-            expected,_,independent=self.auditor._collect(block)
-            tx_hashes=[row['hash'] for row in txs]
-            if tx_hashes!=[row['hash'] for row in independent]:raise Refusal('independent_provider_inventory_changed')
-            actual=fact_inventory(facts);expected=fact_inventory(expected)
-            if actual!=expected:raise Refusal('independent_provider_mismatch')
-            proof={'kind':KIND,'version':1,'parent_ref':self.coverage['parent_ref'],'inventory':expected,
-                   'transactions':len(txs),'transaction_hashes_sha256':digest(tx_hashes),
-                   'created_outputs':jsonable(sorted(self.auditor.discovery.block_created))}
-            if len(canonical(proof).encode())>MAX_PROOF:raise Refusal('relevance_work_unit_limit')
-            for table,entry in expected.items():self.known[table].update(canonical(k) for k in entry['keys'])
-            if sum(map(len,self.known.values()))>MAX_KEYS:raise Refusal('relevance_work_unit_limit')
-            stats['relevance']=proof
+            yield from inventory_paths(block)
+            yield from selected
+    def block_facts(self,block):
+        with prefetch_scope(self.provider):
+            facts,stats,txs=self._collect(block)
+            if self.auditor is not None:
+                from db_sync_alt.sources.blockfrost.relevance import inventory as fact_inventory,KIND,MAX_KEYS,MAX_PROOF
+                expected,_,independent=self.auditor._collect(block)
+                tx_hashes=[row['hash'] for row in txs]
+                if tx_hashes!=[row['hash'] for row in independent]:raise Refusal('independent_provider_inventory_changed')
+                actual=fact_inventory(facts);expected=fact_inventory(expected)
+                if actual!=expected:raise Refusal('independent_provider_mismatch')
+                proof={'kind':KIND,'version':1,'parent_ref':self.coverage['parent_ref'],'inventory':expected,
+                       'transactions':len(txs),'transaction_hashes_sha256':digest(tx_hashes),
+                       'created_outputs':jsonable(sorted(self.auditor.discovery.block_created))}
+                if len(canonical(proof).encode())>MAX_PROOF:raise Refusal('relevance_work_unit_limit')
+                for table,entry in expected.items():self.known[table].update(canonical(k) for k in entry['keys'])
+                if sum(map(len,self.known.values()))>MAX_KEYS:raise Refusal('relevance_work_unit_limit')
+                stats['relevance']=proof
         return facts,stats
 
 def complete_inherited_epoch(provider,store,g,epoch,inherited):

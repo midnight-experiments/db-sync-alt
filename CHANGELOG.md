@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- An update can keep several Blockfrost requests in flight
+  (`sync.provider_concurrency`, 1 to 8, default 1) and pace them
+  (`sync.provider_max_requests_per_hour`, 1 to 28,800, absent by default).
+  - **Before:** an update sent one request at a time, each after the previous
+    answer. On a Mainnet catch-up most of each request's time was Blockfrost's
+    answer time (about 0.55 s of about 0.66 s).
+  - **Now:** with more than 1, an update sends up to that number minus one
+    requests ahead whose paths it already knows (the pages of the blocks it
+    sizes, the `/txs/{hash}/utxos` requests a block's selection can make, the
+    independent pass's pages and transactions, the per-pool stake requests of an
+    epoch), after the same checks and with the job attempt saved first, as for
+    any request. It uses and checks the answers in the same order as before, so
+    the published data are the same for every setting. A request sent ahead and
+    not used stays counted and its answer is dropped. Receipts list the requests
+    in the order they were used; their attempt numbers are reservation numbers
+    and need not increase along a list. The pace spaces the update's requests,
+    sent directly or ahead, at least 3,600 / value seconds apart. The built-in
+    client still sends one request at a time.
+  - With the defaults an update sends the same requests, in the same order,
+    with the same receipts and job saves as 0.4.8.
+  - Not breaking: an image swap from 0.4.8; a pending update continues. 0.4.8
+    refuses the two new options: remove them from `sync` before starting 0.4.8
+    again.
 - A PostgreSQL lock timeout in the follower's update or in its tip poll is
   temporary: the follower waits and runs it again.
   - **Before:** when another session held a row the follower writes (its
