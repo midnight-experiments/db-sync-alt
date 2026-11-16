@@ -4,7 +4,8 @@ db-sync-alt reports problems as short stable codes: in `/health` and `/status`
 (`reason_codes`, `error_code`, `poll_error_code`), and as `{"error_code": "…"}` or
 `{"error": "…"}` printed by a command that stops. Commands exit with 2 for a
 refusal and 75 when the condition is temporary and a retry can succeed (a
-provider failure during `acquire`, a lost database connection of the service).
+provider failure or a database lock timeout during `acquire`, a lost database
+connection of the service).
 Codes never contain secrets, URLs or raw exception text.
 
 General rules: stop the service before administrative commands; never delete
@@ -77,6 +78,7 @@ Shown as `error_code` in `/status`, or printed when the service exits.
 | `postgres_backup_tool_unavailable`, `postgres_backup_tool_version_mismatch` | `pg_dump`/`pg_restore` 17 is missing from `PATH` or has another version | Install the PostgreSQL 17 client tools |
 | `storage_low` | A checked volume has less free space than its configured reserve | Free space on that volume, then restart |
 | `provider_unavailable`, `provider_timeout` | Blockfrost failed, or the connection broke or timed out; the request was counted | Temporary: db-sync-alt waits and retries by itself |
+| `database_lock_timeout` | Another PostgreSQL session held a row or lock the follower needed (its update job, the day's poll job, the shared `provider-metrics` row, or the serving lock at publication) longer than the follower's lock timeout (2 to 5 seconds for the update, 1 second for the poll), usually while the disk under PostgreSQL stalled. Reported as `error_code` for the update (`sync` reads `backoff`) and as `poll_error_code` for the poll | Temporary: db-sync-alt rolls the update or the poll back and runs it again after 1, 2, 4, 8, 16 and then every 30 seconds, and logs `database_lock_timeout_retry` each time; a pending generation resumes where it stopped. When every run for 300 seconds ends in a lock timeout the service stops with `database_unavailable` (exit code 75) and logs `database_lock_timeout_persisted`: check the disk and the sessions holding locks (`pg_stat_activity`, `pg_locks`) before restarting |
 | `quota_exhausted` | The daily request ceiling is reached | db-sync-alt waits for the next UTC day; see [costs](costs.md) |
 | `request_budget_exhausted` | A job used up its own request budget for the UTC day (10,000 requests by default) | Temporary: db-sync-alt waits for the next UTC day (`quota_wait`). Polling continues with that day's job; an update continues where it stopped under a new job record (`provider-active`) that carries the earlier count (`prior_attempts`), and the exhausted record is kept as `provider-acquire-<job id>`. Never reset accounting |
 | `provider_request_rejected` | Blockfrost refused a request (for example a wrong key or network) | Check the key file and that it is a key of the configured network |

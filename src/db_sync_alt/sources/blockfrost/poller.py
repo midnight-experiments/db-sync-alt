@@ -14,7 +14,7 @@ import time
 import uuid
 
 from db_sync_alt.contract import canonical, Refusal
-from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure
+from db_sync_alt.errors import LifecycleFailure, LockTimeouts, TransientSyncFailure, lock_timeout
 from db_sync_alt.store.database import connect, metrics_marker, save_metrics_marker
 from psycopg.types.json import Jsonb
 
@@ -285,6 +285,7 @@ class HeadPoller:
         self.thread = None; self.sequence = 0; self.last_day = None
         self.health.configure_follow('incremental', interval)
         self.previous_start = None; self.max_gap = 0; self.missed_ticks = 0
+        self.lock_timeouts = LockTimeouts(clock, 'poll')
 
     def start(self):
         if self.thread is not None: raise LifecycleFailure('startup_failed')
@@ -327,7 +328,7 @@ class HeadPoller:
             if committed and confirmed['height']<committed['height']:
                 provider._wait('provider_unavailable')
         except Exception as error:
-            if not (isinstance(error,Refusal) and error.code=='interrupted' and self.stop.is_set()):
+            if not (isinstance(error,Refusal) and error.code=='interrupted' and self.stop.is_set()) and not lock_timeout(error):
                 provider.record_failure(error)
             raise
         if self.stop.is_set(): return
@@ -354,11 +355,16 @@ class HeadPoller:
                             max_gap_seconds=self.max_gap,lateness_seconds=lateness,missed_ticks=self.missed_ticks)
                 self.health.heartbeat('poll'); self.health.poll_timing(**timing)
                 try:
-                    self.tick(store,client); self.retry_at=0
+                    self.tick(store,client); self.retry_at=0; self.lock_timeouts.reset()
                 except PollDayChanged:
-                    self.retry_at=0
+                    self.retry_at=0; self.lock_timeouts.reset()
                 except TransientSyncFailure as error:
-                    self.retry_at=error.retry_at; self.health.poll_error(error.code)
+                    self.retry_at=error.retry_at; self.health.poll_error(error.code); self.lock_timeouts.reset()
+                except Exception as error:
+                    if not lock_timeout(error): raise
+                    # The tick's statement rolled back; it polls again after the pause, without a failure record.
+                    pause=self.lock_timeouts.retry(error)
+                    self.retry_at=pause.retry_at; self.health.poll_error(pause.code)
                 finally:
                     timing['completed_at']=self.clock(); self.health.poll_timing(**timing)
                 now=self.mono()

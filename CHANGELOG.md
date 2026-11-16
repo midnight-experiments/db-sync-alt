@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- A PostgreSQL lock timeout in the follower's update or in its tip poll is
+  temporary: the follower waits and runs it again.
+  - **Before:** when another session held a row the follower writes (its
+    update job, the day's poll job or the shared `provider-metrics` row) or the
+    serving lock longer than the follower's lock timeout (2 to 5 s for the
+    update, 1 s for the poll), for example while a disk stall slowed
+    PostgreSQL, the service stopped with `database_unavailable` (exit code 75):
+    it stayed down, or a restart repeated its startup verification.
+  - **Now:** the update or the poll rolls back and runs again after 1, 2, 4,
+    8, 16 and then every 30 seconds; a pending generation resumes where it
+    stopped. Meanwhile `/status` reports `database_lock_timeout` (`error_code`
+    for the update, with `sync` `backoff`; `poll_error_code` for the poll), each
+    retry logs `database_lock_timeout_retry`, and no failure record is written
+    to the job. When every run for 300 seconds ends in a lock timeout, the
+    service stops as before with `database_unavailable` (exit code 75) and logs
+    `database_lock_timeout_persisted`.
+  - `acquire --source blockfrost` reports a lock timeout as
+    `database_lock_timeout` with exit code 75 (temporary) instead of
+    `invalid_configuration_or_database` with exit code 2.
+  - Every other database error is handled as before, and the lock timeout
+    settings are unchanged.
+- No format, schema, manifest or refusal change.
+
 ## 0.4.8
 
 - A relevance update holds as many blocks as its content allows, up to
