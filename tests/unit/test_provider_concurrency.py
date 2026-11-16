@@ -124,11 +124,13 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(sum(t.name.startswith('db-sync-alt-request') for t in threading.enumerate()), workers)
 
     def test_four_in_flight_consume_in_order_with_the_same_results_and_reservations_first(self):
-        # Every fifth path is not hinted: it goes out directly, beside the requests sent ahead.
+        # Every fifth path is not hinted: it goes out directly, beside the requests sent ahead. Every third answer
+        # is slower, so answers complete out of order.
         hinted = [p for i, p in enumerate(PATHS) if i % 5]
         timed = {}
         for size in (1, 4):
             run = Run(size, delay=0.05)
+            run.client.delays = {p: 0.12 for p in PATHS[::3]}
             start = time.monotonic()
             results = run.traverse(PATHS, hinted=hinted)
             timed[size] = (time.monotonic() - start, run)
@@ -191,6 +193,8 @@ class ConcurrencyTests(unittest.TestCase):
                 for size in (1, 4):
                     run = Run(size)
                     run.client.errors[paths[k]] = text
+                    # The failure arrives while the two requests before it are still awaited.
+                    run.client.delays = {paths[k - 2]: 0.15, paths[k - 1]: 0.15, paths[k]: 0}
                     results[size] = (outcome(run, paths, optional=optional), run)
                 (one, first), (four, second) = results[1], results[4]
                 self.assertEqual(one, four)
