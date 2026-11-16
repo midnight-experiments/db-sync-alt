@@ -195,7 +195,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_transient_and_quota_retry_keep_coverage_without_polling_provider(self):
         for code, pause in (('provider_unavailable', 'backoff'), ('quota_exhausted', 'quota_wait'),
-                            ('request_budget_exhausted', 'quota_wait')):
+                            ('request_budget_exhausted', 'quota_wait'), ('database_lock_timeout', 'backoff')):
             with self.subTest(code=code):
                 runtime = Runtime()
                 sync = Sync(runtime)
