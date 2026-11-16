@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.9
 
 - An update can keep several Blockfrost requests in flight
   (`sync.provider_concurrency`, 1 to 8, default 1) and pace them
@@ -47,6 +47,10 @@
   - Every other database error is handled as before, and the lock timeout
     settings are unchanged.
 - No format, schema, manifest or refusal change.
+- Upgrading from 0.4.8 is an image swap: no schema, format or backup change. A
+  pending generation started on 0.4.8 resumes on 0.4.9, and the reverse. A
+  downgrade to 0.4.8 needs the `sync` section without `provider_concurrency`
+  and `provider_max_requests_per_hour`.
 
 ## 0.4.8
 
