@@ -452,6 +452,19 @@ class Discovery:
         if any(x is None or x for x in decisions):return True
         refs=decoded['ordinary']|(decoded['collateral'] if not decoded['valid'] else frozenset())
         return any(self.contains(key) for key in refs) or any(self.profile.required(p,n) for p,n,_ in decoded['mints'])
+    def may_select(self,transactions):
+        """The transactions of a block `select` can take, from the state at the block's start: those it takes now and
+        those spending an output of an earlier one of them that `output` does not rule out. A superset: an undecided
+        output may turn out irrelevant."""
+        reachable=set()
+        for decoded in transactions:
+            if 'outputs' in decoded:
+                refs=decoded['ordinary']|(decoded['collateral'] if not decoded['valid'] else frozenset())
+                if not refs&reachable and not self.select(decoded):continue
+            yield decoded
+            outputs=list(decoded.get('outputs',()))
+            if decoded.get('collateral_return'):outputs.append(decoded.get('collateral_output'))
+            reachable.update((decoded['hash'],index) for index,value in enumerate(outputs) if self.output(value) is not False)
     def advance(self,decoded,outputs):
         """Record the relevant outputs the transaction created (a phase-2-invalid one: its collateral return)."""
         from db_sync_alt.sources.blockfrost.adapter import output_value

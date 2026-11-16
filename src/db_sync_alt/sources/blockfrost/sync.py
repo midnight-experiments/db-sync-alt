@@ -8,6 +8,8 @@ An update (acquisition job) is sized to its blocks and spends at most its budget
 UTC day: an exhausted update waits for the next UTC day and continues under a new job
 record that carries the earlier count. Polling has an explicit independent UTC-day budget.
 """
+from concurrent import futures
+import contextlib
 import datetime as dt
 import hashlib
 import math
@@ -18,6 +20,7 @@ import uuid
 
 from db_sync_alt.resources import profile_dir
 from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, ProviderClient, block_row, bounded_answer, input_cut, update)
+from db_sync_alt.sources.blockfrost.prefetch import MAX_CONCURRENCY, MAX_REQUESTS_PER_HOUR, Ahead, Dispatcher, Pacer, Window
 from db_sync_alt.sources.blockfrost.provider import MAX_DAILY_LIMIT, UTXOS, transport_kind
 from db_sync_alt.contract import Profile, Refusal
 from db_sync_alt.service.health import ChainPoint, PendingProgress, QuotaStatus
@@ -355,6 +358,11 @@ def job_target(store, ready, limit, budget, *, relevance):
     return target
 
 
+def valid_path(path):
+    return (isinstance(path, str) and path.startswith('/') and not path.startswith('//')
+            and not any(c in path for c in ('#', '\\', '\n', '\r')))
+
+
 def validate_job(job, *, kind=None, security=None):
     """Fail closed on corrupted counters; never normalize a spent budget.
 
@@ -393,7 +401,7 @@ def validate_job(job, *, kind=None, security=None):
 
 
 class AccountedProvider(ProviderClient):
-    def __init__(self, store, key, job, client, health, stop_event, *, network, clock=time.time, profile=None):
+    def __init__(self, store, key, job, client, health, stop_event, *, network, clock=time.time, profile=None, dispatcher=None):
         # The job row carries budget, attempts and identity; there is no per-invocation budget.
         validate_job(job, security=network.security)
         self.network = network
@@ -405,6 +413,10 @@ class AccountedProvider(ProviderClient):
         self.receipts = []
         self.failure_context = {'stage': 'unknown'}
         self.failure_recorded = False
+        # The sync driver's sends (`prefetch.Dispatcher`): several in flight and their pace, when configured.
+        self.dispatcher = dispatcher
+        # With several requests in flight, the hinted paths of the current block of work (`prefetch_scope`).
+        self.window = Window(dispatcher.size) if dispatcher is not None and dispatcher.size > 1 else None
 
     def set_failure_context(self, stage, **fields):
         # Every stage resets block/transaction fields. Only generation carries.
@@ -479,12 +491,34 @@ class AccountedProvider(ProviderClient):
         """Counted GET whose provider HTTP 404 answer is returned as None."""
         return self._get(path, missing_ok=True)
 
+    @contextlib.contextmanager
+    def prefetch_scope(self, paths=()):
+        if self.window is None:
+            yield
+            return
+        self.window.scopes += 1
+        try:
+            self.prefetch(paths)
+            yield
+        finally:
+            self.window.scopes -= 1
+            if not self.window.scopes:
+                self.window.drop()
+
+    def prefetch(self, paths):
+        if self.window is not None and self.window.scopes:
+            self.window.queued.extend(path for path in paths if valid_path(path) and path != '/metrics')
+
     def _get(self, path, *, missing_ok):
         if self.stop_event.is_set():
             raise Refusal('interrupted')
-        if (not isinstance(path, str) or not path.startswith('/') or path.startswith('//')
-                or any(c in path for c in ('#', '\\', '\n', '\r'))):
+        if not valid_path(path):
             raise Refusal('invalid_provider_path')
+        if self.window is not None and path != '/metrics':
+            ahead = self.window.take(path)
+            if ahead is not None:
+                self._send_ahead()
+                return self._consume(path, ahead, missing_ok=missing_ok)
         now = self.clock()
         if self.job.get('retry_at', 0) > now:
             raise TransientSyncFailure(self.job.get('error_code', 'provider_unavailable'),
@@ -511,40 +545,106 @@ class AccountedProvider(ProviderClient):
             self.save()
             raise TransientSyncFailure('request_budget_exhausted', retry_at=retry)
         self.attempts += 1
+        attempt = self.attempts
         self.job['reserved_at'] = self.clock()
         self.save()  # durable reservation BEFORE shared request, including failure
+        if self.window is not None and path != '/metrics':
+            self._send_ahead()
         self.health.end_operation()
         self.health.begin_operation('provider')
-        cut = input_cut(self.profile) if self.profile is not None and UTXOS.fullmatch(path) else None
+        cut = self._cut(path)
         try:
-            # db-sync-alt's own client reads an oversized `/utxos` answer row by row; another client's parsed answer is cut below.
-            extra = {'cut': cut} if cut is not None and getattr(self.client, 'reads_by_row', False) else {}
-            result = self.client.get(path, purpose='db-sync-alt:' + self.job_id, **extra)
+            send = self._sender(path, cut)
+            result = send() if self.dispatcher is None else self.dispatcher.call(send)
         except Exception as error:
-            usage = self._quota()
-            text = str(error)  # classify known shared machine text, never serialize it
-            status = getattr(error, 'http_status', None)
-            kind = getattr(error, 'kind', None) or transport_kind(text)
-            if usage.get('exhausted') or usage['budget_used'] >= usage['daily_limit'] or text.startswith('Daily request budget exhausted') or text.startswith('HTTP 402;') or status == 402:
-                self._wait('quota_exhausted', quota=True)
-            if status in (418, 429) or kind == 'cooldown' or text.startswith(('HTTP 418;', 'HTTP 429;', 'Provider cooldown active', 'Shared rate-limit cooldown')):
-                self._wait('provider_unavailable', minimum=max(self.clock() + 60, usage.get('cooldown_until') or 0))
-            if missing_ok and (status == 404 or text.startswith('HTTP 404;')):
-                return None
-            if (status == 404 or text.startswith('HTTP 404;')) and path.startswith('/epochs/'):
-                raise Refusal('provider_epoch_not_ready') from None
-            if status in (500,502,503,504) or kind in ('timeout','connection') or text.startswith(('HTTP 500;', 'HTTP 502;', 'HTTP 503;', 'HTTP 504;')):
-                self._wait('provider_timeout' if kind == 'timeout' or 'Timeout' in text else 'provider_unavailable')
-            # Authentication, invalid JSON, unexpected HTTP statuses and unknown
-            # errors are not blindly retried and never expose raw exception text.
-            raise LifecycleFailure('provider_request_rejected') from None
+            return self._failed(path, error, missing_ok=missing_ok)
         finally:
             self.health.end_operation()
             self.health.begin_operation('verification')
+        return self._answered(path, result, cut, attempt, day)
+
+    def _cut(self, path):
+        return input_cut(self.profile) if self.profile is not None and UTXOS.fullmatch(path) else None
+
+    def _sender(self, path, cut):
+        # db-sync-alt's own client reads an oversized `/utxos` answer row by row; another client's parsed answer is cut below.
+        extra = {'cut': cut} if cut is not None and getattr(self.client, 'reads_by_row', False) else {}
+        return lambda: self.client.get(path, purpose='db-sync-alt:' + self.job_id, **extra)
+
+    def _send_ahead(self):
+        """Send hinted paths ahead until N - 1 are in flight, after the checks of a direct request (stop, job wait,
+        quota, cooldown, job budget) and one durable job reservation for all of them. Nothing is sent ahead while
+        the `/metrics` reconciliation is due: the next direct request runs it first."""
+        window = self.window
+        room = window.room()
+        if room <= 0 or self.stop_event.is_set():
+            return
+        now = self.clock()
+        if self.job.get('retry_at', 0) > now:
+            return
+        usage = self._quota()
+        cooldown = usage.get('cooldown_until')
+        if usage.get('exhausted') or (isinstance(cooldown, (int, float)) and cooldown > now):
+            return
+        day = dt.datetime.fromtimestamp(now, dt.timezone.utc).date().isoformat()
+        if self._metrics_due(day, usage['budget_used']):
+            return
+        # The client may not have counted the requests sent ahead yet, nor the update thread's own (sent directly
+        # next, or the one it consumes next).
+        room = min(room, self.budget - self.attempts, usage['daily_limit'] - usage['budget_used'] - len(window.sent) - 1)
+        if room <= 0:
+            return
+        first = self.attempts + 1
+        self.attempts += room
+        self.job['reserved_at'] = self.clock()
+        self.save()  # durable reservation BEFORE the requests are sent
+        for attempt in range(first, first + room):
+            path = window.queued.popleft()
+            ahead = Ahead(path, attempt, self._cut(path))
+            ahead.future = self.dispatcher.submit(self._sender(path, ahead.cut), lambda ahead=ahead: ahead.dropped)
+            window.sent.append(ahead)
+
+    def _consume(self, path, ahead, *, missing_ok):
+        """The answer of a request sent ahead, handled as a direct request's: the same classification, receipt and
+        job update. A stop is honoured while it is awaited."""
+        self.health.end_operation()
+        self.health.begin_operation('provider')
+        while not futures.wait((ahead.future,), timeout=0.5).done:
+            if self.stop_event.is_set():
+                raise Refusal('interrupted')
+        try:
+            result = ahead.future.result()
+        except Exception as error:
+            return self._failed(path, error, missing_ok=missing_ok)
+        finally:
+            self.health.end_operation()
+            self.health.begin_operation('verification')
+        return self._answered(path, result, ahead.cut, ahead.attempt, None)
+
+    def _failed(self, path, error, *, missing_ok):
+        usage = self._quota()
+        text = str(error)  # classify known shared machine text, never serialize it
+        status = getattr(error, 'http_status', None)
+        kind = getattr(error, 'kind', None) or transport_kind(text)
+        if usage.get('exhausted') or usage['budget_used'] >= usage['daily_limit'] or text.startswith('Daily request budget exhausted') or text.startswith('HTTP 402;') or status == 402:
+            self._wait('quota_exhausted', quota=True)
+        if status in (418, 429) or kind == 'cooldown' or text.startswith(('HTTP 418;', 'HTTP 429;', 'Provider cooldown active', 'Shared rate-limit cooldown')):
+            self._wait('provider_unavailable', minimum=max(self.clock() + 60, usage.get('cooldown_until') or 0))
+        if missing_ok and (status == 404 or text.startswith('HTTP 404;')):
+            return None
+        if (status == 404 or text.startswith('HTTP 404;')) and path.startswith('/epochs/'):
+            raise Refusal('provider_epoch_not_ready') from None
+        if status in (500,502,503,504) or kind in ('timeout','connection') or text.startswith(('HTTP 500;', 'HTTP 502;', 'HTTP 503;', 'HTTP 504;')):
+            self._wait('provider_timeout' if kind == 'timeout' or 'Timeout' in text else 'provider_unavailable')
+        # Authentication, invalid JSON, unexpected HTTP statuses and unknown
+        # errors are not blindly retried and never expose raw exception text.
+        raise LifecycleFailure('provider_request_rejected') from None
+
+    def _answered(self, path, result, cut, attempt, day):
         usage = self._quota()
         result, encoded = bounded_answer(result, cut)
         self.receipts.append({'endpoint': path, 'sha256': hashlib.sha256(encoded).hexdigest(),
-                              'bytes': len(encoded), 'attempt': self.attempts,
+                              'bytes': len(encoded), 'attempt': attempt,
                               'at': dt.datetime.fromtimestamp(self.clock(), dt.timezone.utc).isoformat()})
         if len(self.receipts) > 20000:
             raise Refusal('provider_receipt_unit_limit')
@@ -636,8 +736,11 @@ class SyncDriver:
         defaults = {'max_batch_blocks': 100, 'publication_interval_seconds': 60,
                     'acquisition_request_budget': 10000, 'daily_poll_request_budget': 10000,
                     'follow_min_blocks': 1, 'follow_max_wait_seconds': 40,
-                    'integrity_checkpoint_interval_seconds': 21600, 'relevance_enabled': False}
-        if set(self.options) - set(defaults):
+                    'integrity_checkpoint_interval_seconds': 21600, 'relevance_enabled': False,
+                    'provider_concurrency': 1}
+        # Absent: no pace of its own (the client's limits apply).
+        paced = 'provider_max_requests_per_hour'
+        if set(self.options) - set(defaults) - {paced}:
             raise LifecycleFailure('invalid_sync_configuration')
         for key, value in defaults.items():
             self.options.setdefault(key, value)
@@ -646,9 +749,16 @@ class SyncDriver:
         for key, low, high in (('max_batch_blocks', 1, 1000), ('publication_interval_seconds', 1, 1800),
                                ('acquisition_request_budget', 1, 10000), ('daily_poll_request_budget', 1, 10000),
                                ('follow_min_blocks', 1, 100), ('follow_max_wait_seconds', 1, 120),
-                               ('integrity_checkpoint_interval_seconds', 600, 604800)):
+                               ('integrity_checkpoint_interval_seconds', 600, 604800),
+                               ('provider_concurrency', 1, MAX_CONCURRENCY)):
             if type(self.options[key]) is not int or not low <= self.options[key] <= high:
                 raise LifecycleFailure('invalid_sync_configuration')
+        pace = self.options.get(paced)
+        if paced in self.options and (type(pace) is not int or not 1 <= pace <= MAX_REQUESTS_PER_HOUR):
+            raise LifecycleFailure('invalid_sync_configuration')
+        # One set of update requests in flight (and one pace) for the driver's providers; none with the defaults.
+        concurrency = self.options['provider_concurrency']
+        self._dispatcher = Dispatcher(concurrency, Pacer(pace) if pace else None) if concurrency > 1 or pace else None
 
     def check_follow_mode(self, store):
         if not getattr(store, 'supports_incremental', False):
@@ -713,7 +823,7 @@ class SyncDriver:
         if self._client is None:
             self._client = shared_client(self.profile.network)
         provider = AccountedProvider(store, key, job, self._client, health, stop_event, clock=self.clock,
-                                     network=self.profile.network, profile=self.profile)
+                                     network=self.profile.network, profile=self.profile, dispatcher=self._dispatcher)
         self._diagnostic_provider = provider
         return provider
 
