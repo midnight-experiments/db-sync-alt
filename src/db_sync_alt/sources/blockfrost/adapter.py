@@ -462,9 +462,10 @@ class BlockfrostSource:
         self.add('blocks',r);return r
     def transaction(self,h,expected_block=None,expected_index=None,expected_valid=None):
         if h in self.cache:return self.cache[h]
+        # The independent traversal reads the same transaction next: hinted twice, this read takes one hint and the
+        # other is sent beside it.
+        if self.auditor is not None:prefetch(self.provider,['/txs/'+h.hex()]*2)
         r=self.provider.get('/txs/'+h.hex())
-        # The independent traversal reads the same transaction next.
-        if self.auditor is not None:prefetch(self.provider,['/txs/'+h.hex()])
         if r.get('hash')!=h.hex() or type(r.get('valid_contract')) is not bool or (expected_valid is not None and r['valid_contract']!=expected_valid):raise Refusal('provider_transaction_mismatch')
         block=self.block(hexbytes(r.get('block'),32));index=integer(r.get('index'))
         if integer(r.get('block_height'))!=block['height'] or index>=block['tx_count'] or (expected_block is not None and block['hash']!=expected_block) or (expected_index is not None and index!=expected_index):raise Refusal('provider_transaction_position_mismatch')
