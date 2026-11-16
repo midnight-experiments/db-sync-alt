@@ -41,9 +41,20 @@ transactions need more requests than empty ones.
 | Limit | Default | Where it is kept |
 | --- | --- | --- |
 | Requests per UTC day for the key | 50,000 attempts; with the shared adapter, the limit its client reports (up to 10,000,000) | The request ledger, `accounting/usage.json` in the state directory |
-| Request rate | 8 per second | The same ledger |
+| Request rate of the built-in client | 8 per second | The same ledger |
+| Requests of an update in flight | 1 (`provider_concurrency`, up to 8) | `service.json` (`sync`) |
+| Pace of an update's requests | None of its own (`provider_max_requests_per_hour`, 1 to 28,800) | `service.json` (`sync`) |
 | One day's polling job | 10,000 attempts | The database (`chain.sync_jobs`) |
 | One update (acquisition job) | 10,000 attempts per UTC day | The database |
+
+Blockfrost limits each IP address to 10 requests per second, with a burst of
+500 that cools off at 10 per second, and answers HTTP 429 above that (418 after
+repeated floods); db-sync-alt then waits out the cooldown
+(`provider_unavailable`). An external client shared by several programs on one
+host should space all their requests below that, for example 8 per second for
+the whole host. With several requests in flight
+([requests in flight](operations.md#requests-in-flight)), a pace keeps a whole
+day under the key's daily limit.
 
 Every attempt is counted before it is sent, including failures and usage
 checks. Restarting the process never resets a count. When the daily ceiling is

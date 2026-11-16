@@ -2,8 +2,8 @@
 """Several requests of one update in flight: the accounted provider's prefetch window against a threaded fake client.
 
 The fake client answers each path on the calling thread after a delay, counts the requests in flight and records, at
-each call, whether the job attempts saved so far cover every call; the fake store saves a little late, so a request
-sent before its reservation is saved would be seen. Each run is compared with the same requests made one at a time.
+each call, whether the job attempts saved so far cover every call and how far they run ahead of the calls; the fake
+store saves a little late, so a request sent before its reservation is saved would be seen. Each run is compared with the same requests made one at a time.
 """
 import datetime as dt
 import threading
@@ -38,7 +38,7 @@ class ThreadedClient:
         self.delays, self.errors, self.hooks = {}, {}, {}
         self.lock = threading.Lock()
         self.calls, self.sent_at, self.uncovered = [], [], []
-        self.flight = self.most = self.used = self.cooldown = 0
+        self.flight = self.most = self.used = self.cooldown = self.ahead = 0
         self.limit = 50000
 
     def status(self):
@@ -52,8 +52,10 @@ class ThreadedClient:
             self.sent_at.append(self.clock())
             self.flight += 1
             self.most = max(self.most, self.flight)
-            if self.store.jobs[KEY]['attempts'] < len(self.calls):
+            saved = self.store.jobs[KEY]['attempts']
+            if saved < len(self.calls):
                 self.uncovered.append(path)
+            self.ahead = max(self.ahead, saved - len(self.calls))
         try:
             if path in self.hooks:
                 self.hooks[path]()
@@ -141,6 +143,9 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(one.receipts(), four.receipts())
         self.assertEqual(one.client.most, 1)
         self.assertEqual(four.client.most, 4)
+        # Reserved and not sent yet, at any request: at most the others of the four.
+        self.assertEqual(one.client.ahead, 0)
+        self.assertLessEqual(four.client.ahead, 3)
         self.assertLess(timed[4][0], timed[1][0] / 2)
 
     def test_the_job_budget_and_the_quota_bound_what_is_sent_ahead(self):

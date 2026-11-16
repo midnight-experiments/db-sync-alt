@@ -69,6 +69,21 @@ requests (about 5) are paid for one or two blocks. For Mainnet with filtering,
 about a minute more before a block is served. Both settings stay below Mainnet's
 `serving_lag_max_blocks` of 9.
 
+A catch-up spends most of its time waiting for Blockfrost's answers, one after
+another. With a shared client that lets several requests of one key be in
+flight, `provider_concurrency` 4 keeps up to four of an update's requests in
+flight at once, and the published data stay the same
+([requests in flight](operations.md#requests-in-flight)). Add a pace that keeps
+a whole day under the key's limit with room for its other users, for example
+`provider_max_requests_per_hour` 16,000 for a key of 500,000 requests a day
+(384,000 update requests and about 8,700 poll requests). At such a pace more than 4
+requests in flight gain nothing:
+
+```json
+{"sync": {"relevance_enabled": true, "follow_min_blocks": 3, "follow_max_wait_seconds": 60,
+          "provider_concurrency": 4, "provider_max_requests_per_hour": 16000}}
+```
+
 To return to an earlier release, stop the writer while `/status` shows no update
 in progress and `db-sync-alt status` shows no pending generation. An earlier
 release declares an unfinished update job's whole target without sizing it.
