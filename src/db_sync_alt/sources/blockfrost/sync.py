@@ -21,7 +21,7 @@ from db_sync_alt.sources.blockfrost.adapter import (OPENAPI, ProviderClient, blo
 from db_sync_alt.sources.blockfrost.provider import MAX_DAILY_LIMIT, UTXOS, transport_kind
 from db_sync_alt.contract import Profile, Refusal
 from db_sync_alt.service.health import ChainPoint, PendingProgress, QuotaStatus
-from db_sync_alt.errors import LifecycleFailure, TransientSyncFailure, CooperativeStop
+from db_sync_alt.errors import LifecycleFailure, LockTimeouts, TransientSyncFailure, CooperativeStop, lock_timeout
 from db_sync_alt.verify.completion import COMPLETION_ERRORS, validate_completion
 
 
@@ -630,6 +630,7 @@ class SyncDriver:
         self._follow_sequence = 0
         self._eligible_at = None
         self._checkpoint_due = None
+        self._lock_timeouts = LockTimeouts(clock, 'sync')
         self.profile = profile or Profile(profile_dir(config.network), config.network)
         self.options = dict(getattr(config, 'sync', {}))
         defaults = {'max_batch_blocks': 100, 'publication_interval_seconds': 60,
@@ -725,7 +726,9 @@ class SyncDriver:
             if self._poller is None and isinstance(store,PgStore):
                 direct_poll_lock=store.db.execute('SELECT pg_try_advisory_lock(%s,%s)',POLL_LOCK).fetchone()[0]
                 if not direct_poll_lock:raise LifecycleFailure('writer_busy')
-            return self._run_once(store, health, stop_event)
+            result = self._run_once(store, health, stop_event)
+            self._lock_timeouts.reset()
+            return result
         except Exception as error:
             # The lifecycle owner catches this exact local checkpoint signal.
             # Preserve its rollback/no-diagnostic behavior across driver frames.
@@ -736,6 +739,10 @@ class SyncDriver:
             # during shutdown retain diagnostics and their original mapping.
             if isinstance(error, Refusal) and error.code == 'interrupted' and stop_event.is_set():
                 return
+            # The update's transaction rolled back; it runs again after the pause, without a failure record.
+            if lock_timeout(error):
+                raise self._lock_timeouts.retry(error) from None
+            self._lock_timeouts.reset()
             provider = self._diagnostic_provider
             if provider is not None:
                 provider.record_failure(error)

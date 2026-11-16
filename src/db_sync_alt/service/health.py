@@ -23,7 +23,7 @@ ERROR_CODES = frozenset({
     'relevance_inventory_invalid', 'relevance_output_unqualified', 'relevance_profile_address_invalid', 'relevance_work_unit_limit',
     'unsupported_follow_mode', 'completion_recovery_required', 'completion_invalid', 'completion_mismatch',
     'provider_unavailable', 'provider_timeout', 'quota_exhausted',
-    'database_unavailable', 'database_timeout', 'canonical_conflict',
+    'database_unavailable', 'database_timeout', 'database_lock_timeout', 'canonical_conflict',
     'unsupported_capability', 'invalid_backup', 'invalid_identity',
     'invalid_coverage', 'internal_error', 'writer_busy', 'incomplete_restore',
     'missing_backup', 'sync_unavailable', 'sql_unavailable', 'shutdown_timeout', 'startup_failed', 'storage_low',
