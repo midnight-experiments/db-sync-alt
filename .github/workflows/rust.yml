@@ -1,0 +1,71 @@
+name: rust
+on:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'profiles/**'
+      - 'reference/**'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'profiles/**'
+      - 'reference/**'
+      - '.github/workflows/rust.yml'
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    container: rust:1.100.0-bookworm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
+      - run: python3 .github/scripts/check_public_source.py
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - name: Check generated profiles against the node sources
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/midnightntwrk/midnight-node.git "$RUNNER_TEMP/midnight-node"
+          git -C "$RUNNER_TEMP/midnight-node" checkout 86774edf8cc76345a5c3a4221f3fe80c094b1c33
+          cargo run --locked -p dsa-chain --example generate_profiles -- --node-source "$RUNNER_TEMP/midnight-node" --check
+  integration:
+    runs-on: ubuntu-24.04
+    container: rust:1.100.0-bookworm
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: dsa_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
+      - name: PostgreSQL integration tests
+        env:
+          DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
+        run: cargo test --locked -p dsa-store --test postgres -- --ignored

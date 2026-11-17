@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/dsa-chain", "crates/dsa-store", "crates/db-sync-alt"]
+resolver = "3"
+
+[workspace.package]
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+repository = "https://github.com/midnight-experiments/db-sync-alt"
+
+[workspace.dependencies]
+dsa-chain = { path = "crates/dsa-chain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"

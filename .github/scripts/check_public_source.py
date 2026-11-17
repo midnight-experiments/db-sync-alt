@@ -10,8 +10,9 @@ import subprocess
 
 ROOT_FILES = {'README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md',
               'SECURITY.md','CHANGELOG.md','CODE_OF_CONDUCT.md','.gitignore','.dockerignore',
-              'pyproject.toml','requirements.lock','.env.example'}
-ROOT_DIRS = {'src','tests','profiles','reference','deploy','tools','docs','.github'}
+              'pyproject.toml','requirements.lock','.env.example',
+              'Cargo.toml','Cargo.lock','rust-toolchain.toml'}
+ROOT_DIRS = {'src','tests','profiles','reference','deploy','tools','docs','.github','crates'}
 PATTERNS = {
     'personal_absolute_path': re.compile(r'/(?:home|Users|media)/[A-Za-z0-9_.-]+/'),
     'private_key': re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'),
