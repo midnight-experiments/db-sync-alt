@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Documentation only. midnight-node 2.1.101 connects to its db-sync database
+  only over TLS and ignores `ALLOW_NON_SSL`: the docs give tested steps to turn
+  TLS on, for any PostgreSQL server and for the Compose deployment's bundled
+  one, and `SSL_ROOT_CERT` for the node. The network status describes the
+  Mainnet database built from a real Mainnet cardano-db-sync and followed
+  through Blockfrost. The README and the costs page give the Blockfrost costs
+  measured at the Preprod tip and for a catch-up from the published snapshot,
+  date the memory and disk measurement, and say when `provider_concurrency` and
+  `provider_max_requests_per_hour` apply. The operations page counts eleven
+  reader relations.
+
 ## 0.4.9
 
 - An update can keep several Blockfrost requests in flight

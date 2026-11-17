@@ -59,12 +59,16 @@ are refused.
 | db-sync `meta.network_name` | `mainnet` | `preprod` | `preview` |
 | Blockfrost host | `cardano-mainnet.blockfrost.io` | `cardano-preprod.blockfrost.io` | `cardano-preview.blockfrost.io` |
 | Node stability margin / `/health` block-lag limit | 10 / 9 | 10 / 9 | 10 / 9 |
-| End-to-end qualified | no | yes | no |
+| End-to-end qualified | partly: built and followed, node at the tip not tested | yes | no |
 
 Preprod is built, followed, served and checked against cardano-db-sync end to
-end. The Mainnet and Preview profiles are checked by unit and integration tests
-on synthetic data only (for example a Preview build from block 0 with k = 432);
-neither network has been built from real data with this release.
+end. A Mainnet database built from a real Mainnet cardano-db-sync 13.8.0.0 (up
+to block 14,160,853), upgraded and verified, is followed through Blockfrost with
+[relevance filtering](mainnet-relevance.md), and a Midnight node 2.1.101 reads
+it over TLS; serving that node at the Mainnet chain tip is not tested. The
+Preview profile is checked by unit and integration tests on synthetic data only
+(for example a Preview build from block 0 with k = 432); no Preview database has
+been built from real data.
 
 With S = 0 (Preview) there is no history before the start cursor: a first
 generation has no prerequisites range, and the required epochs start at epoch 0

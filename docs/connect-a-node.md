@@ -9,6 +9,7 @@ cardano-db-sync database, with the reader login you created for it
 
 ```sh
 DB_SYNC_POSTGRES_CONNECTION_STRING='postgresql://db_sync_alt_reader:<password>@<host>:5432/db_sync_alt'
+SSL_ROOT_CERT=/path/to/root-ca.crt
 CARDANO_SECURITY_PARAMETER=2160
 ```
 
@@ -17,13 +18,67 @@ CARDANO_SECURITY_PARAMETER=2160
 | Host and port | Your PostgreSQL server as the node reaches it |
 | Database | db-sync-alt's database (`db_sync_alt` in the examples) |
 | User and password | The reader login and its password, never the owner login db-sync-alt runs as |
-| TLS | Your server's configuration, as for cardano-db-sync. With TLS on the server the node uses it; without it the node needs `ALLOW_NON_SSL=true`, and the connection must stay on loopback or a private network |
+| TLS | Required: midnight-node 2.1.101 connects only over TLS and refuses a server without it; `ALLOW_NON_SSL` has no effect. `SSL_ROOT_CERT` (the server's CA certificate) makes the node check the certificate and host name ([TLS](#tls)) |
 | `CARDANO_SECURITY_PARAMETER` | The network's security parameter k (2160 on Mainnet and Preprod, 432 on Preview); it must equal the profile's k (see below) |
 
 With the [Compose deployment](docker.md) PostgreSQL is not published on the
 host: attach the node's container to the deployment's `node` network and use
 host `postgres`, port 5432; the reader's password is
-`~/.local/share/db-sync-alt/private/operator/reader.password`.
+`~/.local/share/db-sync-alt/private/operator/reader.password`. The bundled
+server has no TLS until you
+[turn it on](docker.md#tls-for-the-midnight-node).
+
+## TLS
+
+midnight-node 2.1.101 connects to its db-sync database only over TLS. It refuses
+a PostgreSQL server that does not offer TLS, and its `ALLOW_NON_SSL` setting has
+no effect. With `SSL_ROOT_CERT` set to the server's CA certificate, the node
+checks the server's certificate and host name; without it, the connection is
+encrypted but the certificate is not checked. db-sync-alt's own connections stay
+on loopback and need no TLS.
+
+To turn TLS on in a PostgreSQL 17 server you administer:
+
+1. Create a CA and a server certificate for the host name in the node's
+   connection string (`<host>`):
+
+   ```sh
+   host='<host>'
+   openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=db-sync-alt PostgreSQL CA' \
+     -keyout root-ca.key -out root-ca.crt
+   openssl req -newkey rsa:3072 -nodes -subj "/CN=$host" -keyout server.key -out server.csr
+   printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$host" > server.ext
+   openssl x509 -req -in server.csr -CA root-ca.crt -CAkey root-ca.key -CAcreateserial \
+     -days 365 -extfile server.ext -out server.crt
+   ```
+
+   Keep `root-ca.key` private and off the server. A node that reaches the server
+   by IP address needs `subjectAltName=IP:<address>` instead. Renew
+   `server.crt` before it expires (365 days here); a reload picks up new files.
+2. Copy `server.crt` and `server.key` into a directory of the server, both owned
+   by the server's operating-system user and readable by it only (mode `600`).
+3. As the server's administrator, turn TLS on. A reload applies it; the server
+   keeps running:
+
+   ```sql
+   ALTER SYSTEM SET ssl = 'on';
+   ALTER SYSTEM SET ssl_cert_file = '<directory>/server.crt';
+   ALTER SYSTEM SET ssl_key_file = '<directory>/server.key';
+   SELECT pg_reload_conf();
+   ```
+
+4. Give the node the CA certificate: set `SSL_ROOT_CERT` to the path of
+   `root-ca.crt` as the node sees it (mount the file into the node's container).
+5. Check the connection as the reader, with the checks the node makes:
+
+   ```sh
+   psql 'postgresql://db_sync_alt_reader@<host>:5432/db_sync_alt?sslmode=verify-full&sslrootcert=root-ca.crt' \
+     -c '\conninfo'
+   ```
+
+   The answer reports an SSL connection and its protocol (for example TLSv1.3).
+   A certificate for another host name, or from another CA, is refused here as
+   it is by the node.
 
 ## Node requirements
 
@@ -173,10 +228,10 @@ and the server enough `max_connections` for every database on it.
 
 ## Checking the connection
 
-With `psql`, as the reader:
+With `psql`, as the reader, over TLS as the node connects:
 
 ```sh
-psql 'postgresql://db_sync_alt_reader@<host>:5432/db_sync_alt' \
+psql 'postgresql://db_sync_alt_reader@<host>:5432/db_sync_alt?sslmode=verify-full&sslrootcert=root-ca.crt' \
   -c "select count(*) from information_schema.tables where table_name = 'tx_in'" \
   -c 'select block_no from block order by block_no desc limit 1'
 ```

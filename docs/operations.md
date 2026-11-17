@@ -46,7 +46,7 @@ relation and remember that until it restarts. db-sync-alt removes `PUBLIC`'s
 privileges on its database again whenever it creates or restores it.
 
 Once the database serves, db-sync-alt grants the reader `CONNECT`, `USAGE` on
-schema `public`, `SELECT` on the ten node-facing relations and `EXECUTE` on the
+schema `public`, `SELECT` on the eleven node-facing relations and `EXECUTE` on the
 serving check; it does so at every service start and after every restore. It then
 verifies that the reader can do nothing more — no role membership, no `TEMP` or
 `CREATE`, no access to its internal schemas, no write, no other function — and

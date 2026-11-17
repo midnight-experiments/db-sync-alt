@@ -3,8 +3,8 @@
 Cardano data for a Midnight node in a small PostgreSQL database, instead of a
 full Cardano node and cardano-db-sync stack.
 
-- **Up to 83 % less memory:** run a full Midnight node with up to 83 % less
-  memory than with a Cardano node and cardano-db-sync
+- **About 13 GiB less memory:** run a full Midnight node without a Cardano node
+  and cardano-db-sync, which take about 14 GiB with their PostgreSQL
   ([memory and disk](#memory-and-disk)).
 - **About 58 GiB less disk:** only the Cardano data Midnight uses is kept, 1.5 GiB
   instead of 59.1 GiB.
@@ -24,7 +24,7 @@ full Cardano node and cardano-db-sync stack.
 
 ```mermaid
 flowchart LR
-    blockfrost["Blockfrost API<br/>(Cardano Preprod)"] -- new blocks --> follower
+    blockfrost["Blockfrost API<br/>(Cardano)"] -- new blocks --> follower
     initial["Release snapshot or<br/>your own db-sync"] -. initial data, once .-> follower
     follower["db-sync-alt"] -- checked updates --> postgres[("PostgreSQL 17")]
     node["Midnight node"] -- "db-sync SQL queries<br/>(reader login)" --> postgres
@@ -32,8 +32,9 @@ flowchart LR
 
 ## Memory and disk
 
-Measured on a running Preprod deployment. Memory is RAM plus swap plus the
-inactive file cache.
+Measured on a running Preprod deployment on 3 November 2026, with db-sync-alt
+0.1.0 and midnight-node 1.0.400. Memory is RAM plus swap plus the inactive file
+cache.
 
 | Original full stack | GiB of memory | db-sync-alt stack | GiB of memory |
 | --- | ---: | --- | ---: |
@@ -43,7 +44,10 @@ inactive file cache.
 | PostgreSQL 15 | 2.20 | | |
 | **Total** | **15.56** | **Total** | **2.59** |
 
-About 83 % less memory. Both stacks run the same Midnight node process.
+About 13 GiB less memory: the Cardano node, cardano-db-sync and PostgreSQL 15
+take 14.26 GiB, db-sync-alt and PostgreSQL 17 take 1.29 GiB. Both stacks run the
+same Midnight node process, so the saving does not depend on it; the percentage
+(83 % here) does.
 
 | Original full stack | GiB on disk | db-sync-alt stack | GiB on disk |
 | --- | ---: | --- | ---: |
@@ -54,7 +58,9 @@ About 83 % less memory. Both stacks run the same Midnight node process.
 | **Total** | **398.20** | **Total** | **340.57** |
 
 About 58 GiB less disk. Data and configuration only, no container images or
-logs. The PostgreSQL database grows with each update.
+logs. The PostgreSQL database grows with each update: on 17 November 2026 the
+same deployment's PostgreSQL 17 held 1.89 GiB on disk and used 1.86 GiB of
+memory, 1.62 GiB of it inactive file cache.
 
 ## Requirements
 
@@ -105,7 +111,7 @@ holds your Blockfrost API key.
 ### Option A: the published Preprod snapshot
 
 The 0.1.0 release carries a db-sync-alt backup of Cardano Preprod up to block
-5,366,232 (the snapshot), its manifest and a checksum file:
+5,366,232 of 2 November 2026 (the snapshot), its manifest and a checksum file:
 
 | File | Size |
 | --- | ---: |
@@ -113,10 +119,10 @@ The 0.1.0 release carries a db-sync-alt backup of Cardano Preprod up to block
 | `db-sync-alt-0.1.0-preprod-5366232.manifest.json` | 0.1 MB |
 | `SHA256SUMS` | < 0.1 MB |
 
-The snapshot was built with this release from a cardano-db-sync database
+The snapshot was built with 0.1.0 from a cardano-db-sync database
 ([option B](#option-b-build-it-from-your-own-db-sync)), without Blockfrost
-requests, on PostgreSQL 17. With 1 CPU and 1 GiB for PostgreSQL, restoring it
-takes about 4 minutes and verifying it about 2 more; the restored database is
+requests, on PostgreSQL 17. With 1 CPU and 1 GiB for PostgreSQL, 0.1.0 restored
+it in about 4 minutes and verified it in about 2 more; the restored database is
 about 750 MB.
 
 Download the three files into one directory, check them, then start db-sync-alt
@@ -135,18 +141,32 @@ db-sync-alt run --network preprod \
 
 db-sync-alt restores and verifies the snapshot, upgrades it to schema 5 (reading
 each stored epoch's maximum transaction size from Blockfrost, 2 requests per
-stored epoch), then serves it and follows new blocks from Blockfrost; `/health` returns 200 once it has caught up. Catching up
-from the snapshot costs Blockfrost requests ([costs](docs/costs.md)). It runs in
-the foreground: Ctrl-C stops it and the same command resumes it. All options:
-`db-sync-alt run --help`.
+stored epoch: 100 requests for the snapshot's 50 epochs), then serves it and
+follows new blocks from Blockfrost; `/health` returns 200 once it has caught up.
+It runs in the foreground: Ctrl-C stops it and the same command resumes it. All
+options: `db-sync-alt run --help`.
+
+Catching up from the snapshot takes days, and longer the older the snapshot is.
+Measured on Preprod up to 17 November 2026: the chain adds about 3,900 blocks a
+day, at 3.6 to 4 transactions per block, and with the default settings each
+block caught up costs 5.5 to 6 requests (about 1.3 per transaction, plus one per
+block with transactions). The tip poll takes about 8,700 of the built-in
+client's 50,000 requests a day, so each day between the snapshot and your start
+takes 1.2 to 1.3 days to catch up: about 17.5 days on 17 November 2026. When a
+day's requests are spent, the service waits for the next UTC day
+(`quota_exhausted`). To start closer to the tip, build the initial data from your
+own db-sync ([option B](#option-b-build-it-from-your-own-db-sync)), or follow
+with a larger Blockfrost plan through an external accounting client
+([Blockfrost costs](#blockfrost-costs)).
 
 ### Option B: build it from your own db-sync
 
 If you run cardano-db-sync 13.7.1.0 or 13.8.0.0 for Preprod with its retained
-core/full history,
-db-sync-alt can build the initial data from it once: read-only, without
-Blockfrost requests, in about 18 minutes for Preprod. Then run
-`db-sync-alt upgrade` and `db-sync-alt run` without `--archive`. See
+core/full history, db-sync-alt can build the initial data from it once:
+read-only, without Blockfrost requests, up to its newest confirmed block, so
+the catch-up from Blockfrost that follows is short. 0.1.0 built Preprod up to
+block 5,366,232 this way in about 18 minutes. Then run `db-sync-alt upgrade` and
+`db-sync-alt run` without `--archive`. See
 [build initial data from your own db-sync](docs/operations.md#build-initial-data-from-your-own-db-sync).
 
 ## Upgrade an existing database
@@ -178,14 +198,16 @@ login:
 
 ```sh
 DB_SYNC_POSTGRES_CONNECTION_STRING='postgresql://db_sync_alt_reader:<password>@<host>:5432/db_sync_alt'
+SSL_ROOT_CERT=/path/to/root-ca.crt
 CARDANO_SECURITY_PARAMETER=2160
 ```
 
 - `<host>` is your PostgreSQL server as the node reaches it; `<password>` is the
   reader login's password you chose when you created it.
-- TLS is your PostgreSQL server's configuration, as for cardano-db-sync. Without
-  TLS on the server, the node needs `ALLOW_NON_SSL=true`; then keep the
-  connection on loopback or a private network.
+- midnight-node 2.1.101 connects only over TLS: it refuses a PostgreSQL server
+  without TLS, and `ALLOW_NON_SSL` has no effect. Turn TLS on in your server and
+  give the node its CA certificate with `SSL_ROOT_CERT`, so that it checks the
+  server's certificate and host name ([TLS](docs/connect-a-node.md#tls)).
 - `CARDANO_SECURITY_PARAMETER` must equal the network's security parameter k
   (2160 on Mainnet and Preprod, 432 on Preview), and the node's Cardano
   addresses and policies must be the profile's: db-sync-alt cannot see the
@@ -218,8 +240,10 @@ observation reads and, from its coverage start, the token bridge data its bridge
 query reads ([bridge readiness](docs/connect-a-node.md#bridge-readiness)).
 
 - **Networks** (`--network`): **Preprod** is supported and tested end to end.
-  The **Mainnet** and **Preview** profiles are packaged but not tested on their
-  real chains, only on synthetic data ([networks](docs/networks.md)).
+  **Mainnet**: a database built from a real Mainnet cardano-db-sync is followed
+  through Blockfrost, and a Midnight node reads it; serving that node at the
+  Mainnet chain tip is not tested. **Preview**: the profile is packaged and
+  tested on synthetic data only ([networks](docs/networks.md)).
 - **PostgreSQL 17**, which you provide, as you would for cardano-db-sync. It is
   the major version the Midnight node's reference environment runs its
   cardano-db-sync database on, so db-sync-alt's database can live on the same
@@ -231,22 +255,35 @@ See the [compatibility matrix](docs/compatibility.md) and
 
 Planned next:
 
-- Cardano Mainnet and Preview built and followed end to end;
+- a Midnight node served at the Mainnet chain tip;
+- Cardano Preview built and followed end to end;
 - a bound on how much update history the database keeps.
 
 ## Blockfrost costs
 
-Measured at the Preprod chain tip:
+Measured at the Preprod chain tip with the default settings, at 3,800 to 3,900
+blocks and 10,600 to 17,000 transactions a day
+([how it was counted](docs/costs.md#blockfrost-requests)):
 
 | Work | Requests per day |
 | --- | ---: |
 | Polling the chain tip every 20 seconds | ≈ 8,700 |
-| Publishing new blocks (≈ 9 requests per block) | ≈ 24,700 |
-| **Total** | **≈ 33,400** |
+| Publishing new blocks (7.3 to 9.5 requests per block) | ≈ 28,600 to 36,800 |
+| **Total** | **≈ 36,500 to 45,100** |
 
-Catching up after a pause costs more, in proportion to the blocks missed. The
-default daily ceiling is 50,000 requests. The key is read from a private file;
-see [costs](docs/costs.md).
+A block costs about 1.3 requests per transaction plus one for its transaction
+page, and each update about 5 more, so the cost grows with the chain's
+transactions. Catching up after a pause costs more, in proportion to the blocks
+missed ([from the snapshot](#option-a-the-published-preprod-snapshot)).
+
+The built-in client's daily ceiling is 50,000 requests, and it sends one request
+at a time. For a larger Blockfrost plan, db-sync-alt can delegate requests and
+accounting to an external client, not part of this repository
+(`DBSYNC_PROVIDER_ADAPTER=shared`). Then `provider_concurrency` keeps several
+requests of an update in flight and `provider_max_requests_per_hour` paces
+them, which shortens a catch-up
+([requests in flight](docs/operations.md#requests-in-flight)). The key is read
+from a private file; see [costs](docs/costs.md).
 
 ## More
 

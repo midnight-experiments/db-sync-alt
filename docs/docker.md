@@ -73,6 +73,38 @@ node's Compose file as an external network named `<project>_node`, and connect t
 host `postgres`, port 5432, database `db_sync_alt`, user `db_sync_alt_reader`,
 with the password in `operator/reader.password`.
 
+## TLS for the Midnight node
+
+The bundled PostgreSQL server starts without TLS, and midnight-node 2.1.101
+refuses a server without TLS ([TLS](connect-a-node.md#tls)). Create the CA and
+the server certificate as described there, with `postgres` as the host name
+(`host='postgres'`), then, from the directory that holds them, copy the
+certificate and key into the server's data volume and turn TLS on:
+
+```sh
+docker compose -f deploy/compose.yaml --env-file "$env_file" exec -T -u postgres postgres \
+  sh -c 'umask 077; mkdir -p "$PGDATA/tls"; cat > "$PGDATA/tls/server.crt"' < server.crt
+docker compose -f deploy/compose.yaml --env-file "$env_file" exec -T -u postgres postgres \
+  sh -c 'umask 077; cat > "$PGDATA/tls/server.key"' < server.key
+docker compose -f deploy/compose.yaml --env-file "$env_file" exec -T -u postgres postgres psql -v ON_ERROR_STOP=1 \
+  -c "ALTER SYSTEM SET ssl = 'on'" \
+  -c "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/data/tls/server.crt'" \
+  -c "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/data/tls/server.key'" \
+  -c 'SELECT pg_reload_conf()'
+```
+
+The reload applies it; PostgreSQL and the service keep running, and the
+setting stays in the volume. Mount `root-ca.crt` into the node's container and
+set `SSL_ROOT_CERT` to its path there. To check from the `node` network, as the
+reader (psql asks for the password in `operator/reader.password`):
+
+```sh
+docker run --rm -it --network <project>_node -v "$PWD/root-ca.crt:/tmp/root-ca.crt:ro" \
+  --entrypoint psql postgres:17.11-bookworm \
+  'host=postgres dbname=db_sync_alt user=db_sync_alt_reader sslmode=verify-full sslrootcert=/tmp/root-ca.crt' \
+  -c '\conninfo'
+```
+
 ## Stop
 
 ```sh
