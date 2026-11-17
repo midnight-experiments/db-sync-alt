@@ -31,6 +31,7 @@ jobs:
           persist-credentials: false
       - name: Install the pinned toolchain
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           rustup show active-toolchain
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
       - run: python3 .github/scripts/check_public_source.py
@@ -63,6 +64,7 @@ jobs:
           persist-credentials: false
       - name: Install the pinned toolchain
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           rustup show active-toolchain
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
       - name: PostgreSQL integration tests
