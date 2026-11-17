@@ -2,13 +2,31 @@
 
 ## Blockfrost requests
 
-Measured at the Preprod chain tip:
+Counted from the request receipts of a Preprod deployment at the chain tip with
+the default settings (full scan, the `sync` values `db-sync-alt run` writes),
+over six whole UTC days, 5 to 10 November 2026: 3,834 to 3,893 blocks and 10,609
+to 16,975 transactions a day. The counts leave out the usage checks (`/metrics`);
+this version makes one per 10,000 requests counted.
 
 | Work | Requests per day |
 | --- | ---: |
 | Polling the chain tip every 20 seconds (tip, confirmed block, periodic usage check) | ≈ 8,700 |
-| Publishing new blocks, ≈ 9 requests per block | ≈ 24,700 |
-| **Total** | **≈ 33,400** |
+| Publishing new blocks, 7.3 to 9.5 requests per block | ≈ 28,600 to 36,800 |
+| **Total** | **≈ 36,500 to 45,100** |
+
+Without relevance filtering, a block's cost follows its transactions: about 1.3
+`/txs/{hash}/utxos` requests per transaction (its own, and some of the outputs
+it spends), one transaction page per 100 transactions, and per update about 5
+fixed requests at the tip, where an update holds one or two blocks, or about 9
+in a catch-up update of 100 blocks. Measured over 99,333 transactions of that
+deployment: 1.29 `/utxos` requests per transaction.
+
+Catching up from the published Preprod snapshot (block 5,366,232) costs about
+5.5 requests per block for its 3.6 transactions per block on average, and the
+blocks of the last seven days before 17 November 2026 about 6 (4.0 transactions
+per block). With about 8,700 of the built-in client's 50,000 requests a day
+going to polls, each day of snapshot age takes 1.2 to 1.3 days to catch up
+([first run](../README.md#option-a-the-published-preprod-snapshot)).
 
 Bridge metadata adds one request per published transaction with an output at
 the ICS address (two with relevance filtering, which repeats every request for
@@ -90,22 +108,19 @@ the command line or a log:
 
 ## Memory
 
-On Preprod, in RAM + swap (one measurement, not a guarantee):
-
-| Original full stack | GiB | db-sync-alt stack | GiB |
-| --- | ---: | --- | ---: |
-| Midnight node | 1.81 | Midnight node | 1.81 |
-| Cardano node | 6.66 | db-sync-alt | 0.32 |
-| cardano-db-sync | 5.35 | PostgreSQL | 0.30 |
-| PostgreSQL | 2.13 | | |
-| **Total** | **15.94** | **Total** | **2.42** |
+See [memory and disk](../README.md#memory-and-disk): one dated measurement on a
+running Preprod deployment, not a guarantee.
 
 ## Disk
 
-The Preprod release snapshot (up to block 5,366,232) restores to about 750 MB,
-214 MB of it the served tables the node reads. A database that follows the
-chain grows with every update: each update's receipts and block membership are
-kept as the record of past updates; bounding that record is on the roadmap.
+The Preprod release snapshot (up to block 5,366,232) restored with 0.1.0 to about
+750 MB, 214 MB of it the served tables the node reads. A database that follows
+the chain grows with every update: each update's receipts and block membership
+are kept as the record of past updates; bounding that record is on the roadmap.
+The Preprod database restored from that snapshot on 3 November 2026 held
+1.79 GiB (`pg_database_size`) on 17 November 2026, after about 32,700 updates.
+The Mainnet database built from cardano-db-sync up to block 14,160,853 held
+9.28 GiB on 17 November 2026, at block 14,193,809.
 Keep free space for the database, backups, the snapshot you
 restore from, and the free-space reserves db-sync-alt checks before writing
 (10 GiB on the state directory's filesystem by default).

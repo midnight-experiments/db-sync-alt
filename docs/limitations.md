@@ -1,10 +1,13 @@
 # Limitations
 
-- **One query set; one qualified network.** The SQL queries of Midnight node
-  2.1.101 only. Cardano Mainnet, Preprod and Preview have network profiles, but
-  only Preprod has been built, followed and checked against cardano-db-sync end
-  to end; Mainnet and Preview are tested on synthetic data only
-  ([networks](networks.md)). Other networks have no profile and are refused.
+- **One query set; one fully qualified network.** The SQL queries of Midnight
+  node 2.1.101 only. Cardano Mainnet, Preprod and Preview have network profiles.
+  Preprod has been built, followed, served to a Midnight node and checked
+  against cardano-db-sync end to end. A Mainnet database built from a real
+  Mainnet cardano-db-sync is followed through Blockfrost, and a Midnight node
+  reads it; serving that node at the Mainnet chain tip is not tested. Preview is
+  tested on synthetic data only ([networks](networks.md)). Other networks have
+  no profile and are refused.
 - **Node configuration must match the profile.** The node's
   `CARDANO_SECURITY_PARAMETER` must equal the profile's k, and its Cardano
   addresses and policies must be the profile's. db-sync-alt cannot see the
@@ -71,7 +74,9 @@
   checkpoint pauses publication for that long every 6 hours by default. Backups
   need the writer lock, so the service must be stopped.
 - **TLS is your PostgreSQL server's.** db-sync-alt's launcher connects over
-  loopback without TLS; the node uses whatever your server offers.
+  loopback without TLS. midnight-node 2.1.101 connects only over TLS, so the
+  server must offer it ([TLS](connect-a-node.md#tls)); the Compose deployment's
+  bundled server starts without it.
 - **Growing history.** Every update adds its receipts and block membership to
   the database; there is no pruning yet ([costs](costs.md#disk)).
 - **What the tests cover.** The test suite uses synthetic data and disposable
