@@ -42,8 +42,8 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --name dsa-conversion-build --cpus 2 --memory 3g --memory-swap 3g \
-            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/usr/local/cargo" -v "$RUNNER_TEMP/target:/target" \
-            -w /workspace -e CARGO_TARGET_DIR=/target "$RUST_IMAGE" \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target "$RUST_IMAGE" \
             cargo test --locked -p db-sync-alt --test conversion --no-run 2>&1 | tee "$RUNNER_TEMP/evidence/build.log"
       - name: Start isolated generated PostgreSQL
         shell: bash
@@ -66,8 +66,8 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --name dsa-conversion-small --network dsa-conversion-internal --cpus 2 --memory 2g --memory-swap 2g \
-            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/usr/local/cargo" -v "$RUNNER_TEMP/target:/target" \
-            -w /workspace -e CARGO_TARGET_DIR=/target \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target \
             -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
             -e DSA_CONVERSION_HEADERS=10000 "$RUST_IMAGE" \
             cargo test --locked --offline -p db-sync-alt --test conversion convert_scaled_source_cost -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/evidence/small.log"
@@ -76,8 +76,8 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm --name dsa-conversion-full --network dsa-conversion-internal --cpus 2 --memory 2g --memory-swap 2g \
-            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/usr/local/cargo" -v "$RUNNER_TEMP/target:/target" \
-            -w /workspace -e CARGO_TARGET_DIR=/target \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target \
             -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
             -e DSA_CONVERSION_HEADERS=2432170 "$RUST_IMAGE" \
             cargo test --locked --offline -p db-sync-alt --test conversion convert_scaled_source_cost -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/evidence/full.log"
