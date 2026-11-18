@@ -1,10 +1,13 @@
 //! Canonical content digest, development format v1 (not a released file contract).
 //!
-//! Each family is a stream of JSON arrays in its natural-key order. SQL supplies
+//! Each family is a stream of PostgreSQL17 JSONB array text in natural-key order. SQL supplies
 //! byte strings as lowercase hex, integral amounts as scale-zero decimal strings, and
 //! timestamps as integer microseconds since the PostgreSQL epoch. SQL NULL is
-//! JSON null. Object keys are recursively sorted; arrays retain order. Numbers
-//! retain their exact decimal representation, never passing through an f64.
+//! JSON null. PostgreSQL's deterministic JSONB text fixes object-key order;
+//! arrays retain order and arbitrary JSON numbers retain exact decimal text.
+//! Rust hashes text bytes directly, without parsing nested datum/metadata JSON,
+//! recursion limits or an f64. Memory holds one supported PostgreSQL row, not a
+//! table; no artificial depth/number cap is added to PostgreSQL's own limits.
 //!
 //! Natural keys: block(height,hash); tx(hash); output(creator hash,index);
 //! input(spender hash,origin hash,index); asset(creator hash,index,policy,name);
@@ -36,7 +39,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,10 +66,9 @@ impl FamilyHasher {
         Self { hash, rows: 0 }
     }
 
-    pub fn row(&mut self, value: &Value) -> Result<(), serde_json::Error> {
-        framed(&mut self.hash, &serde_json::to_vec(value)?);
+    pub fn row(&mut self, canonical_jsonb_text: &[u8]) {
+        framed(&mut self.hash, canonical_jsonb_text);
         self.rows += 1;
-        Ok(())
     }
 
     pub fn finish(self) -> FamilyDigest {

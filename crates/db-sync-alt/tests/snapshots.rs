@@ -550,6 +550,8 @@ async fn snapshot_verify_named_corruptions() -> Result {
             ),
             "invalid_consumed_before_horizon",
         ),
+        ("INSERT INTO serve.tx_in SELECT tx_in_id*4096+4095,tx_in_id,tx_out_id,tx_out_index FROM serve.tx_in ORDER BY id LIMIT 1".to_owned(),"duplicate_natural_key"),
+        ("INSERT INTO serve.ma_tx_out SELECT tx_out_id*4096+4095,quantity+1,tx_out_id,ident FROM serve.ma_tx_out ORDER BY id LIMIT 1".to_owned(),"duplicate_natural_key"),
     ];
     for (sql, expected) in cases {
         let db = Database::new().await?;
@@ -735,5 +737,243 @@ async fn snapshot_repeatable_read_while_writer_commits() -> Result {
         "writer could not commit while snapshot ran"
     );
     db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn snapshot_lossless_structured_jsonb_and_flat_generations() -> Result {
+    let f = fixture(91);
+    let dir = tempfile::tempdir()?;
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let wide = "340282366920938463463374607431768211456";
+    // An ordinary constructor/list-shaped datum, about200JSON levels. This is
+    // generated SQL content, not an imported third-party adversarial fixture.
+    let mut datum = format!("{{\"int\":{wide}}}");
+    for _ in 0..100 {
+        datum = format!("{{\"constructor\":0,\"fields\":[{datum}]}}");
+    }
+    let client = connect(&source.config).await?;
+    client.execute("UPDATE serve.datum SET value=$1::text::jsonb WHERE id=(SELECT min(id) FROM serve.datum)",&[&datum]).await?;
+    client.execute("UPDATE serve.tx_metadata SET json=$1::text::jsonb WHERE id=(SELECT min(id) FROM serve.tx_metadata)",&[&datum]).await?;
+    let before = source.cli("verify", &f.profile.network, &[]).await?;
+    let mut current = source;
+    let mut original_origin = None;
+    let mut lengths = Vec::new();
+    for generation in 0..4 {
+        let file = dir.path().join(format!("generation{generation}.dsa"));
+        let description = current
+            .cli("snapshot", &f.profile.network, &file_args(&file))
+            .await?;
+        let mut origin = description["origin"].as_object().unwrap().clone();
+        for key in ["kind", "snapshot_content_digest", "snapshot_state_digest"] {
+            origin.remove(key);
+        }
+        assert!(
+            origin.values().all(|v| !v.is_object() && !v.is_array()),
+            "recursive provenance"
+        );
+        if let Some(original) = &original_origin {
+            assert_eq!(&origin, original);
+        } else {
+            original_origin = Some(origin);
+        }
+        let length = serde_json::to_vec(&description["origin"])?.len();
+        assert!(length < 2048);
+        lengths.push(length);
+        let dest = Database::new().await?;
+        let restored = dest
+            .cli("restore", &f.profile.network, &file_args(&file))
+            .await?;
+        assert_eq!(restored["content_digest"], before["content_digest"]);
+        assert_eq!(restored["state_digest"], before["state_digest"]);
+        let destination = connect(&dest.config).await?;
+        let origin_client = connect(&current.config).await?;
+        for (table, column) in [("datum", "value"), ("tx_metadata", "json")] {
+            let query = format!("SELECT {column}::text FROM serve.{table} ORDER BY id");
+            let expected = origin_client
+                .query(&query, &[])
+                .await?
+                .into_iter()
+                .map(|r| r.get::<_, Option<String>>(0))
+                .collect::<Vec<_>>();
+            assert!(expected.iter().flatten().any(|v| v.contains(wide)));
+            let actual = destination
+                .query(&query, &[])
+                .await?
+                .into_iter()
+                .map(|r| r.get::<_, Option<String>>(0))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+        drop(origin_client);
+        drop(destination);
+        current.cleanup().await?;
+        current = dest;
+    }
+    // Initial null links become one fixed pair of digests on the first restore;
+    // generations thereafter have exactly constant flat provenance size.
+    assert_eq!(lengths[1], lengths[2]);
+    assert_eq!(lengths[2], lengths[3]);
+    drop(client);
+    current.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn snapshot_preflight_limits_lock_and_relative_paths() -> Result {
+    let f = fixture(101);
+    let dir = tempfile::tempdir()?;
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    source.admin.batch_execute(&format!("ALTER ROLE {} SET statement_timeout='60s';ALTER ROLE {} SET idle_in_transaction_session_timeout='60s'",source.owner,source.owner)).await?;
+    let output = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "snapshot",
+            "--database",
+            &source.dsn(),
+            "--network",
+            &f.profile.network,
+            "--file",
+            "relative.dsa",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let good = dir.path().join("relative.dsa");
+    assert!(good.is_file());
+    let description: Value = serde_json::from_slice(&output.stdout)?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    dest.admin.batch_execute(&format!("ALTER ROLE {} SET statement_timeout='60s';ALTER ROLE {} SET idle_in_transaction_session_timeout='60s'",dest.owner,dest.owner)).await?;
+    let mut lock = Store::connect(dest.config.clone(), None).await?;
+    lock.writer_transaction().await?.commit().await?;
+    let busy = dest
+        .cli_raw("restore", &f.profile.network, &file_args(&good))
+        .await?;
+    assert!(!busy.status.success());
+    assert!(String::from_utf8(busy.stderr)?.contains("writer_busy"));
+    lock.client()
+        .batch_execute("SELECT pg_advisory_unlock_all()")
+        .await?;
+    drop(lock);
+    let client = connect(&dest.config).await?;
+    client.batch_execute("CREATE FUNCTION serve.preflight_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'COPY started before preflight rejected the last section';END$$;CREATE TRIGGER preflight_guard BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.preflight_guard()").await?;
+    let mut bytes = std::fs::read(&good)?;
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    let bad = dir.path().join("late-corruption.dsa");
+    std::fs::write(&bad, &bytes)?;
+    let rejected = dest
+        .cli_raw("restore", &f.profile.network, &file_args(&bad))
+        .await?;
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8(rejected.stderr)?.contains("snapshot_section_hash_mismatch"),
+        "late corruption reached COPY trigger"
+    );
+    client.batch_execute("DROP TRIGGER preflight_guard ON serve.block;DROP FUNCTION serve.preflight_guard();CREATE FUNCTION serve.timeout_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF current_setting('statement_timeout')='0' OR current_setting('idle_in_transaction_session_timeout')='0' THEN RAISE EXCEPTION 'caller timeout was disabled';END IF;RETURN NEW;END$$;CREATE TRIGGER timeout_guard BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.timeout_guard()").await?;
+    let args = [
+        "--file",
+        good.to_str().unwrap(),
+        "--statement-timeout-seconds",
+        "120",
+        "--idle-transaction-timeout-seconds",
+        "120",
+    ];
+    let restored = dest.cli("restore", &f.profile.network, &args).await?;
+    assert_eq!(
+        restored["content_digest"],
+        description["verified"]["content_digest"]
+    );
+    let settings=client.query_one("SELECT current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout')",&[]).await?;
+    assert_eq!(settings.get::<_, String>(0), "1min");
+    assert_eq!(settings.get::<_, String>(1), "1min");
+    drop(client);
+    source.cleanup().await?;
+    dest.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn snapshot_input_change_after_preflight_is_refused() -> Result {
+    let f = fixture(111);
+    let dir = tempfile::tempdir()?;
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let file = dir.path().join("changing.dsa");
+    source
+        .cli("snapshot", &f.profile.network, &file_args(&file))
+        .await?;
+    let original = std::fs::read(&file)?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    let client = connect(&dest.config).await?;
+    client.batch_execute("CREATE FUNCTION serve.copy_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(724,1);RETURN NEW;END$$;CREATE TRIGGER copy_barrier BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.copy_barrier();SELECT pg_advisory_lock(724,1)").await?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    command
+        .args([
+            "restore",
+            "--database",
+            &dest.dsn(),
+            "--network",
+            &f.profile.network,
+        ])
+        .args(file_args(&file));
+    let restore = tokio::spawn(async move { command.output().await });
+    let mut blocked = false;
+    for _ in 0..500 {
+        blocked=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory')",&[&dest.name]).await?.get(0);
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // This barrier is inside the first COPY: all preflight hashes are complete,
+    // but the later internal-state section has not been opened for loading.
+    assert!(
+        blocked,
+        "restore never reached its post-preflight COPY barrier"
+    );
+    let mut changed = original.clone();
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    std::fs::write(&file, changed)?;
+    client
+        .batch_execute("SELECT pg_advisory_unlock_all()")
+        .await?;
+    let failed = restore.await??;
+    assert!(
+        !failed.status.success(),
+        "accepted changed input after preflight"
+    );
+    let status = dest.cli("status", &f.profile.network, &[]).await?;
+    assert_eq!(status["position"]["serving"], false);
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM serve.block", &[])
+            .await?
+            .get::<_, i64>(0),
+        0
+    );
+    std::fs::write(&file, original)?;
+    client
+        .batch_execute(
+            "DROP TRIGGER copy_barrier ON serve.block;DROP FUNCTION serve.copy_barrier()",
+        )
+        .await?;
+    dest.cli("restore", &f.profile.network, &file_args(&file))
+        .await?;
+    drop(client);
+    source.cleanup().await?;
+    dest.cleanup().await?;
     Ok(())
 }

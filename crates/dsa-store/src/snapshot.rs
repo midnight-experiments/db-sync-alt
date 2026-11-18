@@ -22,11 +22,25 @@
 //! lock. Only after all hashes/sizes are known is a new complete file atomically
 //! published; an existing file is never overwritten. Every temporary is removed
 //! on error. Compression memory is bounded; whole tables are never buffered.
+//! Temporary sections plus the final temporary output require roughly twice
+//! the compressed file size. Bytes copied into the final file are re-hashed.
+//! A directory fsync failure after publication is reported as published with
+//! durability uncertain; the file remains present and must not be overwritten.
+//!
+//! Provenance is a fixed flat record, not a recursively embedded snapshot chain.
+//! Original source kind/network/target/tip/creation time survive every restore;
+//! only the latest snapshot's two digests are retained. Each text field is
+//! bounded (64 bytes except small kind/network labels), so depth and maximum
+//! description size do not grow with generations.
 //!
 //! Restore validates the destination before any destructive change: an existing
 //! serving/nonempty database is preserved and refused. An empty database gets
 //! the layout without secondary indexes and a closed gate; an explicitly owned
 //! failed restore may retry. Identity/state are committed closed before ingest.
+//! All section hashes and total file framing are preflighted outside the load
+//! transaction. Compressed bytes actually decoded are hashed again during COPY.
+//! Caller statement/idle transaction timeouts remain in force; no timeout is
+//! silently disabled. Long operations need explicit operator-chosen limits.
 //! A writer-locked transaction streams bounded decompression into binary COPY,
 //! checks exact sizes/hashes/trailing EOF, creates indexes, analyzes, initializes
 //! private allocation sequences above imported identity IDs, verifies closure,
@@ -53,9 +67,8 @@ use bytes::Bytes;
 use dsa_chain::{VERSION, profiles::Profile};
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio_postgres::IsolationLevel;
+use tokio_postgres::{GenericClient, IsolationLevel};
 
 use crate::{
     DATABASE_FORMAT, Error, KEEP_RULE_VERSION, NODE_RELATIONS, Store,
@@ -86,9 +99,110 @@ pub struct Description {
     pub keep_rule_version: i32,
     pub node_release: String,
     pub tool_version: String,
-    pub origin: Value,
+    pub origin: Provenance,
     pub verified: Verification,
     pub sections: Vec<Section>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    pub kind: String,
+    pub source_kind: String,
+    pub source_network: String,
+    pub source_target_height: u32,
+    pub source_target_hash: String,
+    pub source_target_time: String,
+    pub source_tip_height: u32,
+    pub source_tip_hash: String,
+    pub source_tip_time: String,
+    pub source_created_at: String,
+    pub snapshot_content_digest: Option<String>,
+    pub snapshot_state_digest: Option<String>,
+}
+
+impl Provenance {
+    fn validate(&self, profile: &Profile) -> Result<(), Error> {
+        if self.kind.is_empty()
+            || self.kind.len() > 32
+            || self.source_kind.is_empty()
+            || self.source_kind.len() > 32
+            || self.source_network != profile.network
+            || self.source_tip_height >= 134217728
+            || self.source_target_height > self.source_tip_height
+        {
+            return Err(Error::Refusal("invalid_snapshot_provenance"));
+        }
+        for value in [&self.source_target_hash, &self.source_tip_hash]
+            .into_iter()
+            .chain(self.snapshot_content_digest.iter())
+            .chain(self.snapshot_state_digest.iter())
+        {
+            if value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            {
+                return Err(Error::Refusal("invalid_snapshot_provenance"));
+            }
+        }
+        for value in [
+            &self.source_target_time,
+            &self.source_tip_time,
+            &self.source_created_at,
+        ] {
+            if value.is_empty() || value.len() > 64 {
+                return Err(Error::Refusal("invalid_snapshot_provenance"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn capture<C: GenericClient>(
+        client: &C,
+        profile: &Profile,
+        verified: &Verification,
+    ) -> Result<Self, Error> {
+        let row=client.query_one("SELECT origin->>'kind',origin->>'source_kind',origin->>'source_network',origin->>'source_target_height',origin->>'source_target_hash',origin->>'source_target_time',origin->>'source_tip_height',origin->>'source_tip_hash',origin->>'source_tip_time',coalesce(origin->>'source_created_at',to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')),origin->>'snapshot_content_digest',origin->>'snapshot_state_digest' FROM dsa.identity WHERE id=1",&[]).await?;
+        let text = |index: usize, default: &str| {
+            row.get::<_, Option<String>>(index)
+                .unwrap_or_else(|| default.to_owned())
+        };
+        let kind = text(0, "unknown");
+        let height = |index: usize, default: u32| -> Result<u32, Error> {
+            match row.get::<_, Option<String>>(index) {
+                Some(value) => value
+                    .parse()
+                    .map_err(|_| Error::Refusal("invalid_snapshot_provenance")),
+                None => Ok(default),
+            }
+        };
+        let result = Self {
+            kind: kind.clone(),
+            source_kind: text(1, &kind),
+            source_network: text(2, &profile.network),
+            source_target_height: height(3, verified.state.target.height)?,
+            source_target_hash: text(4, &verified.state.target.hash),
+            source_target_time: text(5, &verified.state.target.time),
+            source_tip_height: height(6, verified.state.tip.height)?,
+            source_tip_hash: text(7, &verified.state.tip.hash),
+            source_tip_time: text(8, &verified.state.tip.time),
+            source_created_at: row.get(9),
+            snapshot_content_digest: row.get(10),
+            snapshot_state_digest: row.get(11),
+        };
+        result.validate(profile)?;
+        Ok(result)
+    }
+
+    fn restored(&self, verified: &Verification) -> Self {
+        Self {
+            kind: "restored".to_owned(),
+            snapshot_content_digest: Some(verified.content_digest.clone()),
+            snapshot_state_digest: Some(verified.state_digest.clone()),
+            ..self.clone()
+        }
+    }
 }
 
 fn tables() -> impl Iterator<Item = &'static str> {
@@ -117,6 +231,52 @@ fn hash_reader(reader: &mut impl Read) -> Result<(u64, String), Error> {
         hash.update(&buf[..n]);
     }
     Ok((size, format!("{:x}", hash.finalize())))
+}
+
+struct CheckedReader<R> {
+    inner: R,
+    hash: Sha256,
+    bytes: u64,
+}
+impl<R> CheckedReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hash: Sha256::new(),
+            bytes: 0,
+        }
+    }
+    fn finish(self) -> (u64, String) {
+        (self.bytes, format!("{:x}", self.hash.finalize()))
+    }
+}
+impl<R: Read> Read for CheckedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buffer)?;
+        self.hash.update(&buffer[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+
+fn preflight(file: &mut File, description: &Description) -> Result<(), Error> {
+    let first = file.stream_position()?;
+    let expected = description
+        .sections
+        .iter()
+        .try_fold(first, |offset, s| offset.checked_add(s.compressed_bytes))
+        .ok_or(Error::Refusal("snapshot_section_bounds"))?;
+    if file.metadata()?.len() != expected {
+        return Err(Error::Refusal("snapshot_file_size_mismatch"));
+    }
+    for section in &description.sections {
+        let (size, hash) = hash_reader(&mut Read::by_ref(file).take(section.compressed_bytes))?;
+        if size != section.compressed_bytes || hash != section.sha256 {
+            return Err(Error::Refusal("snapshot_section_hash_mismatch"));
+        }
+    }
+    file.seek(SeekFrom::Start(first))?;
+    Ok(())
 }
 
 fn read_description(file: &mut File, profile: &Profile) -> Result<Description, Error> {
@@ -160,6 +320,7 @@ fn read_description(file: &mut File, profile: &Profile) -> Result<Description, E
     if description.node_release != profile.node_release {
         return Err(Error::Refusal("node_release_mismatch"));
     }
+    description.origin.validate(profile)?;
     if description
         .sections
         .iter()
@@ -212,10 +373,7 @@ impl Store {
             .start()
             .await?;
         let verified = verify::verify(&tx, profile, true).await?;
-        let origin: Value = tx
-            .query_one("SELECT origin FROM dsa.identity WHERE id=1", &[])
-            .await?
-            .get(0);
+        let origin = Provenance::capture(&tx, profile, &verified).await?;
         let mut sections = Vec::new();
         for table in tables() {
             let file = File::options()
@@ -282,14 +440,21 @@ impl Store {
         output.write_all(&(json.len() as u64).to_be_bytes())?;
         output.write_all(&Sha256::digest(&json))?;
         output.write_all(&json)?;
-        for table in tables() {
-            std::io::copy(&mut File::open(staging.path().join(table))?, &mut output)?;
+        for section in &description.sections {
+            let mut reader = CheckedReader::new(File::open(staging.path().join(&section.table))?);
+            std::io::copy(&mut reader, &mut output)?;
+            let (size, hash) = reader.finish();
+            if size != section.compressed_bytes || hash != section.sha256 {
+                return Err(Error::Refusal("snapshot_spool_changed"));
+            }
         }
         output.as_file().sync_all()?;
         output
             .persist_noclobber(path)
             .map_err(|_| Error::Refusal("snapshot_publish_failed"))?;
-        File::open(parent)?.sync_all()?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| Error::PublishedDurabilityUncertain)?;
         Ok(description)
     }
 
@@ -306,8 +471,8 @@ impl Store {
         }
         self.open(profile).await?;
         let tx = self.writer_transaction().await?;
-        let row=tx.query_one("SELECT p.serving,i.origin FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1",&[]).await?;
-        let origin: Value = row.get(1);
+        let row=tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1",&[]).await?;
+        let origin: Option<String> = row.get(1);
         if row.get::<_, bool>(0) {
             return Err(Error::Refusal("destination_not_empty"));
         }
@@ -316,7 +481,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?
             .join("+");
         let occupied: i64 = tx.query_one(&format!("SELECT {counts}"), &[]).await?.get(0);
-        if occupied != 0 || !matches!(origin["kind"].as_str(), Some("empty" | "restore_failed")) {
+        if occupied != 0 || !matches!(origin.as_deref(), Some("empty" | "restore_failed")) {
             return Err(Error::Refusal("destination_not_empty"));
         }
         tx.batch_execute("UPDATE dsa.position SET serving=false,reason='restore_failed',updated_at=now() WHERE id=1; UPDATE dsa.identity SET origin='{\"kind\":\"restore_failed\"}'::jsonb WHERE id=1").await?;
@@ -329,6 +494,7 @@ impl Store {
         // Opening/parsing happens after a closed, identifiable retry state exists.
         let mut file = File::open(path)?;
         let description = read_description(&mut file, profile)?;
+        preflight(&mut file, &description)?;
         let tx = self.writer_transaction().await?;
         // A manually initialized empty layout may already have secondary indexes.
         for line in include_str!("indexes.sql")
@@ -344,17 +510,10 @@ impl Store {
                 .await?;
         }
         for section in &description.sections {
-            let start = file.stream_position()?;
-            let (size, hash) =
-                hash_reader(&mut Read::by_ref(&mut file).take(section.compressed_bytes))?;
-            if size != section.compressed_bytes || hash != section.sha256 {
-                return Err(Error::Refusal("snapshot_section_hash_mismatch"));
-            }
-            file.seek(SeekFrom::Start(start))?;
             {
-                let mut decoder = zstd::stream::read::Decoder::new(
+                let mut decoder = zstd::stream::read::Decoder::new(CheckedReader::new(
                     Read::by_ref(&mut file).take(section.compressed_bytes),
-                )?;
+                ))?;
                 decoder.window_log_max(27)?;
                 let query = format!(
                     "COPY {} FROM STDIN (FORMAT binary)",
@@ -377,12 +536,15 @@ impl Store {
                         .send(Bytes::copy_from_slice(&buf[..n]))
                         .await?;
                 }
+                let (size, hash) = decoder.finish().into_inner().finish();
+                if size != section.compressed_bytes || hash != section.sha256 {
+                    return Err(Error::Refusal("snapshot_section_hash_mismatch"));
+                }
                 let rows = sink.as_mut().finish().await?;
                 if bytes != section.plain_bytes || rows != section.rows {
                     return Err(Error::Refusal("snapshot_row_count_mismatch"));
                 }
             }
-            file.seek(SeekFrom::Start(start + section.compressed_bytes))?;
         }
         let mut extra = [0];
         if file.read(&mut extra)? != 0 {
@@ -410,7 +572,14 @@ impl Store {
             return Err(Error::Refusal("snapshot_content_digest_mismatch"));
         }
         tx.execute("INSERT INTO dsa.first_served SELECT id,transaction_timestamp() FROM serve.block WHERE id BETWEEN $1 AND $2",&[&i64::from(s.horizon.height),&i64::from(s.target.height)]).await?;
-        tx.execute("UPDATE dsa.identity SET origin=$1,tool_version=$2 WHERE id=1",&[&verify::origin(&json!({"origin":description.origin,"content_digest":verified.content_digest,"state_digest":verified.state_digest})),&VERSION]).await?;
+        tx.execute(
+            "UPDATE dsa.identity SET origin=$1,tool_version=$2 WHERE id=1",
+            &[
+                &serde_json::to_value(description.origin.restored(&verified))?,
+                &VERSION,
+            ],
+        )
+        .await?;
         tx.batch_execute(
             "UPDATE dsa.position SET serving=true,reason='serving',updated_at=now() WHERE id=1",
         )

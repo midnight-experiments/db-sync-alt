@@ -50,6 +50,8 @@ pub enum Error {
     Profile(#[from] serde_json::Error),
     #[error("snapshot_io_error")]
     Io(#[from] std::io::Error),
+    #[error("snapshot_published_durability_uncertain")]
+    PublishedDurabilityUncertain,
 }
 
 impl Error {
@@ -64,6 +66,9 @@ impl Error {
             }
             Self::Io(error) => {
                 json!({"error":"snapshot_io_error","kind":format!("{:?}",error.kind())})
+            }
+            Self::PublishedDurabilityUncertain => {
+                json!({"error":"snapshot_published_durability_uncertain","published":true,"durability":"uncertain"})
             }
             _ => json!({"error": self.to_string()}),
         }

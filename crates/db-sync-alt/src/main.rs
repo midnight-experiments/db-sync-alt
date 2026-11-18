@@ -24,6 +24,12 @@ struct DatabaseArguments {
     /// PEM roots for verified TLS, including server hostname verification.
     #[arg(long)]
     tls_root_cert: Option<PathBuf>,
+    /// Explicit session statement limit; default preserves PostgreSQL settings.
+    #[arg(long, value_parser=clap::value_parser!(u32).range(1..=86400))]
+    statement_timeout_seconds: Option<u32>,
+    /// Explicit idle transaction limit; default preserves PostgreSQL settings.
+    #[arg(long, value_parser=clap::value_parser!(u32).range(1..=86400))]
+    idle_transaction_timeout_seconds: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -120,6 +126,7 @@ async fn execute(command: Command) -> Result<Value, Error> {
         config,
         &profile,
         database.tls_root_cert.as_deref(),
+        database,
     )
     .await;
     eprintln!(
@@ -138,8 +145,26 @@ async fn database_command(
     config: tokio_postgres::Config,
     profile: &Profile,
     root: Option<&std::path::Path>,
+    limits: &DatabaseArguments,
 ) -> Result<Value, Error> {
     let mut store = Store::connect(config, root).await?;
+    for (name, seconds) in [
+        ("statement_timeout", limits.statement_timeout_seconds),
+        (
+            "idle_in_transaction_session_timeout",
+            limits.idle_transaction_timeout_seconds,
+        ),
+    ] {
+        if let Some(seconds) = seconds {
+            store
+                .client()
+                .query_one(
+                    "SELECT set_config($1,$2,false)",
+                    &[&name, &format!("{seconds}s")],
+                )
+                .await?;
+        }
+    }
     match command {
         Command::Create { .. } => {
             store.create(profile).await?;

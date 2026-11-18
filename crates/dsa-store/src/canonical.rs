@@ -63,6 +63,6 @@ pub(crate) fn query(table: &str) -> Result<String, Error> {
         _ => return Err(Error::Refusal("invalid_snapshot_table")),
     };
     Ok(format!(
-        "WITH h AS (SELECT $1::bigint AS height) SELECT jsonb_build_array({payload}) FROM {from} ORDER BY {order}"
+        "WITH h AS (SELECT $1::bigint AS height) SELECT jsonb_build_array({payload})::text FROM {from} ORDER BY {order}"
     ))
 }

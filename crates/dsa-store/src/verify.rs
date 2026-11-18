@@ -9,7 +9,6 @@ use dsa_chain::{
 };
 use futures_util::{StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use tokio_postgres::GenericClient;
 
 use crate::{
@@ -127,7 +126,7 @@ pub(crate) async fn verify<C: GenericClient>(
             "empty_tx_in",
         ),
         (
-            "SELECT EXISTS(SELECT 1 FROM serve.epoch_stake GROUP BY epoch_no,pool_id HAVING count(*)<>1)",
+            "SELECT EXISTS(SELECT 1 FROM serve.epoch_stake GROUP BY epoch_no,pool_id HAVING count(*)<>1) OR EXISTS(SELECT 1 FROM serve.tx_in GROUP BY tx_in_id,tx_out_id,tx_out_index HAVING count(*)>1) OR EXISTS(SELECT 1 FROM serve.ma_tx_out GROUP BY tx_out_id,ident HAVING count(*)>1)",
             "duplicate_natural_key",
         ),
     ];
@@ -225,8 +224,8 @@ pub(crate) async fn verify<C: GenericClient>(
         let stream = client.query_raw(&canonical::query(table)?, [&h]).await?;
         pin_mut!(stream);
         while let Some(row) = stream.next().await {
-            let row: Value = row?.get(0);
-            digest.row(&row)?;
+            let row: String = row?.try_get(0)?;
+            digest.row(row.as_bytes());
         }
         let digest = digest.finish();
         let schema = if table == MARKERS { "dsa" } else { "serve" };
@@ -279,8 +278,4 @@ pub(crate) fn logical_equal(a: &Verification, b: &Verification) -> bool {
         && a.protected_state == b.protected_state
         && a.state_digest == b.state_digest
         && a.supply == b.supply
-}
-
-pub(crate) fn origin(value: &Value) -> Value {
-    json!({"kind":"restored","source":value})
 }
