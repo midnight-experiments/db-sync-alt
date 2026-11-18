@@ -415,7 +415,7 @@ async fn snapshot_digest_identity_independence_and_payload_sensitivity() -> Resu
     );
     let output: i64 = client
         .query_one(
-            "SELECT id FROM serve.tx_out WHERE id>=8*16777216 ORDER BY id LIMIT 1",
+            "SELECT id FROM serve.tx_out WHERE id>=8*16777216 AND data_hash IS NULL ORDER BY id LIMIT 1",
             &[],
         )
         .await?
