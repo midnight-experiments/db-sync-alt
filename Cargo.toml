@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dsa-chain", "crates/dsa-store", "crates/db-sync-alt"]
+members = ["crates/dsa-chain", "crates/dsa-store", "crates/dsa-provider", "crates/db-sync-alt"]
 resolver = "3"
 
 [workspace.package]
