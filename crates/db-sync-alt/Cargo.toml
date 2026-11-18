@@ -18,4 +18,5 @@ tokio-postgres.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+jsonschema = { version = "0.61.2", default-features = false }
 tokio = { workspace = true, features = ["process"] }

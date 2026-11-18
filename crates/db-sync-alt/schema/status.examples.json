@@ -1,0 +1,786 @@
+{
+  "following": {
+    "status_schema_version": 1,
+    "service_version": "0.5.0",
+    "network": "mainnet",
+    "node_release": "2.1.101",
+    "database_format": 1,
+    "keep_rule_version": 1,
+    "profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "updated_at": 1795042800,
+    "state": "following",
+    "state_since": 1795042200,
+    "state_reason": null,
+    "retry_at": null,
+    "serving": "ready",
+    "sync": "idle",
+    "provider_head": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "provider_observed_at": 1795042798,
+    "stored_tip": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "confirmed_target": {
+      "height": 14207840,
+      "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "timestamp": 1794999595
+    },
+    "served_target": {
+      "height": 14207840,
+      "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "timestamp": 1794999595
+    },
+    "horizon": {
+      "height": 14177840,
+      "hash": "3333333333333333333333333333333333333333333333333333333333333333",
+      "timestamp": 1794394795
+    },
+    "lag": {
+      "blocks": 0,
+      "seconds": 0
+    },
+    "tip_lag": {
+      "blocks": 2160,
+      "seconds": 43200
+    },
+    "freshness": {
+      "provider_observation_age_seconds": 2
+    },
+    "progress": {
+      "blocks_remaining": 0,
+      "blocks_per_hour": 4500.0,
+      "sampled_at": 1795042799,
+      "estimated_tip_at": 1795042800
+    },
+    "last_update": {
+      "started_at": 1795042792,
+      "finished_at": 1795042794,
+      "duration_seconds": 2.0,
+      "blocks_written": 1,
+      "events_written": 3,
+      "rows_pruned": 2
+    },
+    "error_code": null,
+    "poll_error_code": null,
+    "last_error": null,
+    "retention": {
+      "seconds": 604800,
+      "next_horizon_move_at": 1795042814
+    },
+    "provider": {
+      "utc_day": "2026-11-18",
+      "calls_today": 9000,
+      "calls_previous_days": [
+        {
+          "utc_day": "2026-11-17",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-16",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-15",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-14",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-13",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-12",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-11",
+          "requests": 10000
+        }
+      ],
+      "poll_interval_seconds": 20,
+      "pace_requests_per_second": 2,
+      "requests_in_flight": 0,
+      "last_refusal": null
+    },
+    "epochs": {
+      "current_epoch": 667,
+      "newest_parameters_epoch": 667,
+      "newest_stake_epoch": 666
+    },
+    "integrity": {
+      "unspent_outputs": 250000,
+      "supply_check": {
+        "passed": true,
+        "checked_at": 1795042700
+      },
+      "snapshot": {
+        "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "created_at": 1795041800
+      }
+    },
+    "database": {
+      "reachable": true,
+      "checked_at": 1795042800,
+      "age_seconds": 0,
+      "error_code": null,
+      "size_bytes": 250000000,
+      "tls_available": true,
+      "reader_check": {
+        "passed": true,
+        "checked_at": 1795042800,
+        "error_code": null
+      }
+    },
+    "reader": {
+      "role": "db_sync_alt_reader",
+      "privileges": "node_relations_only",
+      "settings": {
+        "statement_timeout": "60s",
+        "idle_in_transaction_session_timeout": "60s",
+        "search_path": "public",
+        "default_transaction_read_only": "on",
+        "connection_limit": 40
+      },
+      "warnings": []
+    },
+    "policy": {
+      "observation_max_age_seconds": 120,
+      "serving_lag_max_blocks": 29,
+      "serving_lag_max_seconds": 600
+    },
+    "warnings": [],
+    "healthy": true,
+    "reason_codes": []
+  },
+  "restoring": {
+    "status_schema_version": 1,
+    "service_version": "0.5.0",
+    "network": "mainnet",
+    "node_release": "2.1.101",
+    "database_format": 1,
+    "keep_rule_version": 1,
+    "profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "updated_at": 1795042800,
+    "state": "restoring",
+    "state_since": 1795042790,
+    "state_reason": "restore_in_progress",
+    "retry_at": null,
+    "serving": "unready",
+    "sync": "syncing",
+    "provider_head": null,
+    "provider_observed_at": null,
+    "stored_tip": null,
+    "confirmed_target": null,
+    "served_target": null,
+    "horizon": null,
+    "lag": {
+      "blocks": null,
+      "seconds": null
+    },
+    "tip_lag": {
+      "blocks": null,
+      "seconds": null
+    },
+    "freshness": {
+      "provider_observation_age_seconds": null
+    },
+    "progress": {
+      "blocks_remaining": null,
+      "blocks_per_hour": null,
+      "sampled_at": null,
+      "estimated_tip_at": null
+    },
+    "last_update": null,
+    "error_code": null,
+    "poll_error_code": null,
+    "last_error": null,
+    "retention": {
+      "seconds": 604800,
+      "next_horizon_move_at": 1795042814
+    },
+    "provider": {
+      "utc_day": "2026-11-18",
+      "calls_today": 9000,
+      "calls_previous_days": [
+        {
+          "utc_day": "2026-11-17",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-16",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-15",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-14",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-13",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-12",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-11",
+          "requests": 10000
+        }
+      ],
+      "poll_interval_seconds": 20,
+      "pace_requests_per_second": 2,
+      "requests_in_flight": 0,
+      "last_refusal": null
+    },
+    "epochs": {
+      "current_epoch": 667,
+      "newest_parameters_epoch": 667,
+      "newest_stake_epoch": 666
+    },
+    "integrity": {
+      "unspent_outputs": null,
+      "supply_check": null,
+      "snapshot": null
+    },
+    "database": {
+      "reachable": true,
+      "checked_at": 1795042800,
+      "age_seconds": 0,
+      "error_code": null,
+      "size_bytes": 250000000,
+      "tls_available": true,
+      "reader_check": null
+    },
+    "reader": null,
+    "policy": {
+      "observation_max_age_seconds": 120,
+      "serving_lag_max_blocks": 29,
+      "serving_lag_max_seconds": 600
+    },
+    "warnings": [],
+    "healthy": false,
+    "reason_codes": [
+      "lifecycle_restoring",
+      "serving_unready",
+      "coverage_unknown"
+    ]
+  },
+  "catching_up": {
+    "status_schema_version": 1,
+    "service_version": "0.5.0",
+    "network": "mainnet",
+    "node_release": "2.1.101",
+    "database_format": 1,
+    "keep_rule_version": 1,
+    "profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "updated_at": 1795042800,
+    "state": "catching_up",
+    "state_since": 1795042200,
+    "state_reason": "catching_up",
+    "retry_at": null,
+    "serving": "ready",
+    "sync": "syncing",
+    "provider_head": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "provider_observed_at": 1795042798,
+    "stored_tip": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "confirmed_target": {
+      "height": 14207840,
+      "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "timestamp": 1794999595
+    },
+    "served_target": {
+      "height": 14205840,
+      "hash": "4444444444444444444444444444444444444444444444444444444444444444",
+      "timestamp": 1794959595
+    },
+    "horizon": {
+      "height": 14177840,
+      "hash": "3333333333333333333333333333333333333333333333333333333333333333",
+      "timestamp": 1794394795
+    },
+    "lag": {
+      "blocks": 2000,
+      "seconds": 40000
+    },
+    "tip_lag": {
+      "blocks": 4160,
+      "seconds": 83200
+    },
+    "freshness": {
+      "provider_observation_age_seconds": 2
+    },
+    "progress": {
+      "blocks_remaining": 2000,
+      "blocks_per_hour": 4500.0,
+      "sampled_at": 1795042799,
+      "estimated_tip_at": 1795044400
+    },
+    "last_update": {
+      "started_at": 1795042792,
+      "finished_at": 1795042794,
+      "duration_seconds": 2.0,
+      "blocks_written": 1,
+      "events_written": 3,
+      "rows_pruned": 2
+    },
+    "error_code": null,
+    "poll_error_code": null,
+    "last_error": null,
+    "retention": {
+      "seconds": 604800,
+      "next_horizon_move_at": 1795042814
+    },
+    "provider": {
+      "utc_day": "2026-11-18",
+      "calls_today": 9000,
+      "calls_previous_days": [
+        {
+          "utc_day": "2026-11-17",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-16",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-15",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-14",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-13",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-12",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-11",
+          "requests": 10000
+        }
+      ],
+      "poll_interval_seconds": 20,
+      "pace_requests_per_second": 2,
+      "requests_in_flight": 0,
+      "last_refusal": null
+    },
+    "epochs": {
+      "current_epoch": 667,
+      "newest_parameters_epoch": 667,
+      "newest_stake_epoch": 666
+    },
+    "integrity": {
+      "unspent_outputs": 250000,
+      "supply_check": {
+        "passed": true,
+        "checked_at": 1795042700
+      },
+      "snapshot": {
+        "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "created_at": 1795041800
+      }
+    },
+    "database": {
+      "reachable": true,
+      "checked_at": 1795042800,
+      "age_seconds": 0,
+      "error_code": null,
+      "size_bytes": 250000000,
+      "tls_available": true,
+      "reader_check": {
+        "passed": true,
+        "checked_at": 1795042800,
+        "error_code": null
+      }
+    },
+    "reader": {
+      "role": "db_sync_alt_reader",
+      "privileges": "node_relations_only",
+      "settings": {
+        "statement_timeout": "60s",
+        "idle_in_transaction_session_timeout": "60s",
+        "search_path": "public",
+        "default_transaction_read_only": "on",
+        "connection_limit": 40
+      },
+      "warnings": []
+    },
+    "policy": {
+      "observation_max_age_seconds": 120,
+      "serving_lag_max_blocks": 29,
+      "serving_lag_max_seconds": 600
+    },
+    "warnings": [],
+    "healthy": false,
+    "reason_codes": [
+      "serving_block_lag_exceeded",
+      "serving_lag_exceeded"
+    ]
+  },
+  "waiting": {
+    "status_schema_version": 1,
+    "service_version": "0.5.0",
+    "network": "mainnet",
+    "node_release": "2.1.101",
+    "database_format": 1,
+    "keep_rule_version": 1,
+    "profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "updated_at": 1795042800,
+    "state": "waiting",
+    "state_since": 1795042200,
+    "state_reason": "quota_exhausted",
+    "retry_at": 1795046400,
+    "serving": "ready",
+    "sync": "quota_wait",
+    "provider_head": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "provider_observed_at": 1795042798,
+    "stored_tip": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "confirmed_target": {
+      "height": 14207840,
+      "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "timestamp": 1794999595
+    },
+    "served_target": {
+      "height": 14207840,
+      "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "timestamp": 1794999595
+    },
+    "horizon": {
+      "height": 14177840,
+      "hash": "3333333333333333333333333333333333333333333333333333333333333333",
+      "timestamp": 1794394795
+    },
+    "lag": {
+      "blocks": 0,
+      "seconds": 0
+    },
+    "tip_lag": {
+      "blocks": 2160,
+      "seconds": 43200
+    },
+    "freshness": {
+      "provider_observation_age_seconds": 2
+    },
+    "progress": {
+      "blocks_remaining": 0,
+      "blocks_per_hour": 4500.0,
+      "sampled_at": 1795042799,
+      "estimated_tip_at": null
+    },
+    "last_update": {
+      "started_at": 1795042792,
+      "finished_at": 1795042794,
+      "duration_seconds": 2.0,
+      "blocks_written": 1,
+      "events_written": 3,
+      "rows_pruned": 2
+    },
+    "error_code": "quota_exhausted",
+    "poll_error_code": "quota_exhausted",
+    "last_error": {
+      "code": "quota_exhausted",
+      "at": 1795042799,
+      "block_height": null,
+      "transaction_hash": null
+    },
+    "retention": {
+      "seconds": 604800,
+      "next_horizon_move_at": 1795042814
+    },
+    "provider": {
+      "utc_day": "2026-11-18",
+      "calls_today": 9000,
+      "calls_previous_days": [
+        {
+          "utc_day": "2026-11-17",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-16",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-15",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-14",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-13",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-12",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-11",
+          "requests": 10000
+        }
+      ],
+      "poll_interval_seconds": 20,
+      "pace_requests_per_second": 2,
+      "requests_in_flight": 0,
+      "last_refusal": {
+        "http_status": 402,
+        "code": "quota_exhausted",
+        "at": 1795042799,
+        "wait_until": 1795046400
+      }
+    },
+    "epochs": {
+      "current_epoch": 667,
+      "newest_parameters_epoch": 667,
+      "newest_stake_epoch": 666
+    },
+    "integrity": {
+      "unspent_outputs": 250000,
+      "supply_check": {
+        "passed": true,
+        "checked_at": 1795042700
+      },
+      "snapshot": {
+        "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "created_at": 1795041800
+      }
+    },
+    "database": {
+      "reachable": true,
+      "checked_at": 1795042800,
+      "age_seconds": 0,
+      "error_code": null,
+      "size_bytes": 250000000,
+      "tls_available": true,
+      "reader_check": {
+        "passed": true,
+        "checked_at": 1795042800,
+        "error_code": null
+      }
+    },
+    "reader": {
+      "role": "db_sync_alt_reader",
+      "privileges": "node_relations_only",
+      "settings": {
+        "statement_timeout": "60s",
+        "idle_in_transaction_session_timeout": "60s",
+        "search_path": "public",
+        "default_transaction_read_only": "on",
+        "connection_limit": 40
+      },
+      "warnings": []
+    },
+    "policy": {
+      "observation_max_age_seconds": 120,
+      "serving_lag_max_blocks": 29,
+      "serving_lag_max_seconds": 600
+    },
+    "warnings": [],
+    "healthy": false,
+    "reason_codes": [
+      "provider_poll_quota_exhausted"
+    ]
+  },
+  "stopped_by_check": {
+    "status_schema_version": 1,
+    "service_version": "0.5.0",
+    "network": "mainnet",
+    "node_release": "2.1.101",
+    "database_format": 1,
+    "keep_rule_version": 1,
+    "profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "updated_at": 1795042800,
+    "state": "stopped_by_check",
+    "state_since": 1795042200,
+    "state_reason": "supply_mismatch",
+    "retry_at": null,
+    "serving": "revoked",
+    "sync": "halted",
+    "provider_head": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "provider_observed_at": 1795042798,
+    "stored_tip": {
+      "height": 14210000,
+      "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "timestamp": 1795042795
+    },
+    "confirmed_target": {
+      "height": 14207840,
+      "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "timestamp": 1794999595
+    },
+    "served_target": {
+      "height": 14207840,
+      "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "timestamp": 1794999595
+    },
+    "horizon": {
+      "height": 14177840,
+      "hash": "3333333333333333333333333333333333333333333333333333333333333333",
+      "timestamp": 1794394795
+    },
+    "lag": {
+      "blocks": 0,
+      "seconds": 0
+    },
+    "tip_lag": {
+      "blocks": 2160,
+      "seconds": 43200
+    },
+    "freshness": {
+      "provider_observation_age_seconds": 2
+    },
+    "progress": {
+      "blocks_remaining": 0,
+      "blocks_per_hour": 4500.0,
+      "sampled_at": 1795042799,
+      "estimated_tip_at": null
+    },
+    "last_update": {
+      "started_at": 1795042792,
+      "finished_at": 1795042794,
+      "duration_seconds": 2.0,
+      "blocks_written": 1,
+      "events_written": 3,
+      "rows_pruned": 2
+    },
+    "error_code": "supply_mismatch",
+    "poll_error_code": null,
+    "last_error": {
+      "code": "supply_mismatch",
+      "at": 1795042799,
+      "block_height": 14207840,
+      "transaction_hash": null
+    },
+    "retention": {
+      "seconds": 604800,
+      "next_horizon_move_at": 1795042814
+    },
+    "provider": {
+      "utc_day": "2026-11-18",
+      "calls_today": 9000,
+      "calls_previous_days": [
+        {
+          "utc_day": "2026-11-17",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-16",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-15",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-14",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-13",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-12",
+          "requests": 10000
+        },
+        {
+          "utc_day": "2026-11-11",
+          "requests": 10000
+        }
+      ],
+      "poll_interval_seconds": 20,
+      "pace_requests_per_second": 2,
+      "requests_in_flight": 0,
+      "last_refusal": null
+    },
+    "epochs": {
+      "current_epoch": 667,
+      "newest_parameters_epoch": 667,
+      "newest_stake_epoch": 666
+    },
+    "integrity": {
+      "unspent_outputs": 250000,
+      "supply_check": {
+        "passed": false,
+        "checked_at": 1795042799
+      },
+      "snapshot": {
+        "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "created_at": 1795041800
+      }
+    },
+    "database": {
+      "reachable": true,
+      "checked_at": 1795042800,
+      "age_seconds": 0,
+      "error_code": null,
+      "size_bytes": 250000000,
+      "tls_available": true,
+      "reader_check": {
+        "passed": true,
+        "checked_at": 1795042800,
+        "error_code": null
+      }
+    },
+    "reader": {
+      "role": "db_sync_alt_reader",
+      "privileges": "node_relations_only",
+      "settings": {
+        "statement_timeout": "60s",
+        "idle_in_transaction_session_timeout": "60s",
+        "search_path": "public",
+        "default_transaction_read_only": "on",
+        "connection_limit": 40
+      },
+      "warnings": []
+    },
+    "policy": {
+      "observation_max_age_seconds": 120,
+      "serving_lag_max_blocks": 29,
+      "serving_lag_max_seconds": 600
+    },
+    "warnings": [],
+    "healthy": false,
+    "reason_codes": [
+      "serving_revoked",
+      "sync_halted"
+    ]
+  }
+}
