@@ -1,0 +1,128 @@
+name: synthetic-keep-rule-plans
+on:
+  push:
+    branches: ['validation/keep-rule-plans-2524fa3']
+permissions:
+  contents: read
+jobs:
+  plans:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      PRODUCT_PIN: 2524fa3a743b44995f4bde360947ff945b0acc0f
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+      POSTGRES_IMAGE: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2524fa3a743b44995f4bde360947ff945b0acc0f
+          persist-credentials: false
+      - name: Record isolated public inputs and hosted resources
+        run: |
+          mkdir -p "$RUNNER_TEMP/keep-evidence" "$RUNNER_TEMP/keep-target" "$RUNNER_TEMP/keep-cargo"
+          test "$(git rev-parse HEAD)" = "$PRODUCT_PIN"
+          test -z "$(git status --porcelain)"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,platform
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE']);e=pathlib.Path(os.environ['RUNNER_TEMP'])/'keep-evidence'
+          files=['Cargo.lock','rust-toolchain.toml','crates/dsa-chain/src/keep.rs','crates/dsa-store/src/keep.rs','crates/dsa-store/src/keep.sql','crates/db-sync-alt/tests/keep_rule.rs','crates/db-sync-alt/tests/keep_rule/fixtures.rs','crates/db-sync-alt/tests/keep_rule/queries.rs']
+          memory=dict(line.split(':',1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
+          available=int(memory['MemAvailable'].strip().split()[0])*1024
+          assert available>=6*1024**3,'RAM-backed fixture needs at least6GiB available'
+          d={'environment':'standard GitHub-hosted ubuntu-24.04; not a premium runner','product_pin':os.environ['PRODUCT_PIN'],'validation_commit':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'rust_image':os.environ['RUST_IMAGE'],'postgres_image':os.environ['POSTGRES_IMAGE'],'cpu_count':os.cpu_count(),'kernel':platform.release(),'mem_available_bytes':available,'source_sha256':{f:hashlib.sha256((root/f).read_bytes()).hexdigest() for f in files},'data':'public code and deterministic generated rows only; no operator samples or backups','timings':'RAM-backed hosted CI; separate from local NVMe throttled measurements'}
+          (e/'provenance.json').write_text(json.dumps(d,indent=2)+'\n')
+          PY
+          docker pull "$RUST_IMAGE"
+          docker pull "$POSTGRES_IMAGE"
+      - name: Build the pinned test from public dependencies
+        run: |
+          docker run --rm --name keep-plan-build --cpus 2 --memory 2g --memory-swap 2g \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/keep-target,dst=/target" \
+            --mount "type=bind,src=$RUNNER_TEMP/keep-cargo,dst=/cargo" \
+            -e RUSTUP_TOOLCHAIN=1.100.0 -e RUSTUP_AUTO_INSTALL=0 \
+            -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
+            -e GIT_OPTIONAL_LOCKS=0 -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/workspace \
+            -w /workspace "$RUST_IMAGE" sh -ec \
+            'rustc --version; cargo --version; rustup show active-toolchain; cargo test --locked --workspace --test keep_rule --no-run' \
+            2>&1 | tee "$RUNNER_TEMP/keep-evidence/build.log"
+      - name: Start RAM-backed isolated PostgreSQL
+        run: |
+          docker network create --internal keep-plan-net
+          docker run -d --name keep-plan-postgres --network keep-plan-net --network-alias postgres \
+            --cpus 2 --memory 5g --memory-swap 5g --shm-size 128m \
+            --tmpfs /var/lib/postgresql/data:rw,size=4294967296 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=dsa_test \
+            "$POSTGRES_IMAGE" \
+            -c shared_buffers=64MB -c max_connections=30 -c max_wal_size=512MB \
+            -c jit=off -c max_parallel_workers_per_gather=0 -c autovacuum=off \
+            -c temp_file_limit=1GB
+          for attempt in $(seq 1 60); do
+            if docker exec keep-plan-postgres pg_isready -U postgres -d dsa_test; then break; fi
+            sleep 1
+          done
+          docker exec keep-plan-postgres pg_isready -U postgres -d dsa_test
+          docker inspect keep-plan-postgres > "$RUNNER_TEMP/keep-evidence/postgres-container.json"
+          docker network inspect keep-plan-net > "$RUNNER_TEMP/keep-evidence/internal-network.json"
+      - name: Execute the full generated fixture and all plan variants
+        run: |
+          docker run --rm --name keep-plan-test --network keep-plan-net --cpus 1 --memory 1g --memory-swap 1g \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/keep-target,dst=/target" \
+            --mount "type=bind,src=$RUNNER_TEMP/keep-cargo,dst=/cargo" \
+            -e RUSTUP_TOOLCHAIN=1.100.0 -e RUSTUP_AUTO_INSTALL=0 \
+            -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target -e CARGO_NET_OFFLINE=true \
+            -e GIT_OPTIONAL_LOCKS=0 -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/workspace \
+            -e 'DSA_TEST_DATABASE=host=postgres port=5432 user=postgres dbname=dsa_test sslmode=disable' \
+            -e DSA_PLAN_TIMEOUT_SECONDS=300 -e DSA_PLAN_BATCH_HEIGHTS=5000 \
+            -w /workspace "$RUST_IMAGE" \
+            cargo test --locked --workspace --test keep_rule keep_rule_realistic_plans -- --ignored --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/keep-evidence/benchmark.log"
+      - name: Validate full-scale evidence
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          e=pathlib.Path(os.environ['RUNNER_TEMP'])/'keep-evidence';log=e/'benchmark.log';objects=[]
+          for line in log.read_text().splitlines():
+              if line.startswith('{'):objects.append(json.loads(line))
+          setup=next(x for x in objects if 'source_headers' in x)
+          assert setup['source_headers']==1232170 and setup['source_outputs']==2464340 and setup['source_inputs']==2160000
+          assert setup['jit']=='off' and setup['work_mem']=='4MB' and setup['parallel_workers_per_gather']=='0'
+          bounds=next(x for x in objects if 'realistic_database' in x)
+          assert (bounds['horizon'],bounds['target'],bounds['tip'])==(1200000,1230009,1232169)
+          plans=[x for x in objects if 'realistic_plan_family' in x]
+          expected={(f,w,i) for f in ['block','tx_out','tx_in'] for w in [False,True] for i in [False,True]}
+          assert {(p['realistic_plan_family'],p['window_has_spend'],p['forced_index_plan']) for p in plans}==expected and len(plans)==12
+          for index,plan in enumerate(plans):
+              (e/f'plan-{index:02}.json').write_text(json.dumps(plan,indent=2)+'\n')
+          summary={'product_pin':os.environ['PRODUCT_PIN'],'validation_commit':os.environ['GITHUB_SHA'],'bounds':bounds,'settings_and_counts':setup,'plans':[{k:v for k,v in p.items() if k not in ['explain','per_node_row_work']} for p in plans],'benchmark_log_sha256':hashlib.sha256(log.read_bytes()).hexdigest(),'environment':'GitHub-hosted RAM-backed PostgreSQL; no local operator disk or data'}
+          (e/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['PRODUCT_PIN']
+          assert not subprocess.check_output(['git','status','--porcelain'],text=True).strip()
+          PY
+      - name: Capture server outcome
+        if: always()
+        run: |
+          docker logs keep-plan-postgres > "$RUNNER_TEMP/keep-evidence/postgres.log" 2>&1 || true
+          docker inspect keep-plan-postgres > "$RUNNER_TEMP/keep-evidence/postgres-final.json" || true
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          e=pathlib.Path(os.environ['RUNNER_TEMP'])/'keep-evidence';files={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in e.iterdir() if p.is_file()}
+          (e/'artifact-sha256.json').write_text(json.dumps(files,indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keep-rule-plans-${{ github.run_id }}
+          path: ${{ runner.temp }}/keep-evidence/
+          retention-days: 14
+      - name: Remove hosted scratch
+        if: always()
+        run: |
+          docker rm -f keep-plan-test keep-plan-build keep-plan-postgres 2>/dev/null || true
+          docker network rm keep-plan-net 2>/dev/null || true
