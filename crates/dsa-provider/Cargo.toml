@@ -25,6 +25,9 @@ httpdate = "1"
 tokio = { workspace = true, features = ["sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
+dsa-chain.workspace = true
+clap.workspace = true
+hex = "0.4"
 bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
