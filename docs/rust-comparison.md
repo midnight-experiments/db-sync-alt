@@ -10,7 +10,7 @@ TLS verifies the server identity by default. Use `--a-tls-root-cert` and
 `--b-password-file` for reader passwords. Inline passwords are refused.
 An explicit `sslmode=disable` supports local connections. Positive statement
 and idle-transaction timeout overrides apply only to these connections;
-configured limits otherwise remain in force.
+positive configured limits otherwise remain in force.
 
 Auto positions include consecutive cursor/reference pairs spread across the
 whole window, a spanning pair and every epoch boundary. `--max-pairs` controls
@@ -47,13 +47,42 @@ Rule1 pruned stores and mismatched rule declarations/identity are refused.
 Genuine legacy schema5 readers remain supported. Preprod's empty-name cNIGHT
 and named NIGHT bridge unit are reported separately.
 
-Each endpoint uses one REPEATABLE READ READ ONLY transaction. A source advancing
-between standalone conversions and comparisons changes the unbounded newest
-header answer. For an anchored conversion, a coordinator must call the reusable
-`compare::capture` on the same still-open source transaction passed to
-`Store::stage_conversion`, then compare that capture with the published target.
-The newest-header SQL is unchanged. The library accepts captured pairs without
-keeping a source transaction open during destination index/verification work.
+For an advancing source, use the normal anchored pair:
+
+```
+db-sync-alt convert --network mainnet --database '<destination DSN>' --source '<reader DSN>' --capture-source source.capture.json
+db-sync-alt compare --network mainnet --a-capture source.capture.json --b '<converted reader DSN>'
+```
+
+Conversion captures all literal source answers, including the unbounded newest
+header, in its one source REPEATABLE READ READ ONLY transaction. It commits that
+source before file hashing/publication and destination finish. The new file is
+bounded, checksum-protected and atomically published before destination serving.
+Existing files are refused. If destination finish fails, the file remains a
+source observation; it does not claim conversion success. File failure leaves
+the staged destination closed. A subsequent conversion uses a new file path.
+The capture reader verifies format, rule, profile, catalogue and checksum before
+opening B. Positions and the missing-policy probe are carried by the file. No
+source DSN, user, hostname or credential path enters the file. The reusable
+library still accepts an already-open source transaction for coordinators.
+
+A standalone comparison opens one read-only repeatable snapshot per endpoint.
+A fresh source snapshot after advancement must report a real newest-header
+difference; that SQL is never rewritten. Source capture files preserve JSON
+numbers inside typed JSON/JSONB columns verbatim, since the node can distinguish
+`{"int":1}` from `{"int":1.0}`. Only SQL scalar numeric display scale is
+normalized. The pinned node type evidence is separate from integer amounts.
+
+Compare and convert default to a3600s overall deadline, configurable with
+`--overall-timeout-seconds`. Their source readers set statement/idle limits to60s
+only when the inherited value is0; every positive owner limit is preserved and
+explicit positive overrides remain connection-local. New sockets default to a
+10s connect timeout and30s TCP user timeout, with keepalive idle at most30s.
+SIGINT/SIGTERM, deadlines and failures send cancellation to the operation's own
+backends through the original TLS configuration before the scoped clients close.
+This never cancels another program's query. The cancellation request itself is
+bounded by5s per socket, and logs whether it was sent. A7 rehearses release of
+this project's read transaction under its actual health stop.
 
 Capture streams each query and enforces row/UTF8 byte budgets before retaining
 its results. Paging accounts for previously retained rows; unbounded validation

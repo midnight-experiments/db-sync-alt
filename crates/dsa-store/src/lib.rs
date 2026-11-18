@@ -6,9 +6,10 @@ pub mod compare;
 pub mod convert;
 pub mod keep;
 pub mod snapshot;
+pub mod source_capture;
 pub mod verify;
 
-use std::{io::BufReader, path::Path};
+use std::{io::BufReader, path::Path, time::Duration};
 
 use dsa_chain::{VERSION, profiles::Profile};
 use serde_json::{Value, json};
@@ -125,6 +126,19 @@ pub struct Store {
     client: Client,
     connection: JoinHandle<()>,
     writer_locked: bool,
+    cancellation: Cancellation,
+}
+/// Capability for this exact backend only, using the same TLS validation.
+/// No secret-bearing Debug/serialization implementation is exposed.
+#[derive(Clone)]
+pub struct Cancellation {
+    token: tokio_postgres::CancelToken,
+    tls: MakeRustlsConnect,
+}
+impl Cancellation {
+    pub async fn cancel(&self) -> Result<(), Error> {
+        Ok(self.token.cancel_query(self.tls.clone()).await?)
+    }
 }
 
 impl Drop for Store {
@@ -141,6 +155,13 @@ impl Store {
         mut config: Config,
         root_certificate: Option<&Path>,
     ) -> Result<Self, Error> {
+        if config.get_connect_timeout().is_none() {
+            config.connect_timeout(Duration::from_secs(10));
+        }
+        if config.get_tcp_user_timeout().is_none() {
+            config.tcp_user_timeout(Duration::from_secs(30));
+        }
+        config.keepalives_idle(config.get_keepalives_idle().min(Duration::from_secs(30)));
         let mut roots = rustls::RootCertStore::empty();
         if let Some(path) = root_certificate {
             if config.get_ssl_mode() == SslMode::Disable {
@@ -172,7 +193,12 @@ impl Store {
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let (client, connection) = config.connect(MakeRustlsConnect::new(tls)).await?;
+        let tls = MakeRustlsConnect::new(tls);
+        let (client, connection) = config.connect(tls.clone()).await?;
+        let cancellation = Cancellation {
+            token: client.cancel_token(),
+            tls,
+        };
         let connection = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -180,6 +206,7 @@ impl Store {
             client,
             connection,
             writer_locked: false,
+            cancellation,
         };
         let version: i32 = store
             .client
@@ -190,6 +217,18 @@ impl Store {
             return Err(Error::Refusal("postgresql_17_required"));
         }
         Ok(store)
+    }
+
+    pub fn cancellation(&self) -> Cancellation {
+        self.cancellation.clone()
+    }
+    /// Supply finite per-session bounds only when the owner has left them at0.
+    /// Existing positive limits, including shorter values, are preserved.
+    pub async fn finite_read_limits(&self) -> Result<(), Error> {
+        for name in ["statement_timeout", "idle_in_transaction_session_timeout"] {
+            self.client.query_one("SELECT set_config($1,CASE WHEN current_setting($1)::interval=interval '0' THEN '60s' ELSE current_setting($1) END,false)",&[&name]).await?;
+        }
+        Ok(())
     }
 
     pub fn client(&self) -> &Client {

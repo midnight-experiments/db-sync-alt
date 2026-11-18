@@ -49,7 +49,11 @@ row/byte/batch counts and wall cost, plus destination preparation,
 index/analyze/sequence, verification, commit and total finish times. Network
 time is included in the reported bounds read time. The transaction can hold back source vacuum while active.
 
-PostgreSQL's configured statement and idle-transaction limits are preserved.
+Positive PostgreSQL statement and idle-transaction limits are preserved. A
+source reader whose inherited value is0 receives a scoped60s default. The
+command's default overall deadline is3600s, controlled by
+`--overall-timeout-seconds`; interrupts and deadline expiry cancel this
+operation's own queries before closing its connections.
 Explicit positive overrides are connection-local:
 `--source-statement-timeout-seconds`,
 `--source-idle-transaction-timeout-seconds`,
@@ -77,3 +81,9 @@ Library callers can use `LegacySource::snapshot` and `Store::stage_conversion`
 to capture reference answers in the same source transaction. Commit the source
 transaction before `StagedConversion::finish` to avoid keeping it idle during
 destination index construction and verification.
+
+`--capture-source FILE` preserves the source's exact node-query answers in the
+conversion snapshot for a later `compare --a-capture FILE --b '<reader DSN>'`.
+See [comparison](rust-comparison.md) for publication/failure ordering and source
+advancement. It adds the configured catalogue read workload to conversion;
+real-source access budgets must include those reads.

@@ -7,9 +7,10 @@
 //! checking their documented relationships/sentinels. Ident resolution #16 is
 //! an ordinary exact answer, and each endpoint's ident/bounds feed its events.
 //!
-//! Rows are PostgreSQL17 JSONB canonical text, normalized with a non-recursive
-//! numeric lexer (no f64/JSON parser/depth limit). This preserves NULL, wide
-//! integers, JSON, bytea and timestamps; numeric scale is insignificant. Ordered
+//! Rows use PostgreSQL17 JSONB canonical text. A nonrecursive lexer normalizes
+//! SQL scalar numeric display scale, preserving typed JSON/JSONB columns verbatim
+//! because node datum/metadata decoders observe JSON number spelling. NULL, wide
+//! integers, bytea and timestamps are preserved without nested Rust JSON parsing. Ordered
 //! statements keep result order; statements without a top-level ORDER BY compare
 //! duplicate-preserving multisets. No tie exemption changes an ordered result.
 use crate::{
@@ -186,9 +187,9 @@ impl Reader {
         config
             .options(&options)
             .application_name("db-sync-alt-compare");
-        Ok(Self {
-            store: Store::connect(config, root).await?,
-        })
+        let store = Store::connect(config, root).await?;
+        store.finite_read_limits().await?;
+        Ok(Self { store })
     }
     pub async fn limits(&self, statement: Option<u32>, idle: Option<u32>) -> Result<(), Error> {
         for (name, value) in [
@@ -206,6 +207,9 @@ impl Reader {
             }
         }
         Ok(())
+    }
+    pub fn cancellation(&self) -> crate::Cancellation {
+        self.store.cancellation()
     }
     pub async fn snapshot(&mut self) -> Result<Transaction<'_>, Error> {
         Ok(self
@@ -425,6 +429,109 @@ pub fn canonical_row(input: &str) -> Result<String, Error> {
     }
     String::from_utf8(out).map_err(|_| Error::Refusal("invalid_comparison_row"))
 }
+/// Numeric SQL scalars compare by value. JSON/JSONB result columns preserve
+/// their PostgreSQL text, because the node's datum/metadata decoders can observe
+/// the difference between JSON integer1 and decimal1.0. Only root column names
+/// are parsed; nested data is scanned iteratively and is never decoded by Rust.
+pub fn canonical_row_with_json(row: &str, fields: &BTreeSet<String>) -> Result<String, Error> {
+    if fields.is_empty() {
+        return canonical_row(row);
+    }
+    fn quoted(bytes: &[u8], mut i: usize) -> Result<usize, Error> {
+        i += 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'"' => return Ok(i + 1),
+                _ => i += 1,
+            }
+        }
+        Err(Error::Refusal("invalid_comparison_row"))
+    }
+    fn end_value(bytes: &[u8], start: usize) -> Result<usize, Error> {
+        let mut depth = 0usize;
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    i = quoted(bytes, i)?;
+                    if depth == 0 {
+                        return Ok(i);
+                    }
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    if depth == 0 {
+                        return Ok(i);
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(i + 1);
+                    }
+                }
+                b',' if depth == 0 => return Ok(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        Err(Error::Refusal("invalid_comparison_row"))
+    }
+    let bytes = row.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut previous = 0u8;
+    let mut copied = 0usize;
+    let mut out = String::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let end = quoted(bytes, i)?;
+                if depth == 1 && (previous == b'{' || previous == b',') {
+                    let key: String = serde_json::from_str(&row[i..end])
+                        .map_err(|_| Error::Refusal("invalid_comparison_row"))?;
+                    if fields.contains(&key) {
+                        let mut value = end;
+                        while value < bytes.len() && bytes[value].is_ascii_whitespace() {
+                            value += 1;
+                        }
+                        if bytes.get(value) != Some(&b':') {
+                            return Err(Error::Refusal("invalid_comparison_row"));
+                        }
+                        value += 1;
+                        while value < bytes.len() && bytes[value].is_ascii_whitespace() {
+                            value += 1;
+                        }
+                        let last = end_value(bytes, value)?;
+                        out.push_str(&canonical_row(&row[copied..value])?);
+                        out.push_str(&row[value..last]);
+                        copied = last;
+                        i = last;
+                        previous = b'v';
+                        continue;
+                    }
+                }
+                i = end;
+                previous = b'v';
+                continue;
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or(Error::Refusal("invalid_comparison_row"))?;
+            }
+            _ => {}
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            previous = bytes[i];
+        }
+        i += 1;
+    }
+    out.push_str(&canonical_row(&row[copied..])?);
+    Ok(out)
+}
+
 fn ordered(sql: &str) -> bool {
     let mut depth = 0i32;
     let mut quote = false;
@@ -473,6 +580,19 @@ async fn rows_limited(
     max_rows: usize,
     max_bytes: usize,
 ) -> Result<Vec<String>, Error> {
+    let native = tx
+        .prepare_typed(
+            statement.sql.trim().trim_end_matches(';'),
+            &parameter_types(statement),
+        )
+        .await
+        .map_err(|error| query_error(statement, error))?;
+    let json_fields = native
+        .columns()
+        .iter()
+        .filter(|column| *column.type_() == Type::JSONB || *column.type_() == Type::JSON)
+        .map(|column| column.name().to_owned())
+        .collect::<BTreeSet<_>>();
     let sql = format!(
         "SELECT to_jsonb(observation)::text FROM ({}) observation",
         statement.sql.trim().trim_end_matches(';')
@@ -495,7 +615,7 @@ async fn rows_limited(
         if rows.len() >= max_rows || raw.len() > max_bytes.saturating_sub(bytes) {
             return Err(Error::Refusal("comparison_capture_limit"));
         }
-        let canonical = canonical_row(raw)?;
+        let canonical = canonical_row_with_json(raw, &json_fields)?;
         if canonical.len() > max_bytes.saturating_sub(bytes) {
             return Err(Error::Refusal("comparison_capture_limit"));
         }
@@ -633,6 +753,11 @@ pub async fn validate_chain_order(tx: &Transaction<'_>) -> Result<(), Error> {
 
 async fn preflight(tx: &Transaction<'_>) -> Result<serde_json::Value, Error> {
     let settings=tx.query_one("SELECT jsonb_build_object('statement_timeout',current_setting('statement_timeout'),'idle_in_transaction_session_timeout',current_setting('idle_in_transaction_session_timeout'),'work_mem',current_setting('work_mem'),'ssl',coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()),false),'default_transaction_read_only',current_setting('default_transaction_read_only'),'transaction_read_only',current_setting('transaction_read_only'),'transaction_isolation',current_setting('transaction_isolation'))",&[]).await?.get::<_,serde_json::Value>(0);
+    if settings["statement_timeout"] == "0"
+        || settings["idle_in_transaction_session_timeout"] == "0"
+    {
+        return Err(Error::Refusal("comparison_requires_finite_read_limits"));
+    }
     if settings["default_transaction_read_only"] != "on"
         || settings["transaction_read_only"] != "on"
         || settings["transaction_isolation"] != "repeatable read"

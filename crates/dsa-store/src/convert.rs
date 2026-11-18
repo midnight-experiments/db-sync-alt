@@ -122,12 +122,15 @@ impl LegacySource {
         config
             .options(&options)
             .application_name("db-sync-alt-convert-source");
-        Ok(Self {
-            store: Store::connect(config, root_certificate).await?,
-        })
+        let store = Store::connect(config, root_certificate).await?;
+        store.finite_read_limits().await?;
+        Ok(Self { store })
     }
     pub fn client(&self) -> &tokio_postgres::Client {
         self.store.client()
+    }
+    pub fn cancellation(&self) -> crate::Cancellation {
+        self.store.cancellation()
     }
     pub async fn snapshot(&mut self) -> Result<Transaction<'_>, Error> {
         Ok(self

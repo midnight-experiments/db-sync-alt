@@ -1,4 +1,9 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use clap::{Args, Parser, Subcommand};
 use dsa_chain::profiles::Profile;
@@ -34,14 +39,20 @@ struct DatabaseArguments {
 
 #[derive(Args)]
 struct CompareArguments {
-    #[arg(long)]
-    a: String,
+    #[arg(
+        long,
+        required_unless_present = "a_capture",
+        conflicts_with = "a_capture"
+    )]
+    a: Option<String>,
+    #[arg(long, conflicts_with = "a")]
+    a_capture: Option<PathBuf>,
     #[arg(long)]
     b: String,
     #[arg(long)]
     network: String,
-    /// JSON positions file, or auto with --horizon-block.
-    #[arg(long)]
+    /// JSON positions file; auto uses --horizon-block or a source capture.
+    #[arg(long, default_value = "auto")]
     positions: String,
     #[arg(long)]
     horizon_block: Option<u32>,
@@ -64,6 +75,8 @@ struct CompareArguments {
     verify_unbounded: bool,
     #[arg(long)]
     candidate_address: Option<String>,
+    #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
+    overall_timeout_seconds: u32,
 }
 
 #[derive(Subcommand)]
@@ -124,6 +137,11 @@ enum Command {
         batch_bytes: u32,
         #[arg(long)]
         snapshot: Option<PathBuf>,
+        /// Save literal source answers in the conversion's own RR snapshot.
+        #[arg(long)]
+        capture_source: Option<PathBuf>,
+        #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
+        overall_timeout_seconds: u32,
         /// Preserve the reader's limit unless explicitly overridden.
         #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
         source_statement_timeout_seconds: Option<u32>,
@@ -160,9 +178,66 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+#[derive(Clone, Default)]
+struct CancelGroup(Arc<Mutex<Vec<dsa_store::Cancellation>>>);
+impl CancelGroup {
+    fn add(&self, value: dsa_store::Cancellation) {
+        self.0.lock().expect("cancellation registry").push(value);
+    }
+    async fn cancel(&self) {
+        let handles = self.0.lock().expect("cancellation registry").clone();
+        let mut pending = tokio::task::JoinSet::new();
+        for (index, handle) in handles.into_iter().enumerate() {
+            pending.spawn(async move {let result=tokio::time::timeout(Duration::from_secs(5),handle.cancel()).await; eprintln!("{}",json!({"event":"cancel_request","connection":index,"sent":matches!(result,Ok(Ok(())))}));});
+        }
+        while pending.join_next().await.is_some() {}
+    }
+}
+async fn stopped() -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|_| Error::Refusal("signal_listener_failed"))?;
+        tokio::select! {r=tokio::signal::ctrl_c()=>r.map_err(|_|Error::Refusal("signal_listener_failed")),_=terminate.recv()=>Ok(())}
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|_| Error::Refusal("signal_listener_failed"))
+    }
+}
 async fn execute(command: Command) -> Result<Value, Error> {
+    let seconds = match &command {
+        Command::Compare(args) => Some(args.overall_timeout_seconds),
+        Command::Convert {
+            overall_timeout_seconds,
+            ..
+        } => Some(*overall_timeout_seconds),
+        _ => None,
+    };
+    let group = CancelGroup::default();
+    if let Some(seconds) = seconds {
+        let work = execute_inner(command, &group);
+        tokio::pin!(work);
+        let result = tokio::select! {
+            result=&mut work=>result,
+            signal=stopped()=>match signal {Ok(())=>Err(Error::Refusal("operation_interrupted")),Err(error)=>Err(error)},
+            _=tokio::time::sleep(Duration::from_secs(u64::from(seconds)))=>Err(Error::Refusal("operation_deadline_exceeded"))
+        };
+        if result.is_err() {
+            group.cancel().await;
+        }
+        result
+    } else {
+        execute_inner(command, &group).await
+    }
+}
+
+async fn execute_inner(command: Command, group: &CancelGroup) -> Result<Value, Error> {
     let (database, operation) = match &command {
-        Command::Compare(args) => return compare_command(args).await,
+        Command::Compare(args) => return compare_command(args, group).await,
         Command::Profile { network } => return Ok(serde_json::to_value(profile(network)?)?),
         Command::Create { database } => (database, "create"),
         Command::Status { database } => (database, "status"),
@@ -195,6 +270,7 @@ async fn execute(command: Command) -> Result<Value, Error> {
         &profile,
         database.tls_root_cert.as_deref(),
         database,
+        group,
     )
     .await;
     eprintln!(
@@ -214,8 +290,10 @@ async fn database_command(
     profile: &Profile,
     root: Option<&std::path::Path>,
     limits: &DatabaseArguments,
+    group: &CancelGroup,
 ) -> Result<Value, Error> {
     let mut store = Store::connect(config, root).await?;
+    group.add(store.cancellation());
     for (name, seconds) in [
         ("statement_timeout", limits.statement_timeout_seconds),
         (
@@ -255,10 +333,14 @@ async fn database_command(
             batch_rows,
             batch_bytes,
             snapshot,
+            capture_source,
             source_statement_timeout_seconds,
             source_idle_transaction_timeout_seconds,
             ..
         } => {
+            if let Some(path) = capture_source {
+                dsa_store::source_capture::preflight(path)?;
+            }
             let mut config = tokio_postgres::Config::from_str(source)
                 .map_err(|_| Error::Refusal("invalid_source_configuration"))?;
             if config.get_password().is_some() {
@@ -276,6 +358,7 @@ async fn database_command(
             let mut source =
                 dsa_store::convert::LegacySource::connect(config, source_tls_root_cert.as_deref())
                     .await?;
+            group.add(source.cancellation());
             source
                 .limits(
                     *source_statement_timeout_seconds,
@@ -289,9 +372,48 @@ async fn database_command(
                 batch_bytes: *batch_bytes as usize,
                 snapshot: snapshot.clone(),
             };
-            Ok(serde_json::to_value(
-                store.convert(profile, &mut source, &options).await?,
-            )?)
+            if let Some(path) = capture_source {
+                let tx = source.snapshot().await?;
+                let staged = store.stage_conversion(profile, &tx, &options).await?;
+                let state = &staged.source().state;
+                let positions = dsa_store::compare::Positions::generate(
+                    &tx,
+                    state.horizon.height,
+                    state.target.height,
+                    500,
+                )
+                .await?;
+                let captured =
+                    dsa_store::compare::capture(&tx, profile, &positions, &Default::default())
+                        .await?;
+                tx.commit().await?;
+                // Observation publication precedes destination publication. File
+                // failure drops the staged conversion with its gate closed.
+                let path = path.clone();
+                let published = tokio::task::spawn_blocking(move || {
+                    dsa_store::source_capture::write(&path, &captured)
+                })
+                .await
+                .map_err(|_| Error::Refusal("source_capture_io_error"))??;
+                let mut converted = staged.finish(profile).await?;
+                if let Some(snapshot) = &options.snapshot {
+                    converted.snapshot =
+                        Some(store.snapshot(profile, snapshot).await.map_err(|error| {
+                            Error::ConvertedSnapshot {
+                                error: Box::new(error),
+                                content_digest: converted.verified.content_digest.clone(),
+                                state_digest: converted.verified.state_digest.clone(),
+                            }
+                        })?);
+                }
+                let mut value = serde_json::to_value(converted)?;
+                value["source_capture"] = serde_json::to_value(published)?;
+                Ok(value)
+            } else {
+                Ok(serde_json::to_value(
+                    store.convert(profile, &mut source, &options).await?,
+                )?)
+            }
         }
         Command::GrantReader {
             role, check: true, ..
@@ -305,7 +427,20 @@ async fn database_command(
     }
 }
 
-async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
+fn hex_policy(value: &str) -> Result<Vec<u8>, Error> {
+    if value.len() != 56 {
+        return Err(Error::Refusal("comparison_probe_policy_invalid"));
+    }
+    (0..56)
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&value[i..i + 2], 16)
+                .map_err(|_| Error::Refusal("comparison_probe_policy_invalid"))
+        })
+        .collect()
+}
+
+async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result<Value, Error> {
     use dsa_store::compare::{Options, Positions, Reader, capture, compare};
     fn config(
         text: &str,
@@ -354,8 +489,61 @@ async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
         Some(positions)
     };
     eprintln!("{}", json!({"operation":"compare","event":"started"}));
+    if let Some(file) = &args.a_capture {
+        if args.a_password_file.is_some() || args.a_tls_root_cert.is_some() {
+            return Err(Error::Refusal("source_capture_has_no_connection"));
+        }
+        let left = dsa_store::source_capture::read(file, &profile)?;
+        let positions = if let Some(positions) = explicit {
+            if positions != left.positions {
+                return Err(Error::Refusal("comparison_capture_context_mismatch"));
+            }
+            positions
+        } else {
+            left.positions.clone()
+        };
+        if args.horizon_block.is_some_and(|h| h != positions.horizon) {
+            return Err(Error::Refusal("comparison_horizon_mismatch"));
+        }
+        let mut b = Reader::connect(
+            config(&args.b, args.b_password_file.as_deref()).map_err(|e| wrap("b", e))?,
+            args.b_tls_root_cert.as_deref(),
+        )
+        .await
+        .map_err(|e| wrap("b", e))?;
+        group.add(b.cancellation());
+        b.limits(
+            args.statement_timeout_seconds,
+            args.idle_transaction_timeout_seconds,
+        )
+        .await
+        .map_err(|e| wrap("b", e))?;
+        let tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
+        let mut options = Options {
+            check_chain_order: true,
+            verify_unbounded: args.verify_unbounded,
+            missing_policy: Some(hex_policy(&left.missing_policy)?),
+            ..Default::default()
+        };
+        if let Some(address) = &args.candidate_address {
+            options.candidate_address = address.clone();
+        }
+        let right = capture(&tx, &profile, &positions, &options)
+            .await
+            .map_err(|e| wrap("b", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| wrap("b", Error::Postgres(e)))?;
+        return Ok(serde_json::to_value(compare(&left, &right)?)?);
+    }
     let mut a = Reader::connect(
-        config(&args.a, args.a_password_file.as_deref()).map_err(|e| wrap("a", e))?,
+        config(
+            args.a
+                .as_deref()
+                .ok_or(Error::Refusal("comparison_source_required"))?,
+            args.a_password_file.as_deref(),
+        )
+        .map_err(|e| wrap("a", e))?,
         args.a_tls_root_cert.as_deref(),
     )
     .await
@@ -366,6 +554,8 @@ async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
     )
     .await
     .map_err(|e| wrap("b", e))?;
+    group.add(a.cancellation());
+    group.add(b.cancellation());
     a.limits(
         args.statement_timeout_seconds,
         args.idle_transaction_timeout_seconds,

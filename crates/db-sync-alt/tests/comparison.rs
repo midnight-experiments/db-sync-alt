@@ -1014,3 +1014,138 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
     target.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_preserves_json_numeric_spelling_but_normalizes_scalar_amounts() -> Result {
+    let (source, target, f) = setup(347).await?;
+    let mut r = Reader::connect(source.reader_config(), None).await?;
+    let tx = r.snapshot().await?;
+    let make = |sql: &str| dsa_store::catalogue::Statement {
+        id: "own-json-scalar-regression".to_owned(),
+        name: "own_json_scalar_regression".to_owned(),
+        sha256: "own".to_owned(),
+        sql: sql.to_owned(),
+        kind: "read".to_owned(),
+        group: "test".to_owned(),
+        parameters: vec![],
+        sources: vec![],
+    };
+    let integer=compare::rows(&tx,&make("SELECT 1::numeric AS amount, '{\"int\":1}'::jsonb AS datum, '{\"value\":1}'::jsonb AS metadata"),&[]).await?;
+    let scaled_scalar=compare::rows(&tx,&make("SELECT 1.00::numeric AS amount, '{\"int\":1}'::jsonb AS datum, '{\"value\":1}'::jsonb AS metadata"),&[]).await?;
+    assert_eq!(integer, scaled_scalar);
+    let scaled_datum=compare::rows(&tx,&make("SELECT 1::numeric AS amount, '{\"int\":1.0}'::jsonb AS datum, '{\"value\":1}'::jsonb AS metadata"),&[]).await?;
+    assert_ne!(integer, scaled_datum);
+    let scaled_metadata=compare::rows(&tx,&make("SELECT 1::numeric AS amount, '{\"int\":1}'::jsonb AS datum, '{\"value\":1.0}'::jsonb AS metadata"),&[]).await?;
+    assert_ne!(integer, scaled_metadata);
+    let json_scalar_integer = compare::rows(&tx, &make("SELECT '1'::jsonb AS datum"), &[]).await?;
+    let json_scalar_decimal =
+        compare::rows(&tx, &make("SELECT '1.0'::jsonb AS datum"), &[]).await?;
+    assert_ne!(json_scalar_integer, json_scalar_decimal);
+    tx.commit().await?;
+    let output = f.tags["council_8"];
+    let hash = f.chain.outputs[&output].datum_hash.as_ref().unwrap();
+    target.write(&format!("UPDATE serve.datum SET value=jsonb_build_object('constructor',0,'fields',jsonb_build_array(jsonb_build_object('int',108.0::numeric))) WHERE hash=decode('{hash}','hex')")).await?;
+    let actual = cli(&source, &target, &f.profile, &[]).await?;
+    assert_eq!(actual.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&actual.stdout)?;
+    assert!(report["differences"].as_array().unwrap().iter().any(|v| {
+        v["query"]
+            .as_str()
+            .unwrap()
+            .starts_with("get_governance_body_utxo:")
+            && v["informational"] == false
+    }));
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_interrupt_and_deadline_cancel_own_queries_and_release_snapshots() -> Result {
+    use std::time::{Duration, Instant};
+    let (source, target, f) = setup(349).await?;
+    for signal in ["TERM", "INT", "deadline"] {
+        let barrier = source.barrier().await?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+        command.args([
+            "compare",
+            "--a",
+            &source.dsn(true),
+            "--b",
+            &target.dsn(true),
+            "--network",
+            "mainnet",
+            "--positions",
+            "auto",
+            "--horizon-block",
+            "6",
+        ]);
+        if signal == "deadline" {
+            command.args(["--overall-timeout-seconds", "1"]);
+        }
+        let child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let pid = child.id().unwrap();
+        let began = Instant::now();
+        loop {
+            let waiting:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-compare' AND wait_event='advisory')",&[&source.name]).await?.get(0);
+            if waiting {
+                break;
+            }
+            if began.elapsed() > Duration::from_secs(10) {
+                return Err("compare did not reach own read barrier".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stop = Instant::now();
+        if signal != "deadline" {
+            assert!(
+                Command::new("kill")
+                    .args([&format!("-{signal}"), &pid.to_string()])
+                    .status()
+                    .await?
+                    .success()
+            );
+        }
+        let output =
+            tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await??;
+        assert_eq!(output.status.code(), Some(1));
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            text.contains(if signal == "deadline" {
+                "operation_deadline_exceeded"
+            } else {
+                "operation_interrupted"
+            }),
+            "{text}"
+        );
+        assert!(text.contains("cancel_request"), "{text}");
+        loop {
+            let remaining:i64=source.admin.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=ANY($1::text[]) AND application_name='db-sync-alt-compare'",&[&vec![source.name.clone(),target.name.clone()]]).await?.get(0);
+            if remaining == 0 {
+                break;
+            }
+            if stop.elapsed() > Duration::from_secs(5) {
+                return Err("interrupted comparison left a backend/snapshot".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        barrier
+            .query_one("SELECT pg_advisory_unlock(726,1)", &[])
+            .await?;
+        drop(barrier);
+        println!(
+            "{}",
+            json!({"event":"comparison_shutdown","signal":signal,"release_seconds":stop.elapsed().as_secs_f64()})
+        );
+    }
+    let output = cli(&source, &target, &f.profile, &[]).await?;
+    assert!(output.status.success());
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
