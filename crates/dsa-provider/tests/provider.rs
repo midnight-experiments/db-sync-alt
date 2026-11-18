@@ -405,55 +405,132 @@ async fn cbor_exact_page_boundary_and_synthetic_forks_are_available_to_checks() 
 #[tokio::test]
 async fn every_typed_endpoint_accepts_the_primary_response_shape() {
     let pool = pool();
-    let pool_string = pool.to_string();
-    let server=Server::start(move |path,_| {
-        let value=if path.contains("/next?") {{ assert!(path.ends_with("/next?count=100&page=1")); json!([header(2)]) }}
-        else if path.ends_with("/parameters") {json!({"epoch":667,"nonce":hash('1'),"max_tx_size":16384,"max_block_size":90112,"unknown":{}})}
-        else if path.contains("/epochs/667/blocks?") {json!([hash('1')])}
-        else if path.contains("/stakes/") {json!([{"stake_address":"stake1synthetic","amount":"0"}])}
-        else if path.ends_with("/epochs/667") {json!({"epoch":667,"active_stake":"1000"})}
-        else if path.contains("/pools/extended?") {json!([{"pool_id":pool_string,"active_stake":"1000","metadata":{"anything":true}}])}
-        else if path.contains("/pools/retired?") {json!([{"pool_id":pool_string,"epoch":666}])}
-        else if path.contains("/history?") {json!([{"epoch":667,"active_stake":"1000","delegators_count":1}])}
-        else if path.contains("/pools?") {json!([pool_string])}
-        else if path.contains("/pools/") {json!({"pool_id":pool_string,"active_stake":"1000"})}
-        else if path.contains("/scripts/datum/") {json!({"cbor":"19a6aa"})}
-        else if path.contains("/metadata") {json!([{"label":"6500973","json_metadata":["0x0123"]}])}
-        else if path.contains("/utxos") {json!({"hash":hash('1'),"inputs":[{"ignored":"input rendering"}],"outputs":[{"address":"addr1synthetic","output_index":0,"amount":[{"unit":"lovelace","quantity":"2"}],"data_hash":null,"inline_datum":null,"collateral":false,"reference_script_hash":null,"consumed_by_tx":null}]})}
-        else if path.ends_with(&hash('1')) {let mut row=header(1);row["hash"]=json!(hash('1'));row}
-        else {header(1)};
-        Behavior::json(value)
-    }).await;
+    let pool_id = pool.to_string();
+    let block = point();
+    let block_hash = block.to_string();
+    let mut by_hash = header(1);
+    by_hash["hash"] = json!(block_hash);
+    let cases = vec![
+        (
+            Endpoint::LatestBlock,
+            "/blocks/latest".to_owned(),
+            header(1),
+        ),
+        (
+            Endpoint::BlockAtHeight(1),
+            "/blocks/1".to_owned(),
+            header(1),
+        ),
+        (
+            Endpoint::Block(block.clone()),
+            format!("/blocks/{block_hash}"),
+            by_hash,
+        ),
+        (
+            Endpoint::NextBlocks {
+                block: block.clone(),
+                page: page(),
+            },
+            format!("/blocks/{block_hash}/next?count=100&page=1"),
+            json!([header(2)]),
+        ),
+        (
+            Endpoint::BlockCbor {
+                block: block.clone(),
+                page: page(),
+            },
+            format!("/blocks/{block_hash}/txs/cbor?count=100&page=1&order=asc"),
+            json!([{"tx_hash": hash('2'), "cbor": "84a0a0f5f6"}]),
+        ),
+        (Endpoint::Genesis, "/genesis".to_owned(), genesis()),
+        (
+            Endpoint::Epoch(667),
+            "/epochs/667".to_owned(),
+            json!({"epoch": 667, "active_stake": "1000"}),
+        ),
+        (
+            Endpoint::EpochParameters(667),
+            "/epochs/667/parameters".to_owned(),
+            json!({"epoch": 667, "nonce": hash('1'), "max_tx_size": 16384, "max_block_size": 90112, "unknown": {}}),
+        ),
+        (
+            Endpoint::EpochBlocks {
+                epoch: 667,
+                page: page(),
+            },
+            "/epochs/667/blocks?count=100&page=1&order=desc".to_owned(),
+            json!([block_hash]),
+        ),
+        (
+            Endpoint::EpochPoolStake {
+                epoch: 667,
+                pool: pool.clone(),
+            },
+            format!("/epochs/667/stakes/{pool_id}?count=1&page=1"),
+            json!([{"stake_address": "stake1synthetic", "amount": "0"}]),
+        ),
+        (
+            Endpoint::Pools(page()),
+            "/pools?count=100&page=1&order=asc".to_owned(),
+            json!([pool_id]),
+        ),
+        (
+            Endpoint::ExtendedPools(page()),
+            "/pools/extended?count=100&page=1&order=asc".to_owned(),
+            json!([{"pool_id": pool_id, "active_stake": "1000", "metadata": {"anything": true}}]),
+        ),
+        (
+            Endpoint::RetiredPools(page()),
+            "/pools/retired?count=100&page=1&order=desc".to_owned(),
+            json!([{"pool_id": pool_id, "epoch": 666}]),
+        ),
+        (
+            Endpoint::Pool(pool.clone()),
+            format!("/pools/{pool_id}"),
+            json!({"pool_id": pool_id, "active_stake": "1000"}),
+        ),
+        (
+            Endpoint::PoolHistory { pool, page: page() },
+            format!("/pools/{pool_id}/history?count=100&page=1&order=desc"),
+            json!([{"epoch": 667, "active_stake": "1000", "delegators_count": 1}]),
+        ),
+        (
+            Endpoint::Datum(block.clone()),
+            format!("/scripts/datum/{block_hash}/cbor"),
+            json!({"cbor": "19a6aa"}),
+        ),
+        (
+            Endpoint::Metadata(block.clone()),
+            format!("/txs/{block_hash}/metadata"),
+            json!([{"label": "6500973", "json_metadata": ["0x0123"]}]),
+        ),
+        (
+            Endpoint::TransactionOutputs(block),
+            format!("/txs/{block_hash}/utxos"),
+            json!({"hash": block_hash, "inputs": [{"ignored": "input rendering"}], "outputs": [{
+                "address": "addr1synthetic", "output_index": 0,
+                "amount": [{"unit": "lovelace", "quantity": "2"}],
+                "data_hash": null, "inline_datum": null, "collateral": false,
+                "reference_script_hash": null, "consumed_by_tx": null
+            }]}),
+        ),
+    ];
+    let responses: Vec<_> = cases
+        .iter()
+        .map(|(_, path, body)| (path.clone(), body.clone()))
+        .collect();
+    let server = Server::start(move |path, index| {
+        let (expected, body) = &responses[index];
+        assert_eq!(path, format!("/api/v0{expected}"));
+        Behavior::json(body.clone())
+    })
+    .await;
     let (provider, _, _) = client(&server.url, |_| {});
-    for endpoint in [
-        Endpoint::BlockAtHeight(1),
-        Endpoint::Block(point()),
-        Endpoint::NextBlocks {
-            block: point(),
-            page: page(),
-        },
-        Endpoint::Epoch(667),
-        Endpoint::EpochParameters(667),
-        Endpoint::EpochBlocks {
-            epoch: 667,
-            page: page(),
-        },
-        Endpoint::EpochPoolStake {
-            epoch: 667,
-            pool: pool.clone(),
-        },
-        Endpoint::Pools(page()),
-        Endpoint::ExtendedPools(page()),
-        Endpoint::RetiredPools(page()),
-        Endpoint::Pool(pool.clone()),
-        Endpoint::PoolHistory { pool, page: page() },
-        Endpoint::Datum(point()),
-        Endpoint::Metadata(point()),
-        Endpoint::TransactionOutputs(point()),
-    ] {
+    let count = cases.len();
+    for (endpoint, _, _) in cases {
         provider.fetch(endpoint).await.unwrap();
     }
-    assert_eq!(server.state.requests.lock().unwrap().len(), 15);
+    assert_eq!(server.state.requests.lock().unwrap().len(), count);
 }
 
 #[tokio::test]
@@ -474,7 +551,7 @@ async fn utxo_fallback_discards_large_inputs_and_limits_retained_outputs() {
         .unwrap();
     assert!(matches!(row,Reply::TransactionOutputs(row) if row.outputs.len()==1));
     let server = Server::start(move |_, _| {
-        Behavior::json(json!({"hash":hash('1'),"inputs":[],"outputs":vec![output.clone();100]}))
+        Behavior::json(json!({"hash":hash('1'),"inputs":[],"outputs":(0..100).map(|index|{let mut row=output.clone();row["output_index"]=json!(index);row}).collect::<Vec<_>>()}))
     })
     .await;
     let (provider, _, _) = client(&server.url, |config| {

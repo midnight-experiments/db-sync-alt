@@ -740,7 +740,6 @@ mod tests {
         }
         for url in [
             "http://example.invalid/api/v0",
-            "https://user:secret@example.invalid",
             "https://example.invalid/?key=secret",
             "https://example.invalid/#fragment",
         ] {
@@ -752,6 +751,18 @@ mod tests {
                 Some("provider.base_url")
             );
         }
+        let mut credential_url = Url::parse("https://example.invalid").unwrap();
+        credential_url.set_username("example-user").unwrap();
+        credential_url
+            .set_password(Some("example-password"))
+            .unwrap();
+        assert_eq!(
+            Config::new(credential_url.as_str(), "/missing-key")
+                .validate()
+                .unwrap_err()
+                .field,
+            Some("provider.base_url")
+        );
         for rate in [0.5, 2.0, 8.0, 10.0] {
             let mut config = Config::new("https://example.invalid/api/v0", "/missing-key");
             config.requests_per_second = rate;
