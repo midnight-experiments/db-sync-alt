@@ -1,0 +1,951 @@
+{
+  "node_commit": "86774edf8cc76345a5c3a4221f3fe80c094b1c33",
+  "files": {
+    "node/src/main_chain_follower.rs": "ade75747ed612809373de14ca94e53f2731f6794723fee56c2cee8c2821add22",
+    "partner-chains/toolkit/committee-selection/authority-selection-inherents/src/authority_selection_inputs.rs": "415cc2bfc7cf8dab6316284206c42a5295aea22b2cdb21025d01d2e38d689360",
+    "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs": "a016a1a87356905083c5f817fd8d4ac1b79e639ddd315b792689c51b223a813d",
+    "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs": "46268764f92e9c071ba9ede1045b974e43acb1f1657c04fbc33f0afedd07728f",
+    "primitives/mainchain-follower/src/db/multi_asset_cache.rs": "78ba4fc3a0ec63ab43364b0a8b8c428f7accebd6da3a6e6f97598ba17bdf3bc3",
+    "primitives/mainchain-follower/src/db/queries/cnight_observation.rs": "42a1b5f5683e958e37ff7f294e4a11036af4a38300c3a6678d80021ea55d0226",
+    "primitives/mainchain-follower/src/db/queries/federated_authority_observation.rs": "eaf508cb65ca614f980f554cf271d3c647bf0741430387616c9c2ec469ecf571",
+    "primitives/mainchain-follower/src/db/types.rs": "333f3a8305b8bcdb7844a2b2cf70483d0f9551a5bb79e86be29110061c149673"
+  },
+  "entries": [
+    {
+      "id": "apply_cnight_observation_autovacuum_tuning:d53883446c",
+      "name": "apply_cnight_observation_autovacuum_tuning",
+      "sql": "ALTER TABLE {table} SET (autovacuum_analyze_scale_factor = 0.01, autovacuum_vacuum_scale_factor = 0.05)",
+      "sha256": "d53883446cdc1560b797dd0324d3f1109516efd01bd21ed0e1f841d37223b9be",
+      "kind": "component",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 361,
+          "function": "apply_cnight_observation_autovacuum_tuning"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:23ceb554fc",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_tx_out_data_hash ON tx_out(data_hash)",
+      "sha256": "23ceb554fce2a3d2d54a1d4a22343c0745983fce28c27b2aa3e8ec55bc6be946",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 323,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:4664473e5d",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_tx_block_id ON tx(block_id)",
+      "sha256": "4664473e5dd07c692f4cd119659ad78afaf85c70cd0a2cd62a1dad3808655235",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 307,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:67de9d5d13",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_tx_in_tx_in_id ON tx_in(tx_in_id)",
+      "sha256": "67de9d5d13d01fd732be696316caf04e2a031279c03a997dcf8ed1532f29472b",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 331,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:8173f2e34f",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_multi_asset_policy_name ON multi_asset(policy, name)",
+      "sha256": "8173f2e34f74eb6fff8a5fa646164596aca8ccfe97341e062009eabeb9b3e171",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 281,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:8249be83c6",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_tx_out_tx_id ON tx_out(tx_id)",
+      "sha256": "8249be83c69c0bc4f93f034f571eca83760e61b228e67b23b72b9f46c2712e94",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 315,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:930d5085eb",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_block_block_no ON block(block_no)",
+      "sha256": "930d5085eb2076191d4590e248fab0c6fd6dc0e728a03cca71c53ad128e01e75",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 299,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:da3c7ac6d7",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_tx_in_tx_out_id_tx_out_index ON tx_in(tx_out_id, tx_out_index)",
+      "sha256": "da3c7ac6d7d752288775581c7f8a96941c0e9566e13f47e4bc3be41d4ea120ca",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 339,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_cnight_observation_indexes:dcc7d26172",
+      "name": "create_cnight_observation_indexes",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_ma_tx_out_id_ident ON ma_tx_out(tx_out_id, ident)",
+      "sha256": "dcc7d2617291fbecf1114ee0477c3a042a1cc988c3e7c33100b71752b614efc9",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 291,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_idx_ma_tx_out_id_ident:b35ead72b0",
+      "name": "create_idx_ma_tx_out_id_ident",
+      "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ma_tx_out_id_ident ON ma_tx_out (tx_out_id, ident)",
+      "sha256": "b35ead72b087dde2aec16882987c12fa5b7a7538b07376e17ea130a7d22bafc4",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 457,
+          "function": "create_idx_ma_tx_out_id_ident"
+        }
+      ]
+    },
+    {
+      "id": "create_idx_ma_tx_out_ident:26e251d40b",
+      "name": "create_idx_ma_tx_out_ident",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_ma_tx_out_ident ON ma_tx_out(ident)",
+      "sha256": "26e251d40bdebabdd98d326f052ee81dc927cb7a1e706867c88a0a3010d22ae9",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 526,
+          "function": "create_idx_ma_tx_out_ident"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 430,
+          "function": "create_idx_ma_tx_out_ident"
+        }
+      ]
+    },
+    {
+      "id": "create_idx_tx_out_address:c4f59255f0",
+      "name": "create_idx_tx_out_address",
+      "sql": "CREATE INDEX IF NOT EXISTS idx_tx_out_address ON tx_out USING hash (address)",
+      "sha256": "c4f59255f07cffd601edf34c21c747f31183fbca1e210b3e9f2b4d11977de1ee",
+      "kind": "ddl",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 541,
+          "function": "create_idx_tx_out_address"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 444,
+          "function": "create_idx_tx_out_address"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 273,
+          "function": "create_cnight_observation_indexes"
+        }
+      ]
+    },
+    {
+      "id": "create_index_if_not_exists:1d13f2b0c9",
+      "name": "create_index_if_not_exists",
+      "sql": "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_multi_asset_policy_name_hex\n\t\t\t\tON multi_asset ((encode(policy, 'hex')), (encode(name, 'hex')))",
+      "sha256": "1d13f2b0c96c8e83bea6d42a544fa11f558fc34fa1ad38976f2abaec7c514b0d",
+      "kind": "ddl",
+      "group": "startup",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "node/src/main_chain_follower.rs",
+          "line": 136,
+          "function": "create_index_if_not_exists"
+        }
+      ]
+    },
+    {
+      "id": "create_index_if_not_exists:b24b06b1bc",
+      "name": "create_index_if_not_exists",
+      "sql": "SELECT EXISTS (\n\t\t\t\tSELECT 1 FROM pg_indexes\n\t\t\t\tWHERE indexname = 'idx_multi_asset_policy_name_hex'\n\t\t\t)",
+      "sha256": "b24b06b1bc6787af289d19a71aaa283b9f1dc13650c1ae82ddd7028569d950e0",
+      "kind": "read",
+      "group": "startup",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "node/src/main_chain_follower.rs",
+          "line": 120,
+          "function": "create_index_if_not_exists"
+        }
+      ]
+    },
+    {
+      "id": "from_connection:7efc50dfcd",
+      "name": "from_connection",
+      "sql": "select count(*) from information_schema.tables where table_name = 'tx_in'",
+      "sha256": "7efc50dfcd56a77d39d88f3649a6b0589f327337e1c3854f6d22015534fc9abf",
+      "kind": "read",
+      "group": "startup",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 32,
+          "function": "from_connection"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 81,
+          "function": "from_connection"
+        }
+      ]
+    },
+    {
+      "id": "from_connection:8787071773",
+      "name": "from_connection",
+      "sql": "SELECT EXISTS (SELECT 1 FROM tx_in)",
+      "sha256": "878707177335b2e72d5b31d13c878aaf45009201fafa29413a159f0dc2d1939e",
+      "kind": "read",
+      "group": "startup",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 41,
+          "function": "from_connection"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 90,
+          "function": "from_connection"
+        }
+      ]
+    },
+    {
+      "id": "get_asset_creates:5918f8e1d2",
+      "name": "get_asset_creates",
+      "sql": "SELECT\n    block.block_no AS \"block_number!: _\",\n    block.hash AS \"block_hash: _\",\n    block.time AS \"block_timestamp: _\",\n    tx.block_index AS \"tx_index_in_block: _\",\n    ma_tx_out.quantity::BIGINT AS \"quantity!\",\n    tx_out.address AS holder_address,\n    tx.hash AS \"tx_hash: _\",\n    tx_out.index AS \"utxo_index: _\"\nFROM block\n    JOIN tx ON tx.block_id = block.id\n    JOIN tx_out ON tx_out.tx_id = tx.id\n    JOIN ma_tx_out ON ma_tx_out.tx_out_id = tx_out.id\nWHERE tx.id >= $8 AND tx.id <= $9\n    AND tx_out.id >= $10 AND tx_out.id <= $11\n    AND ma_tx_out.id >= $12 AND ma_tx_out.id <= $13\n    AND block.block_no >= $2 AND block.block_no <= $4\n    AND ma_tx_out.ident = $1\n    AND (block.block_no > $2 OR (block.block_no = $2 AND tx.block_index >= $3))\n    AND (block.block_no < $4 OR (block.block_no = $4 AND tx.block_index < $5))\nORDER BY block.block_no, tx.block_index, tx_out.index\nLIMIT $6 OFFSET $7",
+      "sha256": "5918f8e1d2068ab2ec148281944bf20b3b2c9585f61596b1ea3c19c69d637325",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int8",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int8",
+        "int8",
+        "int8",
+        "int8",
+        "int8",
+        "int8"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 146,
+          "function": "get_asset_creates"
+        }
+      ]
+    },
+    {
+      "id": "get_asset_spends:bc73c8ec39",
+      "name": "get_asset_spends",
+      "sql": "SELECT\n    spending_block.block_no AS \"block_number!: _\",\n    spending_block.hash AS \"block_hash: _\",\n    spending_block.time AS \"block_timestamp: _\",\n    spending_tx.block_index AS \"tx_index_in_block: _\",\n    ma_tx_out.quantity::BIGINT AS \"quantity!\",\n    tx_out.address AS holder_address,\n    tx.hash AS \"utxo_tx_hash: _\",\n    tx_out.index AS \"utxo_index: _\",\n    spending_tx.hash AS \"spending_tx_hash: _\"\nFROM block AS spending_block\n    JOIN tx AS spending_tx ON spending_tx.block_id = spending_block.id\n    JOIN tx_in ON tx_in.tx_in_id = spending_tx.id\n    JOIN tx_out ON tx_out.tx_id = tx_in.tx_out_id\n                AND tx_out.index = tx_in.tx_out_index\n    JOIN tx ON tx_out.tx_id = tx.id\n    JOIN ma_tx_out ON ma_tx_out.tx_out_id = tx_out.id\nWHERE spending_block.block_no >= $2 AND spending_block.block_no <= $4\n    AND ma_tx_out.ident = $1\n    AND (spending_block.block_no > $2 OR (spending_block.block_no = $2 AND spending_tx.block_index >= $3))\n    AND (spending_block.block_no < $4 OR (spending_block.block_no = $4 AND spending_tx.block_index < $5))\n    AND spending_tx.id >= $8 AND spending_tx.id <=$9\n    AND tx_in.id >= $10 AND tx_in.id <= $11\nORDER BY spending_block.block_no, spending_tx.block_index, tx.hash, tx_out.index\nLIMIT $6 OFFSET $7",
+      "sha256": "bc73c8ec39fdcb0946ec5816b814bca4acb83e10c74c02a49289ac7534a7b1da",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int8",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int8",
+        "int8",
+        "int8",
+        "int8"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 199,
+          "function": "get_asset_spends"
+        }
+      ]
+    },
+    {
+      "id": "get_block_by_hash:a65458d491",
+      "name": "get_block_by_hash",
+      "sql": "SELECT block_no, hash, epoch_no, slot_no, time FROM block WHERE hash = $1",
+      "sha256": "a65458d491a607890c7cb2b0c70a8b7909b1325d613363eb7fa92cacb2a5b9e1",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "bytea"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 302,
+          "function": "get_block_by_hash"
+        }
+      ]
+    },
+    {
+      "id": "get_block_by_hash:b8c6cdaa6c",
+      "name": "get_block_by_hash",
+      "sql": "SELECT\n    block_no AS block_number,\n    hash AS hash,\n    epoch_no AS epoch_number,\n    slot_no AS slot_number,\n    time,\n    tx_count\nFROM block\nWHERE hash = $1",
+      "sha256": "b8c6cdaa6cd40b6c28fd4b28a265274f224d04acb02b326ae88028a6014a3817",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "bytea"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 374,
+          "function": "get_block_by_hash"
+        }
+      ]
+    },
+    {
+      "id": "get_block_info_for_tx_hash:83f8d02ff0",
+      "name": "get_block_info_for_tx_hash",
+      "sql": "SELECT\n\tblock.block_no AS block_number,\n\ttx.block_index AS tx_ix\nFROM tx\nJOIN block  ON block.id = tx.block_id\nWHERE tx.hash = $1\n",
+      "sha256": "83f8d02ff0c0d572c7d4f367cbf662aa3dcc9f7ea84d609bb41fd90f36fc8b25",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "bytea"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 715,
+          "function": "get_block_info_for_tx_hash"
+        }
+      ]
+    },
+    {
+      "id": "get_blocks_by_numbers:a2b9ddf0ae",
+      "name": "get_blocks_by_numbers",
+      "sql": "SELECT block_no, hash, epoch_no, slot_no, time\nFROM block\nWHERE block_no >= $1 AND block_no <= $2\nORDER BY block_no ASC",
+      "sha256": "a2b9ddf0aefd04fa811d54e8b6b6e9a37cc2164c485cf3d8f045abe0cf3819e6",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int4",
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 250,
+          "function": "get_blocks_by_numbers"
+        }
+      ]
+    },
+    {
+      "id": "get_bridge_txs:3b8f8846c4",
+      "name": "get_bridge_txs",
+      "sql": "SELECT\n\t\t\t  tx_out.tx_id       AS producing_tx_id\n\t\t\t, ma_tx_out.quantity AS quantity\n\t\tFROM tx_out\n\t\t\tJOIN ma_tx_out   ON ma_tx_out.tx_out_id = tx_out.id\n\t\t\tJOIN multi_asset ON multi_asset.id = ma_tx_out.ident\n\t\tWHERE multi_asset.policy = $3\n\t\t  AND multi_asset.name = $4\n\t\t  AND tx_out.address = $1",
+      "sha256": "3b8f8846c4111c61085d7eccea02e5c79676509fabf61b33688451b1c49f7f4a",
+      "kind": "component",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 827,
+          "function": "get_bridge_txs"
+        }
+      ]
+    },
+    {
+      "id": "get_bridge_txs:3fd9bc1a2c",
+      "name": "get_bridge_txs",
+      "sql": "SELECT\n\t\t\t    tx_in.tx_in_id     AS consuming_tx_id\n\t\t\t  , ma_tx_out.quantity AS quantity\n\t\t\tFROM tx_in\n\t\t\t\tJOIN tx_out      ON tx_out.tx_id = tx_in.tx_out_id AND tx_out.index = tx_in.tx_out_index\n\t\t\t\tJOIN ma_tx_out   ON ma_tx_out.tx_out_id = tx_out.id\n\t\t\t\tJOIN multi_asset ON multi_asset.id = ma_tx_out.ident\n\t\t\tWHERE multi_asset.policy = $3\n\t\t\t\tAND multi_asset.name = $4\n\t\t\t\tAND tx_out.address = $1",
+      "sha256": "3fd9bc1a2c55850375c5837a12146121100f451d495d0f9aaa1681790084a3e9",
+      "kind": "component",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 780,
+          "function": "get_bridge_txs"
+        }
+      ]
+    },
+    {
+      "id": "get_bridge_txs:545e69ef02",
+      "name": "get_bridge_txs",
+      "sql": "SELECT\n\t\t\t\t  tx_out.consumed_by_tx_id  AS consuming_tx_id\n\t\t\t\t, ma_tx_out.quantity        AS quantity\n\t\t\tFROM tx_out\n\t\t\t\tJOIN ma_tx_out   ON ma_tx_out.tx_out_id = tx_out.id\n\t\t\t\tJOIN multi_asset ON multi_asset.id = ma_tx_out.ident\n\t\t\tWHERE multi_asset.policy = $3\n\t\t\t  AND multi_asset.name = $4\n\t\t\t  AND tx_out.address = $1\n\t\t\t  AND tx_out.consumed_by_tx_id IS NOT NULL",
+      "sha256": "545e69ef0253e0fa7570cd435545114f79ad3f89d73d0e4af306c572c5de8a92",
+      "kind": "component",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 766,
+          "function": "get_bridge_txs"
+        }
+      ]
+    },
+    {
+      "id": "get_bridge_txs:69ddde6a09",
+      "name": "get_bridge_txs",
+      "sql": "SELECT\n\t\t\t    tx_in.tx_in_id     AS consuming_tx_id\n\t\t\t  , ma_tx_out.quantity AS quantity\n\t\t\tFROM tx_in\n\t\t\t\tJOIN tx_out      ON tx_out.tx_id = tx_in.tx_out_id AND tx_out.index = tx_in.tx_out_index\n\t\t\t\tJOIN ma_tx_out   ON ma_tx_out.tx_out_id = tx_out.id\n\t\t\t\tJOIN multi_asset ON multi_asset.id = ma_tx_out.ident\n\t\t\tWHERE multi_asset.policy = $3\n\t\t\t\tAND multi_asset.name = $4\n\t\t\t\tAND tx_out.address = $2",
+      "sha256": "69ddde6a09704a1afb96cc13ff4aaa799f234d20270698a26cd07e9fa0b8d753",
+      "kind": "component",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 811,
+          "function": "get_bridge_txs"
+        }
+      ]
+    },
+    {
+      "id": "get_bridge_txs:7a27cccd61",
+      "name": "get_bridge_txs",
+      "sql": "SELECT\n\t\t\t\t  tx_out.consumed_by_tx_id  AS consuming_tx_id\n\t\t\t\t, ma_tx_out.quantity        AS quantity\n\t\t\tFROM tx_out\n\t\t\t\tJOIN ma_tx_out   ON ma_tx_out.tx_out_id = tx_out.id\n\t\t\t\tJOIN multi_asset ON multi_asset.id = ma_tx_out.ident\n\t\t\tWHERE multi_asset.policy = $3\n\t\t\t  AND multi_asset.name = $4\n\t\t\t  AND tx_out.address = $2\n\t\t\t  AND tx_out.consumed_by_tx_id IS NOT NULL",
+      "sha256": "7a27cccd61025e7ebf3c071be326ad5ba5f9c673b4e226454f0bea612c3a58ca",
+      "kind": "component",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 797,
+          "function": "get_bridge_txs"
+        }
+      ]
+    },
+    {
+      "id": "get_bridge_txs:8a1f63b463",
+      "name": "get_bridge_txs",
+      "sql": "SELECT\n\t\t\t  tx_out.tx_id       AS producing_tx_id\n\t\t\t, ma_tx_out.quantity AS quantity\n\t\tFROM tx_out\n\t\t\tJOIN ma_tx_out   ON ma_tx_out.tx_out_id = tx_out.id\n\t\t\tJOIN multi_asset ON multi_asset.id = ma_tx_out.ident\n\t\tWHERE multi_asset.policy = $3\n\t\t  AND multi_asset.name = $4\n\t\t  AND tx_out.address = $2",
+      "sha256": "8a1f63b463e057479caea1f70218bac7c490b3342caf612e982f0272c9ab08f1",
+      "kind": "component",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 839,
+          "function": "get_bridge_txs"
+        }
+      ]
+    },
+    {
+      "id": "get_deregistrations:48b71b78bf",
+      "name": "get_deregistrations",
+      "sql": "SELECT\n    datum.value::jsonb AS \"full_datum!: DbDatumIfValid\",\n    block.block_no as \"block_number!: _\",\n    block.hash as \"block_hash: _\",\n    block.time as \"block_timestamp: _\",\n    tx.block_index as \"tx_index_in_block: _\",\n    tx.hash AS \"tx_hash: _\",\n    tx_tx_out.hash as \"utxo_tx_hash: _\",\n    tx_out.index as \"utxo_index: _\"\nFROM block\n    JOIN tx ON tx.block_id = block.id\n    JOIN tx_in ON tx_in.tx_in_id = tx.id\n    JOIN tx_out ON tx_out.tx_id = tx_in.tx_out_id\n                AND tx_out.index = tx_in.tx_out_index\n    JOIN tx as tx_tx_out ON tx_out.tx_id = tx_tx_out.id\n    JOIN datum ON datum.hash = tx_out.data_hash\nWHERE block.block_no >= $2 AND block.block_no <= $4\n    AND tx_out.address = $1\n    AND (block.block_no > $2 OR (block.block_no = $2 AND tx.block_index >= $3))\n    AND (block.block_no < $4 OR (block.block_no = $4 AND tx.block_index < $5))\n    AND tx.id >= $8 AND tx.id <=$9\n    AND tx_in.id >= $10 AND tx_in.id <= $11\nORDER BY block.block_no, tx.block_index, tx_tx_out.hash, tx_out.index\nLIMIT $6 OFFSET $7",
+      "sha256": "48b71b78bf8a4b33830eeed5c9b2c344f8d46855f4c185bc1db42e6e4d1d2796",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "text",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int8",
+        "int8",
+        "int8",
+        "int8"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 95,
+          "function": "get_deregistrations"
+        }
+      ]
+    },
+    {
+      "id": "get_epoch_for_block_hash:53405559f5",
+      "name": "get_epoch_for_block_hash",
+      "sql": "SELECT epoch_no FROM block WHERE hash = $1",
+      "sha256": "53405559f5d33a8317cd7a0903b535eb5d94c7b1b1c246d4842bb616a6db51aa",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "bytea"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 305,
+          "function": "get_epoch_for_block_hash"
+        }
+      ]
+    },
+    {
+      "id": "get_epoch_nonce:d0cea6c947",
+      "name": "get_epoch_nonce",
+      "sql": "SELECT nonce FROM epoch_param WHERE epoch_no = $1",
+      "sha256": "d0cea6c947bf0da05536b1f8eb0fe9a537b463c0d5e77a054ce2ae6ccf1860ca",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 401,
+          "function": "get_epoch_nonce"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 293,
+          "function": "get_epoch_nonce"
+        }
+      ]
+    },
+    {
+      "id": "get_governance_body_utxo:d75f1751a0",
+      "name": "get_governance_body_utxo",
+      "sql": "SELECT\n    datum.value::jsonb AS full_datum,\n    block.block_no as block_number,\n    block.hash as block_hash,\n    tx.block_index as tx_index_in_block,\n    tx.hash AS tx_hash,\n    tx_out.index AS utxo_index\nFROM tx_out\n    JOIN datum ON tx_out.data_hash = datum.hash\n    JOIN tx ON tx.id = tx_out.tx_id\n    JOIN block ON block.id = tx.block_id\n    JOIN ma_tx_out ON ma_tx_out.tx_out_id = tx_out.id\n    JOIN multi_asset ma ON ma.id = ma_tx_out.ident\nWHERE tx_out.address = $1\n    AND ma.policy = $2\n    AND block.block_no <= $3\nORDER BY block.block_no DESC, tx.block_index DESC\nLIMIT 1",
+      "sha256": "d75f1751a0025a3b0955cb3993352954a55e0ab55f6e8ddd85a7589b7fef5d93",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "text",
+        "bytea",
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/federated_authority_observation.rs",
+          "line": 36,
+          "function": "get_governance_body_utxo"
+        }
+      ]
+    },
+    {
+      "id": "get_high_bounds:9f26d06005",
+      "name": "get_high_bounds",
+      "sql": "SELECT\n    high_tx.tx_id AS \"tx_id!\",\n    high_tx_out.tx_out_id AS \"tx_out_id!\",\n    high_ma_tx_out.ma_tx_out_id AS \"ma_tx_out_id!\",\n    high_tx_in.tx_in_id AS \"tx_in_id!\"\nFROM\n    (SELECT id FROM block WHERE block_no = $1 LIMIT 1) AS block,\n    LATERAL (SELECT COALESCE((SELECT id FROM tx WHERE block_id > block.id ORDER BY block_id ASC LIMIT 1), 9223372036854775807) AS tx_id) AS high_tx,\n    LATERAL (SELECT COALESCE((SELECT id FROM tx_out WHERE tx_id >= high_tx.tx_id ORDER BY tx_id ASC LIMIT 1), 9223372036854775807) AS tx_out_id) AS high_tx_out,\n    LATERAL (SELECT COALESCE((SELECT id FROM ma_tx_out WHERE tx_out_id >= high_tx_out.tx_out_id ORDER BY tx_out_id ASC LIMIT 1), 9223372036854775807) AS ma_tx_out_id) AS high_ma_tx_out,\n    LATERAL (SELECT COALESCE((SELECT id FROM tx_in WHERE tx_in.tx_in_id >= high_tx.tx_id ORDER BY tx_in_id ASC LIMIT 1), 9223372036854775807) AS tx_in_id) AS high_tx_in",
+      "sha256": "9f26d0600529ebcaaec5a34a2fd96833f6bfe6414370c8a027a8b5f49e5f504b",
+      "kind": "read",
+      "group": "bounds",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 433,
+          "function": "get_high_bounds"
+        }
+      ]
+    },
+    {
+      "id": "get_highest_block:090b1bd593",
+      "name": "get_highest_block",
+      "sql": "SELECT block_no, hash, epoch_no, slot_no, time\nFROM block\nWHERE block_no <= $1 AND $2 <= slot_no AND slot_no <= $3 AND $4 <= time AND time <= $5\nORDER BY block_no DESC\nLIMIT 1",
+      "sha256": "090b1bd593c5f8a6f9c4874a9e7ed62e6181ce4768016beb7ac8c17b5c281ee9",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int4",
+        "int8",
+        "int8",
+        "timestamp",
+        "timestamp"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 279,
+          "function": "get_highest_block"
+        }
+      ]
+    },
+    {
+      "id": "get_latest_block_for_epoch:0558a251df",
+      "name": "get_latest_block_for_epoch",
+      "sql": "SELECT block.block_no, block.hash, block.epoch_no, block.slot_no\n\t\tFROM block\n\t\tWHERE block.epoch_no <= $1 AND block.slot_no IS NOT NULL AND block.block_no IS NOT NULL\n\t\tORDER BY block.slot_no DESC\n\t\tLIMIT 1",
+      "sha256": "0558a251df1d2095eb91551ec6f25621aec13e4304102020344602ac90afbd06",
+      "kind": "read",
+      "group": "rpc",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 216,
+          "function": "get_latest_block_for_epoch"
+        }
+      ]
+    },
+    {
+      "id": "get_latest_block_for_epoch:e5cea450fa",
+      "name": "get_latest_block_for_epoch",
+      "sql": "SELECT block.block_no, block.hash, block.epoch_no, block.slot_no, block.time\n\t\tFROM block\n\t\tWHERE block.epoch_no <= $1 AND block.slot_no IS NOT NULL AND block.block_no IS NOT NULL\n\t\tORDER BY block.slot_no DESC\n\t\tLIMIT 1",
+      "sha256": "e5cea450fadc293aaccf9a600446a0176fbd688cd403e8ebefc6249a8baf661e",
+      "kind": "read",
+      "group": "rpc",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 316,
+          "function": "get_latest_block_for_epoch"
+        }
+      ]
+    },
+    {
+      "id": "get_latest_block_info:907b56a3d3",
+      "name": "get_latest_block_info",
+      "sql": "SELECT\n  block.block_no,\n  block.hash,\n  block.epoch_no,\n  block.slot_no,\n  block.time\nFROM\n  block\nWHERE block.block_no IS NOT NULL\nORDER BY block.block_no DESC\nLIMIT 1",
+      "sha256": "907b56a3d37b93bb45f31cdf410ef43d084d2b1f1a6bade6c35d32de2b5ad202",
+      "kind": "read",
+      "group": "node",
+      "parameters": [],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 221,
+          "function": "get_latest_block_info"
+        }
+      ]
+    },
+    {
+      "id": "get_latest_stable_epoch:1e70627b06",
+      "name": "get_latest_stable_epoch",
+      "sql": "SELECT stable_block.epoch_no - 1 as epoch_no\nFROM block INNER JOIN block as stable_block ON block.block_no - $1 = stable_block.block_no\nWHERE block.block_no IS NOT NULL\nORDER BY block.block_no DESC\nLIMIT 1",
+      "sha256": "1e70627b06ae545e0d6b4564184e557217b966dcab7a31241a0d09e50fe42fa9",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 333,
+          "function": "get_latest_stable_epoch"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 232,
+          "function": "get_latest_stable_epoch"
+        }
+      ]
+    },
+    {
+      "id": "get_low_bounds:e1aab4f813",
+      "name": "get_low_bounds",
+      "sql": "SELECT\n    low_tx.tx_id AS \"tx_id!\",\n    low_tx_out.tx_out_id AS \"tx_out_id!\",\n    low_ma_tx_out.ma_tx_out_id AS \"ma_tx_out_id!\",\n    low_tx_in.tx_in_id AS \"tx_in_id!\"\nFROM\n    (SELECT COALESCE ((SELECT id FROM block WHERE block_no = $1 LIMIT 1), 0) AS id) AS block,\n    LATERAL (SELECT COALESCE((SELECT id FROM tx WHERE block_id < block.id ORDER BY block_id DESC LIMIT 1), 0) AS tx_id) AS low_tx,\n    LATERAL (SELECT COALESCE((SELECT id FROM tx_out WHERE tx_id <= low_tx.tx_id ORDER BY tx_id DESC LIMIT 1), 0) AS tx_out_id) AS low_tx_out,\n    LATERAL (SELECT COALESCE((SELECT id FROM ma_tx_out WHERE tx_out_id <= low_tx_out.tx_out_id ORDER BY tx_out_id DESC LIMIT 1), 0) AS ma_tx_out_id) AS low_ma_tx_out,\n    LATERAL (SELECT COALESCE((SELECT id FROM tx_in WHERE tx_in.tx_in_id <= low_tx.tx_id ORDER BY tx_in_id DESC LIMIT 1), 0) AS tx_in_id) AS low_tx_in",
+      "sha256": "e1aab4f813daf8f10a81d960a880cd75704391c55a1aad17fa2949070bdcfab5",
+      "kind": "read",
+      "group": "bounds",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 402,
+          "function": "get_low_bounds"
+        }
+      ]
+    },
+    {
+      "id": "get_max_tx_size:5d62995110",
+      "name": "get_max_tx_size",
+      "sql": "SELECT MAX(epoch_param.max_tx_size)::BIGINT FROM block JOIN epoch_param ON epoch_param.epoch_no = block.epoch_no WHERE block.block_no = $1",
+      "sha256": "5d6299511064ce3735af03c86fbd883bb8253134da925944412f68c99e33bb24",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 458,
+          "function": "get_max_tx_size"
+        }
+      ]
+    },
+    {
+      "id": "get_registrations:444095bc53",
+      "name": "get_registrations",
+      "sql": "SELECT\n    datum.value::jsonb AS \"full_datum!: DbDatumIfValid\",\n    block.block_no AS \"block_number!: _\",\n    block.hash AS \"block_hash: _\",\n    block.time AS \"block_timestamp: _\",\n    tx.block_index AS \"tx_index_in_block: _\",\n    tx.hash AS \"tx_hash: _\",\n    tx_out.index AS \"utxo_index: _\"\nFROM block\n    JOIN tx ON tx.block_id = block.id\n    JOIN tx_out ON tx_out.tx_id = tx.id\n    JOIN datum ON tx_out.data_hash = datum.hash\n    JOIN ma_tx_out ON ma_tx_out.tx_out_id = tx_out.id\nWHERE tx.id >= $9 AND tx.id <= $10\n    AND tx_out.id >= $11 AND tx_out.id <= $12\n    AND ma_tx_out.id >= $13 AND ma_tx_out.id <= $14\n    AND block.block_no >= $3 AND block.block_no <= $5\n    AND tx_out.address = $1\n    AND ma_tx_out.ident = $2\n    AND ma_tx_out.quantity = 1\n    AND (block.block_no > $3 OR (block.block_no = $3 AND tx.block_index >= $4))\n    AND (block.block_no < $5 OR (block.block_no = $5 AND tx.block_index < $6))\nORDER BY block.block_no, tx.block_index, tx_out.index\nLIMIT $7 OFFSET $8",
+      "sha256": "444095bc536a704abd08cdf1a2cd0edf8a50426e1c7e2a8dc47aeca4a66239fb",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "text",
+        "int8",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int4",
+        "int8",
+        "int8",
+        "int8",
+        "int8",
+        "int8",
+        "int8"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 39,
+          "function": "get_registrations"
+        }
+      ]
+    },
+    {
+      "id": "get_stake_distribution:56e3abd3fe",
+      "name": "get_stake_distribution",
+      "sql": "SELECT ph.hash_raw as pool_hash, SUM(es.amount) as stake\n        FROM epoch_stake es\n        INNER JOIN pool_hash ph ON es.pool_id = ph.id\n        WHERE es.epoch_no = $1\n        GROUP BY ph.hash_raw",
+      "sha256": "56e3abd3fe3476ef1ee45ecd5ccbaed56e06425055a55733b2d9cfeaabb9cb25",
+      "kind": "read",
+      "group": "rpc",
+      "parameters": [
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 351,
+          "function": "get_stake_distribution"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 249,
+          "function": "get_stake_distribution"
+        }
+      ]
+    },
+    {
+      "id": "get_token_utxo_for_epoch:13bd0605b9",
+      "name": "get_token_utxo_for_epoch",
+      "sql": "SELECT\n\t\t\torigin_tx.hash        AS origin_tx_hash,\n        \ttx_out.index          AS utxo_index,\n        \torigin_block.epoch_no AS tx_epoch_no,\n        \torigin_block.block_no AS tx_block_no,\n        \torigin_block.slot_no  AS tx_slot_no,\n        \torigin_tx.block_index AS tx_block_index,\n        \tdatum.value           AS datum\n        FROM ma_tx_out\n        INNER JOIN tx_out               ON ma_tx_out.tx_out_id = tx_out.id\n        INNER JOIN tx origin_tx         ON tx_out.tx_id = origin_tx.id\n        INNER JOIN block origin_block   ON origin_tx.block_id = origin_block.id\n        LEFT JOIN datum                 ON tx_out.data_hash = datum.hash\n        WHERE ma_tx_out.ident = $1\n        AND origin_block.epoch_no <= $2\n        ORDER BY tx_block_no DESC, origin_tx.block_index DESC\n        LIMIT 1",
+      "sha256": "13bd0605b952bcd1cc9cc8d73610f66eaf794f2253fb19fc6f7d29c920e5f217",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "int8",
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 265,
+          "function": "get_token_utxo_for_epoch"
+        }
+      ]
+    },
+    {
+      "id": "get_token_utxo_for_epoch:ab784c7578",
+      "name": "get_token_utxo_for_epoch",
+      "sql": "SELECT\n\t\t\torigin_tx.hash        AS origin_tx_hash,\n        \ttx_out.index          AS utxo_index,\n        \torigin_block.epoch_no AS tx_epoch_no,\n        \torigin_block.block_no AS tx_block_no,\n        \torigin_block.slot_no  AS tx_slot_no,\n        \torigin_tx.block_index AS tx_block_index,\n        \tdatum.value           AS datum\n        FROM ma_tx_out\n        INNER JOIN multi_asset          ON ma_tx_out.ident = multi_asset.id\n        INNER JOIN tx_out               ON ma_tx_out.tx_out_id = tx_out.id\n        INNER JOIN tx origin_tx         ON tx_out.tx_id = origin_tx.id\n        INNER JOIN block origin_block   ON origin_tx.block_id = origin_block.id\n        LEFT JOIN datum                 ON tx_out.data_hash = datum.hash\n        WHERE multi_asset.policy = $1\n\t\tAND multi_asset.name = $2\n        AND origin_block.epoch_no <= $3\n        ORDER BY tx_block_no DESC, origin_tx.block_index DESC\n        LIMIT 1",
+      "sha256": "ab784c7578c14e9a7df08ef3e10f390dad7ceba287caf50f759d88d28b97c829",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "bytea",
+        "bytea",
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 369,
+          "function": "get_token_utxo_for_epoch"
+        }
+      ]
+    },
+    {
+      "id": "get_utxos_for_address_tx_in_consumed:5b9f742a82",
+      "name": "get_utxos_for_address_tx_in_consumed",
+      "sql": "SELECT\n          \t\torigin_tx.hash as utxo_id_tx_hash,\n          \t\ttx_out.index as utxo_id_index,\n          \t\torigin_block.block_no as tx_block_no,\n          \t\torigin_block.slot_no as tx_slot_no,\n          \t\torigin_block.epoch_no as tx_epoch_no,\n          \t\torigin_tx.block_index as tx_index_in_block,\n          \t\ttx_out.address,\n          \t\tdatum.value as datum,\n          \t\tarray_agg(concat_ws('#', encode(consumes_tx.hash, 'hex'), consumes_tx_out.index) ORDER BY consumes_tx.hash, consumes_tx_out.index) as tx_inputs\n\t\t\tFROM tx_out\n\t\t\tINNER JOIN tx    origin_tx       ON tx_out.tx_id = origin_tx.id\n\t\t\tINNER JOIN block origin_block    ON origin_tx.block_id = origin_block.id\n\t\t\tLEFT JOIN tx    consuming_tx     ON tx_out.consumed_by_tx_id = consuming_tx.id\n\t\t\tLEFT JOIN block consuming_block  ON consuming_tx.block_id = consuming_block.id\n\t\t\tLEFT JOIN tx_out consumes_tx_out ON consumes_tx_out.consumed_by_tx_id = origin_tx.id\n\t\t\tLEFT JOIN tx consumes_tx         ON consumes_tx.id = consumes_tx_out.tx_id\n\t\t\tLEFT JOIN datum                  ON tx_out.data_hash = datum.hash\n          \tWHERE\n          \t\ttx_out.address = $1 AND origin_block.block_no <= $2\n          \t\tAND (tx_out.consumed_by_tx_id IS NULL OR consuming_block.block_no > $2)\n          \t\tGROUP BY (\n\t\t\t\t\tutxo_id_tx_hash,\n\t\t\t\t\tutxo_id_index,\n\t\t\t\t\ttx_block_no,\n\t\t\t\t\ttx_slot_no,\n\t\t\t\t\ttx_epoch_no,\n\t\t\t\t\ttx_index_in_block,\n\t\t\t\t\ttx_out.address,\n\t\t\t\t\tdatum\n\t\t\t\t)",
+      "sha256": "5b9f742a82894f03d0d84cf1590d8a468d0a9bb0937ca0bfc17be096367b7bfe",
+      "kind": "read",
+      "group": "rpc",
+      "parameters": [
+        "text",
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 479,
+          "function": "get_utxos_for_address_tx_in_consumed"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 383,
+          "function": "get_utxos_for_address_tx_in_consumed"
+        }
+      ]
+    },
+    {
+      "id": "get_utxos_for_address_tx_in_enabled:0f4091c087",
+      "name": "get_utxos_for_address_tx_in_enabled",
+      "sql": "SELECT\n          \t\torigin_tx.hash as utxo_id_tx_hash,\n          \t\ttx_out.index as utxo_id_index,\n          \t\torigin_block.block_no as tx_block_no,\n          \t\torigin_block.slot_no as tx_slot_no,\n          \t\torigin_block.epoch_no as tx_epoch_no,\n          \t\torigin_tx.block_index as tx_index_in_block,\n          \t\ttx_out.address,\n          \t\tdatum.value as datum,\n          \t\tarray_agg(concat_ws('#', encode(consumes_tx.hash, 'hex'), consumes_tx_in.tx_out_index) ORDER BY consumes_tx.hash, consumes_tx_in.tx_out_index) as tx_inputs\n\t\t\tFROM tx_out\n\t\t\tINNER JOIN tx    origin_tx       ON tx_out.tx_id = origin_tx.id\n\t\t\tINNER JOIN block origin_block    ON origin_tx.block_id = origin_block.id\n          \tLEFT JOIN tx_in consuming_tx_in  ON tx_out.tx_id = consuming_tx_in.tx_out_id AND tx_out.index = consuming_tx_in.tx_out_index\n          \tLEFT JOIN tx    consuming_tx     ON consuming_tx_in.tx_in_id = consuming_tx.id\n          \tLEFT JOIN block consuming_block  ON consuming_tx.block_id = consuming_block.id\n\t\t\tLEFT JOIN tx_in consumes_tx_in   ON consumes_tx_in.tx_in_id = origin_tx.id\n          \tLEFT JOIN tx_out consumes_tx_out ON consumes_tx_out.tx_id = consumes_tx_in.tx_out_id AND consumes_tx_in.tx_out_index = consumes_tx_out.index\n          \tLEFT JOIN tx consumes_tx         ON consumes_tx.id = consumes_tx_out.tx_id\n          \tLEFT JOIN datum                  ON tx_out.data_hash = datum.hash\n          \tWHERE\n          \t\ttx_out.address = $1 AND origin_block.block_no <= $2\n          \t\tAND (consuming_tx_in.id IS NULL OR consuming_block.block_no > $2)\n          \t\tGROUP BY (\n\t\t\t\t\tutxo_id_tx_hash,\n\t\t\t\t\tutxo_id_index,\n\t\t\t\t\ttx_block_no,\n\t\t\t\t\ttx_slot_no,\n\t\t\t\t\ttx_epoch_no,\n\t\t\t\t\ttx_index_in_block,\n\t\t\t\t\ttx_out.address,\n\t\t\t\t\tdatum\n\t\t\t\t)",
+      "sha256": "0f4091c087b9202a1f27b2b95ba3ee82db227ee50083cd2d42c4e136558c8660",
+      "kind": "read",
+      "group": "rpc",
+      "parameters": [
+        "text",
+        "int4"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 430,
+          "function": "get_utxos_for_address_tx_in_enabled"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 335,
+          "function": "get_utxos_for_address_tx_in_enabled"
+        }
+      ]
+    },
+    {
+      "id": "index_exists:a4f34b26f9",
+      "name": "index_exists",
+      "sql": "select * from pg_indexes where indexname = $1",
+      "sha256": "a4f34b26f9e3878c2e44b2132959e54a4803fe856e67544270180e898f7f0970",
+      "kind": "read",
+      "group": "startup",
+      "parameters": [
+        "text"
+      ],
+      "sources": [
+        {
+          "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+          "line": 551,
+          "function": "index_exists"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/data_source/candidates_data_source/db_model.rs",
+          "line": 467,
+          "function": "index_exists"
+        },
+        {
+          "file": "primitives/mainchain-follower/src/db/queries/cnight_observation.rs",
+          "line": 243,
+          "function": "index_exists"
+        }
+      ]
+    },
+    {
+      "id": "resolve_ident:3ad7564da6",
+      "name": "resolve_ident",
+      "sql": "SELECT id FROM multi_asset WHERE policy = $1 AND name = $2",
+      "sha256": "3ad7564da63cd5210fc385bf17ef5e7d0861e4558ebef58e3aa519fbb90aaafd",
+      "kind": "read",
+      "group": "node",
+      "parameters": [
+        "bytea",
+        "bytea"
+      ],
+      "sources": [
+        {
+          "file": "primitives/mainchain-follower/src/db/multi_asset_cache.rs",
+          "line": 51,
+          "function": "resolve_ident"
+        }
+      ]
+    }
+  ]
+}

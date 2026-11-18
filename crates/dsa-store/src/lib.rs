@@ -1,6 +1,7 @@
 //! PostgreSQL layout, database identity and least-privilege node access.
 
 mod canonical;
+pub mod catalogue;
 pub mod convert;
 pub mod keep;
 pub mod snapshot;
