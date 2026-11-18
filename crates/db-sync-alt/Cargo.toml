@@ -12,4 +12,10 @@ workspace = true
 [dependencies]
 clap.workspace = true
 dsa-chain.workspace = true
+dsa-store.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process"] }

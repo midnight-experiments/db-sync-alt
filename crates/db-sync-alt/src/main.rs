@@ -1,11 +1,29 @@
-use clap::{Parser, Subcommand};
+use std::{path::PathBuf, str::FromStr};
+
+use clap::{Args, Parser, Subcommand};
 use dsa_chain::profiles::Profile;
+use dsa_store::{Error, Store};
+use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(version = dsa_chain::VERSION, about = "Cardano data for Midnight nodes")]
 struct Arguments {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Args)]
+struct DatabaseArguments {
+    /// PostgreSQL connection string. Read the password from --password-file.
+    #[arg(long)]
+    database: String,
+    #[arg(long)]
+    network: String,
+    #[arg(long)]
+    password_file: Option<PathBuf>,
+    /// PEM roots for verified TLS, including server hostname verification.
+    #[arg(long)]
+    tls_root_cert: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -15,23 +33,103 @@ enum Command {
         #[arg(long)]
         network: String,
     },
+    /// Initialize an empty, operator-owned PostgreSQL 17 database.
+    Create {
+        #[command(flatten)]
+        database: DatabaseArguments,
+    },
+    /// Read the database identity and serving position.
+    Status {
+        #[command(flatten)]
+        database: DatabaseArguments,
+    },
+    /// Grant and check an existing node reader's exact privileges.
+    GrantReader {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[arg(long)]
+        role: String,
+        /// Check existing grants without changing them.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
-fn main() -> std::process::ExitCode {
-    let result = match Arguments::parse().command {
-        Command::Profile { network } => print_profile(&network),
-    };
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    match execute(Arguments::parse().command).await {
+        Ok(value) => {
+            println!("{value}");
+            std::process::ExitCode::SUCCESS
+        }
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("{}", error.report());
             std::process::ExitCode::FAILURE
         }
     }
 }
 
-fn print_profile(network: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let profile = Profile::load(network)?;
-    println!("{}", serde_json::to_string_pretty(&profile)?);
-    Ok(())
+async fn execute(command: Command) -> Result<Value, Error> {
+    let (database, operation) = match &command {
+        Command::Profile { network } => return Ok(serde_json::to_value(profile(network)?)?),
+        Command::Create { database } => (database, "create"),
+        Command::Status { database } => (database, "status"),
+        Command::GrantReader { database, .. } => (database, "grant-reader"),
+    };
+    let profile = profile(&database.network)?;
+    let mut config = tokio_postgres::Config::from_str(&database.database)
+        .map_err(|_| Error::Refusal("invalid_database_configuration"))?;
+    if config.get_password().is_some() {
+        return Err(Error::Refusal("database_password_requires_file"));
+    }
+    if let Some(path) = &database.password_file {
+        let password =
+            std::fs::read_to_string(path).map_err(|_| Error::Refusal("invalid_password_file"))?;
+        let password = password.trim_end_matches(['\r', '\n']);
+        if password.contains(['\r', '\n', '\0']) {
+            return Err(Error::Refusal("invalid_password_file"));
+        }
+        config.password(password);
+    }
+    config.application_name("db-sync-alt");
+    eprintln!("{}", json!({"operation":operation,"event":"started"}));
+    let result = database_command(
+        &command,
+        config,
+        &profile,
+        database.tls_root_cert.as_deref(),
+    )
+    .await;
+    eprintln!(
+        "{}",
+        json!({"operation":operation,"event":"finished","success":result.is_ok()})
+    );
+    result
+}
+
+fn profile(network: &str) -> Result<Profile, Error> {
+    Profile::load(network).map_err(|_| Error::Refusal("unsupported_network"))
+}
+
+async fn database_command(
+    command: &Command,
+    config: tokio_postgres::Config,
+    profile: &Profile,
+    root: Option<&std::path::Path>,
+) -> Result<Value, Error> {
+    let mut store = Store::connect(config, root).await?;
+    match command {
+        Command::Create { .. } => {
+            store.create(profile).await?;
+            store.status(profile).await
+        }
+        Command::Status { .. } => store.status(profile).await,
+        Command::GrantReader {
+            role, check: true, ..
+        } => store.check_reader(profile, role).await,
+        Command::GrantReader {
+            role, check: false, ..
+        } => store.grant_reader(profile, role).await,
+        Command::Profile { .. } => unreachable!("profile commands require no database"),
+    }
 }

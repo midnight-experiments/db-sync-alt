@@ -70,4 +70,4 @@ jobs:
       - name: PostgreSQL integration tests
         env:
           DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
-        run: cargo test --locked -p dsa-store --test postgres -- --ignored
+        run: cargo test --locked --workspace -- --ignored

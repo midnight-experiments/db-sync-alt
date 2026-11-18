@@ -9,6 +9,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[dev-dependencies]
+[dependencies]
+dsa-chain.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
+tokio-postgres-rustls = { version = "0.14", features = ["ring", "webpki-roots"] }
+webpki-roots = "1"
 tokio.workspace = true
 tokio-postgres.workspace = true
