@@ -1406,7 +1406,7 @@ pub async fn capture(
     {
         return Err(Error::Refusal("comparison_target_not_final"));
     }
-    let duplicate:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM public.ma_tx_out WHERE id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 GROUP BY tx_out_id,ident HAVING count(*)>1)",&[&i64::from(positions.horizon),&i64::from(positions.target)]).await?.get(0);
+    let duplicate:bool=tx.query_one("WITH observed_outputs AS MATERIALIZED (SELECT id FROM public.tx_out WHERE id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215 UNION SELECT o.id FROM public.tx_in i JOIN public.tx_out o ON o.tx_id=i.tx_out_id AND o.index=i.tx_out_index WHERE i.id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215) SELECT EXISTS(SELECT 1 FROM observed_outputs o JOIN public.ma_tx_out a ON a.tx_out_id=o.id GROUP BY a.tx_out_id,a.ident HAVING count(*)>1)",&[&i64::from(positions.horizon),&i64::from(positions.target)]).await?.get(0);
     if duplicate {
         return Err(Error::Refusal("comparison_duplicate_asset_unit"));
     }

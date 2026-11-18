@@ -1538,6 +1538,20 @@ async fn compare_no_window_transactions_uses_carried_witness_or_explicit_unavail
         f.chain
             .metadata
             .retain(|_, transaction| f.chain.transactions.contains_key(transaction));
+        if !carried {
+            // Keep positive network evidence and the K10 startup input, but no
+            // transaction with a retained header: only epoch ends3/5 and the
+            // empty window survive. A source with every transaction removed
+            // would correctly fail conversion's network-evidence check.
+            f.chain.transactions.clear();
+            f.chain.outputs.clear();
+            f.chain.output_assets.clear();
+            f.chain.inputs.clear();
+            f.chain.datums.clear();
+            f.chain.metadata.clear();
+            let old = f.output(0, 0, 0, "other", "cnight", None);
+            f.spend(4, 0, 0, old);
+        }
         f.reindex_ordinals();
         let source = Database::new().await?;
         source.legacy(&f).await?;
@@ -1587,6 +1601,49 @@ async fn compare_no_window_transactions_uses_carried_witness_or_explicit_unavail
         println!(
             "{}",
             json!({"event":"quiet_comparison","carried_witness":carried,"transaction_hit_available_a":report["transaction_hit_available_a"],"transaction_hit_available_b":report["transaction_hit_available_b"]})
+        );
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_cli_refuses_duplicate_units_on_window_and_old_spent_outputs() -> Result {
+    for kind in ["window", "old_spent"] {
+        let (source, target, f) = setup(365).await?;
+        let output = if kind == "window" {
+            f.chain
+                .output_assets
+                .values()
+                .find(|a| f.chain.transactions[&f.chain.outputs[&a.output].transaction].block >= 6)
+                .unwrap()
+                .output
+        } else {
+            f.chain
+                .inputs
+                .values()
+                .find(|i| {
+                    f.chain.transactions[&i.transaction].block >= 6
+                        && f.chain.transactions[&f.chain.outputs[&i.output].transaction].block < 6
+                        && f.chain.output_assets.values().any(|a| {
+                            a.output == i.output
+                                && f.chain.assets[&a.asset] == f.profile.assets["cnight"]
+                        })
+                })
+                .unwrap()
+                .output
+        };
+        source.write(&format!("INSERT INTO serve.ma_tx_out(id,quantity,tx_out_id,ident) SELECT {output}::bigint*4096+4094,quantity+1,tx_out_id,ident FROM serve.ma_tx_out WHERE tx_out_id={output} ORDER BY id LIMIT 1")).await?;
+        let result = cli(&source, &target, &f.profile, &[]).await?;
+        println!(
+            "{}",
+            json!({"event":"duplicate_asset_unit_cli","kind":kind,"exit":result.status.code()})
+        );
+        assert_eq!(result.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("comparison_duplicate_asset_unit")
         );
         source.cleanup().await?;
         target.cleanup().await?;
