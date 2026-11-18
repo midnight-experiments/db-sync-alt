@@ -75,7 +75,7 @@ pub struct Rows {
     pub mint: Vec<MintRow>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeldOutput {
     pub transaction_id: i64,
     pub output: Output,
@@ -89,6 +89,33 @@ pub struct Supplements {
     pub datums: BTreeMap<String, Vec<u8>>,
     /// ICS transaction -> label 6500973 absent, or its exact provider JSON.
     pub metadata: BTreeMap<String, Option<String>>,
+}
+
+/// An overlay contains only outputs created or removed by this block. Failed
+/// validation drops it without changing the caller's long-lived held set.
+struct HeldChanges<'a> {
+    original: &'a BTreeMap<Outpoint, HeldOutput>,
+    changes: BTreeMap<Outpoint, Option<HeldOutput>>,
+}
+
+impl HeldChanges<'_> {
+    fn get(&self, point: &Outpoint) -> Option<&HeldOutput> {
+        match self.changes.get(point) {
+            Some(value) => value.as_ref(),
+            None => self.original.get(point),
+        }
+    }
+    fn contains_key(&self, point: &Outpoint) -> bool {
+        self.get(point).is_some()
+    }
+    fn remove(&mut self, point: &Outpoint) {
+        if self.contains_key(point) {
+            self.changes.insert(point.clone(), None);
+        }
+    }
+    fn insert(&mut self, point: Outpoint, output: HeldOutput) {
+        self.changes.insert(point, Some(output));
+    }
 }
 
 pub struct Selection<'a> {
@@ -208,6 +235,31 @@ pub fn build_block(
     height: u32,
     transactions: &[Transaction<'_>],
     held: &mut BTreeMap<Outpoint, HeldOutput>,
+    supplements: &Supplements,
+) -> Result<Rows, Error> {
+    let (rows, changes) = {
+        let mut staged = HeldChanges {
+            original: held,
+            changes: BTreeMap::new(),
+        };
+        let rows = build_rows(profile, height, transactions, &mut staged, supplements)?;
+        (rows, staged.changes)
+    };
+    for (point, output) in changes {
+        if let Some(output) = output {
+            held.insert(point, output);
+        } else {
+            held.remove(&point);
+        }
+    }
+    Ok(rows)
+}
+
+fn build_rows(
+    profile: &Profile,
+    height: u32,
+    transactions: &[Transaction<'_>],
+    held: &mut HeldChanges<'_>,
     supplements: &Supplements,
 ) -> Result<Rows, Error> {
     let selection = Selection::new(profile);
@@ -362,6 +414,139 @@ pub fn build_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_later_transaction_preserves_held_and_retry_matches_clean_block() {
+        // Native row-model facts only; no ledger serialization or external decoder.
+        fn tx(
+            hash: String,
+            inputs: Vec<Outpoint>,
+            outputs: Vec<Option<Output>>,
+        ) -> Transaction<'static> {
+            Transaction {
+                hash,
+                valid: true,
+                ordinary: inputs,
+                collateral: Vec::new(),
+                reference: Vec::new(),
+                outputs,
+                collateral_output: None,
+                has_collateral_return: false,
+                mint: Vec::new(),
+                datums: BTreeMap::new(),
+                body: &[],
+                auxiliary: None,
+                auxiliary_hash: None,
+            }
+        }
+        let profile = Profile::load("mainnet").unwrap();
+        let output = Output {
+            address_raw: Vec::new(),
+            address: Some(profile.addresses["mapping"].clone()),
+            coin: 100,
+            assets: Vec::new(),
+            data_hash: None,
+            inline_datum: None,
+            classification_safe: true,
+        };
+        for failure in ["output", "datum", "metadata"] {
+            let origin = Outpoint {
+                hash: "01".repeat(32),
+                index: 0,
+            };
+            let first = Outpoint {
+                hash: "02".repeat(32),
+                index: 0,
+            };
+            let second = Outpoint {
+                hash: "03".repeat(32),
+                index: 0,
+            };
+            let untouched = Outpoint {
+                hash: "04".repeat(32),
+                index: 7,
+            };
+            let before = BTreeMap::from([
+                (
+                    origin.clone(),
+                    HeldOutput {
+                        transaction_id: 1,
+                        output: output.clone(),
+                    },
+                ),
+                (
+                    untouched.clone(),
+                    HeldOutput {
+                        transaction_id: 2,
+                        output: output.clone(),
+                    },
+                ),
+            ]);
+            let mut later = output.clone();
+            let mut bad = Supplements::default();
+            if failure == "datum" {
+                later.data_hash = Some(hash(&[0]));
+                bad.datums.insert(hash(&[0]), vec![1]);
+            }
+            if failure == "metadata" {
+                later.address = Some(profile.addresses["ics"].clone());
+            }
+            let transactions = [
+                tx(
+                    first.hash.clone(),
+                    vec![origin.clone()],
+                    vec![Some(output.clone())],
+                ),
+                tx(
+                    second.hash.clone(),
+                    vec![first.clone()],
+                    vec![if failure == "output" {
+                        None
+                    } else {
+                        Some(later.clone())
+                    }],
+                ),
+            ];
+            let mut held = before.clone();
+            let error = build_block(&profile, 10, &transactions, &mut held, &bad).unwrap_err();
+            assert_eq!(
+                error.code,
+                match failure {
+                    "output" => "provider_output_resolution_required",
+                    "datum" => "provider_datum_hash_mismatch",
+                    _ => "provider_metadata_resolution_required",
+                }
+            );
+            assert_eq!(
+                held, before,
+                "failure must leave the entire original held set unchanged"
+            );
+            if failure == "output" {
+                bad.outputs
+                    .insert(second.hash.clone(), BTreeMap::from([(0, later)]));
+            }
+            if failure == "datum" {
+                bad.datums.insert(hash(&[0]), vec![0]);
+            }
+            if failure == "metadata" {
+                bad.metadata.insert(second.hash.clone(), None);
+            }
+            let mut clean = before.clone();
+            let expected = build_block(&profile, 10, &transactions, &mut clean, &bad).unwrap();
+            let retried = build_block(&profile, 10, &transactions, &mut held, &bad).unwrap();
+            assert_eq!(retried, expected);
+            assert_eq!(held, clean);
+            assert_eq!(
+                retried.tx_in.len(),
+                2,
+                "same-block created output must be spent through the staged view"
+            );
+            assert!(!held.contains_key(&origin));
+            assert!(!held.contains_key(&first));
+            assert!(held.contains_key(&second));
+            assert_eq!(held.get(&untouched), before.get(&untouched));
+        }
+    }
 
     #[test]
     fn ra_14_c_3_invalid_projection_uses_collateral_return_and_collateral_only() {
