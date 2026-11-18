@@ -193,6 +193,9 @@ pub struct SourceReport {
     pub source_first_header: u32,
     pub horizon_search_start_height: u32,
     pub network_evidence: String,
+    pub preflight_seconds: f64,
+    pub network_read_seconds: f64,
+    pub supply_read_seconds: f64,
     pub bounds_read_seconds: f64,
     pub horizon_read_seconds: f64,
     pub horizon_point_queries: u32,
@@ -205,11 +208,20 @@ pub struct SourceReport {
     pub families: BTreeMap<String, FamilyCost>,
     pub longest_family_seconds: f64,
 }
+#[derive(Debug, Default, Serialize)]
+pub struct DestinationCost {
+    pub prepare_seconds: f64,
+    pub index_analyze_sequence_seconds: f64,
+    pub verify_seconds: f64,
+    pub commit_seconds: f64,
+    pub finish_seconds: f64,
+}
 #[derive(Debug, Serialize)]
 pub struct Conversion {
     pub verified: Verification,
     pub source: SourceReport,
     pub snapshot: Option<Description>,
+    pub destination: DestinationCost,
 }
 
 pub struct StagedConversion<'a> {
@@ -219,15 +231,17 @@ pub struct StagedConversion<'a> {
     families: BTreeMap<String, FamilyDigest>,
     protected_state: FamilyDigest,
     supply: BTreeMap<String, String>,
+    destination: DestinationCost,
 }
 impl StagedConversion<'_> {
     pub fn source(&self) -> &SourceReport {
         &self.source
     }
-    pub async fn finish(self, profile: &Profile) -> Result<Conversion, Error> {
+    pub async fn finish(mut self, profile: &Profile) -> Result<Conversion, Error> {
         if self.profile_hash != profile.hash()? {
             return Err(Error::Refusal("profile_hash_mismatch"));
         }
+        let finished = Instant::now();
         let tx = &self.transaction;
         let state = &self.source.state;
         write_state(tx, state).await?;
@@ -238,6 +252,7 @@ impl StagedConversion<'_> {
             )
             .await?;
         }
+        let index_started = Instant::now();
         tx.batch_execute(include_str!("indexes.sql")).await?;
         for table in NODE_RELATIONS.into_iter().chain([MARKERS]) {
             let schema = if table == MARKERS { "dsa" } else { "serve" };
@@ -247,7 +262,10 @@ impl StagedConversion<'_> {
         for table in ["multi_asset", "datum", "pool_hash", "epoch_stake"] {
             tx.query_one(&format!("SELECT setval('dsa.{table}_id_seq',greatest(coalesce(max(id),0)+1,1),false) FROM serve.{table}"),&[]).await?;
         }
+        self.destination.index_analyze_sequence_seconds = index_started.elapsed().as_secs_f64();
+        let verify_started = Instant::now();
         let verified = verify::verify(tx, profile, false).await?;
+        self.destination.verify_seconds = verify_started.elapsed().as_secs_f64();
         if verified.families != self.families
             || verified.content_digest != root(&self.families)
             || verified.protected_state != self.protected_state
@@ -271,11 +289,15 @@ impl StagedConversion<'_> {
             "UPDATE dsa.position SET serving=true,reason='serving',updated_at=now() WHERE id=1",
         )
         .await?;
+        let commit_started = Instant::now();
         self.transaction.commit().await?;
+        self.destination.commit_seconds = commit_started.elapsed().as_secs_f64();
+        self.destination.finish_seconds = finished.elapsed().as_secs_f64();
         Ok(Conversion {
             verified,
             source: self.source,
             snapshot: None,
+            destination: self.destination,
         })
     }
 }
@@ -512,9 +534,11 @@ async fn source_report(
     profile: &Profile,
     options: &ConvertOptions,
 ) -> Result<SourceReport, Error> {
+    let preflight_started = Instant::now();
     let settings = settings(source).await?;
     let gate = validate_reader(source).await?;
     validate_schema(source, gate).await?;
+    let preflight_seconds = preflight_started.elapsed().as_secs_f64();
     let start = Instant::now();
     let newest = endpoint(source, 0, 134217727, true)
         .await?
@@ -527,7 +551,9 @@ async fn source_report(
         .checked_sub(profile.cardano.security_parameter)
         .ok_or(Error::Refusal("source_tip_below_security_parameter"))?;
     let target = header(source, target_height).await?;
+    let network_started = Instant::now();
     let (network_evidence, start_anchor) = network_evidence(source, profile, newest).await?;
+    let network_read_seconds = network_started.elapsed().as_secs_f64();
     // A positive start anchor establishes a known suffix. An adjacent earlier
     // prefix may also be continuous; discover it only when target-time retention
     // needs it. Without that anchor never classify an arbitrary gap as a start.
@@ -643,6 +669,9 @@ async fn source_report(
         source_first_header: oldest,
         horizon_search_start_height: first,
         network_evidence,
+        preflight_seconds,
+        network_read_seconds,
+        supply_read_seconds: 0.0,
         bounds_read_seconds,
         horizon_read_seconds: horizon_started.elapsed().as_secs_f64(),
         horizon_point_queries: point_queries,
@@ -779,8 +808,15 @@ impl Store {
         options.validate()?;
         self.conversion_destination_preflight(profile).await?;
         let mut report = source_report(source, profile, options).await?;
+        let supply_started = Instant::now();
         let amounts = supply(source, profile, report.state.target.height).await?;
+        report.supply_read_seconds = supply_started.elapsed().as_secs_f64();
+        let prepare_started = Instant::now();
         self.prepare_destination(profile, "convert_failed").await?;
+        let destination = DestinationCost {
+            prepare_seconds: prepare_started.elapsed().as_secs_f64(),
+            ..Default::default()
+        };
         let selection = Selection::new(
             profile,
             Bounds {
@@ -882,6 +918,7 @@ impl Store {
             families,
             protected_state: markers.finish(),
             supply: amounts,
+            destination,
         })
     }
 

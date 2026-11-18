@@ -942,6 +942,7 @@ async fn convert_scaled_source_cost() -> Result {
           INSERT INTO serve.tx SELECT n*4096+7,decode(md5('tx/'||n::text)||md5('tx2/'||n::text),'hex'),n,7,true FROM generate_series({low}::bigint,least({high},{t})::bigint)n WHERE n%2=0;
           INSERT INTO serve.tx_out SELECT n*16777216+7*4096,n*4096+7,0,'external-'||(n%10007)::text,1,NULL,NULL FROM generate_series({low}::bigint,least({high},{t})::bigint)n WHERE n%2=0;
           INSERT INTO serve.ma_tx_out SELECT (n*16777216+7*4096)*4096,1,n*16777216+7*4096,{asset} FROM generate_series({low}::bigint,least({high},{t})::bigint)n WHERE n%2=0;
+          INSERT INTO serve.ma_tx_out SELECT (n*16777216+7*4096)*4096+1,1,n*16777216+7*4096,9011 FROM generate_series({low}::bigint,least({high},{t})::bigint)n WHERE n%10=0;
           INSERT INTO serve.tx SELECT (n+1)*4096+8,decode(md5('spend/'||n::text)||md5('spend2/'||n::text),'hex'),n+1,8,true FROM generate_series({low}::bigint,least({high},{h}-2)::bigint)n WHERE n%2=0 AND n%10<>0;
           INSERT INTO serve.tx_in SELECT (n+1)*16777216+8*4096,(n+1)*4096+8,n*4096+7,0 FROM generate_series({low}::bigint,least({high},{h}-2)::bigint)n WHERE n%2=0 AND n%10<>0")).await?;
         if (low - offset).is_multiple_of(100000) {
@@ -1052,7 +1053,15 @@ async fn convert_scaled_source_cost() -> Result {
         }
         let tx = session.snapshot().await?;
         let settings:Value=tx.query_one("SELECT jsonb_build_object('statement_timeout',current_setting('statement_timeout'),'work_mem',current_setting('work_mem'),'jit',current_setting('jit'),'parallel',current_setting('max_parallel_workers_per_gather'),'server_version',current_setting('server_version'))",&[]).await?.get(0);
-        for table in ["block", "tx_out", "tx_in"] {
+        for table in [
+            "block",
+            "tx",
+            "tx_out",
+            "tx_in",
+            "ma_tx_out",
+            "datum",
+            "multi_asset",
+        ] {
             let sql = selection.conversion_rows_sql(table)?;
             let plan: Value = tx
                 .query_one(

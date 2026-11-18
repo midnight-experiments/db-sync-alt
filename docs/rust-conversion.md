@@ -44,8 +44,10 @@ The source sends one natural-key stream per family. Destination batches use
 `--batch-rows` (default4096) and `--batch-bytes` (default4MiB); one larger
 supported row travels alone. Source work includes prefix unspent/carry
 selection and sorting. Reports include actual source limits, work_mem,
-header/horizon read times and each family's row/byte/batch counts and wall
-cost. The transaction can hold back source vacuum while active.
+preflight, network, supply and header/horizon read times, each family's
+row/byte/batch counts and wall cost, plus destination preparation,
+index/analyze/sequence, verification, commit and total finish times. Network
+time is included in the reported bounds read time. The transaction can hold back source vacuum while active.
 
 PostgreSQL's configured statement and idle-transaction limits are preserved.
 Explicit positive overrides are connection-local:
