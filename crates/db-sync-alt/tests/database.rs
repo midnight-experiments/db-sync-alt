@@ -464,8 +464,23 @@ async fn identity_refusals_status_and_single_writer() -> Result {
     let status: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(status["position"]["serving"], false);
     drop(first);
-    tokio::task::yield_now().await;
-    second.writer_transaction().await?.commit().await?;
+    // Dropping the client initiates socket teardown. Wait for PostgreSQL to
+    // observe the disconnect before expecting its session lock to be free.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match second.writer_transaction().await {
+            Ok(transaction) => {
+                transaction.commit().await?;
+                break;
+            }
+            Err(dsa_store::Error::Refusal("writer_busy"))
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     assert!(matches!(
         second.create(&preprod).await,
         Err(dsa_store::Error::Refusal("destination_not_empty"))
