@@ -597,16 +597,16 @@ async fn preflight(tx: &Transaction<'_>) -> Result<serde_json::Value, Error> {
         return Err(Error::Refusal("comparison_invalid_reader_role"));
     }
     let role: String = row.get(0);
-    let gates=tx.query("SELECT p.oid,n.nspname::text,p.proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('chain','dsa') AND p.proname='gate' AND p.pronargs=0 AND p.prosecdef AND p.provolatile='s' AND p.prorettype=16",&[]).await?;
+    let gates=tx.query("SELECT p.oid,n.nspname::text,obj_description(p.oid,'pg_proc') FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('chain','dsa') AND p.proname='gate' AND p.pronargs=0 AND p.prosecdef AND p.provolatile='s' AND p.prorettype=16",&[]).await?;
     if gates.len() != 1 {
         return Err(Error::Refusal("comparison_unsupported_gate"));
     }
     let gate: u32 = gates[0].get(0);
     let schema: String = gates[0].get(1);
     if schema == "dsa" {
-        let declared: Option<Vec<String>> = gates[0].get(2);
-        let expected = format!("dsa.keep_rule_version={}", crate::KEEP_RULE_VERSION);
-        if !declared.is_some_and(|v| v.contains(&expected)) {
+        let declared: Option<String> = gates[0].get(2);
+        let expected = format!("db-sync-alt keep-rule-version={}", crate::KEEP_RULE_VERSION);
+        if declared.as_deref() != Some(expected.as_str()) {
             return Err(Error::Refusal("comparison_keep_rule_mismatch"));
         }
     }

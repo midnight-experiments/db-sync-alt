@@ -51,14 +51,10 @@ CREATE SEQUENCE dsa.datum_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.pool_hash_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.epoch_stake_id_seq MINVALUE 1;
 REVOKE ALL ON ALL TABLES IN SCHEMA dsa FROM PUBLIC;
--- Register a USERSET custom placeholder before PostgreSQL validates function
--- SET options for the non-superuser layout owner. Transaction-local only.
-SET LOCAL dsa.keep_rule_version='__KEEP_RULE_VERSION__';
 CREATE FUNCTION dsa.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
-SET search_path=pg_catalog,dsa
-SET dsa.keep_rule_version='__KEEP_RULE_VERSION__' AS $$
+SET search_path=pg_catalog,dsa AS $$
 BEGIN
- IF NOT EXISTS(SELECT 1 FROM dsa.identity WHERE id=1 AND database_format=1 AND keep_rule_version=current_setting('dsa.keep_rule_version')::integer) THEN
+ IF NOT EXISTS(SELECT 1 FROM dsa.identity WHERE id=1 AND database_format=1 AND keep_rule_version=__KEEP_RULE_VERSION__) THEN
    RAISE EXCEPTION 'db_sync_alt_not_serving' USING ERRCODE='55000',DETAIL='identity';
  END IF;
  IF NOT EXISTS(SELECT 1 FROM dsa.position WHERE id=1 AND serving) THEN
@@ -66,4 +62,5 @@ BEGIN
  END IF;
  RETURN true;
 END $$;
+COMMENT ON FUNCTION dsa.gate() IS 'db-sync-alt keep-rule-version=__KEEP_RULE_VERSION__';
 REVOKE EXECUTE ON FUNCTION dsa.gate() FROM PUBLIC;

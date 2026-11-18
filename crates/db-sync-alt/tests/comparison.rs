@@ -536,7 +536,7 @@ async fn compare_refuses_rule_one_and_declared_stored_mismatch_even_empty() -> R
         (2, 1, "comparison_keep_rule_mismatch"),
         (1, 2, "comparison_not_serving"),
     ] {
-        c.batch_execute(&format!("SET dsa.keep_rule_version='2';UPDATE dsa.identity SET keep_rule_version={stored};ALTER FUNCTION dsa.gate() SET dsa.keep_rule_version='{declared}'")).await?;
+        c.batch_execute(&format!("UPDATE dsa.identity SET keep_rule_version={stored};COMMENT ON FUNCTION dsa.gate() IS 'db-sync-alt keep-rule-version={declared}'")).await?;
         let mut r = Reader::connect(target.reader_config(), None).await?;
         let snapshot = r.snapshot().await?;
         let error = compare::capture(&snapshot, &f.profile, &positions, &Options::default())
