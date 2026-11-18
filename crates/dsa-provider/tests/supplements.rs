@@ -103,3 +103,52 @@ fn invalid_native_model_requires_only_the_return_at_body_output_count() {
         "provider_output_count_mismatch"
     );
 }
+
+#[path = "../examples/support/recorded.rs"]
+mod recorded;
+
+#[test]
+fn recorded_404_is_scoped_to_the_requesting_block() {
+    use dsa_chain::rows::{DatumAvailability, SupplementRequest, Supplements};
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::create_dir(scratch.path().join("datums")).unwrap();
+    let hash = transaction::hash(&[0]);
+    let request = SupplementRequest::Datum(hash.clone());
+    // A legacy unscoped negative response cannot establish current absence.
+    std::fs::write(scratch.path().join(format!("datums/{hash}.json")), "null").unwrap();
+    let mut supplements = Supplements::default();
+    assert!(!recorded::load(scratch.path(), &request, 10, &[], &mut supplements).unwrap());
+    std::fs::write(
+        scratch.path().join(format!("datums/10-{hash}.json")),
+        "null",
+    )
+    .unwrap();
+    assert!(recorded::load(scratch.path(), &request, 10, &[], &mut supplements).unwrap());
+    assert_eq!(supplements.datums[&hash], DatumAvailability::NotFound);
+    let mut later = Supplements::default();
+    assert!(!recorded::load(scratch.path(), &request, 11, &[], &mut later).unwrap());
+    std::fs::write(
+        scratch.path().join(format!("datums/11-{hash}.json")),
+        "\"00\"",
+    )
+    .unwrap();
+    assert!(recorded::load(scratch.path(), &request, 11, &[], &mut later).unwrap());
+    assert_eq!(later.datums[&hash], DatumAvailability::Present(vec![0]));
+    std::fs::write(
+        scratch.path().join(format!("datums/12-{hash}.json")),
+        "\"01\"",
+    )
+    .unwrap();
+    assert_eq!(
+        recorded::load(
+            scratch.path(),
+            &request,
+            12,
+            &[],
+            &mut Supplements::default()
+        )
+        .unwrap_err()
+        .to_string(),
+        "provider_datum_hash_mismatch"
+    );
+}

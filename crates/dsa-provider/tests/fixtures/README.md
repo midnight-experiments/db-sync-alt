@@ -29,7 +29,8 @@ model. The complete historical corpus supplies broader real-shape coverage.
 
 An older support block remains recorded with its original provenance. Causal
 replay uses only the current transaction's bytes, a requested recorded datum
-API response or an earlier successfully stored datum. Row assertions apply to
+API response or an earlier successfully stored datum. Explicit404 replies are
+scoped to their requesting block, so a later spend can discover the preimage. Row assertions apply to
 the manifest's `projection_blocks`. The complete local corpus preserves the independent
 comparison of the older bridge outputs and their differing asset rows.
 
