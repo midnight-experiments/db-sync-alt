@@ -9,13 +9,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      PRODUCT_PIN: 975f0318ec72ba9f9245c76ebc549930e25c1bb9
+      PRODUCT_PIN: 15bb93b301c60a43217399985edcb3e95f2cdeff
       RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
       PG_IMAGE: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 975f0318ec72ba9f9245c76ebc549930e25c1bb9
+          ref: 15bb93b301c60a43217399985edcb3e95f2cdeff
           persist-credentials: false
       - name: Positive baselines and real source mutation failures
         shell: bash
