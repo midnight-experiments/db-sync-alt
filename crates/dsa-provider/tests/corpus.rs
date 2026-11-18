@@ -195,6 +195,7 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
         &std::fs::read(scratch.path().join("comparison-result.json")).unwrap(),
     )
     .unwrap();
+    assert_eq!(summary["asset_rule_version"], 2);
     for (expected, actual) in [
         ("tx", "tx"),
         ("tx_out", "outputs"),

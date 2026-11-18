@@ -418,13 +418,33 @@ fn compare(path: &Path, planning: bool) {
         a.hash == b.hash
     });
     let mut source_counts = BTreeMap::<String, usize>::new();
-    let coverage:Vec<_>=eligible.iter().map(|hash|{
-        let sources=preimage_sources.get(hash).cloned().unwrap_or_default();
-        let chosen=["inline","witness","datum_api"].into_iter().find(|source|sources.contains(*source)).unwrap_or("missing");
-        *source_counts.entry(chosen.to_owned()).or_default()+=1;
-        serde_json::json!({"legacy_sql_hash":hash,"raw_byte_length":datum_bytes.get(hash),"hash_verified":datum_bytes.contains_key(hash),"observed_sources":sources})
-    }).collect();
-    serde_json::to_writer_pretty(File::create(path.join("datum-byte-coverage.json")).unwrap(),&serde_json::json!({"eligible_unique_hashes":eligible.len(),"chosen_source_counts":source_counts,"per_hash":coverage,"large_datums":large_datums,"availability":"current transaction, explicit API response, or earlier successfully stored datum"})).unwrap();
+    let coverage: Vec<_> = eligible
+        .iter()
+        .map(|hash| {
+            let sources = preimage_sources.get(hash).cloned().unwrap_or_default();
+            for source in &sources {
+                *source_counts.entry(source.clone()).or_default() += 1;
+            }
+            serde_json::json!({
+                "legacy_sql_hash": hash,
+                "raw_byte_length": datum_bytes.get(hash),
+                "hash_verified": datum_bytes.contains_key(hash),
+                "observed_sources": sources,
+            })
+        })
+        .collect();
+    serde_json::to_writer_pretty(
+        File::create(path.join("datum-byte-coverage.json")).unwrap(),
+        &serde_json::json!({
+            "eligible_unique_hashes": eligible.len(),
+            "observed_source_hash_counts": source_counts,
+            "source_counts_overlap": true,
+            "per_hash": coverage,
+            "large_datums": large_datums,
+            "availability": "current transaction, explicit API response, or earlier successfully stored datum",
+            "request_trace": "supplement-requests.jsonl",
+        }),
+    ).unwrap();
     if planning {
         serde_json::to_writer_pretty(
             File::create(path.join("missing-supplements.json")).unwrap(),
@@ -506,7 +526,32 @@ fn compare(path: &Path, planning: bool) {
         &shape_witnesses,
     )
     .unwrap();
-    let summary = serde_json::json!({"network":plan.network,"blocks":plan.blocks.len(),"decoded_transactions":decoded,"pallas_compared":compared,"pallas_unavailable":pallas_unavailable,"comparison_decoder_eras":decoder_eras,"skipped_non_effective_collateral_outputs":skipped_non_effective_collateral_outputs,"skipped_non_effective_ordinary_outputs":skipped_non_effective_ordinary_outputs,"collateral_outputs_compared":collateral_outputs_compared,"fallback_outputs_compared":fallback_outputs_compared,"invalid_transactions":invalid_transactions,"multi_input_transactions":multi_input_transactions,"byron_outputs":byron_outputs,"pointer_outputs":pointer_outputs,"tx":actual.tx.len(),"outputs":actual.tx_out.len(),"assets":actual.ma_tx_out.len(),"spends":actual.tx_in.len(),"datums":actual.datum.len(),"metadata":actual.tx_metadata.len(),"mints":actual.mint.len(),"differing_tables":differences,"result":if differences.is_empty(){"equal"}else{"different"}});
+    let summary = serde_json::json!({
+        "network": plan.network,
+        "asset_rule_version": dsa_chain::assets::RULE_VERSION,
+        "blocks": plan.blocks.len(),
+        "decoded_transactions": decoded,
+        "pallas_compared": compared,
+        "pallas_unavailable": pallas_unavailable,
+        "comparison_decoder_eras": decoder_eras,
+        "skipped_non_effective_collateral_outputs": skipped_non_effective_collateral_outputs,
+        "skipped_non_effective_ordinary_outputs": skipped_non_effective_ordinary_outputs,
+        "collateral_outputs_compared": collateral_outputs_compared,
+        "fallback_outputs_compared": fallback_outputs_compared,
+        "invalid_transactions": invalid_transactions,
+        "multi_input_transactions": multi_input_transactions,
+        "byron_outputs": byron_outputs,
+        "pointer_outputs": pointer_outputs,
+        "tx": actual.tx.len(),
+        "outputs": actual.tx_out.len(),
+        "assets": actual.ma_tx_out.len(),
+        "spends": actual.tx_in.len(),
+        "datums": actual.datum.len(),
+        "metadata": actual.tx_metadata.len(),
+        "mints": actual.mint.len(),
+        "differing_tables": differences,
+        "result": if differences.is_empty() { "equal" } else { "different" },
+    });
     serde_json::to_writer_pretty(
         File::create(path.join("comparison-result.json")).unwrap(),
         &summary,
