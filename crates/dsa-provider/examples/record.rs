@@ -21,6 +21,7 @@ mod origins;
 mod recorded;
 use dsa_provider::{
     AttemptRecorder, Config, DailyCount, Provider, RecordFuture, RecorderError,
+    pages::CapturedBlock,
     types::{Endpoint, Hash32, Header, Page, Reply, TransactionCbor},
 };
 use serde::{Deserialize, Serialize};
@@ -272,10 +273,22 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
         let tx_path = args
             .output
             .join(format!("transactions/{}.json", block.height));
-        let transactions: Vec<TransactionCbor> = if tx_path.exists() {
-            serde_json::from_reader(File::open(&tx_path)?)?
+        let (transactions, source) = if tx_path.exists() {
+            let rows: Vec<TransactionCbor> = serde_json::from_reader(File::open(&tx_path)?)?;
+            let source = dsa_chain::inventory::CapturedTransactions::from_records(
+                rows.iter()
+                    .map(|record| {
+                        Ok((
+                            record.tx_hash.to_string(),
+                            hex::decode(record.cbor.as_str())?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, hex::FromHexError>>()?,
+            );
+            (rows, source)
         } else {
             let mut rows = Vec::new();
+            let mut captured = CapturedBlock::new(block.hash.clone(), block.tx_count)?;
             if block.tx_count > 0 {
                 for page in 1..=10000 {
                     let reply = fetch(
@@ -290,12 +303,9 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                     let Reply::Transactions(batch) = reply else {
                         return Err("unexpected provider CBOR reply".into());
                     };
-                    let last = batch.len() < 100;
                     rows.extend(batch.records().iter().cloned());
-                    if rows.len() > block.tx_count as usize {
-                        return Err("provider transaction count mismatch".into());
-                    }
-                    if last {
+                    captured.push(batch)?;
+                    if captured.is_complete() {
                         break;
                     }
                 }
@@ -303,21 +313,14 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
             if rows.len() != block.tx_count as usize {
                 return Err("provider transaction count mismatch".into());
             }
+            let source = captured.finish()?;
             atomic_json(&tx_path, &rows)?;
-            rows
+            (rows, source)
         };
         if transactions.len() != block.tx_count as usize {
             return Err("cached transaction count mismatch".into());
         }
-        let raw: Vec<_> = transactions
-            .iter()
-            .map(|tx| hex::decode(tx.cbor.as_str()))
-            .collect::<Result<_, _>>()?;
-        let decoded: Vec<_> = transactions
-            .iter()
-            .zip(&raw)
-            .map(|(tx, raw)| dsa_chain::transaction::decode(raw, tx.tx_hash.as_str()))
-            .collect::<Result<_, _>>()?;
+        let decoded = source.decode()?;
         let mut supplements = Supplements::default();
         supplements.datums.extend(
             known_datums
@@ -336,7 +339,7 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                         &args.output,
                         &request,
                         block.height,
-                        &decoded,
+                        decoded.transactions(),
                         &mut supplements,
                     )?
                     .is_some()
@@ -400,7 +403,7 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                         &args.output,
                         &request,
                         block.height,
-                        &decoded,
+                        decoded.transactions(),
                         &mut supplements,
                     )?
                     .is_some()

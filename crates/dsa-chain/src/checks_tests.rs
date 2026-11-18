@@ -222,7 +222,7 @@ fn supply_detects_an_unbooked_mint_and_excludes_old_spent_carry_records() {
         &Supplements::default(),
     )
     .unwrap();
-    rows::build_block(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
+    rows::build_facts(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
     let actual = checks::aggregate_supply(
         &profile,
         10,
@@ -334,7 +334,7 @@ fn effective_collateral_and_same_block_spends_share_the_row_builder_rules() {
         "invalid mint and ordinary outputs have no effect"
     );
     let mut actual = held;
-    let rows = rows::build_block(
+    let rows = rows::build_facts(
         &profile,
         10,
         &transactions,
@@ -740,7 +740,7 @@ fn generated_valid_chains_preserve_conservation_and_supply_on_both_profiles() {
                     checks::apply_mint_delta(&profile, height, &supply, &BTreeMap::new()).unwrap();
                 supply = checks::apply_mint_delta(&profile, height, &supply, &effects.mint_delta)
                     .unwrap();
-                rows::build_block(&profile, height, &txs, &mut held, &Supplements::default())
+                rows::build_facts(&profile, height, &txs, &mut held, &Supplements::default())
                     .unwrap();
                 assert_eq!(
                     held, expected,
@@ -845,7 +845,7 @@ fn a_failure_in_the_last_transaction_returns_no_effects_or_partial_rows() {
     // A late rendering failure after five row-producing transactions must also
     // discard the block overlay and preserve the retry's entire starting set.
     txs[5].outputs[0].as_mut().unwrap().classification_safe = false;
-    assert!(rows::build_block(&profile, 10, &txs, &mut held, &Supplements::default()).is_err());
+    assert!(rows::build_facts(&profile, 10, &txs, &mut held, &Supplements::default()).is_err());
     assert_eq!(held, before);
     txs[5].outputs[0] = Some(output(&profile, 100));
     let effects = check_facts(
@@ -860,7 +860,7 @@ fn a_failure_in_the_last_transaction_returns_no_effects_or_partial_rows() {
     .unwrap();
     assert_eq!(effects.transactions_checked, 6);
     assert!(effects.mint_delta.is_empty());
-    rows::build_block(&profile, 10, &txs, &mut held, &Supplements::default()).unwrap();
+    rows::build_facts(&profile, 10, &txs, &mut held, &Supplements::default()).unwrap();
     assert_eq!(held.len(), 1);
     assert!(held.contains_key(&point));
 }
@@ -915,9 +915,9 @@ fn distinct_names_governance_mints_burn_to_zero_and_invalid_collateral_loss() {
         ]),
         "all governance names conserve, only six fixed full units have supply entries"
     );
-    let mut wrong = next.clone();
+    let mut wrong = held[&point].output.clone();
     wrong.assets[0].quantity = 101;
-    wrong.assets[1].quantity = 7;
+    wrong.assets[1].quantity = 6;
     let tx = transaction(
         b"native cannot offset names",
         vec![point.clone()],
@@ -927,6 +927,27 @@ fn distinct_names_governance_mints_burn_to_zero_and_invalid_collateral_loss() {
     assert!(
         matches!(check_facts(&profile,&previous,&header,9,&[tx],&held,&Supplements::default()),Err(CheckError::AssetBalance{unit,..}) if unit==profile.assets["cnight"].unit())
     );
+    let mut sibling = asset(&profile, "cnight", 500);
+    sibling.name = "01".to_owned();
+    let mut unchanged = held[&point].output.clone();
+    unchanged.assets.push(sibling.clone());
+    let foreign_sibling = transaction(
+        b"native exact unit sibling is ignored",
+        vec![point.clone()],
+        vec![Some(unchanged)],
+        vec![sibling],
+    );
+    let effects = check_facts(
+        &profile,
+        &previous,
+        &header,
+        9,
+        &[foreign_sibling],
+        &held,
+        &Supplements::default(),
+    )
+    .unwrap();
+    assert!(effects.mint_delta.is_empty());
     let burn = transaction(
         b"native burn all",
         vec![point.clone()],
@@ -1035,6 +1056,28 @@ fn duplicate_position_supply_units_and_reachable_arithmetic_errors_are_typed() {
             height: 10,
             transaction: transaction::hash(b"native duplicate")
         }
+    );
+    let tx = transaction(
+        b"native positional count",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let oversized: Vec<_> = (0..=ids::INDEX_LIMIT).map(|_| clone_fact(&tx)).collect();
+    let mut oversized_header = header.clone();
+    oversized_header.transaction_count = oversized.len();
+    assert_eq!(
+        check_facts(
+            &profile,
+            &previous,
+            &oversized_header,
+            9,
+            &oversized,
+            &BTreeMap::new(),
+            &Supplements::default()
+        )
+        .unwrap_err(),
+        CheckError::Position { height: 10 }
     );
     let mut bad = header.clone();
     bad.height = ids::HEIGHT_LIMIT;

@@ -305,6 +305,36 @@ mod tests {
                 previous_hash: Some(previous.hash.clone()),
                 transaction_count: 2,
             };
+            let mut held = BTreeMap::from([(
+                Outpoint {
+                    hash: "cd".repeat(32),
+                    index: 1,
+                },
+                crate::rows::HeldOutput {
+                    transaction_id: 17,
+                    output: decoded.transactions[0].outputs[0].as_ref().unwrap().clone(),
+                },
+            )]);
+            let before = held.clone();
+            let row_error = crate::rows::build_block(
+                &Profile::load("preprod").unwrap(),
+                10,
+                &decoded,
+                &mut held,
+                &Supplements::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(row_error, crate::rows::BuildError::Captured(_)));
+            if matches!(mutation, "address" | "datum" | "validity") {
+                assert!(matches!(
+                    row_error,
+                    crate::rows::BuildError::Captured(IntegrityError::Facts { position: 0, .. })
+                ));
+            }
+            assert_eq!(
+                held, before,
+                "rejected facts cannot alter held output state"
+            );
             let error = checks::check_block(
                 &Profile::load("preprod").unwrap(),
                 &previous,

@@ -115,11 +115,14 @@ pub enum BuildError {
     Invalid(#[from] Error),
     #[error("{0:?} requires a provider supplement")]
     Required(SupplementRequest),
+    #[error(transparent)]
+    Captured(#[from] crate::inventory::IntegrityError),
 }
 
 impl BuildError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Captured(_) => "decoded_fact_integrity",
             Self::Invalid(error) => error.code,
             Self::Required(SupplementRequest::Output { .. }) => {
                 "provider_output_resolution_required"
@@ -325,7 +328,25 @@ pub fn effective_outputs<'a>(
 /// Build one block in inventory order. Held origins include all relevant
 /// outputs spent by this range, plus creations in earlier blocks. The caller
 /// can do one batched database lookup for these outpoints before this function.
+/// Build rows from the same immutable decoded capture used by the checks.
 pub fn build_block(
+    profile: &Profile,
+    height: u32,
+    transactions: &crate::inventory::DecodedTransactions<'_>,
+    held: &mut BTreeMap<Outpoint, HeldOutput>,
+    supplements: &Supplements,
+) -> Result<Rows, BuildError> {
+    transactions.validate()?;
+    build_facts(
+        profile,
+        height,
+        transactions.transactions(),
+        held,
+        supplements,
+    )
+}
+
+pub(crate) fn build_facts(
     profile: &Profile,
     height: u32,
     transactions: &[Transaction<'_>],
@@ -531,7 +552,7 @@ mod tests {
             let mut supplements = Supplements::default();
             if required {
                 assert_eq!(
-                    build_block(
+                    build_facts(
                         &profile,
                         10,
                         std::slice::from_ref(&tx),
@@ -545,7 +566,7 @@ mod tests {
                     .datums
                     .insert(datum_hash.clone(), DatumAvailability::Present(vec![0]));
             }
-            let rows = build_block(&profile, 10, &[tx], &mut held, &supplements).unwrap();
+            let rows = build_facts(&profile, 10, &[tx], &mut held, &supplements).unwrap();
             assert_eq!(rows.tx_out[0].data_hash.as_ref(), Some(&datum_hash));
             assert_eq!(rows.ma_tx_out.len(), 1);
             assert_eq!(
@@ -638,7 +659,7 @@ mod tests {
         for tx in &transactions {
             supplements.metadata.insert(tx.hash.clone(), None);
         }
-        let rows = build_block(
+        let rows = build_facts(
             &profile,
             10,
             &transactions,
@@ -704,7 +725,7 @@ mod tests {
             };
         let creation = make_tx("01".repeat(32), Vec::new(), vec![Some(output.clone())]);
         let mut held = BTreeMap::new();
-        let request = build_block(
+        let request = build_facts(
             &profile,
             10,
             std::slice::from_ref(&creation),
@@ -721,7 +742,7 @@ mod tests {
         missing
             .datums
             .insert(datum_hash.clone(), DatumAvailability::NotFound);
-        let created = build_block(&profile, 10, &[creation], &mut held, &missing).unwrap();
+        let created = build_facts(&profile, 10, &[creation], &mut held, &missing).unwrap();
         assert!(created.datum.is_empty());
         assert_eq!(created.tx_out[0].data_hash.as_ref(), Some(&datum_hash));
         let point = Outpoint {
@@ -730,7 +751,7 @@ mod tests {
         };
         let mut spending = make_tx("02".repeat(32), vec![point.clone()], Vec::new());
         assert_eq!(
-            build_block(
+            build_facts(
                 &profile,
                 11,
                 std::slice::from_ref(&spending),
@@ -742,7 +763,7 @@ mod tests {
             "an earlier 404 must not suppress the later lookup"
         );
         spending.datums.insert(datum_hash.clone(), raw.clone());
-        let rows = build_block(
+        let rows = build_facts(
             &profile,
             11,
             &[spending],
@@ -767,7 +788,7 @@ mod tests {
                 .datums
                 .insert(datum_hash.clone(), available.clone());
             let creation = make_tx("03".repeat(32), Vec::new(), vec![Some(output.clone())]);
-            let result = build_block(
+            let result = build_facts(
                 &profile,
                 12,
                 &[creation],
@@ -784,7 +805,7 @@ mod tests {
         inline.inline_datum = Some(raw);
         let creation = make_tx("04".repeat(32), Vec::new(), vec![Some(inline)]);
         assert_eq!(
-            build_block(
+            build_facts(
                 &profile,
                 13,
                 &[creation],
@@ -800,7 +821,7 @@ mod tests {
         irrelevant.address = Some("unrelated".to_owned());
         let ignored = make_tx("05".repeat(32), Vec::new(), vec![Some(irrelevant)]);
         assert!(
-            build_block(
+            build_facts(
                 &profile,
                 14,
                 &[ignored],
@@ -854,7 +875,7 @@ mod tests {
             auxiliary: None,
             auxiliary_hash: None,
         };
-        let result = build_block(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
+        let result = build_facts(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
         assert_eq!(
             result.tx_in[0].id, 167772161,
             "legacy height*2^24 + transaction*2^12 + rank among all inputs"
@@ -955,7 +976,7 @@ mod tests {
                 ),
             ];
             let mut held = before.clone();
-            let error = build_block(&profile, 10, &transactions, &mut held, &bad).unwrap_err();
+            let error = build_facts(&profile, 10, &transactions, &mut held, &bad).unwrap_err();
             assert_eq!(
                 error.code(),
                 match failure {
@@ -980,8 +1001,8 @@ mod tests {
                 bad.metadata.insert(second.hash.clone(), None);
             }
             let mut clean = before.clone();
-            let expected = build_block(&profile, 10, &transactions, &mut clean, &bad).unwrap();
-            let retried = build_block(&profile, 10, &transactions, &mut held, &bad).unwrap();
+            let expected = build_facts(&profile, 10, &transactions, &mut clean, &bad).unwrap();
+            let retried = build_facts(&profile, 10, &transactions, &mut held, &bad).unwrap();
             assert_eq!(retried, expected);
             assert_eq!(held, clean);
             assert_eq!(
@@ -1057,7 +1078,7 @@ mod tests {
                 },
             ),
         ]);
-        let rows = build_block(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
+        let rows = build_facts(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
         assert_eq!(rows.tx.len(), 1);
         assert!(!rows.tx[0].valid_contract);
         assert_eq!(rows.tx_in.len(), 1);

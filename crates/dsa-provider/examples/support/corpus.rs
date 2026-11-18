@@ -128,6 +128,64 @@ fn large_datum_observation(bytes: &[u8], source: &str, height: Option<u32>) -> s
     })
 }
 
+#[cfg(test)]
+fn check_recorded_block(
+    profile: &Profile,
+    path: &Path,
+    block: &Block,
+    decoded: &dsa_chain::inventory::DecodedTransactions<'_>,
+    held: &BTreeMap<Outpoint, rows::HeldOutput>,
+    supplements: &Supplements,
+    expected: &Rows,
+) -> Result<(), BuildError> {
+    let provider: dsa_provider::types::Header =
+        read(path.join(format!("provider/headers/{}.json", block.height)));
+    let header = dsa_chain::checks::Header::from(&provider);
+    // Historical independent contexts: parent hash is the captured header's
+    // declared predecessor, not an independently obtained durable checkpoint.
+    let previous = dsa_chain::checks::Header {
+        height: block.height - 1,
+        hash: header.previous_hash.clone().unwrap(),
+        previous_hash: None,
+        transaction_count: 0,
+    };
+    let effects = match dsa_chain::checks::check_block(
+        profile,
+        &previous,
+        &header,
+        block.height - 1,
+        decoded,
+        held,
+        supplements,
+    ) {
+        Ok(effects) => effects,
+        Err(dsa_chain::checks::CheckError::Supplement(error)) => return Err(error),
+        Err(error) => panic!("normal captured check failed at {}: {error}", block.height),
+    };
+    let hashes: BTreeSet<_> = decoded
+        .transactions()
+        .iter()
+        .map(|tx| tx.hash.as_str())
+        .collect();
+    let fixed = dsa_chain::assets::fixed_units(profile);
+    let mut expected_delta = BTreeMap::new();
+    for mint in expected
+        .mint
+        .iter()
+        .filter(|mint| hashes.contains(mint.tx_hash.as_str()))
+    {
+        let unit = format!("{}{}", mint.policy, mint.name);
+        if fixed.contains(&unit) {
+            *expected_delta.entry(unit).or_insert(0i128) += mint.quantity.parse::<i128>().unwrap();
+        }
+    }
+    assert_eq!(
+        effects.mint_delta, expected_delta,
+        "fixed-unit effects vs independently exported SQL"
+    );
+    Ok(())
+}
+
 fn compare(path: &Path, planning: bool) {
     let plan: Plan = read(path.join("recording-plan.json"));
     let profile = Profile::load(&plan.network).unwrap();
@@ -169,11 +227,14 @@ fn compare(path: &Path, planning: bool) {
             .iter()
             .map(|r| hex::decode(r.cbor.as_str()).unwrap())
             .collect();
-        let transactions: Vec<_> = records
-            .iter()
-            .zip(&raw)
-            .map(|(r, b)| transaction::decode(b, r.tx_hash.as_str()).unwrap())
-            .collect();
+        let source = dsa_chain::inventory::CapturedTransactions::from_records(
+            records
+                .iter()
+                .zip(&raw)
+                .map(|(record, bytes)| (record.tx_hash.to_string(), bytes.clone())),
+        );
+        let decoded_capture = source.decode().unwrap();
+        let transactions = decoded_capture.transactions();
         let mut supplements = Supplements::default();
         supplements.datums.extend(
             known_datums
@@ -182,13 +243,26 @@ fn compare(path: &Path, planning: bool) {
         );
         let mut requests = BTreeSet::new();
         let rows = loop {
-            match rows::build_block(
-                &profile,
-                block.height,
-                &transactions,
-                &mut held,
-                &supplements,
-            ) {
+            let attempt = (|| {
+                #[cfg(test)]
+                check_recorded_block(
+                    &profile,
+                    path,
+                    block,
+                    &decoded_capture,
+                    &held,
+                    &supplements,
+                    &expected,
+                )?;
+                rows::build_block(
+                    &profile,
+                    block.height,
+                    &decoded_capture,
+                    &mut held,
+                    &supplements,
+                )
+            })();
+            match attempt {
                 Ok(rows) => break rows,
                 Err(BuildError::Required(request)) => {
                     assert!(
@@ -200,7 +274,7 @@ fn compare(path: &Path, planning: bool) {
                         &provider_path,
                         &request,
                         block.height,
-                        &transactions,
+                        transactions,
                         &mut supplements,
                     )
                     .unwrap()
@@ -230,7 +304,7 @@ fn compare(path: &Path, planning: bool) {
                 Err(error) => panic!("row building failed at {}: {error}", block.height),
             }
         };
-        for tx in &transactions {
+        for tx in transactions {
             for (hash, bytes) in &tx.datums {
                 preimage_sources
                     .entry(hash.clone())
