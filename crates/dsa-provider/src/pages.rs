@@ -46,7 +46,7 @@ impl TransactionPage {
 }
 
 /// B4 can append received pages directly. Their requested block/page metadata
-/// and within-page order are immutable. Header/list truth remains Q3's trust.
+/// and within-page order are immutable. The initial provider header/list is trusted.
 pub struct CapturedBlock {
     block: Hash32,
     expected_count: usize,

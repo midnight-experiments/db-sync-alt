@@ -1,5 +1,5 @@
 //! Immutable capture of one received transaction inventory. Initial provider
-//! truth is the Q3 trust boundary. Local decoding preserves the captured order
+//! truth is trusted. Local decoding preserves the captured order
 //! and binds interpreted facts to the successful decode of those same bytes.
 
 use serde::Serialize;

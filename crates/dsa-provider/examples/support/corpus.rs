@@ -15,7 +15,7 @@ use dsa_chain::{
 use dsa_provider::types::TransactionCbor;
 
 #[path = "origins.rs"]
-mod origins;
+pub(crate) mod origins;
 #[path = "recorded.rs"]
 mod recorded;
 use pallas_primitives::conway::MintedDatumOption;

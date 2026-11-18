@@ -1,7 +1,5 @@
 //! Replay the public ledger subset against its independently exported SQL rows.
 
-#[path = "../examples/support/origins.rs"]
-mod check_origins;
 #[path = "../examples/support/corpus.rs"]
 mod corpus;
 
@@ -206,7 +204,7 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
             },
         ));
         let decoded = source.decode().unwrap();
-        let held = check_origins::load(
+        let held = corpus::origins::load(
             &scratch.path().join("origins.json"),
             &std::collections::BTreeSet::from([height]),
         )
