@@ -1195,7 +1195,7 @@ async fn keep_rule_realistic_plans() -> Result {
     // than a small fixture; this session-only timeout is recorded explicitly.
     db.store
         .client()
-        .batch_execute(&format!("SET statement_timeout='{timeout}s'"))
+        .batch_execute(&format!("SET statement_timeout='{timeout}s'; SET jit=off"))
         .await?;
     let last: i64 = db
         .store
@@ -1253,10 +1253,10 @@ async fn keep_rule_realistic_plans() -> Result {
         )
         .await?;
     db.store.client().batch_execute("ANALYZE serve.block; ANALYZE serve.tx; ANALYZE serve.tx_out; ANALYZE serve.tx_in; ANALYZE serve.ma_tx_out; ANALYZE serve.multi_asset").await?;
-    let settings=db.store.client().query_one("SELECT current_setting('statement_timeout'),current_setting('work_mem'),current_setting('max_wal_size'),current_setting('max_parallel_workers_per_gather')",&[]).await?;
+    let settings=db.store.client().query_one("SELECT current_setting('statement_timeout'),current_setting('work_mem'),current_setting('max_wal_size'),current_setting('max_parallel_workers_per_gather'),current_setting('jit'),current_setting('server_version'),current_setting('block_size')",&[]).await?;
     println!(
         "{}",
-        json!({"realistic_setup_seconds":started.elapsed().as_secs_f64(),"source_headers":tip+1,"source_outputs":(tip+1)*2,"source_inputs":2*((tip.min(1_199_999))-(tip.min(1_199_999))/10),"statement_timeout":settings.get::<_,String>(0),"work_mem":settings.get::<_,String>(1),"max_wal_size":settings.get::<_,String>(2),"parallel_workers_per_gather":settings.get::<_,String>(3)})
+        json!({"realistic_setup_seconds":started.elapsed().as_secs_f64(),"source_headers":tip+1,"source_outputs":(tip+1)*2,"source_inputs":2*((tip.min(1_199_999))-(tip.min(1_199_999))/10),"statement_timeout":settings.get::<_,String>(0),"work_mem":settings.get::<_,String>(1),"max_wal_size":settings.get::<_,String>(2),"parallel_workers_per_gather":settings.get::<_,String>(3),"jit":settings.get::<_,String>(4),"server_version":settings.get::<_,String>(5),"block_size":settings.get::<_,String>(6)})
     );
     let lower = i64::from(horizon) * 16_777_216;
     let upper = i64::from(target) * 16_777_216 + 16_777_215;
@@ -1356,9 +1356,50 @@ async fn keep_rule_realistic_plans() -> Result {
                         );
                     }
                 }
+                fn work(value: &Value, rows: &mut Vec<Value>) {
+                    if let Some(object) = value.as_object() {
+                        if object.contains_key("Node Type") {
+                            let loops = object
+                                .get("Actual Loops")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0);
+                            let actual = object
+                                .get("Actual Rows")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0);
+                            let filtered = [
+                                "Rows Removed by Filter",
+                                "Rows Removed by Join Filter",
+                                "Rows Removed by Index Recheck",
+                            ]
+                            .iter()
+                            .filter_map(|key| object.get(*key).and_then(Value::as_f64))
+                            .sum::<f64>();
+                            rows.push(json!({"node":object.get("Node Type"),"relation":object.get("Relation Name"),"alias":object.get("Alias"),"rows_times_loops":actual*loops,"filtered_rows_times_loops":filtered*loops,"approximate_row_work":(actual+filtered)*loops}));
+                        }
+                        for child in object.values() {
+                            work(child, rows);
+                        }
+                    } else if let Some(array) = value.as_array() {
+                        for child in array {
+                            work(child, rows);
+                        }
+                    }
+                }
+                let mut row_work = Vec::new();
+                work(&plan, &mut row_work);
+                let mut totals: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+                for node in &row_work {
+                    if let Some(relation) = node["relation"].as_str() {
+                        let total = totals.entry(relation.to_owned()).or_default();
+                        total.0 += node["rows_times_loops"].as_f64().unwrap();
+                        total.1 += node["filtered_rows_times_loops"].as_f64().unwrap();
+                    }
+                }
+                let relation_work:BTreeMap<_,_>=totals.into_iter().map(|(name,(rows,filtered))|(name,json!({"rows_times_loops":rows,"filtered_rows_times_loops":filtered,"approximate_row_work":rows+filtered}))).collect();
                 println!(
                     "{}",
-                    json!({"realistic_plan_family":table,"window_has_spend":window,"forced_index_plan":forced,"elapsed_seconds":begin.elapsed().as_secs_f64(),"max_inner_loops":max_loops,"fallback_source_scans":reads,"execution_ms":plan[0]["Execution Time"],"temp_read_blocks":plan[0]["Plan"]["Temp Read Blocks"],"temp_written_blocks":plan[0]["Plan"]["Temp Written Blocks"],"explain":plan})
+                    json!({"realistic_plan_family":table,"window_has_spend":window,"forced_index_plan":forced,"elapsed_seconds":begin.elapsed().as_secs_f64(),"max_inner_loops":max_loops,"fallback_source_scans":reads,"execution_ms":plan[0]["Execution Time"],"temp_read_blocks":plan[0]["Plan"]["Temp Read Blocks"],"temp_written_blocks":plan[0]["Plan"]["Temp Written Blocks"],"shared_hit_blocks":plan[0]["Plan"]["Shared Hit Blocks"],"shared_read_blocks":plan[0]["Plan"]["Shared Read Blocks"],"per_node_row_work":row_work,"per_relation_row_work":relation_work,"statistics":"ANALYZE before fixture variant; unchanged in the rolled-back variant","explain":plan})
                 );
             }
         }
@@ -1371,21 +1412,25 @@ async fn keep_rule_realistic_plans() -> Result {
     // Change only the owned fixture. Rollback preserves a byte-consistent
     // resume prefix for a later same-scale run, including after an error.
     let variant = db.store.writer_transaction().await?;
-    if window {
+    let affected = if window {
         variant
             .execute(
                 "DELETE FROM serve.tx_in WHERE id BETWEEN $1 AND $2",
                 &[&lower, &upper],
             )
-            .await?;
+            .await?
     } else {
         variant
             .execute(
                 "INSERT INTO serve.tx_in VALUES($1,$2,36864,0)",
                 &[&(lower + 4095), &(i64::from(horizon) * 4096)],
             )
-            .await?;
-    }
+            .await?
+    };
+    println!(
+        "{}",
+        json!({"fixture_variant":if window {"delete_all_window_spends"}else{"insert_one_window_spend"},"affected_rows":affected,"statistics":"pre-variant ANALYZE; no re-analyze","rolled_back_after_plans":true})
+    );
     plans(&variant, &selection, !window, (tip + 1) * 2).await?;
     variant.rollback().await?;
     if std::env::var("DSA_PLAN_KEEP_DATABASE").as_deref() == Ok("1") {
