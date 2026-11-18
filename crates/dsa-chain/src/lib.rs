@@ -5,6 +5,7 @@ pub mod cbor;
 pub mod checks;
 pub mod datum;
 pub mod ids;
+pub mod inventory;
 pub mod metadata;
 pub mod profiles;
 pub mod rows;

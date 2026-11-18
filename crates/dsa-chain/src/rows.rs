@@ -164,6 +164,35 @@ impl<'a> HeldChanges<'a> {
     pub(crate) fn insert(&mut self, point: Outpoint, output: HeldOutput) {
         self.changes.insert(point, Some(output));
     }
+
+    /// One transition shared by validation and row construction. The overlay
+    /// stays private to the whole block until every transaction succeeds.
+    pub(crate) fn apply_transaction(
+        &mut self,
+        transaction_id: i64,
+        tx: &Transaction<'_>,
+        outputs: &[(u16, &Output)],
+        selection: &Selection<'_>,
+    ) {
+        for point in tx.effective_inputs() {
+            self.remove(point);
+        }
+        for (index, output) in outputs
+            .iter()
+            .filter(|(_, output)| selection.relevant(output))
+        {
+            self.insert(
+                Outpoint {
+                    hash: tx.hash.clone(),
+                    index: *index,
+                },
+                HeldOutput {
+                    transaction_id,
+                    output: (*output).clone(),
+                },
+            );
+        }
+    }
 }
 
 pub struct Selection<'a> {
@@ -336,8 +365,10 @@ fn build_rows(
         let tx_index = ordinal(position)?;
         let tx_id = id(ids::transaction_id(height, tx_index))?;
         let inputs = tx.effective_inputs();
-        let kept_outputs: Vec<_> = effective_outputs(tx, supplements)?
-            .into_iter()
+        let effective = effective_outputs(tx, supplements)?;
+        let kept_outputs: Vec<_> = effective
+            .iter()
+            .copied()
             .filter(|(_, output)| selection.relevant(output))
             .collect();
         let mints: Vec<_> = tx
@@ -372,9 +403,6 @@ fn build_rows(
                 datum_for(&origin.output, tx, supplements, &mut datums)?;
             }
         }
-        for point in inputs {
-            held.remove(point);
-        }
         let mut ics = false;
         for (index, output) in kept_outputs {
             let output_id = id(ids::output_id(height, tx_index, index))?;
@@ -408,16 +436,6 @@ fn build_rows(
             if selection.needs_datum(output) {
                 datum_for(output, tx, supplements, &mut datums)?;
             }
-            held.insert(
-                Outpoint {
-                    hash: tx.hash.clone(),
-                    index,
-                },
-                HeldOutput {
-                    transaction_id: tx_id,
-                    output: output.clone(),
-                },
-            );
         }
         for asset in mints {
             rows.mint.push(MintRow {
@@ -442,6 +460,7 @@ fn build_rows(
                 crate::metadata::checked(tx, None)?;
             }
         }
+        held.apply_transaction(tx_id, tx, &effective, &selection);
     }
     rows.datum = datums.into_values().collect();
     Ok(rows)

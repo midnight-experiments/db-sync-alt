@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     assets::fixed_units,
     ids,
+    inventory::{DecodedTransactions, IntegrityError},
     profiles::Profile,
     rows::{self, BuildError, HeldChanges, HeldOutput, Selection, Supplements},
     transaction::{self, Asset, Outpoint, Output, Transaction},
@@ -69,6 +70,12 @@ pub enum CheckError {
     },
     #[error("supply_units at block {height}")]
     SupplyUnits { height: u32 },
+    #[error("captured_transactions at block {height}: {source}")]
+    Captured {
+        height: u32,
+        #[source]
+        source: IntegrityError,
+    },
     #[error(transparent)]
     Supplement(#[from] BuildError),
 }
@@ -149,6 +156,32 @@ pub fn check_header(previous: &Header, header: &Header) -> Result<(), CheckError
 /// Same-block creations are visible through the same bounded overlay used by
 /// row construction. Missing output supplements retain their typed request.
 pub fn check_block(
+    profile: &Profile,
+    previous: &Header,
+    header: &Header,
+    previous_target: u32,
+    transactions: &DecodedTransactions<'_>,
+    held: &BTreeMap<Outpoint, HeldOutput>,
+    supplements: &Supplements,
+) -> Result<BlockEffects, CheckError> {
+    transactions
+        .validate()
+        .map_err(|source| CheckError::Captured {
+            height: header.height,
+            source,
+        })?;
+    check_facts(
+        profile,
+        previous,
+        header,
+        previous_target,
+        transactions.transactions(),
+        held,
+        supplements,
+    )
+}
+
+fn check_facts(
     profile: &Profile,
     previous: &Header,
     header: &Header,
@@ -263,9 +296,6 @@ pub fn check_block(
                     unit,
                 })?;
         }
-        for point in tx.effective_inputs() {
-            staged.remove(point);
-        }
         let transaction_index = u16::try_from(index).map_err(|_| CheckError::Position {
             height: header.height,
         })?;
@@ -275,21 +305,7 @@ pub fn check_block(
                     height: header.height,
                 }
             })?;
-        for (index, output) in effective_outputs
-            .into_iter()
-            .filter(|(_, output)| selection.relevant(output))
-        {
-            staged.insert(
-                Outpoint {
-                    hash: tx.hash.clone(),
-                    index,
-                },
-                HeldOutput {
-                    transaction_id,
-                    output: output.clone(),
-                },
-            );
-        }
+        staged.apply_transaction(transaction_id, tx, &effective_outputs, &selection);
         effects.transactions_checked += 1;
     }
     Ok(effects)
@@ -383,3 +399,7 @@ pub fn check_supply(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "checks_tests.rs"]
+mod tests;

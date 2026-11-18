@@ -266,7 +266,7 @@ pub enum Endpoint {
 pub enum Reply {
     Header(Header),
     Headers(Vec<Header>),
-    Transactions(Vec<TransactionCbor>),
+    Transactions(crate::pages::TransactionPage),
     Genesis(Genesis),
     Epoch(EpochInfo),
     EpochParameters(EpochParameters),
@@ -445,7 +445,14 @@ impl Endpoint {
                 }
                 Reply::Headers(rows)
             }
-            Self::BlockCbor { .. } => Reply::Transactions(page(body, 100)?),
+            Self::BlockCbor {
+                block,
+                page: number,
+            } => Reply::Transactions(crate::pages::TransactionPage::capture(
+                block.clone(),
+                *number,
+                page(body, 100)?,
+            )?),
             Self::Genesis => Reply::Genesis(parse(body)?),
             Self::Epoch(expected) => {
                 let row: EpochInfo = parse(body)?;

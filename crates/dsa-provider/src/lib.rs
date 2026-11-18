@@ -4,6 +4,7 @@
 
 mod accounting;
 mod outputs;
+pub mod pages;
 pub mod supplements;
 pub mod types;
 

@@ -291,7 +291,7 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                         return Err("unexpected provider CBOR reply".into());
                     };
                     let last = batch.len() < 100;
-                    rows.extend(batch);
+                    rows.extend(batch.records().iter().cloned());
                     if rows.len() > block.tx_count as usize {
                         return Err("provider transaction count mismatch".into());
                     }
