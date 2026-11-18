@@ -330,7 +330,7 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
     result.insert("spend_of_output_below_horizon", Fixture::base(2));
     result.insert("v2_mixed_assets_and_q4_datums", Fixture::base(42));
     let mut expanded = Fixture::base(42);
-    expanded.bounds.horizon = 6;
+    expanded.bounds.horizon = 7;
     expanded.expanded_token_rule_edges();
     result.insert("v2_all_unit_policies_governance_and_datums", expanded);
     let mut first = Fixture::base(4);
@@ -509,7 +509,7 @@ fn version_two_projection_and_q4_boundaries() -> Result {
 async fn keep_rule_v2_literal_governance_and_datum_edges() -> Result {
     for seed in [41, 42] {
         let mut f = Fixture::base(seed);
-        f.bounds.horizon = 6;
+        f.bounds.horizon = 7;
         f.expanded_token_rule_edges();
         let kept = keep(&f.chain, &f.profile, f.bounds)?;
         for role in [
@@ -565,7 +565,7 @@ async fn keep_rule_v2_literal_governance_and_datum_edges() -> Result {
         let db = Database::new(&f.profile).await?;
         db.replace(&f).await?;
         for (body_index, body) in ["council", "technical_committee"].into_iter().enumerate() {
-            for (kind, reference) in [("carry", 6_i32), ("live", 8_i32)] {
+            for (kind, reference) in [("carry", 7_i32), ("live", 8_i32)] {
                 let output = f.tags[&format!("v2_{body}_{kind}_alt")];
                 assert!(kept["tx_out"].contains(&output));
                 let tx = f.chain.outputs[&output].transaction;
