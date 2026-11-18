@@ -68,6 +68,32 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Convert a serving legacy public reader snapshot into this database.
+    Convert {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        source_password_file: Option<PathBuf>,
+        #[arg(long)]
+        source_tls_root_cert: Option<PathBuf>,
+        #[arg(long)]
+        horizon_block: Option<u32>,
+        #[arg(long,default_value_t=604800,value_parser=clap::value_parser!(i64).range(86400..))]
+        retention_seconds: i64,
+        #[arg(long,default_value_t=4096,value_parser=clap::value_parser!(u32).range(1..=65536))]
+        batch_rows: u32,
+        #[arg(long,default_value_t=4194304,value_parser=clap::value_parser!(u32).range(1024..=67108864))]
+        batch_bytes: u32,
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        /// Preserve the reader's limit unless explicitly overridden.
+        #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+        source_statement_timeout_seconds: Option<u32>,
+        #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+        source_idle_transaction_timeout_seconds: Option<u32>,
+    },
     /// Grant and check an existing node reader's exact privileges.
     GrantReader {
         #[command(flatten)]
@@ -102,6 +128,7 @@ async fn execute(command: Command) -> Result<Value, Error> {
         Command::Verify { database } => (database, "verify"),
         Command::Snapshot { database, .. } => (database, "snapshot"),
         Command::Restore { database, .. } => (database, "restore"),
+        Command::Convert { database, .. } => (database, "convert"),
         Command::GrantReader { database, .. } => (database, "grant-reader"),
     };
     let profile = profile(&database.network)?;
@@ -177,6 +204,53 @@ async fn database_command(
         }
         Command::Restore { file, .. } => {
             Ok(serde_json::to_value(store.restore(profile, file).await?)?)
+        }
+        Command::Convert {
+            source,
+            source_password_file,
+            source_tls_root_cert,
+            horizon_block,
+            retention_seconds,
+            batch_rows,
+            batch_bytes,
+            snapshot,
+            source_statement_timeout_seconds,
+            source_idle_transaction_timeout_seconds,
+            ..
+        } => {
+            let mut config = tokio_postgres::Config::from_str(source)
+                .map_err(|_| Error::Refusal("invalid_source_configuration"))?;
+            if config.get_password().is_some() {
+                return Err(Error::Refusal("source_password_requires_file"));
+            }
+            if let Some(path) = source_password_file {
+                let password = std::fs::read_to_string(path)
+                    .map_err(|_| Error::Refusal("invalid_source_password_file"))?;
+                let password = password.trim_end_matches(['\r', '\n']);
+                if password.contains(['\r', '\n', '\0']) {
+                    return Err(Error::Refusal("invalid_source_password_file"));
+                }
+                config.password(password);
+            }
+            let mut source =
+                dsa_store::convert::LegacySource::connect(config, source_tls_root_cert.as_deref())
+                    .await?;
+            source
+                .limits(
+                    *source_statement_timeout_seconds,
+                    *source_idle_transaction_timeout_seconds,
+                )
+                .await?;
+            let options = dsa_store::convert::ConvertOptions {
+                horizon_block: *horizon_block,
+                retention_seconds: *retention_seconds,
+                batch_rows: *batch_rows as usize,
+                batch_bytes: *batch_bytes as usize,
+                snapshot: snapshot.clone(),
+            };
+            Ok(serde_json::to_value(
+                store.convert(profile, &mut source, &options).await?,
+            )?)
         }
         Command::GrantReader {
             role, check: true, ..

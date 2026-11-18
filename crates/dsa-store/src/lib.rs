@@ -1,6 +1,7 @@
 //! PostgreSQL layout, database identity and least-privilege node access.
 
 mod canonical;
+pub mod convert;
 pub mod keep;
 pub mod snapshot;
 pub mod verify;
@@ -52,6 +53,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("snapshot_published_durability_uncertain")]
     PublishedDurabilityUncertain,
+    #[error("conversion_completed_snapshot_failed")]
+    ConvertedSnapshot(Box<Error>),
 }
 
 impl Error {
@@ -69,6 +72,9 @@ impl Error {
             }
             Self::PublishedDurabilityUncertain => {
                 json!({"error":"snapshot_published_durability_uncertain","published":true,"durability":"uncertain"})
+            }
+            Self::ConvertedSnapshot(error) => {
+                json!({"error":"conversion_completed_snapshot_failed","converted":true,"snapshot_error":error.report()})
             }
             _ => json!({"error": self.to_string()}),
         }

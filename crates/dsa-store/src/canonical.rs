@@ -2,8 +2,8 @@
 
 use crate::Error;
 
-pub(crate) fn query(table: &str) -> Result<String, Error> {
-    let (payload, from, order) = match table {
+fn parts(table: &str) -> Result<(&'static str, &'static str, &'static str), Error> {
+    Ok(match table {
         "block" => (
             "b.block_no,encode(b.hash,'hex'),b.epoch_no,b.slot_no,(extract(epoch FROM (b.time-timestamp '2000-01-01'))*1000000)::numeric(30,0)::text,b.tx_count",
             "serve.block b",
@@ -61,8 +61,46 @@ pub(crate) fn query(table: &str) -> Result<String, Error> {
             "t.hash,o.index",
         ),
         _ => return Err(Error::Refusal("invalid_snapshot_table")),
-    };
+    })
+}
+
+pub(crate) fn query(table: &str) -> Result<String, Error> {
+    let (payload, from, order) = parts(table)?;
     Ok(format!(
         "WITH h AS (SELECT $1::bigint AS height) SELECT jsonb_build_array({payload})::text FROM {from} ORDER BY {order}"
+    ))
+}
+
+pub(crate) fn selected_source(table: &str) -> Result<String, Error> {
+    if !crate::NODE_RELATIONS.contains(&table) {
+        return Err(Error::Refusal("invalid_keep_table"));
+    }
+    let (payload, from, order) = parts(table)?;
+    let alias = from
+        .split_whitespace()
+        .nth(1)
+        .ok_or(Error::Refusal("invalid_canonical_catalogue"))?;
+    let key = if table == "epoch_param" {
+        "epoch_no"
+    } else {
+        "id"
+    };
+    let target = format!("public.{table} {alias}");
+    let mut from = from.replace("serve.", "public.").replacen(
+        &target,
+        &format!("{target} JOIN keep_{table} selected ON selected.id={alias}.{key}"),
+        1,
+    );
+    if !from.contains("CROSS JOIN h") {
+        from.push_str(" CROSS JOIN h");
+    }
+    let marker = if table == "tx_out" {
+        "CASE WHEN o.id<h.height*16777216 AND EXISTS(SELECT 1 FROM public.tx_in spent WHERE spent.tx_out_id=o.tx_id AND spent.tx_out_index=o.index AND spent.id BETWEEN 0 AND h.height*16777216-1) THEN jsonb_build_array(encode(t.hash,'hex'),o.index)::text ELSE NULL::text END"
+    } else {
+        "NULL::text"
+    };
+    Ok(format!(
+        "{}, h AS (SELECT $1::bigint AS height) SELECT to_jsonb({alias})::text,jsonb_build_array({payload})::text,{alias}.{key}::bigint,{marker} FROM {from} ORDER BY {order}",
+        crate::keep::Selection::ctes_sql(crate::keep::SourceSchema::Public)
     ))
 }

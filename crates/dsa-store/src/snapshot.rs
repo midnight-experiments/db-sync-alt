@@ -473,7 +473,14 @@ impl Store {
 
     /// Preserve serving/nonempty destinations. A failed restore owns only its
     /// explicitly marked empty layout; its load transaction always rolls back.
-    async fn restore_destination(&mut self, profile: &Profile) -> Result<(), Error> {
+    pub(crate) async fn prepare_destination(
+        &mut self,
+        profile: &Profile,
+        failed_kind: &'static str,
+    ) -> Result<(), Error> {
+        if !matches!(failed_kind, "restore_failed" | "convert_failed") {
+            return Err(Error::Refusal("invalid_load_operation"));
+        }
         let identity: bool = self
             .client
             .query_one("SELECT to_regclass('dsa.identity') IS NOT NULL", &[])
@@ -493,17 +500,28 @@ impl Store {
             .map(|t| qualified(t).map(|q| format!("(SELECT count(*) FROM {q})")))
             .collect::<Result<Vec<_>, _>>()?
             .join("+");
-        let occupied: i64 = tx.query_one(&format!("SELECT {counts}"), &[]).await?.get(0);
-        if occupied != 0 || !matches!(origin.as_deref(), Some("empty" | "restore_failed")) {
+        let occupied: i64 = tx.query_one(&format!("SELECT {counts}+(SELECT count(*) FROM dsa.supply)+(SELECT count(*) FROM dsa.first_served)+(SELECT count(*) FROM dsa.calls)"), &[]).await?.get(0);
+        if occupied != 0
+            || !(origin.as_deref() == Some("empty") || origin.as_deref() == Some(failed_kind))
+        {
             return Err(Error::Refusal("destination_not_empty"));
         }
-        tx.batch_execute("UPDATE dsa.position SET serving=false,reason='restore_failed',updated_at=now() WHERE id=1; UPDATE dsa.identity SET origin='{\"kind\":\"restore_failed\"}'::jsonb WHERE id=1").await?;
+        tx.execute(
+            "UPDATE dsa.position SET serving=false,reason=$1,updated_at=now() WHERE id=1",
+            &[&failed_kind],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE dsa.identity SET origin=jsonb_build_object('kind',$1::text) WHERE id=1",
+            &[&failed_kind],
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
     pub async fn restore(&mut self, profile: &Profile, path: &Path) -> Result<Verification, Error> {
-        self.restore_destination(profile).await?;
+        self.prepare_destination(profile, "restore_failed").await?;
         // Opening/parsing happens after a closed, identifiable retry state exists.
         let mut file = File::open(path)?;
         let description = read_description(&mut file, profile)?;

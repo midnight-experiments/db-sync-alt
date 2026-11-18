@@ -153,6 +153,13 @@ impl Selection {
         Ok(sql.replace(predicate,"AND NOT EXISTS(SELECT 1 FROM dsa.consumed_before_horizon c WHERE c.tx_out_id=o.id)\n AND NOT EXISTS(SELECT 1 FROM serve.tx_in i\n"))
     }
 
+    /// Complete-source conversion stream: original JSONB row text, lossless
+    /// canonical natural-key text, original key and optional sparse marker text.
+    /// One execution per family, sorted by its natural key; no source TEMP/DDL.
+    pub fn conversion_rows_sql(&self, table: &str) -> Result<String, Error> {
+        crate::canonical::selected_source(table)
+    }
+
     pub async fn stream_rows<C: GenericClient>(
         &self,
         client: &C,
