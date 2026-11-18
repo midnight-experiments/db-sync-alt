@@ -1,0 +1,268 @@
+name: rule-v2-validation
+on:
+  push:
+    branches: [validation/rule-v2-fd740a3]
+permissions:
+  contents: read
+jobs:
+  keep-rule-proof:
+    strategy:
+      fail-fast: false
+      matrix:
+        seed_start: [0, 5000]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PRODUCT_PIN: fd740a31f118df478abcd6dc3c4b01a9536b76d8
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+      PG_IMAGE: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+      SEED_START: ${{ matrix.seed_start }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fd740a31f118df478abcd6dc3c4b01a9536b76d8
+          persist-credentials: false
+      - name: Pin and build public generated-only proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/cargo" "$RUNNER_TEMP/target"
+          {
+            git rev-parse HEAD
+            test "$(git rev-parse HEAD)" = "$PRODUCT_PIN"
+            test -z "$(git status --porcelain)"
+            git ls-files -z | xargs -0 sha256sum
+            uname -a
+            nproc
+            free -b
+            df -B1 "$RUNNER_TEMP"
+            docker version
+          } > "$RUNNER_TEMP/evidence/provenance.txt"
+          docker pull "$RUST_IMAGE"
+          docker pull "$PG_IMAGE"
+          docker image inspect "$RUST_IMAGE" "$PG_IMAGE" > "$RUNNER_TEMP/evidence/images.json"
+          docker run --rm --name dsa-rule-build --cpus 2 --memory 3g --memory-swap 3g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target "$RUST_IMAGE" \
+            cargo test --locked -p db-sync-alt --test keep_rule --no-run 2>&1 | tee "$RUNNER_TEMP/evidence/build.log"
+      - name: Start isolated RAM-backed generated PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create --internal dsa-rule-internal
+          docker run -d --name dsa-rule-postgres --network dsa-rule-internal --network-alias postgres \
+            --cpus 2 --memory 2g --memory-swap 2g --shm-size 256m \
+            --tmpfs /var/lib/postgresql/data:rw,size=1073741824 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=dsa_test "$PG_IMAGE" \
+            -c jit=off -c max_parallel_workers_per_gather=0 -c shared_buffers=256MB
+          for i in $(seq 1 60); do
+            if docker exec dsa-rule-postgres pg_isready -U postgres -d dsa_test; then break; fi
+            sleep 1
+          done
+          docker exec dsa-rule-postgres psql -U postgres -d dsa_test -XAtc "SELECT json_build_object('server_version',version(),'fsync',current_setting('fsync'),'full_page_writes',current_setting('full_page_writes'),'synchronous_commit',current_setting('synchronous_commit'),'shared_buffers',current_setting('shared_buffers'),'work_mem',current_setting('work_mem'),'jit',current_setting('jit'),'parallel',current_setting('max_parallel_workers_per_gather'),'statement_timeout',current_setting('statement_timeout'))" > "$RUNNER_TEMP/evidence/server-settings.json"
+          docker inspect dsa-rule-postgres > "$RUNNER_TEMP/evidence/startup-inspect.json"
+      - name: Repeat clean 64-seed digest then prove 5000 disjoint chains
+        shell: bash
+        run: |
+          set -euo pipefail
+          for label in smoke-first smoke-second full; do
+            cases=64
+            if [ "$label" = full ]; then cases=5000; fi
+            docker run --rm --name dsa-rule-test --network dsa-rule-internal --cpus 2 --memory 2g --memory-swap 2g \
+              -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/target:/target:ro" -w /workspace \
+              -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
+              -e DSA_KEEP_CASES="$cases" -e DSA_KEEP_SEED_START="$SEED_START" "$RUST_IMAGE" \
+              sh -ec 'test_binary=$(find /target/debug -type f -executable -name "keep_rule-*"); test -n "$test_binary"; "$test_binary" keep_rule_ten_thousand_chains --ignored --exact --nocapture --test-threads=1' \
+              2>&1 | tee "$RUNNER_TEMP/evidence/$label.log"
+          done
+      - name: Strict proof readback
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'evidence'
+          results=[]
+          for label,cases in [('smoke-first',64),('smoke-second',64),('full',5000)]:
+              text=(root/f'{label}.log').read_text()
+              assert 'test result: ok. 1 passed;' in text
+              events=[]
+              for line in text.splitlines():
+                  i=line.find('{')
+                  if i<0:continue
+                  try:events.append(json.loads(line[i:]))
+                  except json.JSONDecodeError:pass
+              summaries=[e for e in events if 'selected_rows_sha256' in e]
+              assert len(summaries)==1
+              result=summaries[0]
+              assert result['cases']==cases and result['seed_start']==int(os.environ['SEED_START'])
+              assert result['positions']>0 and result['node_queries']>0
+              coverage=[e['generator_coverage'] for e in events if 'generator_coverage' in e]
+              assert len(coverage)==1 and coverage[0]['distinct_bounds_epoch_cutoffs']>1
+              results.append({'label':label,'result':result,'coverage':coverage[0]})
+          assert results[0]['result']['selected_rows_sha256']==results[1]['result']['selected_rows_sha256']
+          (root/'readback.json').write_text(json.dumps({'passed':True,'product_pin':os.environ['PRODUCT_PIN'],'keep_rule_version':2,'runs':results},indent=2)+'\n')
+          PY
+      - name: Preserve raw server and resource measurements
+        if: always()
+        shell: bash
+        run: |
+          docker inspect dsa-rule-postgres > "$RUNNER_TEMP/evidence/final-inspect.json" || true
+          docker logs --timestamps dsa-rule-postgres > "$RUNNER_TEMP/evidence/postgres.log" 2>&1 || true
+          df -B1 "$RUNNER_TEMP" > "$RUNNER_TEMP/evidence/final-disk.txt"
+          free -b > "$RUNNER_TEMP/evidence/final-memory.txt"
+          cd "$RUNNER_TEMP/evidence"
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rule-v2-proof-${{ matrix.seed_start }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
+      - name: Remove exact generated scratch
+        if: always()
+        run: |
+          docker rm -f dsa-rule-test dsa-rule-build dsa-rule-postgres || true
+          docker network rm dsa-rule-internal || true
+  generated-reader-cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PRODUCT_PIN: fd740a31f118df478abcd6dc3c4b01a9536b76d8
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+      PG_IMAGE: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fd740a31f118df478abcd6dc3c4b01a9536b76d8
+          persist-credentials: false
+      - name: Record public source and runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/cargo" "$RUNNER_TEMP/target" "$RUNNER_TEMP/pgdata"
+          {
+            git rev-parse HEAD
+            test "$(git rev-parse HEAD)" = "$PRODUCT_PIN"
+            test -z "$(git status --porcelain)"
+            git status --porcelain
+            sha256sum Cargo.lock rust-toolchain.toml crates/dsa-store/src/{convert,canonical,keep,verify,snapshot}.rs crates/dsa-store/src/keep.sql crates/db-sync-alt/tests/conversion.rs
+            uname -a
+            nproc
+            free -b
+            df -B1 "$RUNNER_TEMP"
+            docker version
+          } > "$RUNNER_TEMP/evidence/provenance.txt"
+          docker pull "$RUST_IMAGE"
+          docker pull "$PG_IMAGE"
+          docker image inspect "$RUST_IMAGE" "$PG_IMAGE" > "$RUNNER_TEMP/evidence/images.json"
+      - name: Compile pinned public test without operator inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --name dsa-conversion-build --cpus 2 --memory 3g --memory-swap 3g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target "$RUST_IMAGE" \
+            cargo test --locked -p db-sync-alt --test conversion --no-run 2>&1 | tee "$RUNNER_TEMP/evidence/build.log"
+      - name: Start isolated generated PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create --internal dsa-conversion-internal
+          docker run -d --name dsa-conversion-postgres --network dsa-conversion-internal --network-alias postgres \
+            --cpus 2 --memory 2g --memory-swap 2g --shm-size 256m \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=dsa_test \
+            -v "$RUNNER_TEMP/pgdata:/var/lib/postgresql/data" "$PG_IMAGE" \
+            -c jit=off -c max_parallel_workers_per_gather=0 -c shared_buffers=256MB -c max_wal_size=2GB
+          for i in $(seq 1 60); do
+            if docker exec dsa-conversion-postgres pg_isready -U postgres -d dsa_test; then break; fi
+            sleep 1
+          done
+          docker exec dsa-conversion-postgres psql -U postgres -d dsa_test -XAtc "SELECT json_build_object('server_version',version(),'fsync',current_setting('fsync'),'full_page_writes',current_setting('full_page_writes'),'synchronous_commit',current_setting('synchronous_commit'),'shared_buffers',current_setting('shared_buffers'),'work_mem',current_setting('work_mem'),'jit',current_setting('jit'),'parallel',current_setting('max_parallel_workers_per_gather'),'statement_timeout',current_setting('statement_timeout'))" > "$RUNNER_TEMP/evidence/server-settings.json"
+          docker inspect dsa-conversion-postgres > "$RUNNER_TEMP/evidence/startup-inspect.json"
+      - name: Small generated harness control
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --name dsa-conversion-small --network dsa-conversion-internal --cpus 2 --memory 2g --memory-swap 2g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target \
+            -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
+            -e DSA_CONVERSION_HEADERS=10000 "$RUST_IMAGE" \
+            sh -ec 'test_binary=$(find /target/debug -type f -executable -name "conversion-*"); test -n "$test_binary"; "$test_binary" convert_scaled_source_cost --ignored --exact --nocapture --test-threads=1'  2>&1 | tee "$RUNNER_TEMP/evidence/small.log"
+      - name: Full generated source reader measurement
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --name dsa-conversion-full --network dsa-conversion-internal --cpus 2 --memory 2g --memory-swap 2g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target \
+            -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
+            -e DSA_CONVERSION_HEADERS=2432170 "$RUST_IMAGE" \
+            sh -ec 'test_binary=$(find /target/debug -type f -executable -name "conversion-*"); test -n "$test_binary"; "$test_binary" convert_scaled_source_cost --ignored --exact --nocapture --test-threads=1'  2>&1 | tee "$RUNNER_TEMP/evidence/full.log"
+      - name: Strict evidence readback
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'evidence'
+          summaries=[]
+          for name,headers in [('small',10000),('full',2432170)]:
+              text=(root/f'{name}.log').read_text()
+              assert 'test result: ok. 1 passed;' in text
+              events=[]
+              for line in text.splitlines():
+                  start=line.find('{')
+                  if start<0: continue
+                  try: events.append(json.loads(line[start:]))
+                  except json.JSONDecodeError: pass
+              ready=[v for v in events if v.get('event')=='cost_fixture_ready']
+              assert len(ready)==1 and ready[0]['physical_rows']['block']==headers
+              results=[v for v in events if v.get('event') in ('cost_conversion','cost_conversion_failure')]
+              assert len(results)==2 and [v['explicit_statement_seconds'] for v in results]==[None,300]
+              assert results[1]['event']=='cost_conversion'
+              if results[0]['event']=='cost_conversion':
+                  for key in ['content_digest','state_digest']:
+                      assert results[0]['result']['verified'][key]==results[1]['result']['verified'][key]
+              else: assert results[0]['error']['error']=='source_statement_timeout'
+              for result in results:
+                  if result['event']=='cost_conversion':
+                      source=result['result']['source']
+                      assert len(source['families'])==11
+                      assert source['settings']['statement_timeout']==('1min' if result['explicit_statement_seconds'] is None else '5min')
+                      assert source['settings']['work_mem']=='4MB'
+                      assert source['state']['horizon']['height']==ready[0]['H']
+                      assert source['state']['target']['height']==ready[0]['T']
+                      assert source['state']['tip']['height']==ready[0]['P']
+              plans=[v for v in events if v.get('event')=='cost_plan']
+              assert {(v['family'],v['window_spend_present']) for v in plans}=={(t,p) for t in ['block','tx','tx_out','tx_in','ma_tx_out','datum','multi_asset'] for p in [False,True]} and len(plans)==14
+              for plan in plans:
+                  assert plan['settings']['statement_timeout']=='5min'
+                  assert plan['settings']['jit']=='off' and plan['settings']['parallel']=='0'
+                  assert plan['plan'][0]['Execution Time']>0
+              (root/f'{name}-events.json').write_text(json.dumps(events,indent=2)+'\n')
+              summaries.append({'name':name,'fixture':ready[0],'results':results,'plans':len(plans)})
+          (root/'readback.json').write_text(json.dumps({'passed':True,'product_pin':os.environ['PRODUCT_PIN'],'runs':summaries},indent=2)+'\n')
+          PY
+      - name: Preserve server and host measurements
+        if: always()
+        shell: bash
+        run: |
+          docker inspect dsa-conversion-postgres > "$RUNNER_TEMP/evidence/final-inspect.json" || true
+          docker logs --timestamps dsa-conversion-postgres > "$RUNNER_TEMP/evidence/postgres.log" 2>&1 || true
+          df -B1 "$RUNNER_TEMP" > "$RUNNER_TEMP/evidence/final-disk.txt"
+          free -b > "$RUNNER_TEMP/evidence/final-memory.txt"
+          cd "$RUNNER_TEMP/evidence"
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rule-v2-conversion-cost
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
+      - name: Remove exact generated scratch
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f dsa-conversion-small dsa-conversion-full dsa-conversion-build dsa-conversion-postgres || true
+          docker network rm dsa-conversion-internal || true
+          sudo rm -rf -- "$RUNNER_TEMP/pgdata"
