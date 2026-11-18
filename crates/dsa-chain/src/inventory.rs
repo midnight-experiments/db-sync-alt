@@ -76,7 +76,7 @@ pub struct DecodeError {
     pub source: cbor::Error,
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IntegrityError {
     #[error("captured_transaction_count, expected {expected}, actual {actual}")]
     Length { expected: usize, actual: usize },

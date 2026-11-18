@@ -176,4 +176,144 @@ mod tests {
             "provider_page_block_mismatch"
         );
     }
+
+    #[test]
+    fn endpoint_pages_retry_atomically_and_preserve_all_103_original_records() {
+        use sha2::{Digest, Sha256};
+        let raw = include_bytes!("../tests/fixtures/pagination-finalized.json");
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/pagination-finalized.manifest.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(raw)),
+            manifest["fixture_sha256"].as_str().unwrap()
+        );
+        assert_eq!(raw.len() as u64, manifest["bytes"].as_u64().unwrap());
+        let bundle: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        assert_eq!(bundle["format"], "finalized-pagination-inputs-v1");
+        assert_eq!(
+            bundle["recording_plan_sha256"],
+            manifest["recording_plan_sha256"]
+        );
+        let records: Vec<TransactionCbor> =
+            serde_json::from_value(bundle["records"].clone()).unwrap();
+        assert_eq!(records.len(), 103);
+        for record in bundle["records"].as_array().unwrap() {
+            let source_height = record["source_height"].as_u64().unwrap();
+            assert!((5395925..=5397924).contains(&source_height));
+            assert_eq!(
+                record["source_sha256"],
+                manifest["source_files"][source_height.to_string()]
+            );
+        }
+        // Controlled transport pages, composed of intact finalized transactions
+        // from several actual blocks. This declares no real 103-item block.
+        let block: Hash32 = "01".repeat(32).parse().unwrap();
+        let page = |number, items: &[TransactionCbor]| {
+            let endpoint = crate::types::Endpoint::BlockCbor {
+                block: block.clone(),
+                page: Page::new(number).unwrap(),
+            };
+            let crate::types::Reply::Transactions(page) = endpoint
+                .decode(&serde_json::to_vec(items).unwrap())
+                .unwrap()
+            else {
+                panic!("CBOR page reply")
+            };
+            page
+        };
+        let mut captured = CapturedBlock::new(block.clone(), 103).unwrap();
+        assert_eq!(
+            captured.push(page(2, &records[100..])).unwrap_err(),
+            "provider_page_order_mismatch"
+        );
+        assert_eq!(
+            captured.push(page(1, &records[..99])).unwrap_err(),
+            "provider_transaction_count_mismatch"
+        );
+        assert!(!captured.is_complete());
+        captured.push(page(1, &records[..100])).unwrap();
+        captured.push(page(2, &records[100..])).unwrap();
+        assert!(captured.is_complete());
+        assert_eq!(
+            captured.push(page(2, &records[100..])).unwrap_err(),
+            "provider_page_after_complete"
+        );
+        let source = captured.finish().unwrap();
+        let decoded = source.decode().unwrap();
+        assert_eq!(
+            decoded
+                .transactions()
+                .iter()
+                .map(|tx| tx.hash.as_str())
+                .collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|record| record.tx_hash.as_str())
+                .collect::<Vec<_>>()
+        );
+        let profile = dsa_chain::profiles::Profile::load("preprod").unwrap();
+        let previous = dsa_chain::checks::Header {
+            height: 9,
+            hash: "02".repeat(32),
+            previous_hash: None,
+            transaction_count: 0,
+        };
+        let header = dsa_chain::checks::Header {
+            height: 10,
+            hash: block.to_string(),
+            previous_hash: Some(previous.hash.clone()),
+            transaction_count: 103,
+        };
+        let mut held = std::collections::BTreeMap::new();
+        let supplements = dsa_chain::rows::Supplements::default();
+        assert_eq!(
+            dsa_chain::checks::check_block(
+                &profile,
+                &previous,
+                &header,
+                9,
+                &decoded,
+                &held,
+                &supplements
+            )
+            .unwrap()
+            .transactions_checked,
+            103
+        );
+        let rows =
+            dsa_chain::rows::build_block(&profile, 10, &decoded, &mut held, &supplements).unwrap();
+        assert!(
+            rows.tx.is_empty() && held.is_empty(),
+            "the quiet real sources have no selected facts"
+        );
+        let mut duplicate_tail = records[100..].to_vec();
+        duplicate_tail[0] = records[0].clone();
+        let mut duplicate = CapturedBlock::new(block.clone(), 103).unwrap();
+        duplicate.push(page(1, &records[..100])).unwrap();
+        duplicate.push(page(2, &duplicate_tail)).unwrap();
+        let duplicate_source = duplicate.finish().unwrap();
+        let duplicate_decoded = duplicate_source.decode().unwrap();
+        assert_eq!(
+            dsa_chain::checks::check_block(
+                &profile,
+                &previous,
+                &header,
+                9,
+                &duplicate_decoded,
+                &held,
+                &supplements
+            )
+            .unwrap_err(),
+            dsa_chain::checks::CheckError::DuplicateTransaction {
+                height: 10,
+                transaction: records[0].tx_hash.to_string()
+            }
+        );
+        assert!(matches!(
+            CapturedBlock::new("03".repeat(32).parse().unwrap(), 4097),
+            Err("provider_transaction_count_limit")
+        ));
+    }
 }
