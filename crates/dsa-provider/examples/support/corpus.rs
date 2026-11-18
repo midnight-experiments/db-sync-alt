@@ -243,17 +243,19 @@ fn compare(path: &Path, planning: bool) {
         );
         let mut requests = BTreeSet::new();
         let rows = loop {
-            let attempt = (|| {
-                #[cfg(test)]
-                check_recorded_block(
-                    &profile,
-                    path,
-                    block,
-                    &decoded_capture,
-                    &held,
-                    &supplements,
-                    &expected,
-                )?;
+            #[cfg(test)]
+            let checked = check_recorded_block(
+                &profile,
+                path,
+                block,
+                &decoded_capture,
+                &held,
+                &supplements,
+                &expected,
+            );
+            #[cfg(not(test))]
+            let checked: Result<(), BuildError> = Ok(());
+            let attempt = checked.and_then(|()| {
                 rows::build_block(
                     &profile,
                     block.height,
@@ -261,7 +263,7 @@ fn compare(path: &Path, planning: bool) {
                     &mut held,
                     &supplements,
                 )
-            })();
+            });
             match attempt {
                 Ok(rows) => break rows,
                 Err(BuildError::Required(request)) => {
