@@ -475,6 +475,26 @@ async fn convert_network_identity_rejects_shared_units_and_uses_positive_anchor(
         .refusal("preview", &source.dsn(true), &[], "unsupported_network")
         .await?;
     assert_eq!(target.catalog().await?, before);
+    let preview: Profile =
+        serde_json::from_str(include_str!("../../dsa-chain/profiles/preview.json"))?;
+    let mut session = LegacySource::connect(source.reader_config(), None).await?;
+    let tx = session.snapshot().await?;
+    let mut store = Store::connect(target.config.clone(), None).await?;
+    let error = match store
+        .stage_conversion(&preview, &tx, &ConvertOptions::default())
+        .await
+    {
+        Ok(_) => panic!("placeholder Preview profile was accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.report()["error"],
+        "source_profile_has_no_positive_anchor"
+    );
+    drop(tx);
+    drop(session);
+    drop(store);
+    assert_eq!(target.catalog().await?, before);
     source.cleanup().await?;
     // A genuine positive Preprod anchor also works before any exclusive mint.
     let mut f = fixture(206);
@@ -531,7 +551,7 @@ async fn convert_sparse_origins_continuous_suffix_and_missing_window_headers() -
         .cli("convert", "preprod", &["--source", &source.dsn(true)])
         .await?;
     assert_eq!(out["source"]["state"]["horizon"]["height"], start);
-    assert_eq!(out["source"]["continuous_start_height"], start);
+    assert_eq!(out["source"]["horizon_search_start_height"], start);
     assert_eq!(out["source"]["source_first_header"], 4_318_350);
     assert_eq!(out["source"]["horizon_clamped_to_source_start"], true);
     assert!(
@@ -540,6 +560,31 @@ async fn convert_sparse_origins_continuous_suffix_and_missing_window_headers() -
             .any(|r| r["id"] == old)
     );
     target.cleanup().await?;
+    // An adjacent prefix before the known anchor is valid too. Stop at its
+    // actual beginning, not at either the profile anchor or the isolated row.
+    source.write(&format!("INSERT INTO serve.block SELECT n,decode(md5(n::text)||md5('prefix/'||n::text),'hex'),0,n,n,timestamp '2026-01-01'+n*interval '1second',0 FROM generate_series({}::bigint,{}::bigint)n",start-3,start-1)).await?;
+    let extended = Database::new().await?;
+    let out = extended
+        .cli("convert", "preprod", &["--source", &source.dsn(true)])
+        .await?;
+    assert_eq!(out["source"]["state"]["horizon"]["height"], start - 3);
+    assert!(out["source"]["horizon_prefix_chunks"].as_u64().unwrap() > 0);
+    extended.cleanup().await?;
+    let explicit = Database::new().await?;
+    let out = explicit
+        .cli(
+            "convert",
+            "preprod",
+            &[
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                &(start - 2).to_string(),
+            ],
+        )
+        .await?;
+    assert_eq!(out["source"]["state"]["horizon"]["height"], start - 2);
+    explicit.cleanup().await?;
     let target = Database::new().await?;
     let before = target.catalog().await?;
     target
@@ -547,7 +592,7 @@ async fn convert_sparse_origins_continuous_suffix_and_missing_window_headers() -
             "preprod",
             &source.dsn(true),
             &["--horizon-block", "4318351"],
-            "horizon_before_source_history",
+            "source_header_gap",
         )
         .await?;
     source
@@ -555,6 +600,14 @@ async fn convert_sparse_origins_continuous_suffix_and_missing_window_headers() -
         .await?;
     target
         .refusal("preprod", &source.dsn(true), &[], "source_header_gap")
+        .await?;
+    target
+        .refusal(
+            "preprod",
+            &source.dsn(true),
+            &["--horizon-block", &(start + 1).to_string()],
+            "source_header_gap",
+        )
         .await?;
     assert_eq!(target.catalog().await?, before);
     source.cleanup().await?;
@@ -672,7 +725,22 @@ async fn convert_readonly_session_counters_and_coordinator_snapshot() -> Result 
     let source = Database::new().await?;
     source.legacy(&f).await?;
     let target = Database::new().await?;
+    source
+        .admin
+        .batch_execute(&format!(
+            "ALTER ROLE {} SET default_transaction_read_only=off",
+            source.reader
+        ))
+        .await?;
     let mut reader = LegacySource::connect(source.reader_config(), None).await?;
+    assert_eq!(
+        reader
+            .client()
+            .query_one("SHOW default_transaction_read_only", &[])
+            .await?
+            .get::<_, String>(0),
+        "on"
+    );
     // It is the same actual product source connection, without private/TEMP grants.
     assert!(
         reader
@@ -875,6 +943,8 @@ async fn convert_late_snapshot_failure_reports_published_digest_and_recovery() -
 async fn convert_large_lossless_rows_and_k10_fallback() -> Result {
     let mut f = fixture(221);
     f.no_window_spend();
+    let zero = f.asset_id("auth");
+    f.chain.output_assets.retain(|_, a| a.asset != zero);
     let source = Database::new().await?;
     source.legacy(&f).await?;
     // Use our own supported structured JSONB, never third-party reproduction.
@@ -901,6 +971,10 @@ async fn convert_large_lossless_rows_and_k10_fallback() -> Result {
             ],
         )
         .await?;
+    assert_eq!(
+        converted["verified"]["supply"][f.profile.assets["auth"].unit()],
+        "0"
+    );
     let c = connect(&target.config).await?;
     let original = connect(&source.config).await?;
     for table in ["datum", "tx_metadata", "tx_out"] {
@@ -1250,5 +1324,54 @@ async fn convert_scaled_source_cost() -> Result {
     drop(session);
     drop(owner);
     source.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_source_preflight_rejects_extra_rights_empty_spends_and_old_schema() -> Result {
+    let f = fixture(229);
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    let before = target.catalog().await?;
+    source
+        .admin
+        .batch_execute(&format!(
+            "GRANT TEMP ON DATABASE {} TO {}",
+            source.name, source.reader
+        ))
+        .await?;
+    target
+        .refusal(
+            "mainnet",
+            &source.dsn(true),
+            &[],
+            "reader_privileges_not_exact",
+        )
+        .await?;
+    source
+        .admin
+        .batch_execute(&format!(
+            "REVOKE TEMP ON DATABASE {} FROM {}",
+            source.name, source.reader
+        ))
+        .await?;
+    source.write("DELETE FROM serve.tx_in").await?;
+    target
+        .refusal("mainnet", &source.dsn(true), &[], "source_has_no_spends")
+        .await?;
+    source.write(&format!("DROP VIEW public.epoch_param;CREATE VIEW public.epoch_param AS SELECT epoch_no,nonce FROM serve.epoch_param WHERE chain.gate();GRANT SELECT ON public.epoch_param TO {}",source.reader)).await?;
+    target
+        .refusal(
+            "mainnet",
+            &source.dsn(true),
+            &[],
+            "unsupported_legacy_schema",
+        )
+        .await?;
+    assert_eq!(target.catalog().await?, before);
+    source.cleanup().await?;
+    target.cleanup().await?;
     Ok(())
 }

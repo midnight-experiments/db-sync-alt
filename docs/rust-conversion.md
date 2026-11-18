@@ -22,9 +22,11 @@ days before the *source target's timestamp*. It is independent of wall clock
 and of a fixed block-rate estimate. `--retention-seconds` accepts durations of
 at least86400; `--horizon-block` chooses an explicit height instead. A short
 source clamps to its verified beginning, reporting its shorter coverage. A
-matched pinned start establishes the legacy continuous suffix; isolated older
+matched pinned start establishes the legacy continuous suffix, extending into
+an adjacent earlier prefix when target-time retention needs it; isolated older
 origin and epoch headers remain available for retention selection. Without a
 matched anchor, the oldest physical header is the conservative beginning.
+An explicit horizon may precede the anchor when its suffix is continuous.
 Any hole within the promised horizon-to-tip window is refused. Only that
 bounded window is counted for continuity; horizon navigation uses indexed ID
 seeks and point reads, without materializing all historical headers.

@@ -188,13 +188,15 @@ pub struct SourceReport {
     pub network: String,
     pub state: ServingState,
     pub settings: SourceSettings,
-    pub source_header_count: i64,
+    /// Count only [H,P]; earlier source headers can be sparse.
+    pub window_header_count: i64,
     pub source_first_header: u32,
-    pub continuous_start_height: u32,
+    pub horizon_search_start_height: u32,
     pub network_evidence: String,
     pub bounds_read_seconds: f64,
     pub horizon_read_seconds: f64,
     pub horizon_point_queries: u32,
+    pub horizon_prefix_chunks: u32,
     pub covered_seconds: String,
     pub coverage_shorter_than_retention: bool,
     pub explicit_horizon: bool,
@@ -526,23 +528,48 @@ async fn source_report(
         .ok_or(Error::Refusal("source_tip_below_security_parameter"))?;
     let target = header(source, target_height).await?;
     let (network_evidence, start_anchor) = network_evidence(source, profile, newest).await?;
-    // The shipped, positively matched start is a verified beginning of legacy
-    // coverage. Older origin/epoch rows are deliberately outside this suffix.
-    // Without it use the oldest actual header and refuse any intervening hole;
-    // an arbitrary gap is never silently reclassified as a history truncation.
-    let first = start_anchor.unwrap_or(oldest);
+    // A positive start anchor establishes a known suffix. An adjacent earlier
+    // prefix may also be continuous; discover it only when target-time retention
+    // needs it. Without that anchor never classify an arbitrary gap as a start.
+    let mut first = start_anchor
+        .filter(|h| *h <= target_height)
+        .unwrap_or(oldest);
     if first > target_height {
         return Err(Error::Refusal("source_target_before_history"));
     }
     let bounds_read_seconds = start.elapsed().as_secs_f64();
     let horizon_started = Instant::now();
     let mut point_queries = 0;
+    let mut prefix_chunks = 0;
     let mut clamped = false;
+    if options.horizon_block.is_none() && start_anchor.is_some() {
+        let mut span = 1024;
+        while first > oldest {
+            point_queries += 1;
+            if old_enough(source, first, &target, options.retention_seconds).await? {
+                break;
+            }
+            let low = first.saturating_sub(span).max(oldest);
+            // The last consecutive group ends at first, a known present row.
+            // A gap below the verified anchor is a boundary of earlier legacy
+            // coverage, not a hole inside the promised suffix. Rows on the
+            // other side can still be retained origin/epoch facts.
+            let begin:i64=source.query_one("WITH ordered AS(SELECT id,lag(id) OVER(ORDER BY id) AS previous FROM public.block WHERE id BETWEEN $1 AND $2) SELECT max(id) FILTER(WHERE previous IS NULL OR id<>previous+1) FROM ordered", &[&i64::from(low),&i64::from(first)]).await?.get(0);
+            prefix_chunks += 1;
+            let begin =
+                u32::try_from(begin).map_err(|_| Error::Refusal("source_height_out_of_range"))?;
+            first = begin;
+            if first > low {
+                break;
+            }
+            span = span.saturating_mul(2);
+        }
+    }
     let horizon = if let Some(h) = options.horizon_block {
         if h > target_height {
             return Err(Error::Refusal("horizon_above_source_target"));
         }
-        if h < first {
+        if h < oldest {
             return Err(Error::Refusal("horizon_before_source_history"));
         }
         h
@@ -612,13 +639,14 @@ async fn source_report(
             retention_seconds: options.retention_seconds,
         },
         settings,
-        source_header_count: count,
+        window_header_count: count,
         source_first_header: oldest,
-        continuous_start_height: first,
+        horizon_search_start_height: first,
         network_evidence,
         bounds_read_seconds,
         horizon_read_seconds: horizon_started.elapsed().as_secs_f64(),
         horizon_point_queries: point_queries,
+        horizon_prefix_chunks: prefix_chunks,
         covered_seconds: covered.get(0),
         coverage_shorter_than_retention: covered.get(1),
         explicit_horizon: options.horizon_block.is_some(),
