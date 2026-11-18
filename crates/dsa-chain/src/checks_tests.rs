@@ -377,6 +377,9 @@ fn generated_valid_chains_preserve_conservation_and_supply_on_both_profiles() {
     let mut blocks = 0;
     let mut transactions_checked = 0;
     let mut coverage = [0usize; 6];
+    let mut invalid_count = 0;
+    let mut burns_to_zero = 0;
+    let mut same_block_spends = 0;
     for network in ["mainnet", "preprod"] {
         let profile = Profile::load(network).unwrap();
         let mut units: BTreeMap<String, Asset> = crate::assets::fixed_units(&profile)
@@ -474,6 +477,12 @@ fn generated_valid_chains_preserve_conservation_and_supply_on_both_profiles() {
                                 .clone(),
                         );
                     }
+                    same_block_spends += inputs
+                        .iter()
+                        .filter(|point| {
+                            txs.iter().any(|tx: &Transaction<'_>| tx.hash == point.hash)
+                        })
+                        .count();
                     let mut balances: BTreeMap<String, i128> =
                         units.keys().cloned().map(|unit| (unit, 0)).collect();
                     for point in &inputs {
@@ -481,7 +490,8 @@ fn generated_valid_chains_preserve_conservation_and_supply_on_both_profiles() {
                             *balances.get_mut(&value.unit()).unwrap() += value.quantity;
                         }
                     }
-                    let invalid = next_random(&mut random) % 5 == 0;
+                    let invalid = next_random(&mut random).is_multiple_of(5);
+                    invalid_count += usize::from(invalid);
                     let mut mint = Vec::new();
                     if !invalid {
                         for (unit, quantity) in &mut balances {
@@ -489,11 +499,12 @@ fn generated_valid_chains_preserve_conservation_and_supply_on_both_profiles() {
                                 continue;
                             }
                             let draw = next_random(&mut random);
-                            let change = if draw % 13 == 0 {
+                            let change = if draw.is_multiple_of(13) {
                                 -*quantity
                             } else {
                                 ((draw % 7) as i128 - 3).max(-*quantity)
                             };
+                            burns_to_zero += usize::from(*quantity > 0 && *quantity + change == 0);
                             *quantity += change;
                             if change != 0 {
                                 mint.push(Asset {
@@ -774,6 +785,11 @@ fn generated_valid_chains_preserve_conservation_and_supply_on_both_profiles() {
             }
         }
     }
+    println!(
+        "generated_model {}",
+        serde_json::json!({"blocks":blocks,"transactions":transactions_checked,"block_transaction_counts":coverage,"invalid_with_ignored_mint":invalid_count,"burns_to_zero_omitted":burns_to_zero,"same_block_spends":same_block_spends})
+    );
+    assert!(invalid_count > 100 && burns_to_zero > 100 && same_block_spends > 1000);
     assert_eq!(blocks, 2_048);
     assert!(transactions_checked > 6_000);
     assert!(
