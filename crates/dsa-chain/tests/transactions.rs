@@ -36,6 +36,7 @@ fn assets(values: Vec<MultiEraAsset<'_>>) -> Vec<Asset> {
 }
 
 fn output(ours: &Output, theirs: &MultiEraOutput<'_>) {
+    assert_eq!(ours.address_raw, theirs.address().unwrap().to_vec());
     assert_eq!(ours.coin, theirs.value().coin());
     assert_eq!(
         ours.address,
@@ -79,6 +80,15 @@ fn ra_14_a_and_c_real_original_bytes_inputs_outputs_mint_and_validity() {
             assert_eq!(tx.ordinary, inputs(other.inputs()));
             assert_eq!(tx.collateral, inputs(other.collateral()));
             assert_eq!(tx.reference, inputs(other.reference_inputs()));
+            let witness_datums: std::collections::BTreeMap<_, _> = other
+                .plutus_data()
+                .iter()
+                .map(|datum| {
+                    let bytes = datum.raw_cbor();
+                    (transaction::hash(bytes), bytes.to_vec())
+                })
+                .collect();
+            assert_eq!(tx.datums, witness_datums);
             assert_eq!(
                 tx.mint,
                 assets(other.mints().iter().flat_map(|p| p.assets()).collect())
@@ -104,7 +114,11 @@ fn ra_14_a_and_c_real_original_bytes_inputs_outputs_mint_and_validity() {
             }
         }
     }
-    assert!(compared > 0);
+    assert_eq!(
+        compared,
+        records().len(),
+        "every finalized record must compare"
+    );
     println!(
         "real_finalized_transactions_compared={compared} collateral_returns_compared={collateral_compared}"
     );

@@ -8,10 +8,15 @@ use std::{
 
 use dsa_chain::{
     profiles::Profile,
-    rows::{self, HeldOutput, Rows, Supplements},
+    rows::{self, BuildError, DatumAvailability, Rows, SupplementRequest, Supplements},
     transaction::{self, Asset, Outpoint, Output},
 };
-use dsa_provider::types::{CborHex, Metadata, TransactionCbor, TransactionOutputs};
+use dsa_provider::types::TransactionCbor;
+
+#[path = "origins.rs"]
+mod origins;
+#[path = "recorded.rs"]
+mod recorded;
 use pallas_primitives::conway::MintedDatumOption;
 use pallas_traverse::{MultiEraAsset, MultiEraInput, MultiEraOutput, MultiEraTx};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -20,35 +25,12 @@ use serde::{Deserialize, de::DeserializeOwned};
 struct Plan {
     network: String,
     blocks: Vec<Block>,
-    datum_hashes: Vec<String>,
 }
 #[derive(Deserialize)]
 struct Block {
     height: u32,
     tx_count: usize,
 }
-#[derive(Deserialize)]
-struct Origins {
-    outputs: Vec<Origin>,
-    assets: Vec<OriginAsset>,
-}
-#[derive(Deserialize)]
-struct Origin {
-    tx_id: i64,
-    index: u16,
-    hash: String,
-    address: String,
-    value: String,
-    data_hash: Option<String>,
-}
-#[derive(Deserialize)]
-struct OriginAsset {
-    tx_out_id: i64,
-    policy: String,
-    name: String,
-    quantity: String,
-}
-
 fn read<T: DeserializeOwned>(path: impl AsRef<Path>) -> T {
     serde_json::from_reader(File::open(path).expect("corpus file")).expect("corpus JSON")
 }
@@ -95,6 +77,7 @@ fn resolved_output<'a>(
 }
 
 fn compare_output(ours: &Output, theirs: &MultiEraOutput<'_>) {
+    assert_eq!(ours.address_raw, theirs.address().unwrap().to_vec());
     assert_eq!(ours.coin, theirs.value().coin());
     assert_eq!(
         ours.address,
@@ -142,224 +125,23 @@ fn large_datum_observation(bytes: &[u8], source: &str, height: Option<u32>) -> s
     })
 }
 
-fn compare(path: &Path) {
+fn compare(path: &Path, planning: bool) {
     let plan: Plan = read(path.join("recording-plan.json"));
     let profile = Profile::load(&plan.network).unwrap();
     let provider_path = path.join("provider");
     let mut expected: Rows = read(path.join("expected.json"));
-    let origins: Origins = read(path.join("origins.json"));
-    let creating: BTreeSet<_> = expected.tx.iter().map(|t| t.id).collect();
-    let mut held = BTreeMap::new();
-    for origin in origins.outputs {
-        if creating.contains(&origin.tx_id) {
-            continue;
-        }
-        let output_id = (origin.tx_id << 12) | i64::from(origin.index);
-        let assets = origins
-            .assets
-            .iter()
-            .filter(|a| a.tx_out_id == output_id)
-            .map(|a| Asset {
-                policy: a.policy.clone(),
-                name: a.name.clone(),
-                quantity: a.quantity.parse().unwrap(),
-            })
-            .collect();
-        let address_raw = Vec::new();
-        held.insert(
-            Outpoint {
-                hash: origin.hash,
-                index: origin.index,
-            },
-            HeldOutput {
-                transaction_id: origin.tx_id,
-                output: Output {
-                    address_raw,
-                    address: Some(origin.address),
-                    coin: origin.value.parse().unwrap(),
-                    assets,
-                    data_hash: origin.data_hash,
-                    inline_datum: None,
-                    classification_safe: true,
-                },
-            },
-        );
-    }
-    let eligible: BTreeSet<_> = plan.datum_hashes.iter().cloned().collect();
-    let mut preimage_sources: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut large_datums = BTreeMap::new();
-    let mut supplements = Supplements::default();
-    for entry in std::fs::read_dir(provider_path.join("datums")).unwrap() {
-        let entry = entry.unwrap();
-        let bytes: Option<CborHex> = read(entry.path());
-        if let Some(bytes) = bytes {
-            let raw = hex::decode(bytes.as_str()).unwrap();
-            let hash = transaction::hash(&raw);
-            assert_eq!(entry.path().file_stem().unwrap().to_str().unwrap(), hash);
-            if raw.len() > 10000 {
-                large_datums.insert(
-                    hash.clone(),
-                    large_datum_observation(&raw, "datum_api", None),
-                );
-            }
-            preimage_sources
-                .entry(hash.clone())
-                .or_default()
-                .insert("datum_api".to_owned());
-            supplements.datums.insert(hash, raw);
-        }
-    }
-    for entry in std::fs::read_dir(provider_path.join("metadata")).unwrap() {
-        let entry = entry.unwrap();
-        let values: Vec<Metadata> = read(entry.path());
-        let matches: Vec<_> = values
-            .into_iter()
-            .filter(|m| m.label.0 == 6500973)
-            .collect();
-        assert!(matches.len() <= 1, "duplicate bridge metadata label");
-        supplements.metadata.insert(
-            entry
-                .path()
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned(),
-            matches.first().map(|m| m.json_metadata.get().to_owned()),
-        );
-    }
-    for entry in std::fs::read_dir(provider_path.join("outputs")).unwrap() {
-        let entry = entry.unwrap();
-        let values: TransactionOutputs = read(entry.path());
-        let mut outputs = BTreeMap::new();
-        for output in values.outputs {
-            let mut coin = None;
-            let mut assets = Vec::new();
-            for amount in output.amount {
-                if amount.unit == "lovelace" {
-                    coin = Some(amount.quantity.0);
-                } else {
-                    assets.push(Asset {
-                        policy: amount.unit[..56].to_owned(),
-                        name: amount.unit[56..].to_owned(),
-                        quantity: i128::from(amount.quantity.0),
-                    });
-                }
-            }
-            assets.sort_by(|a, b| (&a.policy, &a.name).cmp(&(&b.policy, &b.name)));
-            outputs.insert(
-                u16::try_from(output.output_index).unwrap(),
-                Output {
-                    address_raw: Vec::new(),
-                    address: Some(output.address),
-                    coin: coin.expect("lovelace"),
-                    assets,
-                    data_hash: output.data_hash.map(|h| h.to_string()),
-                    inline_datum: output
-                        .inline_datum
-                        .map(|b| hex::decode(b.as_str()).unwrap()),
-                    classification_safe: true,
-                },
-            );
-        }
-        supplements.outputs.insert(values.hash.to_string(), outputs);
-    }
-    // A local corpus is already complete. Inline/witness bytes from its real
-    // finalized transactions can supply the same preimages as the datum API.
-    let mut support_paths: Vec<_> = std::fs::read_dir(provider_path.join("transactions"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
+    let projected = plan.blocks.iter().map(|block| block.height).collect();
+    let mut held = origins::load(&path.join("origins.json"), &projected).unwrap();
+    let eligible: BTreeSet<_> = expected
+        .datum
+        .iter()
+        .map(|datum| datum.hash.clone())
         .collect();
-    support_paths.sort();
-    for support_path in support_paths {
-        let support_height: u32 = support_path
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let records: Vec<TransactionCbor> = read(&support_path);
-        for record in records {
-            let raw = hex::decode(record.cbor.as_str()).unwrap();
-            let tx = transaction::decode(&raw, record.tx_hash.as_str()).unwrap();
-            for (hash, bytes) in tx.datums {
-                if bytes.len() > 10000 {
-                    large_datums.insert(
-                        hash.clone(),
-                        large_datum_observation(&bytes, "witness", Some(support_height)),
-                    );
-                }
-                if eligible.contains(&hash) {
-                    assert_eq!(transaction::hash(&bytes), hash);
-                    preimage_sources
-                        .entry(hash.clone())
-                        .or_default()
-                        .insert("witness".to_owned());
-                    supplements.datums.insert(hash, bytes);
-                }
-            }
-            for output in tx.outputs.into_iter().flatten().chain(tx.collateral_output) {
-                if let (Some(hash), Some(bytes)) = (output.data_hash, output.inline_datum) {
-                    if bytes.len() > 10000 {
-                        large_datums.insert(
-                            hash.clone(),
-                            large_datum_observation(&bytes, "inline", Some(support_height)),
-                        );
-                    }
-                    if eligible.contains(&hash) {
-                        assert_eq!(transaction::hash(&bytes), hash);
-                        preimage_sources
-                            .entry(hash.clone())
-                            .or_default()
-                            .insert("inline".to_owned());
-                        supplements.datums.insert(hash, bytes);
-                    }
-                }
-            }
-        }
-    }
-    let mut coverage = Vec::new();
-    let mut source_counts = BTreeMap::<String, usize>::new();
-    for hash in &eligible {
-        let bytes = supplements.datums.get(hash);
-        let sources = preimage_sources.get(hash).cloned().unwrap_or_default();
-        let chosen = ["inline", "witness", "datum_api"]
-            .into_iter()
-            .find(|s| sources.contains(*s))
-            .unwrap_or("missing");
-        *source_counts.entry(chosen.to_owned()).or_default() += 1;
-        if let Some(bytes) = bytes {
-            assert_eq!(
-                transaction::hash(bytes),
-                *hash,
-                "raw preimage versus legacy SQL hash"
-            );
-            if let Some(sql) = expected.datum.iter().find(|d| d.hash == *hash)
-                && sql.value.as_ref().is_some_and(|value| value.len() > 10000)
-            {
-                large_datums.entry(hash.clone()).or_insert_with(|| {
-                    serde_json::json!({
-                        "raw_byte_length":bytes.len(),
-                        "source":chosen,
-                        "sql_jsonb_candidate":true,
-                    })
-                });
-            }
-        }
-        coverage.push(serde_json::json!({"legacy_sql_hash":hash,"raw_byte_length":bytes.map(Vec::len),"hash_verified":bytes.is_some(),"available_sources":sources,"chosen_source":chosen}));
-    }
-    for (hash, value) in &mut large_datums {
-        if let Some(sql) = expected.datum.iter().find(|d| d.hash == *hash) {
-            value["legacy_jsonb_text"] = serde_json::json!(sql.value);
-            value["jsonb_oracle"] = serde_json::json!("restored SQL");
-        } else {
-            value["jsonb_oracle"] = serde_json::json!(
-                "unavailable: not an eligible stored datum in this SQL projection"
-            );
-        }
-    }
-    serde_json::to_writer_pretty(File::create(path.join("datum-byte-coverage.json")).unwrap(),&serde_json::json!({"eligible_unique_hashes":eligible.len(),"chosen_source_counts":source_counts,"per_hash":coverage,"large_datums":large_datums})).unwrap();
+    let mut known_datums = BTreeSet::<String>::new();
+    let mut preimage_sources = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut datum_bytes = BTreeMap::<String, usize>::new();
+    let mut large_datums = BTreeMap::new();
+    let mut missing = BTreeSet::new();
     let mut actual = Rows::default();
     let mut shape_witnesses = BTreeMap::new();
     let (mut invalid_transactions, mut byron_outputs, mut pointer_outputs) =
@@ -379,6 +161,92 @@ fn compare(path: &Path) {
             .zip(&raw)
             .map(|(r, b)| transaction::decode(b, r.tx_hash.as_str()).unwrap())
             .collect();
+        let mut supplements = Supplements::default();
+        supplements.datums.extend(
+            known_datums
+                .iter()
+                .map(|hash| (hash.clone(), DatumAvailability::Stored)),
+        );
+        let rows = loop {
+            match rows::build_block(
+                &profile,
+                block.height,
+                &transactions,
+                &mut held,
+                &supplements,
+            ) {
+                Ok(rows) => break rows,
+                Err(BuildError::Required(request)) => {
+                    if !recorded::load(&provider_path, &request, &transactions, &mut supplements)
+                        .unwrap()
+                    {
+                        missing.insert(serde_json::to_string(&request).unwrap());
+                        serde_json::to_writer_pretty(
+                            File::create(path.join("missing-supplements.json")).unwrap(),
+                            &missing,
+                        )
+                        .unwrap();
+                        if planning && let SupplementRequest::Datum(hash) = request {
+                            supplements.datums.insert(hash, DatumAvailability::NotFound);
+                            continue;
+                        }
+                        panic!("required supplement is unrecorded: {request:?}");
+                    }
+                }
+                Err(error) => panic!("row building failed at {}: {error}", block.height),
+            }
+        };
+        for tx in &transactions {
+            for (hash, bytes) in &tx.datums {
+                preimage_sources
+                    .entry(hash.clone())
+                    .or_default()
+                    .insert("witness".to_owned());
+                datum_bytes.insert(hash.clone(), bytes.len());
+                if bytes.len() > 10000 {
+                    large_datums.insert(
+                        hash.clone(),
+                        large_datum_observation(bytes, "witness", Some(block.height)),
+                    );
+                }
+            }
+            for output in tx
+                .outputs
+                .iter()
+                .flatten()
+                .chain(tx.collateral_output.iter())
+            {
+                if let (Some(hash), Some(bytes)) = (&output.data_hash, &output.inline_datum) {
+                    preimage_sources
+                        .entry(hash.clone())
+                        .or_default()
+                        .insert("inline".to_owned());
+                    datum_bytes.insert(hash.clone(), bytes.len());
+                    if bytes.len() > 10000 {
+                        large_datums.insert(
+                            hash.clone(),
+                            large_datum_observation(bytes, "inline", Some(block.height)),
+                        );
+                    }
+                }
+            }
+        }
+        for (hash, availability) in &supplements.datums {
+            if let DatumAvailability::Present(bytes) = availability {
+                preimage_sources
+                    .entry(hash.clone())
+                    .or_default()
+                    .insert("datum_api".to_owned());
+                datum_bytes.insert(hash.clone(), bytes.len());
+                if bytes.len() > 10000 {
+                    large_datums.insert(
+                        hash.clone(),
+                        large_datum_observation(bytes, "datum_api", Some(block.height)),
+                    );
+                }
+            }
+        }
+        known_datums.extend(rows.datum.iter().map(|datum| datum.hash.clone()));
         for (tx, raw) in transactions.iter().zip(&raw) {
             decoded += 1;
             if !tx.valid {
@@ -417,6 +285,15 @@ fn compare(path: &Path) {
                     assert_eq!(tx.ordinary, points(other.inputs()));
                     assert_eq!(tx.collateral, points(other.collateral()));
                     assert_eq!(tx.reference, points(other.reference_inputs()));
+                    let witness_datums: BTreeMap<_, _> = other
+                        .plutus_data()
+                        .iter()
+                        .map(|datum| {
+                            let bytes = datum.raw_cbor();
+                            (transaction::hash(bytes), bytes.to_vec())
+                        })
+                        .collect();
+                    assert_eq!(tx.datums, witness_datums, "original witness datum bytes");
                     assert_eq!(
                         tx.mint,
                         assets(other.mints().iter().flat_map(|p| p.assets()).collect())
@@ -457,14 +334,6 @@ fn compare(path: &Path) {
                 Err(_) => pallas_unavailable += 1,
             }
         }
-        let rows = rows::build_block(
-            &profile,
-            block.height,
-            &transactions,
-            &mut held,
-            &supplements,
-        )
-        .unwrap();
         actual.tx.extend(rows.tx);
         actual.tx_out.extend(rows.tx_out);
         actual.ma_tx_out.extend(rows.ma_tx_out);
@@ -486,6 +355,34 @@ fn compare(path: &Path) {
         assert!(a.hash != b.hash || a.value == b.value);
         a.hash == b.hash
     });
+    let mut source_counts = BTreeMap::<String, usize>::new();
+    let coverage:Vec<_>=eligible.iter().map(|hash|{
+        let sources=preimage_sources.get(hash).cloned().unwrap_or_default();
+        let chosen=["inline","witness","datum_api"].into_iter().find(|source|sources.contains(*source)).unwrap_or("missing");
+        *source_counts.entry(chosen.to_owned()).or_default()+=1;
+        serde_json::json!({"legacy_sql_hash":hash,"raw_byte_length":datum_bytes.get(hash),"hash_verified":datum_bytes.contains_key(hash),"observed_sources":sources})
+    }).collect();
+    serde_json::to_writer_pretty(File::create(path.join("datum-byte-coverage.json")).unwrap(),&serde_json::json!({"eligible_unique_hashes":eligible.len(),"chosen_source_counts":source_counts,"per_hash":coverage,"large_datums":large_datums,"availability":"current transaction, explicit API response, or earlier successfully stored datum"})).unwrap();
+    if planning {
+        serde_json::to_writer_pretty(
+            File::create(path.join("missing-supplements.json")).unwrap(),
+            &missing,
+        )
+        .unwrap();
+        println!(
+            "{}",
+            serde_json::json!({"result":"planning_only","missing_unique":missing.len(),"missing":missing})
+        );
+        return;
+    }
+    assert!(
+        decoded > 0,
+        "recorded corpus must exercise transaction decoding"
+    );
+    assert_eq!(
+        pallas_unavailable, 0,
+        "every recorded transaction must be compared or explicitly qualified"
+    );
     let mut differences = Vec::new();
     for (table, ours, theirs) in [
         (
@@ -560,12 +457,16 @@ fn compare(path: &Path) {
     );
 }
 
-pub fn run(path: &Path) {
+pub fn run_mode(path: &Path, planning: bool) {
     let path = path.to_path_buf();
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || compare(&path))
+        .spawn(move || compare(&path, planning))
         .unwrap()
         .join()
         .unwrap();
+}
+
+pub fn run(path: &Path) {
+    run_mode(path, false);
 }

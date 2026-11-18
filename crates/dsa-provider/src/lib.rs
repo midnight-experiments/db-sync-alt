@@ -4,6 +4,7 @@
 
 mod accounting;
 mod outputs;
+pub mod supplements;
 pub mod types;
 
 pub use accounting::{

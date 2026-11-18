@@ -11,6 +11,14 @@ use std::{
 };
 
 use clap::Parser;
+use dsa_chain::{
+    profiles::Profile,
+    rows::{self, BuildError, DatumAvailability, SupplementRequest, Supplements},
+};
+#[path = "support/origins.rs"]
+mod origins;
+#[path = "support/recorded.rs"]
+mod recorded;
 use dsa_provider::{
     AttemptRecorder, Config, DailyCount, Provider, RecordFuture, RecorderError,
     types::{Endpoint, Hash32, Header, Page, Reply, TransactionCbor},
@@ -21,6 +29,8 @@ use serde::{Deserialize, Serialize};
 struct Args {
     #[arg(long)]
     plan: PathBuf,
+    #[arg(long)]
+    origins: PathBuf,
     #[arg(long)]
     key_file: PathBuf,
     #[arg(long)]
@@ -37,8 +47,6 @@ struct Args {
 struct Plan {
     network: String,
     blocks: Vec<Block>,
-    datum_hashes: Vec<String>,
-    metadata_transactions: Vec<String>,
 }
 #[derive(Deserialize)]
 struct Block {
@@ -204,8 +212,10 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
     config.requests_per_second = 2.0;
     config.max_in_flight = 1;
     let provider = Provider::new(config, ledger.clone(), counts)?;
-    let mut preimages = BTreeSet::new();
-    let mut unresolved = BTreeSet::new();
+    let profile = Profile::load(&plan.network)?;
+    let projected = plan.blocks.iter().map(|block| block.height).collect();
+    let mut held = origins::load(&args.origins, &projected)?;
+    let mut known_datums = BTreeSet::<String>::new();
     let mut previous: Option<Header> = None;
     let mut header_queue = BTreeMap::new();
     for block in &plan.blocks {
@@ -298,91 +308,84 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
         if transactions.len() != block.tx_count as usize {
             return Err("cached transaction count mismatch".into());
         }
-        let mut seen = BTreeSet::new();
-        for transaction in transactions {
-            if !seen.insert(transaction.tx_hash.as_str().to_owned()) {
-                return Err("provider duplicate transaction".into());
-            }
-            let bytes = hex::decode(transaction.cbor.as_str())?;
-            let tx = dsa_chain::transaction::decode(&bytes, transaction.tx_hash.as_str())?;
-            if tx
-                .outputs
+        let raw: Vec<_> = transactions
+            .iter()
+            .map(|tx| hex::decode(tx.cbor.as_str()))
+            .collect::<Result<_, _>>()?;
+        let decoded: Vec<_> = transactions
+            .iter()
+            .zip(&raw)
+            .map(|(tx, raw)| dsa_chain::transaction::decode(raw, tx.tx_hash.as_str()))
+            .collect::<Result<_, _>>()?;
+        let mut supplements = Supplements::default();
+        supplements.datums.extend(
+            known_datums
                 .iter()
-                .any(|o| o.as_ref().is_none_or(|o| !o.classification_safe))
-                || tx.has_collateral_return
-                    && tx
-                        .collateral_output
-                        .as_ref()
-                        .is_none_or(|o| !o.classification_safe)
-            {
-                unresolved.insert(tx.hash.clone());
-            }
-            preimages.extend(tx.datums.into_keys());
-            for output in tx
-                .outputs
-                .iter()
-                .flatten()
-                .chain(tx.collateral_output.iter())
-            {
-                if output.inline_datum.is_some() {
-                    preimages.extend(output.data_hash.clone());
+                .map(|hash| (hash.clone(), DatumAvailability::Stored)),
+        );
+        let mut requests = BTreeSet::new();
+        let built = loop {
+            match rows::build_block(&profile, block.height, &decoded, &mut held, &supplements) {
+                Ok(rows) => break rows,
+                Err(BuildError::Required(request)) => {
+                    if !requests.insert(serde_json::to_string(&request)?) {
+                        return Err("provider supplement failed to resolve requested fact".into());
+                    }
+                    if recorded::load(&args.output, &request, &decoded, &mut supplements)? {
+                        continue;
+                    }
+                    match &request {
+                        SupplementRequest::Datum(hash) => {
+                            let Reply::Datum(reply) =
+                                fetch(&provider, &args.output, Endpoint::Datum(hash.parse()?))
+                                    .await?
+                            else {
+                                return Err("unexpected provider datum reply".into());
+                            };
+                            atomic_json(&args.output.join(format!("datums/{hash}.json")), &reply)?;
+                        }
+                        SupplementRequest::Metadata(hash) => {
+                            let Reply::Metadata(reply) =
+                                fetch(&provider, &args.output, Endpoint::Metadata(hash.parse()?))
+                                    .await?
+                            else {
+                                return Err("unexpected provider metadata reply".into());
+                            };
+                            atomic_json(
+                                &args.output.join(format!("metadata/{hash}.json")),
+                                &reply,
+                            )?;
+                        }
+                        SupplementRequest::Output { transaction, .. } => {
+                            let Reply::TransactionOutputs(reply) = fetch(
+                                &provider,
+                                &args.output,
+                                Endpoint::TransactionOutputs(transaction.parse()?),
+                            )
+                            .await?
+                            else {
+                                return Err("unexpected provider output reply".into());
+                            };
+                            atomic_json(
+                                &args.output.join(format!("outputs/{transaction}.json")),
+                                &reply,
+                            )?;
+                        }
+                    }
+                    if !recorded::load(&args.output, &request, &decoded, &mut supplements)? {
+                        return Err("recorded provider supplement missing".into());
+                    }
                 }
+                Err(error) => return Err(error.into()),
             }
-        }
+        };
+        known_datums.extend(built.datum.into_iter().map(|datum| datum.hash));
         println!(
             "recorded network={} height={} attempts={}",
             plan.network,
             block.height,
             *ledger.total.lock().map_err(|_| "ledger lock")?
         );
-    }
-    for hash in unresolved {
-        let path = args.output.join(format!("outputs/{hash}.json"));
-        if path.exists() {
-            continue;
-        }
-        let Reply::TransactionOutputs(outputs) = fetch(
-            &provider,
-            &args.output,
-            Endpoint::TransactionOutputs(hash.parse::<Hash32>()?),
-        )
-        .await?
-        else {
-            return Err("unexpected provider output reply".into());
-        };
-        atomic_json(&path, &outputs)?;
-    }
-    for hash in &plan.datum_hashes {
-        let path = args.output.join(format!("datums/{hash}.json"));
-        if path.exists() || preimages.contains(hash) {
-            continue;
-        }
-        let Reply::Datum(datum) = fetch(
-            &provider,
-            &args.output,
-            Endpoint::Datum(hash.parse::<Hash32>()?),
-        )
-        .await?
-        else {
-            return Err("unexpected provider datum reply".into());
-        };
-        atomic_json(&path, &datum)?;
-    }
-    for hash in &plan.metadata_transactions {
-        let path = args.output.join(format!("metadata/{hash}.json"));
-        if path.exists() {
-            continue;
-        }
-        let Reply::Metadata(metadata) = fetch(
-            &provider,
-            &args.output,
-            Endpoint::Metadata(hash.parse::<Hash32>()?),
-        )
-        .await?
-        else {
-            return Err("unexpected provider metadata reply".into());
-        };
-        atomic_json(&path, &metadata)?;
     }
     let finished = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     atomic_json(

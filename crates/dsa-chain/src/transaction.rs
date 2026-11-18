@@ -167,6 +167,12 @@ pub fn address_text(raw: &[u8]) -> Option<String> {
     }
 }
 
+/// Decode a canonical provider address for supplement validation.
+pub fn address_bytes(text: &str) -> Option<Vec<u8>> {
+    let address: Address = text.parse().ok()?;
+    Some(address.to_vec())
+}
+
 fn output(item: Item<'_>) -> Result<Output, Error> {
     let (address, value, datum, legacy, script) = match item.head()?.major {
         4 => {

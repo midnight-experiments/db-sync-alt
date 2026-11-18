@@ -10,6 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+dsa-chain.workspace = true
+hex = "0.4"
 bytes = "1"
 bech32 = "0.11"
 futures-util = "0.3"
@@ -29,9 +31,7 @@ sha2.workspace = true
 flate2 = "1"
 pallas-traverse = "=0.33.0"
 pallas-primitives = "=0.33.0"
-dsa-chain.workspace = true
 clap.workspace = true
-hex = "0.4"
 bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }

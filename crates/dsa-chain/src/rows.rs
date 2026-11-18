@@ -81,14 +81,54 @@ pub struct HeldOutput {
     pub output: Output,
 }
 
+/// Facts known when a required datum is requested. A 404 applies to this block
+/// attempt only. Callers must retry lookup on a later selected use of the hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DatumAvailability {
+    Present(Vec<u8>),
+    NotFound,
+    /// The caller already holds a verified datum row under this hash.
+    Stored,
+}
+
 #[derive(Default)]
 pub struct Supplements {
     /// Resolved outputs are indexed exactly as in the CBOR body; invalid
     /// transactions have only the collateral return at body.outputs.len().
     pub outputs: BTreeMap<String, BTreeMap<u16, Output>>,
-    pub datums: BTreeMap<String, Vec<u8>>,
+    pub datums: BTreeMap<String, DatumAvailability>,
     /// ICS transaction -> label 6500973 absent, or its exact provider JSON.
     pub metadata: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SupplementRequest {
+    Output { transaction: String, index: u16 },
+    Datum(String),
+    Metadata(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BuildError {
+    #[error(transparent)]
+    Invalid(#[from] Error),
+    #[error("{0:?} requires a provider supplement")]
+    Required(SupplementRequest),
+}
+
+impl BuildError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid(error) => error.code,
+            Self::Required(SupplementRequest::Output { .. }) => {
+                "provider_output_resolution_required"
+            }
+            Self::Required(SupplementRequest::Datum(_)) => "provider_datum_resolution_required",
+            Self::Required(SupplementRequest::Metadata(_)) => {
+                "provider_metadata_resolution_required"
+            }
+        }
+    }
 }
 
 /// An overlay contains only outputs created or removed by this block. Failed
@@ -147,26 +187,6 @@ impl<'a> Selection<'a> {
             .is_some_and(|a| self.addresses.contains(a))
             || output.assets.iter().any(|a| self.required(a))
     }
-    pub fn selected(&self, tx: &Transaction<'_>, held: &BTreeMap<Outpoint, HeldOutput>) -> bool {
-        let outputs: Vec<_> = if tx.valid {
-            tx.outputs.iter().map(Option::as_ref).collect()
-        } else if tx.has_collateral_return {
-            vec![tx.collateral_output.as_ref()]
-        } else {
-            vec![]
-        };
-        outputs
-            .into_iter()
-            .any(|o| o.is_none_or(|o| !o.classification_safe || self.relevant(o)))
-            || tx.valid && tx.mint.iter().any(|a| self.required(a))
-            || (if tx.valid {
-                &tx.ordinary
-            } else {
-                &tx.collateral
-            })
-            .iter()
-            .any(|p| held.contains_key(p))
-    }
     fn keep_all_assets(&self, output: &Output) -> bool {
         ["ics", "reserve"]
             .iter()
@@ -201,29 +221,36 @@ fn datum_for(
     tx: &Transaction<'_>,
     supplements: &Supplements,
     datums: &mut BTreeMap<String, DatumRow>,
-) -> Result<(), Error> {
-    if let Some(expected) = &output.data_hash {
-        if datums.contains_key(expected) {
-            return Ok(());
-        }
-        let raw = output
-            .inline_datum
-            .as_ref()
-            .or_else(|| tx.datums.get(expected))
-            .or_else(|| supplements.datums.get(expected));
-        if let Some(raw) = raw {
-            if hash(raw) != *expected {
-                return Err(error("provider_datum_hash_mismatch", 0));
-            }
-            datums.insert(
-                expected.clone(),
-                DatumRow {
-                    hash: expected.clone(),
-                    value: datum::render(raw)?,
-                },
-            );
-        }
+) -> Result<(), BuildError> {
+    let Some(expected) = &output.data_hash else {
+        return Ok(());
+    };
+    if datums.contains_key(expected) {
+        return Ok(());
     }
+    let local = output
+        .inline_datum
+        .as_ref()
+        .or_else(|| tx.datums.get(expected));
+    let raw = match (local, supplements.datums.get(expected)) {
+        (Some(raw), _) | (None, Some(DatumAvailability::Present(raw))) => raw,
+        (None, Some(DatumAvailability::NotFound | DatumAvailability::Stored)) => return Ok(()),
+        (None, None) => {
+            return Err(BuildError::Required(SupplementRequest::Datum(
+                expected.clone(),
+            )));
+        }
+    };
+    if hash(raw) != *expected {
+        return Err(error("provider_datum_hash_mismatch", 0).into());
+    }
+    datums.insert(
+        expected.clone(),
+        DatumRow {
+            hash: expected.clone(),
+            value: datum::render(raw)?,
+        },
+    );
     Ok(())
 }
 
@@ -236,7 +263,7 @@ pub fn build_block(
     transactions: &[Transaction<'_>],
     held: &mut BTreeMap<Outpoint, HeldOutput>,
     supplements: &Supplements,
-) -> Result<Rows, Error> {
+) -> Result<Rows, BuildError> {
     let (rows, changes) = {
         let mut staged = HeldChanges {
             original: held,
@@ -261,14 +288,14 @@ fn build_rows(
     transactions: &[Transaction<'_>],
     held: &mut HeldChanges<'_>,
     supplements: &Supplements,
-) -> Result<Rows, Error> {
+) -> Result<Rows, BuildError> {
     let selection = Selection::new(profile);
     let mut rows = Rows::default();
     let mut datums = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for (position, tx) in transactions.iter().enumerate() {
         if !seen.insert(&tx.hash) {
-            return Err(error("provider_duplicate_transaction", 0));
+            return Err(error("provider_duplicate_transaction", 0).into());
         }
         let tx_index = ordinal(position)?;
         let tx_id = id(ids::transaction_id(height, tx_index))?;
@@ -299,7 +326,12 @@ fn build_rows(
                         .get(&tx.hash)
                         .and_then(|m| m.get(&index))
                 })
-                .ok_or_else(|| error("provider_output_resolution_required", 0))?;
+                .ok_or_else(|| {
+                    BuildError::Required(SupplementRequest::Output {
+                        transaction: tx.hash.clone(),
+                        index,
+                    })
+                })?;
             output.check_inline_hash()?;
             if selection.relevant(output) {
                 kept_outputs.push((index, output));
@@ -313,7 +345,7 @@ fn build_rows(
         let spends: Vec<_> = inputs
             .iter()
             .enumerate()
-            .filter(|(_, p)| held.contains_key(*p))
+            .filter(|(_, p)| held.contains_key(p))
             .collect();
         if kept_outputs.is_empty() && mints.is_empty() && spends.is_empty() {
             continue;
@@ -343,10 +375,12 @@ fn build_rows(
         let mut ics = false;
         for (index, output) in kept_outputs {
             let output_id = id(ids::output_id(height, tx_index, index))?;
-            let address = output
-                .address
-                .clone()
-                .ok_or_else(|| error("provider_output_resolution_required", 0))?;
+            let address = output.address.clone().ok_or_else(|| {
+                BuildError::Required(SupplementRequest::Output {
+                    transaction: tx.hash.clone(),
+                    index,
+                })
+            })?;
             ics |= profile.addresses.get("ics") == Some(&address);
             rows.tx_out.push(OutputRow {
                 id: output_id,
@@ -391,10 +425,9 @@ fn build_rows(
             });
         }
         if ics && tx.valid {
-            let metadata = supplements
-                .metadata
-                .get(&tx.hash)
-                .ok_or_else(|| error("provider_metadata_resolution_required", 0))?;
+            let metadata = supplements.metadata.get(&tx.hash).ok_or_else(|| {
+                BuildError::Required(SupplementRequest::Metadata(tx.hash.clone()))
+            })?;
             if let Some(json) = metadata {
                 rows.tx_metadata.push(MetadataRow {
                     id: tx_id,
@@ -414,6 +447,195 @@ fn build_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_datums_distinguish_unknown_404_stored_and_later_reveal() {
+        let profile = Profile::load("mainnet").unwrap();
+        let raw = vec![0];
+        let datum_hash = hash(&raw);
+        let output = Output {
+            address_raw: Vec::new(),
+            address: Some(profile.addresses["mapping"].clone()),
+            coin: 100,
+            assets: Vec::new(),
+            data_hash: Some(datum_hash.clone()),
+            inline_datum: None,
+            classification_safe: true,
+        };
+        let make_tx =
+            |hash: String, inputs: Vec<Outpoint>, outputs: Vec<Option<Output>>| Transaction {
+                hash,
+                valid: true,
+                ordinary: inputs,
+                collateral: Vec::new(),
+                reference: Vec::new(),
+                outputs,
+                collateral_output: None,
+                has_collateral_return: false,
+                mint: Vec::new(),
+                datums: BTreeMap::new(),
+                body: &[],
+                auxiliary: None,
+                auxiliary_hash: None,
+            };
+        let creation = make_tx("01".repeat(32), Vec::new(), vec![Some(output.clone())]);
+        let mut held = BTreeMap::new();
+        let request = build_block(
+            &profile,
+            10,
+            std::slice::from_ref(&creation),
+            &mut held,
+            &Supplements::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            request,
+            BuildError::Required(SupplementRequest::Datum(datum_hash.clone()))
+        );
+        assert!(held.is_empty());
+        let mut missing = Supplements::default();
+        missing
+            .datums
+            .insert(datum_hash.clone(), DatumAvailability::NotFound);
+        let created = build_block(&profile, 10, &[creation], &mut held, &missing).unwrap();
+        assert!(created.datum.is_empty());
+        assert_eq!(created.tx_out[0].data_hash.as_ref(), Some(&datum_hash));
+        let point = Outpoint {
+            hash: "01".repeat(32),
+            index: 0,
+        };
+        let mut spending = make_tx("02".repeat(32), vec![point.clone()], Vec::new());
+        assert_eq!(
+            build_block(
+                &profile,
+                11,
+                std::slice::from_ref(&spending),
+                &mut held,
+                &Supplements::default()
+            )
+            .unwrap_err(),
+            BuildError::Required(SupplementRequest::Datum(datum_hash.clone())),
+            "an earlier 404 must not suppress the later lookup"
+        );
+        spending.datums.insert(datum_hash.clone(), raw.clone());
+        let rows = build_block(
+            &profile,
+            11,
+            &[spending],
+            &mut held,
+            &Supplements::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows.datum,
+            vec![DatumRow {
+                hash: datum_hash.clone(),
+                value: datum::render(&raw).unwrap()
+            }]
+        );
+        assert!(!held.contains_key(&point));
+        for available in [
+            DatumAvailability::Present(raw.clone()),
+            DatumAvailability::Stored,
+        ] {
+            let mut supplements = Supplements::default();
+            supplements
+                .datums
+                .insert(datum_hash.clone(), available.clone());
+            let creation = make_tx("03".repeat(32), Vec::new(), vec![Some(output.clone())]);
+            let result = build_block(
+                &profile,
+                12,
+                &[creation],
+                &mut BTreeMap::new(),
+                &supplements,
+            )
+            .unwrap();
+            assert_eq!(
+                result.datum.len(),
+                usize::from(matches!(available, DatumAvailability::Present(_)))
+            );
+        }
+        let mut inline = output.clone();
+        inline.inline_datum = Some(raw);
+        let creation = make_tx("04".repeat(32), Vec::new(), vec![Some(inline)]);
+        assert_eq!(
+            build_block(
+                &profile,
+                13,
+                &[creation],
+                &mut BTreeMap::new(),
+                &Supplements::default()
+            )
+            .unwrap()
+            .datum
+            .len(),
+            1
+        );
+        let mut irrelevant = output;
+        irrelevant.address = Some("unrelated".to_owned());
+        let ignored = make_tx("05".repeat(32), Vec::new(), vec![Some(irrelevant)]);
+        assert!(
+            build_block(
+                &profile,
+                14,
+                &[ignored],
+                &mut BTreeMap::new(),
+                &Supplements::default()
+            )
+            .unwrap()
+            .tx
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn input_ordinals_include_unheld_inputs_in_legacy_sorted_order() {
+        let profile = Profile::load("mainnet").unwrap();
+        let output = Output {
+            address_raw: Vec::new(),
+            address: Some(profile.addresses["mapping"].clone()),
+            coin: 1,
+            assets: Vec::new(),
+            data_hash: None,
+            inline_datum: None,
+            classification_safe: true,
+        };
+        let inputs: Vec<_> = ["01", "02", "03"]
+            .into_iter()
+            .map(|h| Outpoint {
+                hash: h.repeat(32),
+                index: 0,
+            })
+            .collect();
+        let mut held = BTreeMap::from([(
+            inputs[1].clone(),
+            HeldOutput {
+                transaction_id: 17,
+                output,
+            },
+        )]);
+        let tx = Transaction {
+            hash: "04".repeat(32),
+            valid: true,
+            ordinary: inputs,
+            collateral: Vec::new(),
+            reference: Vec::new(),
+            outputs: Vec::new(),
+            collateral_output: None,
+            has_collateral_return: false,
+            mint: Vec::new(),
+            datums: BTreeMap::new(),
+            body: &[],
+            auxiliary: None,
+            auxiliary_hash: None,
+        };
+        let result = build_block(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
+        assert_eq!(
+            result.tx_in[0].id, 167772161,
+            "legacy height*2^24 + transaction*2^12 + rank among all inputs"
+        );
+    }
 
     #[test]
     fn failed_later_transaction_preserves_held_and_retry_matches_clean_block() {
@@ -486,7 +708,8 @@ mod tests {
             let mut bad = Supplements::default();
             if failure == "datum" {
                 later.data_hash = Some(hash(&[0]));
-                bad.datums.insert(hash(&[0]), vec![1]);
+                bad.datums
+                    .insert(hash(&[0]), DatumAvailability::Present(vec![1]));
             }
             if failure == "metadata" {
                 later.address = Some(profile.addresses["ics"].clone());
@@ -510,7 +733,7 @@ mod tests {
             let mut held = before.clone();
             let error = build_block(&profile, 10, &transactions, &mut held, &bad).unwrap_err();
             assert_eq!(
-                error.code,
+                error.code(),
                 match failure {
                     "output" => "provider_output_resolution_required",
                     "datum" => "provider_datum_hash_mismatch",
@@ -526,7 +749,8 @@ mod tests {
                     .insert(second.hash.clone(), BTreeMap::from([(0, later)]));
             }
             if failure == "datum" {
-                bad.datums.insert(hash(&[0]), vec![0]);
+                bad.datums
+                    .insert(hash(&[0]), DatumAvailability::Present(vec![0]));
             }
             if failure == "metadata" {
                 bad.metadata.insert(second.hash.clone(), None);
