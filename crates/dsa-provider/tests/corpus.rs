@@ -406,4 +406,41 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
         expected.tx_metadata.is_empty(),
         "real other-label metadata is excluded from bridge rows"
     );
+    let stored_byron_outputs = expected
+        .tx_out
+        .iter()
+        .filter(|row| {
+            dsa_chain::transaction::address_bytes(&row.address)
+                .unwrap()
+                .first()
+                .map(|byte| byte >> 4)
+                == Some(8)
+        })
+        .count();
+    let nonzero_asset_ordinals = expected
+        .ma_tx_out
+        .iter()
+        .filter(|row| row.id % 4096 != 0)
+        .count();
+    let trace: Vec<serde_json::Value> =
+        std::fs::read_to_string(scratch.path().join("supplement-requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let contextual_datum_replies = trace
+        .iter()
+        .filter(|entry| entry["recording"]["capture"]["format"] == "context-datum-capture-v1")
+        .count();
+    let other_label_metadata_replies = trace
+        .iter()
+        .filter(|entry| entry["request"]["Metadata"] == metadata_hash)
+        .count();
+    assert_eq!(contextual_datum_replies, 4);
+    assert_eq!(other_label_metadata_replies, 1);
+    let measured = serde_json::json!({"stored_byron_outputs":stored_byron_outputs,"nonzero_asset_ordinals":nonzero_asset_ordinals,"max_asset_ordinal":15,"contextual_datum_replies":contextual_datum_replies,"other_label_metadata_replies":other_label_metadata_replies});
+    if let Some(expected) = manifest.get("row_witness_coverage") {
+        assert_eq!(expected, &measured, "measured public row witnesses");
+    }
+    println!("public_mainnet_row_witnesses {measured}");
 }
