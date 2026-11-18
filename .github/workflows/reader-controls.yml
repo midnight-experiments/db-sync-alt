@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 07359406aeb9df9a2338c14d55f959b48a44a49e
+          ref: 13102cccb531d15f595be4fba3d32b7f83cf1685
           persist-credentials: false
       - name: Verify normal reader tests
         shell: bash
@@ -25,7 +25,7 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/reader-artifacts
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          test "$(git rev-parse HEAD)" = 07359406aeb9df9a2338c14d55f959b48a44a49e
+          test "$(git rev-parse HEAD)" = 13102cccb531d15f595be4fba3d32b7f83cf1685
           cargo test --locked -p dsa-chain -p dsa-provider --lib --tests -- --nocapture 2>&1 | tee /tmp/reader-artifacts/positive.log
       - name: Build pinned recording and comparison tools
         run: |
@@ -135,7 +135,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: b3-model-tools-0735940
+          name: b3-model-tools-13102cc
           path: /tmp/reader-artifacts/
           retention-days: 3
           if-no-files-found: error
