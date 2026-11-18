@@ -2,7 +2,7 @@
 //! The committed inventory also includes DDL and non-emitted bridge components;
 //! readers execute only complete SELECTs and the assembled enabled bridge query.
 #[allow(dead_code)]
-#[path = "../build/catalogue.rs"]
+#[path = "../codegen/catalogue.rs"]
 mod extraction;
 pub use extraction::{Catalogue, Source, Statement};
 pub const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/node-catalogue.json"));
