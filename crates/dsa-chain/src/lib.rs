@@ -1,5 +1,6 @@
 //! Chain profiles and positional identifiers shared by the store and follower.
 
+pub mod assets;
 pub mod cbor;
 pub mod checks;
 pub mod datum;
