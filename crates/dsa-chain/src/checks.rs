@@ -308,14 +308,13 @@ pub fn aggregate_supply<'a>(
                         unit,
                     });
                 }
-                *total =
-                    total
-                        .checked_add(asset.quantity)
-                        .ok_or_else(|| CheckError::AssetQuantity {
-                            height,
-                            transaction: None,
-                            unit,
-                        })?;
+                *total = total
+                    .checked_add(asset.quantity)
+                    .ok_or(CheckError::AssetQuantity {
+                        height,
+                        transaction: None,
+                        unit,
+                    })?;
             }
         }
     }

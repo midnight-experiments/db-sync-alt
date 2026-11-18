@@ -113,7 +113,7 @@ fn each_planted_block_fault_names_the_block_or_transaction() {
                 held.get_mut(&point).unwrap().output.assets.push(duplicate);
             }
             "changed body" => {
-                tx.body = b"changed native body";
+                tx.body = b"native conservation modeX";
             }
             "header height" => {
                 header.height += 1;
