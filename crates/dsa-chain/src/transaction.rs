@@ -1,5 +1,7 @@
 //! Facts extracted from the original transaction body, without decoding unused
 //! scripts, metadata, certificates or governance content into value trees.
+//! The endpoint supplies the four-element Alonzo-and-later envelope. Byron
+//! addresses inside later transactions are supported by address rendering.
 
 use std::collections::{BTreeMap, BTreeSet};
 

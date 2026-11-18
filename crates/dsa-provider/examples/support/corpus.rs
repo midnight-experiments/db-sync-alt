@@ -64,16 +64,18 @@ fn resolved_output<'a>(
     index: usize,
     hash: &str,
     supplements: &'a Supplements,
-) -> &'a Output {
-    output
-        .filter(|o| o.classification_safe)
-        .or_else(|| {
-            supplements
-                .outputs
-                .get(hash)
-                .and_then(|outputs| outputs.get(&u16::try_from(index).unwrap()))
-        })
-        .expect("recorded output fallback required for comparison")
+    effective: bool,
+) -> Result<Option<&'a Output>, &'static str> {
+    let resolved = output.filter(|o| o.classification_safe).or_else(|| {
+        supplements
+            .outputs
+            .get(hash)
+            .and_then(|outputs| outputs.get(&u16::try_from(index).unwrap()))
+    });
+    if resolved.is_none() && effective {
+        return Err("effective_output_comparison_unavailable");
+    }
+    Ok(resolved)
 }
 
 fn compare_output(ours: &Output, theirs: &MultiEraOutput<'_>) {
@@ -145,6 +147,9 @@ fn compare(path: &Path, planning: bool) {
     let mut actual = Rows::default();
     let mut shape_witnesses = BTreeMap::new();
     let mut multi_input_transactions = 0usize;
+    let mut skipped_non_effective_collateral_outputs = 0usize;
+    let mut skipped_non_effective_ordinary_outputs = 0usize;
+    let mut decoder_eras = BTreeMap::<String, usize>::new();
     let (mut invalid_transactions, mut byron_outputs, mut pointer_outputs) =
         (0usize, 0usize, 0usize);
     let (mut decoded, mut compared, mut pallas_unavailable) = (0usize, 0usize, 0usize);
@@ -168,6 +173,7 @@ fn compare(path: &Path, planning: bool) {
                 .iter()
                 .map(|hash| (hash.clone(), DatumAvailability::Stored)),
         );
+        let mut requests = BTreeSet::new();
         let rows = loop {
             match rows::build_block(
                 &profile,
@@ -178,6 +184,11 @@ fn compare(path: &Path, planning: bool) {
             ) {
                 Ok(rows) => break rows,
                 Err(BuildError::Required(request)) => {
+                    assert!(
+                        requests.insert(serde_json::to_string(&request).unwrap()),
+                        "cached supplement did not satisfy repeated request at block {}: {request:?}",
+                        block.height
+                    );
                     if !recorded::load(
                         &provider_path,
                         &request,
@@ -293,6 +304,9 @@ fn compare(path: &Path, planning: bool) {
             match MultiEraTx::decode(raw) {
                 Ok(other) => {
                     compared += 1;
+                    *decoder_eras
+                        .entry(format!("{:?}", other.era()))
+                        .or_default() += 1;
                     assert_eq!(tx.hash, other.hash().to_string());
                     assert_eq!(tx.valid, other.is_valid());
                     assert_eq!(tx.ordinary, points(other.inputs()));
@@ -314,33 +328,57 @@ fn compare(path: &Path, planning: bool) {
                     let outputs = other.outputs();
                     assert_eq!(tx.outputs.len(), outputs.len());
                     for (index, (ours, theirs)) in tx.outputs.iter().zip(outputs).enumerate() {
-                        fallback_outputs_compared +=
-                            usize::from(ours.as_ref().is_none_or(|o| !o.classification_safe));
-                        compare_output(
-                            resolved_output(ours.as_ref(), index, &tx.hash, &supplements),
-                            &theirs,
-                        );
+                        match resolved_output(
+                            ours.as_ref(),
+                            index,
+                            &tx.hash,
+                            &supplements,
+                            tx.valid,
+                        )
+                        .expect("effective ordinary output must be independently compared")
+                        {
+                            Some(ours) => {
+                                fallback_outputs_compared += usize::from(
+                                    tx.outputs[index]
+                                        .as_ref()
+                                        .is_none_or(|o| !o.classification_safe),
+                                );
+                                compare_output(ours, &theirs);
+                            }
+                            None => {
+                                skipped_non_effective_ordinary_outputs += 1;
+                                shape_witnesses.entry("skipped_invalid_ordinary_output").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash,"index":index,"reason":"unresolved output has no chain effect"}));
+                            }
+                        }
                     }
                     assert_eq!(
                         tx.has_collateral_return,
                         other.collateral_return().is_some()
                     );
                     if let Some(theirs) = other.collateral_return() {
-                        collateral_outputs_compared += 1;
-                        fallback_outputs_compared += usize::from(
-                            tx.collateral_output
-                                .as_ref()
-                                .is_none_or(|o| !o.classification_safe),
-                        );
-                        compare_output(
-                            resolved_output(
-                                tx.collateral_output.as_ref(),
-                                tx.outputs.len(),
-                                &tx.hash,
-                                &supplements,
-                            ),
-                            &theirs,
-                        );
+                        match resolved_output(
+                            tx.collateral_output.as_ref(),
+                            tx.outputs.len(),
+                            &tx.hash,
+                            &supplements,
+                            !tx.valid,
+                        )
+                        .expect("effective collateral return must be independently compared")
+                        {
+                            Some(ours) => {
+                                collateral_outputs_compared += 1;
+                                fallback_outputs_compared += usize::from(
+                                    tx.collateral_output
+                                        .as_ref()
+                                        .is_none_or(|o| !o.classification_safe),
+                                );
+                                compare_output(ours, &theirs);
+                            }
+                            None => {
+                                skipped_non_effective_collateral_outputs += 1;
+                                shape_witnesses.entry("skipped_valid_collateral_return").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash,"index":tx.outputs.len(),"reason":"unresolved return has no chain effect"}));
+                            }
+                        }
                         shape_witnesses.entry("collateral_return").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash,"valid":tx.valid}));
                     }
                 }
@@ -457,7 +495,7 @@ fn compare(path: &Path, planning: bool) {
         &shape_witnesses,
     )
     .unwrap();
-    let summary = serde_json::json!({"network":plan.network,"blocks":plan.blocks.len(),"decoded_transactions":decoded,"pallas_compared":compared,"pallas_unavailable":pallas_unavailable,"collateral_outputs_compared":collateral_outputs_compared,"fallback_outputs_compared":fallback_outputs_compared,"invalid_transactions":invalid_transactions,"multi_input_transactions":multi_input_transactions,"byron_outputs":byron_outputs,"pointer_outputs":pointer_outputs,"tx":actual.tx.len(),"outputs":actual.tx_out.len(),"assets":actual.ma_tx_out.len(),"spends":actual.tx_in.len(),"datums":actual.datum.len(),"metadata":actual.tx_metadata.len(),"mints":actual.mint.len(),"differing_tables":differences,"result":if differences.is_empty(){"equal"}else{"different"}});
+    let summary = serde_json::json!({"network":plan.network,"blocks":plan.blocks.len(),"decoded_transactions":decoded,"pallas_compared":compared,"pallas_unavailable":pallas_unavailable,"comparison_decoder_eras":decoder_eras,"skipped_non_effective_collateral_outputs":skipped_non_effective_collateral_outputs,"skipped_non_effective_ordinary_outputs":skipped_non_effective_ordinary_outputs,"collateral_outputs_compared":collateral_outputs_compared,"fallback_outputs_compared":fallback_outputs_compared,"invalid_transactions":invalid_transactions,"multi_input_transactions":multi_input_transactions,"byron_outputs":byron_outputs,"pointer_outputs":pointer_outputs,"tx":actual.tx.len(),"outputs":actual.tx_out.len(),"assets":actual.ma_tx_out.len(),"spends":actual.tx_in.len(),"datums":actual.datum.len(),"metadata":actual.tx_metadata.len(),"mints":actual.mint.len(),"differing_tables":differences,"result":if differences.is_empty(){"equal"}else{"different"}});
     serde_json::to_writer_pretty(
         File::create(path.join("comparison-result.json")).unwrap(),
         &summary,
@@ -482,4 +520,22 @@ pub fn run_mode(path: &Path, planning: bool) {
 
 pub fn run(path: &Path) {
     run_mode(path, false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unresolved_non_effective_return_is_reportable_while_effective_output_is_required() {
+        let supplements = Supplements::default();
+        assert!(
+            resolved_output(None, 3, "unused", &supplements, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            resolved_output(None, 3, "effective", &supplements, true).unwrap_err(),
+            "effective_output_comparison_unavailable"
+        );
+    }
 }

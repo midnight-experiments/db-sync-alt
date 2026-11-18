@@ -33,6 +33,61 @@ fn real_output_fallback_preserves_body_coordinates_value_and_collateral_role() {
         "valid collateral return is outside the transaction's effects"
     );
     let mut bad = reply.clone();
+    bad.outputs[0].address = "invalid".to_owned();
+    assert_eq!(
+        resolve_outputs(&tx, &bad).unwrap_err(),
+        "provider_output_address_mismatch"
+    );
+    let mut bad = reply.clone();
+    bad.outputs[0].inline_datum = Some(serde_json::from_value(serde_json::json!("00")).unwrap());
+    assert_eq!(
+        resolve_outputs(&tx, &bad).unwrap_err(),
+        "provider_inline_datum_hash_mismatch"
+    );
+    let mut bad = reply.clone();
+    bad.outputs[0]
+        .amount
+        .retain(|amount| amount.unit != "lovelace");
+    assert_eq!(
+        resolve_outputs(&tx, &bad).unwrap_err(),
+        "provider_invalid_response"
+    );
+    let mut bad = reply.clone();
+    bad.outputs[1].output_index = bad.outputs[0].output_index;
+    assert_eq!(
+        resolve_outputs(&tx, &bad).unwrap_err(),
+        "provider_invalid_response"
+    );
+    let mut bad = reply.clone();
+    bad.outputs.pop();
+    assert_eq!(
+        resolve_outputs(&tx, &bad).unwrap_err(),
+        "provider_output_count_mismatch"
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::create_dir(scratch.path().join("outputs")).unwrap();
+    std::fs::write(
+        scratch.path().join(format!("outputs/{}.json", tx.hash)),
+        serde_json::to_vec(&bad).unwrap(),
+    )
+    .unwrap();
+    let request = dsa_chain::rows::SupplementRequest::Output {
+        transaction: tx.hash.clone(),
+        index: 0,
+    };
+    assert_eq!(
+        recorded::load(
+            scratch.path(),
+            &request,
+            1,
+            std::slice::from_ref(&tx),
+            &mut dsa_chain::rows::Supplements::default()
+        )
+        .unwrap_err()
+        .to_string(),
+        "provider_output_count_mismatch"
+    );
+    let mut bad = reply.clone();
     bad.outputs[0].amount[0].unit = "short".to_owned();
     assert_eq!(
         resolve_outputs(&tx, &bad).unwrap_err(),
@@ -150,5 +205,63 @@ fn recorded_404_is_scoped_to_the_requesting_block() {
         .unwrap_err()
         .to_string(),
         "provider_datum_hash_mismatch"
+    );
+}
+
+#[test]
+fn shared_positive_datum_requires_bound_capture_provenance() {
+    use dsa_chain::rows::{DatumAvailability, SupplementRequest, Supplements};
+    use sha2::{Digest, Sha256};
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::create_dir(scratch.path().join("datums")).unwrap();
+    let hash = transaction::hash(&[0]);
+    let request = SupplementRequest::Datum(hash.clone());
+    let file = scratch.path().join(format!("datums/{hash}.json"));
+    std::fs::write(&file, "\"00\"").unwrap();
+    assert!(
+        !recorded::load(
+            scratch.path(),
+            &request,
+            10,
+            &[],
+            &mut Supplements::default()
+        )
+        .unwrap(),
+        "an unproven shared200 must not silently supply a historical request"
+    );
+    // Native capture-metadata model. Actual corpus provenance records its real
+    // API recorder source and a measured completion timestamp or upper bound.
+    let mut capture = serde_json::json!({"format":"blockfrost-datum-capture-v1","datum_hash":hash,"response_sha256":format!("{:x}",Sha256::digest(std::fs::read(&file).unwrap())),"response_observed_no_later_than_unix":1,"time_basis":"recorder_completion_bound","capture_source_commit":"ae3853d62dec00c1094080099e8809bde9bd9a33","capture_working_tree":"clean","capture_code_blob":"ca1c98759c9e5fb01768481107b624cdfc2934f7","capture_code_basis":"exact_source_commit"});
+    let provenance = file.with_extension("provenance.json");
+    std::fs::write(&provenance, serde_json::to_vec(&capture).unwrap()).unwrap();
+    let mut known = Supplements::default();
+    assert!(recorded::load(scratch.path(), &request, 10, &[], &mut known).unwrap());
+    assert_eq!(known.datums[&hash], DatumAvailability::Present(vec![0]));
+    capture["response_observed_no_later_than_unix"] = serde_json::json!(u64::MAX);
+    std::fs::write(&provenance, serde_json::to_vec(&capture).unwrap()).unwrap();
+    assert_eq!(
+        recorded::load(
+            scratch.path(),
+            &request,
+            11,
+            &[],
+            &mut Supplements::default()
+        )
+        .unwrap_err()
+        .to_string(),
+        "invalid_shared_datum_capture_provenance"
+    );
+    capture["response_observed_no_later_than_unix"] = serde_json::json!(1);
+    capture["response_sha256"] = serde_json::json!("00".repeat(32));
+    std::fs::write(&provenance, serde_json::to_vec(&capture).unwrap()).unwrap();
+    assert!(
+        recorded::load(
+            scratch.path(),
+            &request,
+            11,
+            &[],
+            &mut Supplements::default()
+        )
+        .is_err()
     );
 }

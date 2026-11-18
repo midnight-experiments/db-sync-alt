@@ -38,3 +38,20 @@ Only public ledger responses and node-facing expected rows belong here.
 Source archives, source manifests, request counters, operator paths and
 credentials are excluded. Arbitrary-input and generic deep-item tests run on
 our own parser separately; these bundles contain real finalized transactions.
+
+The transaction reader supports the four-element Alonzo-and-later envelope.
+The pinned profiles and this projection corpus start in that period. The
+recorded Preprod projection headers span epochs 266 through 324 and timestamps
+1769107159 through 1794067347. The comparison report counts Pallas's decoder era
+classification separately. A compatible decoder classification establishes
+which representation was compared. Historical set/map normalization is proven
+by standalone helper vectors and pinned ledger rules, with real occurrence
+counts left to the full historical replay. Byron addresses in later-era
+outputs are distinct from a Byron-era transaction envelope.
+
+Shared positive datum replies require a capture sidecar that binds the exact
+reply digest, datum hash, recorder source and a past response-completion time
+or a documented recorder-completion upper bound. Replies recorded for one
+specific block can satisfy that block's request. The recorder records new
+request/completion times. Reusing a verified positive reply preserves its
+original provenance and saves a repeat request.

@@ -12,10 +12,10 @@
   "datum_support_blocks": [
     4318350
   ],
-  "files": 21,
-  "raw_bundle_bytes": 288390,
-  "compressed_bytes": 47807,
-  "compressed_sha256": "e43107f69a0d4b1369fd9c1764e97944758de57159a68271b12379d057f38277",
+  "files": 24,
+  "raw_bundle_bytes": 291696,
+  "compressed_bytes": 48596,
+  "compressed_sha256": "7111c2e00ccd86ec320a3e5fe36f49c581144e13de8c8acfc3eac7a970cfec8c",
   "expected": {
     "tx": 6,
     "tx_out": 7,
@@ -25,7 +25,7 @@
     "mint": 4,
     "datum": 6
   },
-  "scope": "Public finalized ledger records and independently exported legacy schema5 rows. Support-only blocks supply datum bytes without asserting their row projection; the complete local corpus retains the older bridge asset-row differences.",
+  "scope": "Public finalized ledger records and independently exported legacy schema5 rows. Projection blocks alone enter row and shape counts. Shared API replies carry qualified capture provenance. The complete local corpus retains the older bridge asset-row differences.",
   "coverage": {
     "decoded_transactions": 20,
     "pallas_compared": 20,
@@ -35,6 +35,8 @@
     "pointer_outputs": 0,
     "collateral_outputs_compared": 9,
     "fallback_outputs_compared": 0,
-    "multi_input_transactions": 13
+    "multi_input_transactions": 13,
+    "skipped_non_effective_collateral_outputs": 0,
+    "skipped_non_effective_ordinary_outputs": 0
   }
 }

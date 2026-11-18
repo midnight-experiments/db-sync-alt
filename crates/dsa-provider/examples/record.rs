@@ -24,6 +24,7 @@ use dsa_provider::{
     types::{Endpoint, Hash32, Header, Page, Reply, TransactionCbor},
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 #[derive(Parser)]
 struct Args {
@@ -342,6 +343,8 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                     }
                     match &request {
                         SupplementRequest::Datum(hash) => {
+                            let request_started_unix =
+                                SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                             let Reply::Datum(reply) =
                                 fetch(&provider, &args.output, Endpoint::Datum(hash.parse()?))
                                     .await?
@@ -353,6 +356,14 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                                     .output
                                     .join(format!("datums/{}-{hash}.json", block.height)),
                                 &reply,
+                            )?;
+                            let response_completed_unix =
+                                SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                            atomic_json(
+                                &args
+                                    .output
+                                    .join(format!("datums/{}-{hash}.capture.json", block.height)),
+                                &serde_json::json!({"format":"context-datum-capture-v1","block":block.height,"datum_hash":hash,"request_started_unix":request_started_unix,"response_completed_unix":response_completed_unix,"reply_sha256":format!("{:x}",sha2::Sha256::digest(std::fs::read(args.output.join(format!("datums/{}-{hash}.json",block.height)))?))}),
                             )?;
                         }
                         SupplementRequest::Metadata(hash) => {

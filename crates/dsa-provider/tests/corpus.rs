@@ -88,6 +88,35 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
     for directory in ["headers", "transactions", "datums", "metadata", "outputs"] {
         std::fs::create_dir_all(scratch.path().join("provider").join(directory)).unwrap();
     }
+    let plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(scratch.path().join("recording-plan.json")).unwrap())
+            .unwrap();
+    let heights: Vec<_> = plan["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["height"].clone())
+        .collect();
+    assert_eq!(
+        serde_json::Value::Array(heights.clone()),
+        manifest["projection_blocks"],
+        "only projection blocks may enter replay counts"
+    );
+    for height in manifest["datum_support_blocks"].as_array().unwrap() {
+        assert!(
+            !heights.contains(height),
+            "support-only block must not enter row or shape counts"
+        );
+        assert!(
+            scratch
+                .path()
+                .join(format!(
+                    "provider/transactions/{}.json",
+                    height.as_u64().unwrap()
+                ))
+                .exists()
+        );
+    }
     corpus::run_mode(scratch.path(), true);
     let missing: Vec<String> = serde_json::from_slice(
         &std::fs::read(scratch.path().join("missing-supplements.json")).unwrap(),

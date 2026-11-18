@@ -29,7 +29,7 @@ APPROVED_PNG = {}
 PNG_SIGNATURE = bytes((137, 80, 78, 71, 13, 10, 26, 10))
 APPROVED_JSON_GZIP = {
     'crates/dsa-provider/tests/fixtures/preprod-corpus.json.gz':
-        'e43107f69a0d4b1369fd9c1764e97944758de57159a68271b12379d057f38277',
+        '7111c2e00ccd86ec320a3e5fe36f49c581144e13de8c8acfc3eac7a970cfec8c',
 }
 
 FORBIDDEN_SUFFIXES = {'.dump','.db','.pem','.key','.log','.pyc','.pyo'}
