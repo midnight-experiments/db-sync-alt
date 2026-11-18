@@ -379,8 +379,17 @@ impl Fixture {
         }
         for (index, role) in ["ics", "reserve", "other"].into_iter().enumerate() {
             let out = self.output(8, 8, 20 + index as u16, role, "cnight", None);
-            self.add_asset(out, self.asset_id("auth"), 1);
-            self.add_asset(out, self.asset_id("bridge"), 2);
+            for (ordinal, role) in ["auth", "bridge"].into_iter().enumerate() {
+                let asset = self.asset_id(role);
+                if !self
+                    .chain
+                    .output_assets
+                    .values()
+                    .any(|a| a.output == out && a.asset == asset)
+                {
+                    self.add_asset(out, asset, 1 + ordinal as u16);
+                }
+            }
             for (ordinal, asset) in [9010, 9001, 9011].into_iter().enumerate() {
                 self.add_asset(out, asset, 3 + ordinal as u16);
             }
