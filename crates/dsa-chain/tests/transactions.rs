@@ -1,5 +1,6 @@
-use dsa_chain::transaction::{self, Asset, Outpoint};
-use pallas_traverse::{MultiEraAsset, MultiEraInput, MultiEraTx};
+use dsa_chain::transaction::{self, Asset, Outpoint, Output};
+use pallas_primitives::conway::MintedDatumOption;
+use pallas_traverse::{MultiEraAsset, MultiEraInput, MultiEraOutput, MultiEraTx};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -34,9 +35,39 @@ fn assets(values: Vec<MultiEraAsset<'_>>) -> Vec<Asset> {
     result
 }
 
+fn output(ours: &Output, theirs: &MultiEraOutput<'_>) {
+    assert_eq!(ours.coin, theirs.value().coin());
+    assert_eq!(
+        ours.address,
+        transaction::address_text(&theirs.address().unwrap().to_vec())
+    );
+    assert_eq!(
+        ours.assets,
+        assets(
+            theirs
+                .value()
+                .assets()
+                .iter()
+                .flat_map(|p| p.assets())
+                .collect()
+        )
+    );
+    let (hash, inline) = match theirs.datum() {
+        None => (None, None),
+        Some(MintedDatumOption::Hash(hash)) => (Some(hash.to_string()), None),
+        Some(MintedDatumOption::Data(data)) => {
+            let raw = data.0.raw_cbor();
+            (Some(transaction::hash(raw)), Some(raw.to_vec()))
+        }
+    };
+    assert_eq!(ours.data_hash, hash);
+    assert_eq!(ours.inline_datum, inline);
+}
+
 #[test]
 fn ra_14_a_and_c_real_original_bytes_inputs_outputs_mint_and_validity() {
     let mut compared = 0;
+    let mut collateral_compared = 0;
     for record in records() {
         let raw = hex::decode(record.cbor).unwrap();
         let tx = transaction::decode(&raw, &record.tx_hash).unwrap();
@@ -56,28 +87,27 @@ fn ra_14_a_and_c_real_original_bytes_inputs_outputs_mint_and_validity() {
             assert_eq!(tx.outputs.len(), outputs.len());
             for (ours, theirs) in tx.outputs.iter().zip(outputs) {
                 let ours = ours.as_ref().expect("classified recorded output");
-                assert_eq!(ours.coin, theirs.value().coin());
-                assert_eq!(ours.address_raw, theirs.address().unwrap().to_vec());
-                assert_eq!(
-                    ours.assets,
-                    assets(
-                        theirs
-                            .value()
-                            .assets()
-                            .iter()
-                            .flat_map(|p| p.assets())
-                            .collect()
-                    )
-                );
+                output(ours, &theirs);
             }
             assert_eq!(
                 tx.has_collateral_return,
                 other.collateral_return().is_some()
             );
+            if let Some(theirs) = other.collateral_return() {
+                collateral_compared += 1;
+                output(
+                    tx.collateral_output
+                        .as_ref()
+                        .expect("classified real collateral return"),
+                    &theirs,
+                );
+            }
         }
     }
     assert!(compared > 0);
-    println!("real_finalized_transactions_compared={compared}");
+    println!(
+        "real_finalized_transactions_compared={compared} collateral_returns_compared={collateral_compared}"
+    );
 }
 
 #[test]

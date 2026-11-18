@@ -12,7 +12,8 @@ use dsa_chain::{
     transaction::{self, Asset, Outpoint, Output},
 };
 use dsa_provider::types::{CborHex, Metadata, TransactionCbor, TransactionOutputs};
-use pallas_traverse::{MultiEraAsset, MultiEraInput, MultiEraTx};
+use pallas_primitives::conway::MintedDatumOption;
+use pallas_traverse::{MultiEraAsset, MultiEraInput, MultiEraOutput, MultiEraTx};
 use serde::{Deserialize, de::DeserializeOwned};
 
 #[derive(Deserialize)]
@@ -74,6 +75,52 @@ fn assets(values: Vec<MultiEraAsset<'_>>) -> Vec<Asset> {
         .collect();
     result.sort_by(|a, b| (&a.policy, &a.name).cmp(&(&b.policy, &b.name)));
     result
+}
+
+fn resolved_output<'a>(
+    output: Option<&'a Output>,
+    index: usize,
+    hash: &str,
+    supplements: &'a Supplements,
+) -> &'a Output {
+    output
+        .filter(|o| o.classification_safe)
+        .or_else(|| {
+            supplements
+                .outputs
+                .get(hash)
+                .and_then(|outputs| outputs.get(&u16::try_from(index).unwrap()))
+        })
+        .expect("recorded output fallback required for comparison")
+}
+
+fn compare_output(ours: &Output, theirs: &MultiEraOutput<'_>) {
+    assert_eq!(ours.coin, theirs.value().coin());
+    assert_eq!(
+        ours.address,
+        transaction::address_text(&theirs.address().unwrap().to_vec())
+    );
+    assert_eq!(
+        ours.assets,
+        assets(
+            theirs
+                .value()
+                .assets()
+                .iter()
+                .flat_map(|p| p.assets())
+                .collect()
+        )
+    );
+    let (hash, inline) = match theirs.datum() {
+        None => (None, None),
+        Some(MintedDatumOption::Hash(hash)) => (Some(hash.to_string()), None),
+        Some(MintedDatumOption::Data(data)) => {
+            let raw = data.0.raw_cbor();
+            (Some(transaction::hash(raw)), Some(raw.to_vec()))
+        }
+    };
+    assert_eq!(ours.data_hash, hash);
+    assert_eq!(ours.inline_datum, inline);
 }
 
 fn normalize_json(text: &str) -> serde_json::Value {
@@ -318,6 +365,7 @@ fn compare(path: &Path) {
     let (mut invalid_transactions, mut byron_outputs, mut pointer_outputs) =
         (0usize, 0usize, 0usize);
     let (mut decoded, mut compared, mut pallas_unavailable) = (0usize, 0usize, 0usize);
+    let (mut collateral_outputs_compared, mut fallback_outputs_compared) = (0usize, 0usize);
     for block in &plan.blocks {
         let records: Vec<TransactionCbor> =
             read(provider_path.join(format!("transactions/{}.json", block.height)));
@@ -375,30 +423,36 @@ fn compare(path: &Path) {
                     );
                     let outputs = other.outputs();
                     assert_eq!(tx.outputs.len(), outputs.len());
-                    for (ours, theirs) in tx.outputs.iter().zip(outputs) {
-                        if let Some(ours) = ours {
-                            assert_eq!(ours.coin, theirs.value().coin());
-                            assert_eq!(
-                                ours.address,
-                                transaction::address_text(&theirs.address().unwrap().to_vec())
-                            );
-                            assert_eq!(
-                                ours.assets,
-                                assets(
-                                    theirs
-                                        .value()
-                                        .assets()
-                                        .iter()
-                                        .flat_map(|p| p.assets())
-                                        .collect()
-                                )
-                            );
-                        }
+                    for (index, (ours, theirs)) in tx.outputs.iter().zip(outputs).enumerate() {
+                        fallback_outputs_compared +=
+                            usize::from(ours.as_ref().is_none_or(|o| !o.classification_safe));
+                        compare_output(
+                            resolved_output(ours.as_ref(), index, &tx.hash, &supplements),
+                            &theirs,
+                        );
                     }
                     assert_eq!(
                         tx.has_collateral_return,
                         other.collateral_return().is_some()
                     );
+                    if let Some(theirs) = other.collateral_return() {
+                        collateral_outputs_compared += 1;
+                        fallback_outputs_compared += usize::from(
+                            tx.collateral_output
+                                .as_ref()
+                                .is_none_or(|o| !o.classification_safe),
+                        );
+                        compare_output(
+                            resolved_output(
+                                tx.collateral_output.as_ref(),
+                                tx.outputs.len(),
+                                &tx.hash,
+                                &supplements,
+                            ),
+                            &theirs,
+                        );
+                        shape_witnesses.entry("collateral_return").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash,"valid":tx.valid}));
+                    }
                 }
                 Err(_) => pallas_unavailable += 1,
             }
@@ -493,7 +547,7 @@ fn compare(path: &Path) {
         &shape_witnesses,
     )
     .unwrap();
-    let summary = serde_json::json!({"network":plan.network,"blocks":plan.blocks.len(),"decoded_transactions":decoded,"pallas_compared":compared,"pallas_unavailable":pallas_unavailable,"invalid_transactions":invalid_transactions,"byron_outputs":byron_outputs,"pointer_outputs":pointer_outputs,"tx":actual.tx.len(),"outputs":actual.tx_out.len(),"assets":actual.ma_tx_out.len(),"spends":actual.tx_in.len(),"datums":actual.datum.len(),"metadata":actual.tx_metadata.len(),"mints":actual.mint.len(),"differing_tables":differences,"result":if differences.is_empty(){"equal"}else{"different"}});
+    let summary = serde_json::json!({"network":plan.network,"blocks":plan.blocks.len(),"decoded_transactions":decoded,"pallas_compared":compared,"pallas_unavailable":pallas_unavailable,"collateral_outputs_compared":collateral_outputs_compared,"fallback_outputs_compared":fallback_outputs_compared,"invalid_transactions":invalid_transactions,"byron_outputs":byron_outputs,"pointer_outputs":pointer_outputs,"tx":actual.tx.len(),"outputs":actual.tx_out.len(),"assets":actual.ma_tx_out.len(),"spends":actual.tx_in.len(),"datums":actual.datum.len(),"metadata":actual.tx_metadata.len(),"mints":actual.mint.len(),"differing_tables":differences,"result":if differences.is_empty(){"equal"}else{"different"}});
     serde_json::to_writer_pretty(
         File::create(path.join("comparison-result.json")).unwrap(),
         &summary,
