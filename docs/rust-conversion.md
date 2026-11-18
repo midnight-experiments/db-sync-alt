@@ -1,0 +1,71 @@
+# Convert a legacy database
+
+`db-sync-alt convert --network mainnet --database '<destination DSN>' --source '<reader DSN>'`
+loads an empty operator-owned PostgreSQL17 database from the legacy schema5
+public reader views. Source passwords must come from `--source-password-file`;
+destination passwords use `--password-file`. TLS is required by default and
+verifies the server name. Custom roots use `--source-tls-root-cert` and
+`--tls-root-cert`. An explicit `sslmode=disable` permits a local connection.
+
+The source session is read-only by default, with one REPEATABLE READ READ ONLY
+transaction covering anchors, selected rows, supply and old-spent state. It
+requires the exact legacy reader grant, without TEMP or private chain access.
+The target is the newest stored header minus the profile's security parameter,
+even when event rows are much older or the legacy follower is behind the chain.
+Network identity requires a positive pinned start header or a positive held
+asset under a policy exclusive to that network's generated configuration.
+Shared Preprod/Preview cNIGHT, auth and mapping units alone are ambiguous and
+are refused. Preview is not selectable.
+
+The initial default horizon is the latest source header at or before seven
+days before the *source target's timestamp*. It is independent of wall clock
+and of a fixed block-rate estimate. `--retention-seconds` accepts durations of
+at least86400; `--horizon-block` chooses an explicit height instead. A short
+source clamps to its verified beginning, reporting its shorter coverage. A
+matched pinned start establishes the legacy continuous suffix; isolated older
+origin and epoch headers remain available for retention selection. Without a
+matched anchor, the oldest physical header is the conservative beginning.
+Any hole within the promised horizon-to-tip window is refused. Only that
+bounded window is counted for continuity; horizon navigation uses indexed ID
+seeks and point reads, without materializing all historical headers.
+
+Each event in [horizon,target] receives first-served time when the conversion
+publishes. Header-only rows in (target,tip] do not receive first-served entries.
+This gives the full retention period after conversion, including a lagging
+source. The original selected rows, IDs and asset ordinals are preserved.
+
+The source sends one natural-key stream per family. Destination batches use
+`--batch-rows` (default4096) and `--batch-bytes` (default4MiB); one larger
+supported row travels alone. Source work includes prefix unspent/carry
+selection and sorting. Reports include actual source limits, work_mem,
+header/horizon read times and each family's row/byte/batch counts and wall
+cost. The transaction can hold back source vacuum while active.
+
+PostgreSQL's configured statement and idle-transaction limits are preserved.
+Explicit positive overrides are connection-local:
+`--source-statement-timeout-seconds`,
+`--source-idle-transaction-timeout-seconds`,
+`--statement-timeout-seconds`, and `--idle-transaction-timeout-seconds`.
+Source statement time includes destination backpressure. A destination can be
+idle while a source sort runs; a caller's short idle limit can therefore end a
+conversion. Limits are never silently disabled. Live-source limits still
+require the operator's authorization; synthetic timing does not change them.
+
+Source, horizon, destination and optional snapshot path preflights precede
+layout or ACL mutations. A serving or occupied destination is preserved.
+Loading and publication use one destination transaction; cancellation rolls
+back rows and leaves a closed, explicitly owned `convert_failed` layout that
+may be retried. A failed restore belongs to restore and is refused by convert.
+
+`--snapshot new-file.dsa` writes a verified snapshot after conversion publishes.
+A missing/unwritable parent is refused during preflight. If the path becomes
+unusable later, the command reports `conversion_completed_snapshot_failed`,
+`converted:true`, both completed digests and recovery instructions. The
+database remains serving. Run `snapshot --file` with a usable new path rather
+than repeating convert. Provenance contains chain anchors and source kind,
+never connection strings, credential files or host names.
+
+Library callers can use `LegacySource::snapshot` and `Store::stage_conversion`
+to capture reference answers in the same source transaction. Commit the source
+transaction before `StagedConversion::finish` to avoid keeping it idle during
+destination index construction and verification.

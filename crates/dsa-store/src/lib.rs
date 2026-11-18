@@ -54,7 +54,11 @@ pub enum Error {
     #[error("snapshot_published_durability_uncertain")]
     PublishedDurabilityUncertain,
     #[error("conversion_completed_snapshot_failed")]
-    ConvertedSnapshot(Box<Error>),
+    ConvertedSnapshot {
+        error: Box<Error>,
+        content_digest: String,
+        state_digest: String,
+    },
 }
 
 impl Error {
@@ -73,8 +77,12 @@ impl Error {
             Self::PublishedDurabilityUncertain => {
                 json!({"error":"snapshot_published_durability_uncertain","published":true,"durability":"uncertain"})
             }
-            Self::ConvertedSnapshot(error) => {
-                json!({"error":"conversion_completed_snapshot_failed","converted":true,"snapshot_error":error.report()})
+            Self::ConvertedSnapshot {
+                error,
+                content_digest,
+                state_digest,
+            } => {
+                json!({"error":"conversion_completed_snapshot_failed","converted":true,"content_digest":content_digest,"state_digest":state_digest,"recovery":"The database is serving. Run snapshot with this destination and a new writable --file path; do not repeat convert.","snapshot_error":error.report()})
             }
             _ => json!({"error": self.to_string()}),
         }
@@ -122,6 +130,12 @@ impl Store {
             config.ssl_mode(SslMode::Require);
         } else {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        // Prefer is the driver's default and permits plaintext fallback. All
+        // implicit/default connections require authenticated TLS. Local use
+        // remains possible only through an explicit sslmode=disable.
+        if config.get_ssl_mode() == SslMode::Prefer {
+            config.ssl_mode(SslMode::Require);
         }
         let tls = rustls::ClientConfig::builder()
             .with_root_certificates(roots)

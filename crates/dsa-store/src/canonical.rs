@@ -86,21 +86,41 @@ pub(crate) fn selected_source(table: &str) -> Result<String, Error> {
         "id"
     };
     let target = format!("public.{table} {alias}");
-    let mut from = from.replace("serve.", "public.").replacen(
-        &target,
-        &format!("{target} JOIN keep_{table} selected ON selected.id={alias}.{key}"),
-        1,
-    );
+    // Preserve the raw selected row even if a source reference is missing.
+    // Destination closure validation must refuse it, rather than fingerprint
+    // and publish the same silently shortened stream on both sides.
+    let mut from = from
+        .replace(" JOIN serve.", " LEFT JOIN public.")
+        .replace("serve.", "public.")
+        .replacen(
+            &target,
+            &format!("{target} JOIN keep_{table} selected ON selected.id={alias}.{key}"),
+            1,
+        );
     if !from.contains("CROSS JOIN h") {
         from.push_str(" CROSS JOIN h");
+    }
+    if table == "ma_tx_out" {
+        // K2 includes every window asset row. A corrupt orphan cannot be found
+        // through keep_tx_out: retain the bounded raw window keys too. On a
+        // closed source this union is identical to keep_ma_tx_out.
+        from = from.replace(
+            "JOIN keep_ma_tx_out selected",
+            "JOIN conversion_assets selected",
+        );
     }
     let marker = if table == "tx_out" {
         "CASE WHEN o.id<h.height*16777216 AND EXISTS(SELECT 1 FROM public.tx_in spent WHERE spent.tx_out_id=o.tx_id AND spent.tx_out_index=o.index AND spent.id BETWEEN 0 AND h.height*16777216-1) THEN jsonb_build_array(encode(t.hash,'hex'),o.index)::text ELSE NULL::text END"
     } else {
         "NULL::text"
     };
+    let extra = if table == "ma_tx_out" {
+        ", conversion_assets AS (SELECT id FROM keep_ma_tx_out UNION SELECT id FROM public.ma_tx_out WHERE id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735)"
+    } else {
+        ""
+    };
     Ok(format!(
-        "{}, h AS (SELECT $1::bigint AS height) SELECT to_jsonb({alias})::text,jsonb_build_array({payload})::text,{alias}.{key}::bigint,{marker} FROM {from} ORDER BY {order}",
+        "{}{extra}, h AS (SELECT $1::bigint AS height) SELECT to_jsonb({alias})::text,jsonb_build_array({payload})::text,{alias}.{key}::bigint,{marker} FROM {from} ORDER BY {order}",
         crate::keep::Selection::ctes_sql(crate::keep::SourceSchema::Public)
     ))
 }

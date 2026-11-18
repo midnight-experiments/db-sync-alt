@@ -5,12 +5,14 @@
 //! anchors come from that one transaction. Catalog checks require schema5's
 //! eleven public gated views and the legacy gate, with the exact reader grant:
 //! no TEMP, private facts, writes, ownership, privileged role or membership.
-//! Network evidence is the fixed cNIGHT unit and the profile start hash when the
-//! source covers that header. No provider or private mint table is consulted.
+//! Network evidence is a positive non-placeholder pinned start hash or a held
+//! positive asset from a policy exclusive to this network's generated profiles.
+//! Shared Preprod/Preview units alone are ambiguous. No private facts are read.
 //!
 //! The newest source header P determines target T=P-k, independently of the last
-//! event. A bounded materialized ID-bounds/count aggregate checks complete source
-//! headers. Default H is the newest header at/before target.time-retention, found
+//! event. Indexed endpoint seeks and a bounded count verify the promised suffix,
+//! accepting isolated older origin/epoch headers below a verified start anchor.
+//! Default H is the newest header at/before target.time-retention, found
 //! by indexed height bisection on monotone Cardano header times, without a time
 //! index or a block-rate estimate. Shorter source history clamps H to its first
 //! header. Report chosen times, elapsed target-H seconds, clamp and read cost.
@@ -89,6 +91,17 @@ impl ConvertOptions {
         }
         if self.snapshot.as_ref().is_some_and(|p| p.exists()) {
             return Err(Error::Refusal("snapshot_already_exists"));
+        }
+        if let Some(path) = &self.snapshot {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            // Probe only a disposable file; never create the requested output.
+            // A later filesystem failure is still possible and has a distinct
+            // completed-conversion report with recovery instructions.
+            tempfile::NamedTempFile::new_in(parent)
+                .map_err(|_| Error::Refusal("invalid_snapshot_destination"))?;
         }
         Ok(())
     }
@@ -176,6 +189,9 @@ pub struct SourceReport {
     pub state: ServingState,
     pub settings: SourceSettings,
     pub source_header_count: i64,
+    pub source_first_header: u32,
+    pub continuous_start_height: u32,
+    pub network_evidence: String,
     pub bounds_read_seconds: f64,
     pub horizon_read_seconds: f64,
     pub horizon_point_queries: u32,
@@ -399,13 +415,94 @@ async fn header(source: &Transaction<'_>, height: u32) -> Result<Position, Error
     })
 }
 
+// Both endpoint seeks have only an ID range predicate: the index returns its
+// first qualifying tuple, without a filtered backward walk over event tables.
+async fn endpoint(
+    source: &Transaction<'_>,
+    low: u32,
+    high: u32,
+    newest: bool,
+) -> Result<Option<u32>, Error> {
+    let direction = if newest { "DESC" } else { "ASC" };
+    let sql = format!(
+        "SELECT id FROM public.block WHERE id BETWEEN $1 AND $2 ORDER BY id {direction} LIMIT 1"
+    );
+    source
+        .query_opt(&sql, &[&i64::from(low), &i64::from(high)])
+        .await?
+        .map(|r| {
+            u32::try_from(r.get::<_, i64>(0))
+                .map_err(|_| Error::Refusal("source_height_out_of_range"))
+        })
+        .transpose()
+}
+
 async fn old_enough(
     source: &Transaction<'_>,
     height: u32,
     target: &Position,
     retention: i64,
 ) -> Result<bool, Error> {
-    Ok(source.query_one("SELECT extract(epoch FROM (($2::text::timestamptz AT TIME ZONE 'UTC')-time)) >= $3::bigint FROM public.block WHERE id=$1",&[&i64::from(height),&target.time,&retention]).await?.get(0))
+    Ok(source.query_one("SELECT extract(epoch FROM (($2::text::timestamptz AT TIME ZONE 'UTC')-time)) >= $3::bigint FROM public.block WHERE id=$1", &[&i64::from(height), &target.time, &retention]).await?.get(0))
+}
+
+async fn network_evidence(
+    source: &Transaction<'_>,
+    profile: &Profile,
+    tip: u32,
+) -> Result<(String, Option<u32>), Error> {
+    if profile.start.block_hash.bytes().all(|b| b == b'0') {
+        return Err(Error::Refusal("source_profile_has_no_positive_anchor"));
+    }
+    let anchor = profile.start.block_number;
+    if anchor <= tip
+        && source
+            .query_opt(
+                "SELECT encode(hash,'hex') FROM public.block WHERE id=$1",
+                &[&i64::from(anchor)],
+            )
+            .await?
+            .is_some_and(|r| r.get::<_, String>(0) != profile.start.block_hash)
+    {
+        return Err(Error::Refusal("source_start_anchor_mismatch"));
+    }
+    if anchor <= tip
+        && source
+            .query_opt(
+                "SELECT id FROM public.block WHERE id=$1",
+                &[&i64::from(anchor)],
+            )
+            .await?
+            .is_some()
+    {
+        return Ok(("pinned_start_header".to_owned(), Some(anchor)));
+    }
+    // Compare policy IDs, not names: Preprod's bridge NIGHT name does not
+    // distinguish it from Preview, whose cNIGHT policy is the same.
+    let known: Vec<Profile> = [
+        include_str!("../../dsa-chain/profiles/mainnet.json"),
+        include_str!("../../dsa-chain/profiles/preprod.json"),
+        include_str!("../../dsa-chain/profiles/preview.json"),
+    ]
+    .into_iter()
+    .map(serde_json::from_str)
+    .collect::<Result<_, _>>()?;
+    let policies = profile
+        .assets
+        .values()
+        .filter(|a| {
+            !known
+                .iter()
+                .filter(|p| p.network != profile.network)
+                .any(|p| p.assets.values().any(|other| other.policy == a.policy))
+        })
+        .map(|a| hex::decode(&a.policy).map_err(|_| Error::Refusal("invalid_keep_profile")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let positive: bool = source.query_one("SELECT EXISTS(SELECT 1 FROM public.multi_asset m JOIN public.ma_tx_out a ON a.ident=m.id JOIN public.tx_out o ON o.id=a.tx_out_id JOIN public.tx t ON t.id=o.tx_id WHERE m.policy=ANY($1::bytea[]) AND a.quantity>0 AND a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735 AND o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND t.id BETWEEN 0 AND $2::bigint*4096+4095)", &[&policies, &i64::from(tip)]).await?.get(0);
+    if !positive {
+        return Err(Error::Refusal("source_network_ambiguous"));
+    }
+    Ok(("positive_network_exclusive_policy".to_owned(), None))
 }
 
 async fn source_report(
@@ -417,46 +514,27 @@ async fn source_report(
     let gate = validate_reader(source).await?;
     validate_schema(source, gate).await?;
     let start = Instant::now();
-    // The materialized bounded input prevents a planner min/max index shortcut.
-    // Only this one bounds pass scans history; time navigation uses point reads.
-    let row=source.query_one("WITH ids AS MATERIALIZED(SELECT id FROM public.block WHERE id BETWEEN 0 AND 134217727) SELECT min(id),max(id),count(*) FROM ids",&[]).await?;
-    let first = row
-        .get::<_, Option<i64>>(0)
+    let newest = endpoint(source, 0, 134217727, true)
+        .await?
         .ok_or(Error::Refusal("source_has_no_headers"))?;
-    let newest = row
-        .get::<_, Option<i64>>(1)
+    let oldest = endpoint(source, 0, newest, false)
+        .await?
         .ok_or(Error::Refusal("source_has_no_headers"))?;
-    let count: i64 = row.get(2);
-    if count != newest - first + 1 {
-        return Err(Error::Refusal("source_header_gap"));
-    }
-    let first = u32::try_from(first).map_err(|_| Error::Refusal("source_height_out_of_range"))?;
-    let newest = u32::try_from(newest).map_err(|_| Error::Refusal("source_height_out_of_range"))?;
     let tip = header(source, newest).await?;
     let target_height = newest
         .checked_sub(profile.cardano.security_parameter)
         .ok_or(Error::Refusal("source_tip_below_security_parameter"))?;
-    if target_height < first {
+    let target = header(source, target_height).await?;
+    let (network_evidence, start_anchor) = network_evidence(source, profile, newest).await?;
+    // The shipped, positively matched start is a verified beginning of legacy
+    // coverage. Older origin/epoch rows are deliberately outside this suffix.
+    // Without it use the oldest actual header and refuse any intervening hole;
+    // an arbitrary gap is never silently reclassified as a history truncation.
+    let first = start_anchor.unwrap_or(oldest);
+    if first > target_height {
         return Err(Error::Refusal("source_target_before_history"));
     }
-    let target = header(source, target_height).await?;
     let bounds_read_seconds = start.elapsed().as_secs_f64();
-    let cn = profile
-        .assets
-        .get("cnight")
-        .ok_or(Error::Refusal("invalid_keep_profile"))?;
-    let policy = hex::decode(&cn.policy).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
-    let name = hex::decode(&cn.name).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
-    let network:bool=source.query_one("SELECT EXISTS(SELECT 1 FROM public.multi_asset WHERE policy=$1::bytea AND name=$2::bytea)",&[&policy,&name]).await?.get(0);
-    if !network {
-        return Err(Error::Refusal("network_mismatch"));
-    }
-    if profile.start.block_number >= first
-        && profile.start.block_number <= newest
-        && header(source, profile.start.block_number).await?.hash != profile.start.block_hash
-    {
-        return Err(Error::Refusal("source_start_anchor_mismatch"));
-    }
     let horizon_started = Instant::now();
     let mut point_queries = 0;
     let mut clamped = false;
@@ -478,15 +556,39 @@ async fn source_report(
             while low < high {
                 let mid = low + (high - low).div_ceil(2);
                 point_queries += 1;
-                if old_enough(source, mid, &target, options.retention_seconds).await? {
+                let preceding = endpoint(source, first, mid, true)
+                    .await?
+                    .ok_or(Error::Refusal("source_header_gap"))?;
+                if old_enough(source, preceding, &target, options.retention_seconds).await? {
                     low = mid;
                 } else {
                     high = mid - 1;
                 }
             }
-            low
+            endpoint(source, first, low, true)
+                .await?
+                .ok_or(Error::Refusal("source_header_gap"))?
         }
     };
+    // Combined count/min/max consumes only the requested suffix. count(*)
+    // prevents PostgreSQL's MinMaxAgg shortcut without a materialized spool.
+    let range = source
+        .query_one(
+            "SELECT count(*),min(id),max(id) FROM public.block WHERE id BETWEEN $1 AND $2",
+            &[&i64::from(horizon), &i64::from(newest)],
+        )
+        .await?;
+    let count: i64 = range.get(0);
+    if count != i64::from(newest) - i64::from(horizon) + 1
+        || range.get::<_, Option<i64>>(1) != Some(i64::from(horizon))
+        || range.get::<_, Option<i64>>(2) != Some(i64::from(newest))
+    {
+        return Err(Error::Refusal("source_header_gap"));
+    }
+    let has_spend: bool = source.query_one("SELECT EXISTS(SELECT 1 FROM public.tx_in WHERE id BETWEEN 0 AND $1::bigint*16777216+16777215)", &[&i64::from(target_height)]).await?.get(0);
+    if !has_spend {
+        return Err(Error::Refusal("source_has_no_spends"));
+    }
     let horizon = header(source, horizon).await?;
     point_queries += 1;
     let covered=source.query_one("SELECT extract(epoch FROM ($1::text::timestamptz-$2::text::timestamptz))::text,extract(epoch FROM ($1::text::timestamptz-$2::text::timestamptz))<$3::bigint,to_char(transaction_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",&[&target.time,&horizon.time,&options.retention_seconds]).await?;
@@ -511,6 +613,9 @@ async fn source_report(
         },
         settings,
         source_header_count: count,
+        source_first_header: oldest,
+        continuous_start_height: first,
+        network_evidence,
         bounds_read_seconds,
         horizon_read_seconds: horizon_started.elapsed().as_secs_f64(),
         horizon_point_queries: point_queries,
@@ -587,6 +692,58 @@ impl Batch {
 }
 
 impl Store {
+    /// Read-only refusal check. prepare_destination repeats its authoritative
+    /// checks under the writer lock after source preflight, closing the race.
+    async fn conversion_destination_preflight(&self, profile: &Profile) -> Result<(), Error> {
+        let identity: bool = self
+            .client
+            .query_one("SELECT to_regclass('dsa.identity') IS NOT NULL", &[])
+            .await?
+            .get(0);
+        if !identity {
+            let occupied: bool = self.client.query_one("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('public','information_schema')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public') OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public') OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public') OR EXISTS(SELECT 1 FROM pg_extension WHERE extname<>'plpgsql')", &[]).await?.get(0);
+            return if occupied {
+                Err(Error::Refusal("destination_not_empty"))
+            } else {
+                Ok(())
+            };
+        }
+        self.open(profile).await?;
+        let row = self.client.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1", &[]).await?;
+        if row.get::<_, bool>(0) {
+            return Err(Error::Refusal("destination_not_empty"));
+        }
+        let origin: Option<String> = row.get(1);
+        if origin.as_deref() == Some("restore_failed") {
+            return Err(Error::Refusal("destination_owned_by_failed_restore"));
+        }
+        if !matches!(origin.as_deref(), Some("empty" | "convert_failed")) {
+            return Err(Error::Refusal("destination_not_empty"));
+        }
+        let mut counts = NODE_RELATIONS
+            .iter()
+            .map(|t| format!("(SELECT count(*) FROM serve.{t})"))
+            .collect::<Vec<_>>();
+        counts.extend(
+            [
+                "dsa.consumed_before_horizon",
+                "dsa.supply",
+                "dsa.first_served",
+                "dsa.calls",
+            ]
+            .map(|t| format!("(SELECT count(*) FROM {t})")),
+        );
+        let occupied: i64 = self
+            .client
+            .query_one(&format!("SELECT {}", counts.join("+")), &[])
+            .await?
+            .get(0);
+        if occupied != 0 {
+            return Err(Error::Refusal("destination_not_empty"));
+        }
+        Ok(())
+    }
+
     /// The caller retains the source transaction for reference-answer capture.
     /// Finish/commit source reads before `StagedConversion::finish` if possible.
     pub async fn stage_conversion<'a>(
@@ -596,9 +753,10 @@ impl Store {
         options: &ConvertOptions,
     ) -> Result<StagedConversion<'a>, Error> {
         options.validate()?;
-        self.prepare_destination(profile, "convert_failed").await?;
+        self.conversion_destination_preflight(profile).await?;
         let mut report = source_report(source, profile, options).await?;
         let amounts = supply(source, profile, report.state.target.height).await?;
+        self.prepare_destination(profile, "convert_failed").await?;
         let selection = Selection::new(
             profile,
             Bounds {
@@ -694,11 +852,13 @@ impl Store {
         snapshot.commit().await?;
         let mut converted = stage.finish(profile).await?;
         if let Some(path) = &options.snapshot {
-            converted.snapshot = Some(
-                self.snapshot(profile, path)
-                    .await
-                    .map_err(|error| Error::ConvertedSnapshot(Box::new(error)))?,
-            );
+            converted.snapshot = Some(self.snapshot(profile, path).await.map_err(|error| {
+                Error::ConvertedSnapshot {
+                    error: Box::new(error),
+                    content_digest: converted.verified.content_digest.clone(),
+                    state_digest: converted.verified.state_digest.clone(),
+                }
+            })?);
         }
         Ok(converted)
     }
