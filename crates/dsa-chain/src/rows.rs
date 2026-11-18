@@ -547,7 +547,7 @@ mod tests {
             "address-relevant outputs survive with zero retained token rows"
         );
         assert_eq!(rows.ma_tx_out.len(), 20);
-        for (transaction, chunk) in rows.ma_tx_out.chunks_exact(5).enumerate() {
+        for (transaction, chunk) in rows.ma_tx_out.as_chunks::<5>().0.iter().enumerate() {
             for (row, ordinal) in chunk.iter().zip([1, 3, 4, 6, 7]) {
                 assert_eq!(
                     row.id,
