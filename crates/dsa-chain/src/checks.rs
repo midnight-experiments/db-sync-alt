@@ -125,7 +125,30 @@ fn add_assets(
     Ok(())
 }
 
+/// Check consecutive headers, including headers whose events are not final yet.
+pub fn check_header(previous: &Header, header: &Header) -> Result<(), CheckError> {
+    if ids::block_id(header.height).is_err() {
+        return Err(CheckError::Position {
+            height: header.height,
+        });
+    }
+    let expected = previous.height.saturating_add(1);
+    if header.height != expected {
+        return Err(CheckError::HeaderHeight {
+            height: header.height,
+            expected,
+        });
+    }
+    if header.previous_hash.as_ref() != Some(&previous.hash) {
+        return Err(CheckError::HeaderParent {
+            height: header.height,
+        });
+    }
+    Ok(())
+}
+
 /// Check a finalized block without mutating the caller's held set or supply.
+/// The previous header is the immediate predecessor of this event block.
 /// Same-block creations are visible through the same bounded overlay used by
 /// row construction. Missing output supplements retain their typed request.
 pub fn check_block(
@@ -143,20 +166,9 @@ pub fn check_block(
             target: previous_target,
         });
     }
-    if ids::block_id(header.height).is_err() || transactions.len() > usize::from(ids::INDEX_LIMIT) {
+    check_header(previous, header)?;
+    if transactions.len() > usize::from(ids::INDEX_LIMIT) {
         return Err(CheckError::Position {
-            height: header.height,
-        });
-    }
-    let expected = previous.height.saturating_add(1);
-    if header.height != expected {
-        return Err(CheckError::HeaderHeight {
-            height: header.height,
-            expected,
-        });
-    }
-    if header.previous_hash.as_ref() != Some(&previous.hash) {
-        return Err(CheckError::HeaderParent {
             height: header.height,
         });
     }
