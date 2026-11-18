@@ -21,13 +21,34 @@ struct Bundle {
     sha256: BTreeMap<String, String>,
 }
 
-#[test]
-fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/preprod-corpus.json.gz");
+fn replay(network: &str) -> (tempfile::TempDir, serde_json::Value) {
+    assert!(["mainnet", "preprod"].contains(&network));
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/fixtures/{network}-corpus.json.gz"));
     let compressed = std::fs::read(fixture).expect("committed recorded subset");
-    let manifest: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/preprod-corpus.manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("tests/fixtures/{network}-corpus.manifest.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let combined = std::fs::metadata(directory.join("preprod-corpus.json.gz"))
+        .unwrap()
+        .len()
+        + std::fs::metadata(directory.join("mainnet-corpus.json.gz"))
+            .unwrap()
+            .len()
+        + std::fs::metadata(directory.join("pagination-finalized.json"))
+            .unwrap()
+            .len();
+    assert!(
+        combined <= 5 * 1024 * 1024,
+        "combined recorded subset budget, conservatively including uncompressed pagination input"
+    );
+    assert_eq!(manifest["network"].as_str().unwrap(), network);
     assert_eq!(
         format!("{:x}", Sha256::digest(&compressed)),
         manifest["compressed_sha256"].as_str().unwrap()
@@ -56,7 +77,7 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
         manifest["files"].as_u64().unwrap()
     );
     assert_eq!(bundle.format, "recorded-corpus-v1");
-    assert_eq!(bundle.network, "preprod");
+    assert_eq!(bundle.network, network);
     assert_eq!(bundle.files.len(), bundle.sha256.len());
     let scratch = tempfile::tempdir().unwrap();
     for (name, content) in bundle.files {
@@ -117,47 +138,49 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
                 .exists()
         );
     }
-    // These real bootstrap outpoints exercise token selection separately from
-    // projection-row and shape counts. Their original block remains support-only.
-    let profile = dsa_chain::profiles::Profile::load("preprod").unwrap();
-    let selection = dsa_chain::rows::Selection::new(&profile);
-    let bootstrap: Vec<dsa_provider::types::TransactionCbor> = serde_json::from_slice(
-        &std::fs::read(scratch.path().join("provider/transactions/4318350.json")).unwrap(),
-    )
-    .unwrap();
-    for (hash, policy) in [
-        (
-            "ed8a1f6afb4cb2b10e37e1092601a20a021da7231faafe10816f3c56bc3532d0",
-            "fb964a2751bb9cb9c7a6d1475d1ea4a3960820a0f318883647502426",
-        ),
-        (
-            "725c21c20c9193fe813d98cf886cd9e5e40187ac18cfc3be6e30bb349cbc90b4",
-            "475db387ba92282a387e9ddfb7f8d2fd297f9b660450005f3ed37550",
-        ),
-    ] {
-        let record = bootstrap
-            .iter()
-            .find(|record| record.tx_hash.as_str() == hash)
-            .unwrap();
-        let bytes = hex::decode(record.cbor.as_str()).unwrap();
-        let tx = dsa_chain::transaction::decode(&bytes, hash).unwrap();
-        let supplements = dsa_chain::rows::Supplements::default();
-        let outputs = dsa_chain::rows::effective_outputs(&tx, &supplements).unwrap();
-        let output = outputs.iter().find(|(index, _)| *index == 2).unwrap().1;
-        assert!(
-            selection.relevant(output),
-            "the address retains the original output"
-        );
-        let foreign = output
-            .assets
-            .iter()
-            .find(|asset| asset.policy == policy && asset.name.is_empty())
-            .unwrap();
-        assert_eq!(foreign.quantity, 1);
-        assert!(
-            !selection.required(foreign),
-            "v2 omits the observed foreign bootstrap token at its original outpoint"
-        );
+    if network == "preprod" {
+        // These real bootstrap outpoints exercise token selection separately from
+        // projection-row and shape counts. Their original block remains support-only.
+        let profile = dsa_chain::profiles::Profile::load("preprod").unwrap();
+        let selection = dsa_chain::rows::Selection::new(&profile);
+        let bootstrap: Vec<dsa_provider::types::TransactionCbor> = serde_json::from_slice(
+            &std::fs::read(scratch.path().join("provider/transactions/4318350.json")).unwrap(),
+        )
+        .unwrap();
+        for (hash, policy) in [
+            (
+                "ed8a1f6afb4cb2b10e37e1092601a20a021da7231faafe10816f3c56bc3532d0",
+                "fb964a2751bb9cb9c7a6d1475d1ea4a3960820a0f318883647502426",
+            ),
+            (
+                "725c21c20c9193fe813d98cf886cd9e5e40187ac18cfc3be6e30bb349cbc90b4",
+                "475db387ba92282a387e9ddfb7f8d2fd297f9b660450005f3ed37550",
+            ),
+        ] {
+            let record = bootstrap
+                .iter()
+                .find(|record| record.tx_hash.as_str() == hash)
+                .unwrap();
+            let bytes = hex::decode(record.cbor.as_str()).unwrap();
+            let tx = dsa_chain::transaction::decode(&bytes, hash).unwrap();
+            let supplements = dsa_chain::rows::Supplements::default();
+            let outputs = dsa_chain::rows::effective_outputs(&tx, &supplements).unwrap();
+            let output = outputs.iter().find(|(index, _)| *index == 2).unwrap().1;
+            assert!(
+                selection.relevant(output),
+                "the address retains the original output"
+            );
+            let foreign = output
+                .assets
+                .iter()
+                .find(|asset| asset.policy == policy && asset.name.is_empty())
+                .unwrap();
+            assert_eq!(foreign.quantity, 1);
+            assert!(
+                !selection.required(foreign),
+                "v2 omits the observed foreign bootstrap token at its original outpoint"
+            );
+        }
     }
     // The replay's test boundary checks and builds every block from the same
     // decoded capture, with independent SQL origins and fixed mint effects.
@@ -192,6 +215,22 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
         if source["capture"]["format"] == "blockfrost-datum-capture-v1" {
             assert_eq!(entry["request"]["Datum"], source["capture"]["datum_hash"]);
         }
+        if source["capture"]["format"] == "context-datum-capture-v1" {
+            let capture = &source["capture"];
+            assert_eq!(capture["block"], entry["block"]);
+            assert_eq!(capture["datum_hash"], entry["request"]["Datum"]);
+            assert_eq!(capture["reply_sha256"], source["response_sha256"]);
+            let started = capture["request_started_unix"].as_u64().unwrap();
+            let completed = capture["response_completed_unix"].as_u64().unwrap();
+            assert!(0 < started && started <= completed);
+            assert!(
+                completed
+                    <= std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+            );
+        }
     }
     let summary: serde_json::Value = serde_json::from_slice(
         &std::fs::read(scratch.path().join("comparison-result.json")).unwrap(),
@@ -217,4 +256,154 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
     }
     assert!(summary["decoded_transactions"].as_u64().unwrap() > 0);
     assert_eq!(summary["pallas_unavailable"], 0);
+    println!("public_subset_{network} {summary}");
+    (scratch, manifest)
+}
+
+#[test]
+fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
+    replay("preprod");
+}
+
+#[test]
+fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
+    let (scratch, manifest) = replay("mainnet");
+    let expected: dsa_chain::rows::Rows =
+        serde_json::from_slice(&std::fs::read(scratch.path().join("expected.json")).unwrap())
+            .unwrap();
+    let records = |height: u64| -> Vec<dsa_provider::types::TransactionCbor> {
+        serde_json::from_slice(
+            &std::fs::read(
+                scratch
+                    .path()
+                    .join(format!("provider/transactions/{height}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    for witness in manifest["witnesses"]["invalid_transactions"]
+        .as_array()
+        .unwrap()
+    {
+        let hash = witness["hash"].as_str().unwrap();
+        let block = witness["block"].as_u64().unwrap();
+        let list = records(block);
+        let record = list
+            .iter()
+            .find(|record| record.tx_hash.as_str() == hash)
+            .unwrap();
+        let raw = hex::decode(record.cbor.as_str()).unwrap();
+        let tx = dsa_chain::transaction::decode(&raw, hash).unwrap();
+        assert!(!tx.valid && tx.has_collateral_return);
+        assert_eq!(tx.effective_inputs(), tx.collateral);
+        let row = expected.tx.iter().find(|row| row.hash == hash).unwrap();
+        assert!(!row.valid_contract);
+        let outputs: Vec<_> = expected
+            .tx_out
+            .iter()
+            .filter(|output| output.tx_id == row.id)
+            .collect();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            usize::from(outputs[0].index),
+            tx.outputs.len(),
+            "invalid effective output retains collateral-return index"
+        );
+        assert_eq!(
+            expected
+                .tx_in
+                .iter()
+                .filter(|input| input.tx_in_id == row.id)
+                .count(),
+            1
+        );
+        assert!(!expected.mint.iter().any(|mint| mint.tx_hash == hash));
+    }
+    let byron_block = manifest["witnesses"]["stored_byron_block"]
+        .as_u64()
+        .unwrap();
+    let mut stored_byron = 0;
+    for (index, record) in records(byron_block).iter().enumerate() {
+        let raw = hex::decode(record.cbor.as_str()).unwrap();
+        let tx = dsa_chain::transaction::decode(&raw, record.tx_hash.as_str()).unwrap();
+        for (output_index, output) in
+            dsa_chain::rows::effective_outputs(&tx, &dsa_chain::rows::Supplements::default())
+                .unwrap()
+        {
+            if output.address_raw.first().map(|byte| byte >> 4) == Some(8) {
+                let tx_id = ((byron_block as i64) << 12) | index as i64;
+                if let Some(row) = expected
+                    .tx_out
+                    .iter()
+                    .find(|row| row.tx_id == tx_id && row.index == output_index)
+                {
+                    assert_eq!(Some(row.address.as_str()), output.address.as_deref());
+                    stored_byron += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        stored_byron > 0,
+        "real Byron output is independently stored, not only an ordinary full-block fact"
+    );
+    let witness = &manifest["witnesses"]["asset_ordinal"];
+    let asset: dsa_chain::rows::AssetRow = serde_json::from_value(witness["row"].clone()).unwrap();
+    assert!(expected.ma_tx_out.contains(&asset));
+    assert_eq!(asset.id % 4096, 15);
+    let output = expected
+        .tx_out
+        .iter()
+        .find(|row| row.id == asset.tx_out_id)
+        .unwrap();
+    let tx = expected
+        .tx
+        .iter()
+        .find(|row| row.id == output.tx_id)
+        .unwrap();
+    let list = records(witness["block"].as_u64().unwrap());
+    let record = list
+        .iter()
+        .find(|record| record.tx_hash.as_str() == tx.hash)
+        .unwrap();
+    let raw = hex::decode(record.cbor.as_str()).unwrap();
+    let decoded = dsa_chain::transaction::decode(&raw, &tx.hash).unwrap();
+    let supplements = dsa_chain::rows::Supplements::default();
+    let effective = dsa_chain::rows::effective_outputs(&decoded, &supplements).unwrap();
+    let original = effective
+        .iter()
+        .find(|(index, _)| *index == output.index)
+        .unwrap()
+        .1;
+    assert_eq!(
+        (
+            original.assets[15].policy.as_str(),
+            original.assets[15].name.as_str(),
+            original.assets[15].quantity.to_string()
+        ),
+        (
+            asset.policy.as_str(),
+            asset.name.as_str(),
+            asset.quantity.clone()
+        )
+    );
+    let metadata_hash = manifest["witnesses"]["other_metadata_transaction"]
+        .as_str()
+        .unwrap();
+    let metadata: Vec<dsa_provider::types::Metadata> = serde_json::from_slice(
+        &std::fs::read(
+            scratch
+                .path()
+                .join(format!("provider/metadata/{metadata_hash}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(metadata.iter().any(|item| item.label.0 == 2001));
+    assert!(!metadata.iter().any(|item| item.label.0 == 6500973));
+    assert!(
+        expected.tx_metadata.is_empty(),
+        "real other-label metadata is excluded from bridge rows"
+    );
 }

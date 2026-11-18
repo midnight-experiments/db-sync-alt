@@ -1,0 +1,66 @@
+{
+  "format": "recorded-corpus-v1",
+  "network": "mainnet",
+  "projection_blocks": [
+    13145387,
+    13154250,
+    13922321,
+    14003773,
+    14029488,
+    14149657,
+    14156062,
+    14160593,
+    14160668,
+    14160844
+  ],
+  "datum_support_blocks": [],
+  "files": 32,
+  "raw_bundle_bytes": 400543,
+  "compressed_bytes": 128861,
+  "compressed_sha256": "0195eee4b707ace0f3095902009ff66350288e5f7bf732b6450912377ead5f4f",
+  "expected": {
+    "tx": 43,
+    "tx_out": 73,
+    "ma_tx_out": 73,
+    "tx_in": 61,
+    "tx_metadata": 0,
+    "mint": 3,
+    "datum": 9
+  },
+  "coverage": {
+    "decoded_transactions": 114,
+    "pallas_compared": 114,
+    "pallas_unavailable": 0,
+    "invalid_transactions": 3
+  },
+  "witnesses": {
+    "invalid_transactions": [
+      {
+        "block": 13922321,
+        "hash": "0fe2b6d8a2e05e29100440473c45823d8b12914ffb87b9ea477c420cc208049a"
+      },
+      {
+        "block": 14003773,
+        "hash": "564e9daf7b9857c3aecfd0e6c254e180366d87467c8cf1ee0d1aa903453c0399"
+      },
+      {
+        "block": 14003773,
+        "hash": "7f00265c2fd6b33148e0694ea1e67235794b779ef1162077a60115770564563a"
+      }
+    ],
+    "asset_ordinal": {
+      "block": 14160668,
+      "row": {
+        "id": 973113695225782287,
+        "quantity": "2",
+        "tx_out_id": 237576585748482,
+        "policy": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa",
+        "name": "4e49474854"
+      },
+      "ordinal": 15
+    },
+    "stored_byron_block": 14160844,
+    "other_metadata_transaction": "03b5d301678204ee48c7f93d3446fd4ad0427da6d1966e8d3df423c720657b0e"
+  },
+  "scope": "Intact finalized Mainnet block responses and independently exported schema5 SQL facts under the shared token rule. Invalid collateral, stored Byron and original asset ordinal15 are real witnesses. Contextual API responses retain exact original timestamps and byte hashes. Pointer outputs, raw datums above10000bytes and positive bridge-key metadata were not observed."
+}

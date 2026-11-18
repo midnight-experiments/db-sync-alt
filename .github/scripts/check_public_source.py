@@ -28,6 +28,8 @@ PATTERNS = {
 APPROVED_PNG = {}
 PNG_SIGNATURE = bytes((137, 80, 78, 71, 13, 10, 26, 10))
 APPROVED_JSON_GZIP = {
+    'crates/dsa-provider/tests/fixtures/mainnet-corpus.json.gz':
+        '0195eee4b707ace0f3095902009ff66350288e5f7bf732b6450912377ead5f4f',
     'crates/dsa-provider/tests/fixtures/preprod-corpus.json.gz':
         '7111c2e00ccd86ec320a3e5fe36f49c581144e13de8c8acfc3eac7a970cfec8c',
 }
