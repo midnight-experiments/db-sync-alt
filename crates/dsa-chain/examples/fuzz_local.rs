@@ -12,13 +12,20 @@ fn main() {
         .parse()
         .expect("numeric duration");
     assert!((1..=3600).contains(&seconds));
+    let cpu_mode = std::env::args().nth(2).as_deref() == Some("cpu");
+    let cpu_start = cpu_time();
     let start = Instant::now();
-    let mut seed = 0x51d4_a386_febc_0091u64;
+    let mut measured = Duration::ZERO;
+    let mut seed = if cpu_mode {
+        0xe2f3_7739_514a_6bc1u64
+    } else {
+        0x51d4_a386_febc_0091u64
+    };
     let mut iterations = 0u64;
     let mut accepted = 0u64;
     let mut next_log = 60;
     let mut raw = Vec::new();
-    while start.elapsed() < Duration::from_secs(seconds) {
+    while measured < Duration::from_secs(seconds) {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
@@ -34,6 +41,13 @@ fn main() {
             accepted += 1;
         }
         iterations += 1;
+        if iterations.is_multiple_of(1024) {
+            measured = if cpu_mode {
+                cpu_time() - cpu_start
+            } else {
+                start.elapsed()
+            };
+        }
         if start.elapsed().as_secs() >= next_log {
             println!(
                 "layer=own_structural_parser elapsed_seconds={} iterations={iterations} accepted={accepted}",
@@ -49,7 +63,21 @@ fn main() {
         .unwrap_or("VmHWM: unavailable")
         .to_owned();
     println!(
-        "complete elapsed_seconds={} iterations={iterations} accepted={accepted} seed={seed:016x} {rss}",
+        "complete measured_seconds={} wall_seconds={} cpu_mode={cpu_mode} iterations={iterations} accepted={accepted} seed={seed:016x} {rss}",
+        measured.as_secs(),
         start.elapsed().as_secs()
     );
+}
+
+fn cpu_time() -> Duration {
+    let record = std::fs::read_to_string("/proc/thread-self/schedstat")
+        .expect("Linux thread runtime accounting");
+    Duration::from_nanos(
+        record
+            .split_whitespace()
+            .next()
+            .expect("thread runtime")
+            .parse()
+            .expect("runtime nanoseconds"),
+    )
 }

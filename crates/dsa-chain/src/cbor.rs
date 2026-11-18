@@ -220,6 +220,33 @@ impl<'a> Item<'a> {
     pub fn array(self) -> Result<Vec<Self>, Error> {
         self.children(4)
     }
+
+    pub fn text(self) -> Result<String, Error> {
+        let mut c = Cursor::new(self.raw);
+        let h = c.head()?;
+        if h.major != 3 {
+            return Err(error("cbor_text", 0));
+        }
+        let mut bytes = Vec::new();
+        if let Some(n) = h.arg {
+            bytes.extend_from_slice(
+                c.take(usize::try_from(n).map_err(|_| error("cbor_truncated", 0))?)?,
+            );
+        } else {
+            while c.data.get(c.pos) != Some(&0xff) {
+                let chunk = c.head()?;
+                if chunk.major != 3 {
+                    return Err(error("cbor_invalid_chunks", c.pos));
+                }
+                let n = chunk
+                    .arg
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| error("cbor_invalid_chunks", c.pos))?;
+                bytes.extend_from_slice(c.take(n)?);
+            }
+        }
+        String::from_utf8(bytes).map_err(|_| error("cbor_invalid_utf8", 0))
+    }
     pub fn map(self) -> Result<Vec<(Self, Self)>, Error> {
         let children = self.children(5)?;
         if children.len() % 2 != 0 {

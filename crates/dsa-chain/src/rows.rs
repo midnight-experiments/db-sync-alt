@@ -347,8 +347,10 @@ pub fn build_block(
                     id: tx_id,
                     tx_id,
                     key: 6500973,
-                    json: (json_depth(json) <= datum::JSON_NESTING_LIMIT).then(|| json.clone()),
+                    json: crate::metadata::checked(tx, Some(json))?,
                 });
+            } else {
+                crate::metadata::checked(tx, None)?;
             }
         }
     }
@@ -356,21 +358,34 @@ pub fn build_block(
     Ok(rows)
 }
 
-fn json_depth(text: &str) -> usize {
-    let (mut quoted, mut escape, mut depth, mut maximum) = (false, false, 0usize, 0usize);
-    for byte in text.bytes() {
-        if escape {
-            escape = false;
-        } else if quoted && byte == b'\\' {
-            escape = true;
-        } else if byte == b'"' {
-            quoted = !quoted;
-        } else if !quoted && b"{[".contains(&byte) {
-            depth += 1;
-            maximum = maximum.max(depth);
-        } else if !quoted && b"}]".contains(&byte) {
-            depth = depth.saturating_sub(1);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ra_14_c_2_14_and_d_2_1_full_units_and_governance_policies() {
+        let profile = Profile::load("mainnet").unwrap();
+        let selection = Selection::new(&profile);
+        for role in ["permissioned_candidates", "auth", "cnight"] {
+            let a = &profile.assets[role];
+            assert!(selection.required(&Asset {
+                policy: a.policy.clone(),
+                name: a.name.clone(),
+                quantity: 1
+            }));
+            let other = Asset {
+                policy: a.policy.clone(),
+                name: format!("{}ff", a.name),
+                quantity: 1,
+            };
+            assert!(!selection.required(&other));
+        }
+        for role in ["council", "technical_committee"] {
+            assert!(selection.required(&Asset {
+                policy: profile.assets[role].policy.clone(),
+                name: "ff".to_owned(),
+                quantity: 1
+            }));
         }
     }
-    maximum
 }

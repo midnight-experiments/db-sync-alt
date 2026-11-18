@@ -96,3 +96,22 @@ fn ra_14_a_hash_and_complete_envelope_are_checked() {
         "cbor_trailing_bytes"
     );
 }
+
+#[test]
+fn ra_14_a_7_and_c_auxiliary_original_hash_binding() {
+    let mut checked = 0;
+    for record in records() {
+        let raw = hex::decode(record.cbor).unwrap();
+        let mut tx = transaction::decode(&raw, &record.tx_hash).unwrap();
+        if tx.auxiliary.is_some() {
+            dsa_chain::metadata::checked(&tx, None).unwrap();
+            checked += 1;
+            tx.auxiliary_hash = Some("00".repeat(32));
+            assert_eq!(
+                dsa_chain::metadata::checked(&tx, None).unwrap_err().code,
+                "provider_metadata_conflict"
+            );
+        }
+    }
+    assert!(checked > 0);
+}

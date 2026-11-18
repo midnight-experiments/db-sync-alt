@@ -106,8 +106,12 @@ fn input_set(item: Item<'_>) -> Result<Vec<Outpoint>, Error> {
 
 fn assets(item: Item<'_>, mint: bool) -> Result<Vec<Asset>, Error> {
     let mut result = BTreeMap::new();
+    let mut policies = BTreeSet::new();
     for (policy, names) in item.map()? {
         let policy = hex::encode(bytes_of_length(policy, 28)?);
+        if !policies.insert(policy.clone()) {
+            return Err(error("cbor_duplicate_asset_policy", 0));
+        }
         let pairs = names.map()?;
         if pairs.is_empty() {
             return Err(error("cbor_asset_shape", 0));
@@ -306,4 +310,43 @@ pub fn decode<'a>(raw: &'a [u8], expected_hash: &str) -> Result<Transaction<'a>,
             .map(|x| bytes_of_length(x, 32).map(hex::encode))
             .transpose()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ra_14_a_4_4_interpreted_map_keys_are_semantically_unique() {
+        let raw = hex::decode("a20001180002").unwrap();
+        assert_eq!(
+            fields(Item::parse(&raw).unwrap()).unwrap_err().code,
+            "cbor_duplicate_map_key"
+        );
+    }
+
+    #[test]
+    fn ra_14_a_5_13_standard_input_set_tags_duplicates_and_domains() {
+        let point = format!("825820{}00", "00".repeat(32));
+        for raw in [format!("81{point}"), format!("d9010281{point}")] {
+            let raw = hex::decode(raw).unwrap();
+            assert_eq!(input_set(Item::parse(&raw).unwrap()).unwrap().len(), 1);
+        }
+        let duplicate = hex::decode(format!("82{point}{point}")).unwrap();
+        assert_eq!(
+            input_set(Item::parse(&duplicate).unwrap())
+                .unwrap_err()
+                .code,
+            "cbor_duplicate_input"
+        );
+        let overflow = hex::decode(format!("81825820{}1a00010000", "00".repeat(32))).unwrap();
+        assert!(input_set(Item::parse(&overflow).unwrap()).is_err());
+        let wrong_tag = hex::decode("d9010380").unwrap();
+        assert_eq!(
+            input_set(Item::parse(&wrong_tag).unwrap())
+                .unwrap_err()
+                .code,
+            "cbor_input_tag"
+        );
+    }
 }

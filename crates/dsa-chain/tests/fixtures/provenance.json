@@ -1,6 +1,6 @@
 {
   "origin": "https://github.com/midnight-experiments/db-sync-alt",
-  "commit": "4d7cba2",
+  "commit": "4d7cba2eee66b081c644fa8e2150025baf46a54f",
   "sources": [
     {
       "path": "tests/fixtures/data/blockfrost/block-cbor.json",

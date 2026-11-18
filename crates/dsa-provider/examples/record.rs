@@ -25,6 +25,8 @@ struct Args {
     key_file: PathBuf,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long)]
+    send_lock_file: PathBuf,
     #[arg(long, default_value_t = 6000)]
     total_budget: u64,
     #[arg(long, default_value_t = 50000)]
@@ -137,18 +139,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The outer launch also holds one host-wide recorder flock. This exclusive
     // file prevents accidental overlapping processes on the same corpus.
-    let lock_path = args
-        .output
-        .parent()
-        .ok_or("missing corpus parent")?
-        .join("provider-recording.lock");
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(lock_path)?;
+        .open(&args.send_lock_file)?;
     lock.try_lock()?;
+    // The preceding process held this same lock through its final send. Delay
+    // before our first send too, preserving spacing across network switches or
+    // a resumed recorder instead of giving each process an initial burst.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let refusal = args.output.join("last-refusal.json");
     if refusal.exists() {
         let previous: serde_json::Value = serde_json::from_reader(File::open(refusal)?)?;

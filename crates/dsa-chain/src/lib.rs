@@ -3,6 +3,7 @@
 pub mod cbor;
 pub mod datum;
 pub mod ids;
+pub mod metadata;
 pub mod profiles;
 pub mod rows;
 pub mod transaction;

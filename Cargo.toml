@@ -13,7 +13,7 @@ repository = "https://github.com/midnight-experiments/db-sync-alt"
 dsa-chain = { path = "crates/dsa-chain" }
 dsa-store = { path = "crates/dsa-store" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision", "unbounded_depth"] }
 sha2 = "0.10"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
