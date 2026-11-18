@@ -62,6 +62,9 @@ impl Error {
             Self::Postgres(error) => {
                 json!({"error": "database_error", "sqlstate": error.code().map(|code| code.code())})
             }
+            Self::Io(error) => {
+                json!({"error":"snapshot_io_error","kind":format!("{:?}",error.kind())})
+            }
             _ => json!({"error": self.to_string()}),
         }
     }

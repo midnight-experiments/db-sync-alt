@@ -65,9 +65,6 @@ impl Database {
             name,
         })
     }
-    async fn store(&self) -> Result<Store> {
-        Ok(Store::connect(self.config.clone(), None).await?)
-    }
     fn dsn(&self) -> String {
         let host = match &self.config.get_hosts()[0] {
             Host::Tcp(s) => s.clone(),

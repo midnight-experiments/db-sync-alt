@@ -218,7 +218,11 @@ impl Store {
             .get(0);
         let mut sections = Vec::new();
         for table in tables() {
-            let file = File::create(staging.path().join(table))?;
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(staging.path().join(table))?;
             let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
             let key = if table == "epoch_param" {
                 "epoch_no"
