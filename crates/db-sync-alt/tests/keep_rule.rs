@@ -1,3 +1,11 @@
+//! PostgreSQL proofs use the dedicated Docker fixture in DSA_TEST_DATABASE.
+//! The on-demand realistic plan test defaults to 5,000-height setup batches and
+//! a recorded 300-second session timeout. DSA_PLAN_DATABASE resumes the exact
+//! owned fixture printed at startup, after validating all five row counts.
+//! DSA_PLAN_KEEP_DATABASE=1 retains it for another scale; the variant transaction
+//! rolls back its input change. DSA_PLAN_TIP/HORIZON select a smaller proof;
+//! unset them to finish the full fixture. Batch/timeout overrides are bounded.
+
 #[path = "keep_rule/fixtures.rs"]
 mod fixtures;
 #[path = "keep_rule/queries.rs"]
@@ -74,6 +82,50 @@ impl Database {
                 .await?;
         }
         store.client().batch_execute("UPDATE dsa.position SET serving=true,reason='test',target_height=8,target_hash=decode(repeat('00',32),'hex'),target_time=now(),tip_height=10,tip_hash=decode(repeat('00',32),'hex'),tip_time=now(),horizon_height=6,horizon_hash=decode(repeat('00',32),'hex'),horizon_time=now() WHERE id=1").await?;
+        let full = connect(config.clone(), "public", true).await?;
+        let kept = connect(config, "kept", true).await?;
+        let full_queries = Queries::prepare(&full).await?;
+        let kept_queries = Queries::prepare(&kept).await?;
+        Ok(Self {
+            admin,
+            store,
+            full,
+            kept,
+            full_queries,
+            kept_queries,
+            database,
+            owner,
+            reader: None,
+        })
+    }
+
+    async fn resume(database: String, profile: &dsa_chain::profiles::Profile) -> Result<Self> {
+        if !database.starts_with("keep_database_")
+            || !database
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            return Err("invalid_scratch_database".into());
+        }
+        let root: Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
+        let admin = connect(root.clone(), "public", false).await?;
+        let owner: String = admin
+            .query_one(
+                "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=$1",
+                &[&database],
+            )
+            .await?
+            .get(0);
+        if !owner.starts_with("keep_owner_") {
+            return Err("invalid_scratch_owner".into());
+        }
+        let mut config = root;
+        config
+            .user(&owner)
+            .dbname(&database)
+            .ssl_mode(SslMode::Disable);
+        let store = Store::connect(config.clone(), None).await?;
+        store.open(profile).await?;
         let full = connect(config.clone(), "public", true).await?;
         let kept = connect(config, "kept", true).await?;
         let full_queries = Queries::prepare(&full).await?;
@@ -1108,28 +1160,29 @@ async fn keep_rule_page_and_bridge_checkpoints() -> Result {
 #[ignore = "on-demand realistic PostgreSQL plan check"]
 async fn keep_rule_realistic_plans() -> Result {
     let profile = dsa_chain::profiles::Profile::load("mainnet")?;
-    let db = Database::new(&profile).await?;
-    let horizon = 1_200_000_u32;
-    let target = horizon + 30_009;
-    let tip = target + profile.cardano.security_parameter;
-    let started = Instant::now();
-    for first in (0..=tip).step_by(20000) {
-        let last = (first + 19999).min(tip);
-        db.store.client().batch_execute(&format!("INSERT INTO serve.block SELECT i,decode(md5(i::text)||md5(i::text),'hex'),i/21600,i*20,i,timestamp '2026-01-01'+i*interval '20 seconds',3 FROM generate_series({first}::bigint,{last}::bigint) i; INSERT INTO serve.tx SELECT i*4096+j,decode(md5((i*4096+j)::text)||md5((i*4096+j)::text),'hex'),i,j,true FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.tx_out SELECT (i*4096+j)*4096,i*4096+j,0,'external',1,NULL,NULL FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.ma_tx_out SELECT ((i*4096+j)*4096)*4096,1,(i*4096+j)*4096,1 FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.tx_in SELECT (i*4096)*4096+j/2,i*4096,(i-1)*4096+j,0 FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j) WHERE i>0 AND i<{horizon} AND i%10<>0")).await?;
+    let mut db = if let Ok(database) = std::env::var("DSA_PLAN_DATABASE") {
+        Database::resume(database, &profile).await?
+    } else {
+        Database::new(&profile).await?
+    };
+    let horizon: u32 = std::env::var("DSA_PLAN_HORIZON")
+        .unwrap_or_else(|_| "1200000".to_owned())
+        .parse()?;
+    let tip: u32 = std::env::var("DSA_PLAN_TIP")
+        .unwrap_or_else(|_| (1_200_000 + 30_009 + profile.cardano.security_parameter).to_string())
+        .parse()?;
+    let target = tip
+        .checked_sub(profile.cardano.security_parameter)
+        .ok_or("invalid_plan_tip")?;
+    let timeout: u32 = std::env::var("DSA_PLAN_TIMEOUT_SECONDS")
+        .unwrap_or_else(|_| "300".to_owned())
+        .parse()?;
+    let batch: u32 = std::env::var("DSA_PLAN_BATCH_HEIGHTS")
+        .unwrap_or_else(|_| "5000".to_owned())
+        .parse()?;
+    if !(1..=600).contains(&timeout) || !(1..=20000).contains(&batch) {
+        return Err("invalid_plan_resource_bound".into());
     }
-    let asset = &profile.assets["cnight"];
-    db.store
-        .client()
-        .execute(
-            "INSERT INTO serve.multi_asset VALUES(1,$1,$2)",
-            &[&hex::decode(&asset.policy)?, &hex::decode(&asset.name)?],
-        )
-        .await?;
-    db.store.client().batch_execute("ANALYZE serve.block; ANALYZE serve.tx; ANALYZE serve.tx_out; ANALYZE serve.tx_in; ANALYZE serve.ma_tx_out; ANALYZE serve.multi_asset").await?;
-    println!(
-        "{}",
-        json!({"realistic_setup_seconds":started.elapsed().as_secs_f64(),"source_headers":tip+1,"source_outputs":(tip+1)*2,"source_inputs":2*(horizon-1-(horizon-1)/10)})
-    );
     let selection = Selection::new(
         &profile,
         Bounds {
@@ -1138,49 +1191,210 @@ async fn keep_rule_realistic_plans() -> Result {
             tip,
         },
     )?;
-    for table in ["block", "tx_out", "tx_in"] {
-        for forced in [false, true] {
-            db.store
-                .client()
-                .batch_execute(if forced {
-                    "SET enable_seqscan=off"
-                } else {
-                    "SET enable_seqscan=on"
-                })
-                .await?;
-            let analyze = if forced { "" } else { "ANALYZE, BUFFERS," };
-            let sql = format!(
-                "EXPLAIN ({analyze} FORMAT JSON) SELECT count(*) FROM ({}) rows",
-                selection.rows_sql(SourceSchema::Serve, table)?
-            );
-            let plan: Value = db
-                .store
-                .client()
-                .query_one(&sql, &selection.parameters())
-                .await?
-                .get(0);
-            fn check(value: &Value) {
-                if let Some(object) = value.as_object() {
-                    assert_ne!(
-                        object.get("Scan Direction").and_then(Value::as_str),
-                        Some("Backward"),
-                        "unbounded extrema walk"
-                    );
-                    for child in object.values() {
-                        check(child);
-                    }
-                } else if let Some(array) = value.as_array() {
-                    for child in array {
-                        check(child);
+    // Setup is synthetic and owned. Its checkpoint-paced writes can take longer
+    // than a small fixture; this session-only timeout is recorded explicitly.
+    db.store
+        .client()
+        .batch_execute(&format!("SET statement_timeout='{timeout}s'"))
+        .await?;
+    let last: i64 = db
+        .store
+        .client()
+        .query_one(
+            "SELECT coalesce(max(id),-1) FROM serve.block WHERE id BETWEEN 0 AND $1",
+            &[&i64::from(tip)],
+        )
+        .await?
+        .get(0);
+    let verify_prefix = |last: i64| {
+        let client = db.store.client();
+        async move {
+            let counts=client.query_one("SELECT (SELECT count(*) FROM serve.block),(SELECT count(*) FROM serve.tx),(SELECT count(*) FROM serve.tx_out),(SELECT count(*) FROM serve.ma_tx_out),(SELECT count(*) FROM serve.tx_in)",&[]).await?;
+            let count = last + 1;
+            let spends = last.clamp(0, 1_199_999);
+            let expected = [
+                count,
+                count * 2,
+                count * 2,
+                count * 2,
+                2 * (spends - spends / 10),
+            ];
+            for (index, expected) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    counts.get::<_, i64>(index),
+                    expected,
+                    "resume family {index}"
+                );
+            }
+            Ok::<_, Box<dyn StdError>>(())
+        }
+    };
+    verify_prefix(last).await?;
+    println!(
+        "{}",
+        json!({"realistic_database":db.database,"owner":db.owner,"resume_last_height":last,"horizon":horizon,"target":target,"tip":tip,"batch_heights":batch,"statement_timeout_seconds":timeout})
+    );
+    let started = Instant::now();
+    for first in ((last + 1) as u32..=tip).step_by(batch as usize) {
+        let last = (first + batch - 1).min(tip);
+        db.store.client().batch_execute(&format!("INSERT INTO serve.block SELECT i,decode(md5(i::text)||md5(i::text),'hex'),i/21600,i*20,i,timestamp '2026-01-01'+i*interval '20 seconds',3 FROM generate_series({first}::bigint,{last}::bigint) i; INSERT INTO serve.tx SELECT i*4096+j,decode(md5((i*4096+j)::text)||md5((i*4096+j)::text),'hex'),i,j,true FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.tx_out SELECT (i*4096+j)*4096,i*4096+j,0,'external',1,NULL,NULL FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.ma_tx_out SELECT ((i*4096+j)*4096)*4096,1,(i*4096+j)*4096,1 FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.tx_in SELECT (i*4096)*4096+j/2,i*4096,(i-1)*4096+j,0 FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j) WHERE i>0 AND i<1200000 AND i%10<>0")).await?;
+        println!(
+            "{}",
+            json!({"realistic_setup_last_height":last,"seconds":started.elapsed().as_secs_f64()})
+        );
+    }
+    verify_prefix(i64::from(tip)).await?;
+    let asset = &profile.assets["cnight"];
+    db.store
+        .client()
+        .execute(
+            "INSERT INTO serve.multi_asset VALUES(1,$1::bytea,$2::bytea) ON CONFLICT(id) DO NOTHING",
+            &[&hex::decode(&asset.policy)?, &hex::decode(&asset.name)?],
+        )
+        .await?;
+    db.store.client().batch_execute("ANALYZE serve.block; ANALYZE serve.tx; ANALYZE serve.tx_out; ANALYZE serve.tx_in; ANALYZE serve.ma_tx_out; ANALYZE serve.multi_asset").await?;
+    let settings=db.store.client().query_one("SELECT current_setting('statement_timeout'),current_setting('work_mem'),current_setting('max_wal_size'),current_setting('max_parallel_workers_per_gather')",&[]).await?;
+    println!(
+        "{}",
+        json!({"realistic_setup_seconds":started.elapsed().as_secs_f64(),"source_headers":tip+1,"source_outputs":(tip+1)*2,"source_inputs":2*((tip.min(1_199_999))-(tip.min(1_199_999))/10),"statement_timeout":settings.get::<_,String>(0),"work_mem":settings.get::<_,String>(1),"max_wal_size":settings.get::<_,String>(2),"parallel_workers_per_gather":settings.get::<_,String>(3)})
+    );
+    let lower = i64::from(horizon) * 16_777_216;
+    let upper = i64::from(target) * 16_777_216 + 16_777_215;
+    let window: bool = db
+        .store
+        .client()
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM serve.tx_in WHERE id BETWEEN $1 AND $2)",
+            &[&lower, &upper],
+        )
+        .await?
+        .get(0);
+    async fn plans<C: tokio_postgres::GenericClient>(
+        client: &C,
+        selection: &Selection,
+        window: bool,
+        outputs: u32,
+    ) -> Result {
+        for table in ["block", "tx_out", "tx_in"] {
+            for forced in [false, true] {
+                client
+                    .batch_execute(if forced {
+                        "SET LOCAL enable_seqscan=off"
+                    } else {
+                        "SET LOCAL enable_seqscan=on"
+                    })
+                    .await?;
+                let sql = format!(
+                    "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT count(*) FROM ({}) rows",
+                    selection.rows_sql(SourceSchema::Serve, table)?
+                );
+                let begin = Instant::now();
+                let plan: Value = client
+                    .query_one(&sql, &selection.parameters())
+                    .await?
+                    .get(0);
+                fn scan(value: &Value, max_loops: &mut f64, fallback: &mut Option<Value>) {
+                    if let Some(object) = value.as_object() {
+                        assert_ne!(
+                            object.get("Scan Direction").and_then(Value::as_str),
+                            Some("Backward")
+                        );
+                        *max_loops = (*max_loops).max(
+                            object
+                                .get("Actual Loops")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                        );
+                        if object.get("Subplan Name").and_then(Value::as_str)
+                            == Some("CTE fallback_candidates")
+                        {
+                            *fallback = Some(value.clone());
+                        }
+                        for child in object.values() {
+                            scan(child, max_loops, fallback);
+                        }
+                    } else if let Some(array) = value.as_array() {
+                        for child in array {
+                            scan(child, max_loops, fallback);
+                        }
                     }
                 }
+                let mut max_loops = 0.0;
+                let mut fallback = None;
+                scan(&plan, &mut max_loops, &mut fallback);
+                assert!(
+                    max_loops <= f64::from(outputs) * 3.0 + 1000.0,
+                    "superlinear inner loops"
+                );
+                fn fallback_scans(value: &Value, rows: &mut Vec<Value>) {
+                    if value.get("Relation Name").and_then(Value::as_str) == Some("tx_in") {
+                        rows.push(
+                            json!({"rows":value["Actual Rows"],"loops":value["Actual Loops"]}),
+                        );
+                    }
+                    if let Some(object) = value.as_object() {
+                        for child in object.values() {
+                            fallback_scans(child, rows);
+                        }
+                    } else if let Some(array) = value.as_array() {
+                        for child in array {
+                            fallback_scans(child, rows);
+                        }
+                    }
+                }
+                let mut reads = Vec::new();
+                if let Some(node) = &fallback {
+                    fallback_scans(node, &mut reads);
+                }
+                if table != "block" {
+                    assert!(!reads.is_empty());
+                    for read in &reads {
+                        assert_eq!(
+                            read["loops"].as_f64().unwrap() > 0.0,
+                            !window,
+                            "fallback source branch"
+                        );
+                    }
+                }
+                println!(
+                    "{}",
+                    json!({"realistic_plan_family":table,"window_has_spend":window,"forced_index_plan":forced,"elapsed_seconds":begin.elapsed().as_secs_f64(),"max_inner_loops":max_loops,"fallback_source_scans":reads,"execution_ms":plan[0]["Execution Time"],"temp_read_blocks":plan[0]["Plan"]["Temp Read Blocks"],"temp_written_blocks":plan[0]["Plan"]["Temp Written Blocks"],"explain":plan})
+                );
             }
-            check(&plan);
-            println!(
-                "{}",
-                json!({"realistic_plan_family":table,"forced_index_plan":forced,"explain":plan})
-            );
         }
+        Ok(())
     }
-    db.cleanup().await
+    let tx = db.store.writer_transaction().await?;
+    tx.batch_execute("SET TRANSACTION READ ONLY").await?;
+    plans(&tx, &selection, window, (tip + 1) * 2).await?;
+    tx.commit().await?;
+    // Change only the owned fixture. Rollback preserves a byte-consistent
+    // resume prefix for a later same-scale run, including after an error.
+    let variant = db.store.writer_transaction().await?;
+    if window {
+        variant
+            .execute(
+                "DELETE FROM serve.tx_in WHERE id BETWEEN $1 AND $2",
+                &[&lower, &upper],
+            )
+            .await?;
+    } else {
+        variant
+            .execute(
+                "INSERT INTO serve.tx_in VALUES($1,$2,36864,0)",
+                &[&(lower + 4095), &(i64::from(horizon) * 4096)],
+            )
+            .await?;
+    }
+    plans(&variant, &selection, !window, (tip + 1) * 2).await?;
+    variant.rollback().await?;
+    if std::env::var("DSA_PLAN_KEEP_DATABASE").as_deref() == Ok("1") {
+        println!(
+            "{}",
+            json!({"retained_plan_database":db.database,"owner":db.owner})
+        );
+        Ok(())
+    } else {
+        db.cleanup().await
+    }
 }
