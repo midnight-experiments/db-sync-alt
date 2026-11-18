@@ -73,6 +73,16 @@ pub struct Transaction<'a> {
     pub auxiliary_hash: Option<String>,
 }
 
+impl Transaction<'_> {
+    pub fn effective_inputs(&self) -> &[Outpoint] {
+        if self.valid {
+            &self.ordinary
+        } else {
+            &self.collateral
+        }
+    }
+}
+
 fn fields(item: Item<'_>) -> Result<BTreeMap<u64, Item<'_>>, Error> {
     let mut fields = BTreeMap::new();
     for (k, v) in item.map()? {

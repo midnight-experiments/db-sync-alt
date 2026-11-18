@@ -148,6 +148,17 @@ pub struct TransactionCbor {
     pub cbor: CborHex,
 }
 
+impl From<&Header> for dsa_chain::checks::Header {
+    fn from(header: &Header) -> Self {
+        Self {
+            height: header.height,
+            hash: header.hash.to_string(),
+            previous_hash: header.previous_block.as_ref().map(ToString::to_string),
+            transaction_count: header.tx_count as usize,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Genesis {
     pub network_magic: u32,

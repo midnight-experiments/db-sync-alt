@@ -133,13 +133,20 @@ impl BuildError {
 
 /// An overlay contains only outputs created or removed by this block. Failed
 /// validation drops it without changing the caller's long-lived held set.
-struct HeldChanges<'a> {
+pub(crate) struct HeldChanges<'a> {
     original: &'a BTreeMap<Outpoint, HeldOutput>,
     changes: BTreeMap<Outpoint, Option<HeldOutput>>,
 }
 
-impl HeldChanges<'_> {
-    fn get(&self, point: &Outpoint) -> Option<&HeldOutput> {
+impl<'a> HeldChanges<'a> {
+    pub(crate) fn new(original: &'a BTreeMap<Outpoint, HeldOutput>) -> Self {
+        Self {
+            original,
+            changes: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, point: &Outpoint) -> Option<&HeldOutput> {
         match self.changes.get(point) {
             Some(value) => value.as_ref(),
             None => self.original.get(point),
@@ -148,12 +155,12 @@ impl HeldChanges<'_> {
     fn contains_key(&self, point: &Outpoint) -> bool {
         self.get(point).is_some()
     }
-    fn remove(&mut self, point: &Outpoint) {
+    pub(crate) fn remove(&mut self, point: &Outpoint) {
         if self.contains_key(point) {
             self.changes.insert(point.clone(), None);
         }
     }
-    fn insert(&mut self, point: Outpoint, output: HeldOutput) {
+    pub(crate) fn insert(&mut self, point: Outpoint, output: HeldOutput) {
         self.changes.insert(point, Some(output));
     }
 }
@@ -254,6 +261,47 @@ fn datum_for(
     Ok(())
 }
 
+/// Resolve the outputs created on chain. A valid transaction's collateral
+/// return and an invalid transaction's ordinary outputs have no chain effect.
+pub fn effective_outputs<'a>(
+    tx: &'a Transaction<'_>,
+    supplements: &'a Supplements,
+) -> Result<Vec<(u16, &'a Output)>, BuildError> {
+    let candidates: Vec<_> = if tx.valid {
+        tx.outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| (index, output.as_ref()))
+            .collect()
+    } else if tx.has_collateral_return {
+        vec![(tx.outputs.len(), tx.collateral_output.as_ref())]
+    } else {
+        Vec::new()
+    };
+    candidates
+        .into_iter()
+        .map(|(index, output)| {
+            let index = ordinal(index)?;
+            let output = output
+                .filter(|output| output.classification_safe)
+                .or_else(|| {
+                    supplements
+                        .outputs
+                        .get(&tx.hash)
+                        .and_then(|outputs| outputs.get(&index))
+                })
+                .ok_or_else(|| {
+                    BuildError::Required(SupplementRequest::Output {
+                        transaction: tx.hash.clone(),
+                        index,
+                    })
+                })?;
+            output.check_inline_hash()?;
+            Ok((index, output))
+        })
+        .collect()
+}
+
 /// Build one block in inventory order. Held origins include all relevant
 /// outputs spent by this range, plus creations in earlier blocks. The caller
 /// can do one batched database lookup for these outpoints before this function.
@@ -265,10 +313,7 @@ pub fn build_block(
     supplements: &Supplements,
 ) -> Result<Rows, BuildError> {
     let (rows, changes) = {
-        let mut staged = HeldChanges {
-            original: held,
-            changes: BTreeMap::new(),
-        };
+        let mut staged = HeldChanges::new(held);
         let rows = build_rows(profile, height, transactions, &mut staged, supplements)?;
         (rows, staged.changes)
     };
@@ -299,44 +344,11 @@ fn build_rows(
         }
         let tx_index = ordinal(position)?;
         let tx_id = id(ids::transaction_id(height, tx_index))?;
-        let inputs = if tx.valid {
-            &tx.ordinary
-        } else {
-            &tx.collateral
-        };
-        let mut kept_outputs = Vec::new();
-        let candidates: Vec<_> = if tx.valid {
-            tx.outputs
-                .iter()
-                .enumerate()
-                .map(|(i, o)| (i, o.as_ref()))
-                .collect()
-        } else if tx.has_collateral_return {
-            vec![(tx.outputs.len(), tx.collateral_output.as_ref())]
-        } else {
-            vec![]
-        };
-        for (index, output) in candidates {
-            let index = ordinal(index)?;
-            let output = output
-                .filter(|o| o.classification_safe)
-                .or_else(|| {
-                    supplements
-                        .outputs
-                        .get(&tx.hash)
-                        .and_then(|m| m.get(&index))
-                })
-                .ok_or_else(|| {
-                    BuildError::Required(SupplementRequest::Output {
-                        transaction: tx.hash.clone(),
-                        index,
-                    })
-                })?;
-            output.check_inline_hash()?;
-            if selection.relevant(output) {
-                kept_outputs.push((index, output));
-            }
-        }
+        let inputs = tx.effective_inputs();
+        let kept_outputs: Vec<_> = effective_outputs(tx, supplements)?
+            .into_iter()
+            .filter(|(_, output)| selection.relevant(output))
+            .collect();
         let mints: Vec<_> = tx
             .mint
             .iter()
