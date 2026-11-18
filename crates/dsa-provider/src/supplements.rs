@@ -40,6 +40,11 @@ pub fn resolve_outputs(
         if row.collateral != (transaction.valid && collateral) {
             return Err("provider_output_role_mismatch");
         }
+        // A valid transaction never creates its collateral return. The real
+        // provider may omit its native assets, so only its index/role matters.
+        if transaction.valid && collateral {
+            continue;
+        }
         let original = if collateral {
             transaction.collateral_output.as_ref()
         } else {

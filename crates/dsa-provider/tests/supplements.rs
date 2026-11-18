@@ -22,15 +22,15 @@ fn real_output_fallback_preserves_body_coordinates_value_and_collateral_role() {
     ))
     .unwrap();
     let resolved = resolve_outputs(&tx, &reply).unwrap();
-    assert_eq!(resolved.len(), tx.outputs.len() + 1);
+    assert_eq!(resolved.len(), tx.outputs.len());
     for (index, output) in tx.outputs.iter().enumerate() {
         let output = output.as_ref().unwrap();
         assert_eq!(resolved[&(index as u16)].address_raw, output.address_raw);
         assert_eq!(resolved[&(index as u16)].assets, output.assets);
     }
-    assert_eq!(
-        resolved[&(tx.outputs.len() as u16)],
-        *tx.collateral_output.as_ref().unwrap()
+    assert!(
+        !resolved.contains_key(&(tx.outputs.len() as u16)),
+        "valid collateral return is outside the transaction's effects"
     );
     let mut bad = reply.clone();
     bad.outputs[0].amount[0].unit = "short".to_owned();

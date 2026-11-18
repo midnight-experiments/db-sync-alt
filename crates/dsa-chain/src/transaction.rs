@@ -108,52 +108,50 @@ fn input_set(item: Item<'_>) -> Result<Vec<Outpoint>, Error> {
         }
         let hash = hex::encode(bytes_of_length(pair[0], 32)?);
         let index = u16::try_from(pair[1].unsigned()?).map_err(|_| error("cbor_input_shape", 0))?;
-        if !inputs.insert(Outpoint { hash, index }) {
-            return Err(error("cbor_duplicate_input", 0));
-        }
+        // Ledger versions 2 through 8 decode an effective Set.fromList.
+        // Later valid transactions are already unique and yield the same set.
+        inputs.insert(Outpoint { hash, index });
     }
     Ok(inputs.into_iter().collect())
 }
 
+/// Extract effective multiasset facts from finalized transactions. Historical
+/// ledger decoders use Map.fromList at both map levels, then prune zeros and
+/// empty maps. Later valid encodings are unique and nonzero, yielding the same
+/// facts. Original body bytes remain untouched for transaction hashing.
 fn assets(item: Item<'_>, mint: bool) -> Result<Vec<Asset>, Error> {
-    let mut result = BTreeMap::new();
-    let mut policies = BTreeSet::new();
+    let mut policies = BTreeMap::new();
     for (policy, names) in item.map()? {
         let policy = hex::encode(bytes_of_length(policy, 28)?);
-        if !policies.insert(policy.clone()) {
-            return Err(error("cbor_duplicate_asset_policy", 0));
-        }
-        let pairs = names.map()?;
-        if pairs.is_empty() {
-            return Err(error("cbor_asset_shape", 0));
-        }
-        for (name, quantity) in pairs {
+        let mut values = BTreeMap::new();
+        for (name, quantity) in names.map()? {
             let bytes = name.bytes()?;
             if bytes.len() > 32 {
                 return Err(error("cbor_asset_shape", 0));
             }
-            let name = hex::encode(bytes);
             let quantity = quantity.integer()?;
-            if quantity == 0
-                || if mint {
-                    i64::try_from(quantity).is_err()
-                } else {
-                    u64::try_from(quantity).is_err()
-                }
-            {
+            if if mint {
+                i64::try_from(quantity).is_err()
+            } else {
+                u64::try_from(quantity).is_err()
+            } {
                 return Err(error("cbor_asset_quantity", 0));
             }
-            if result.insert((policy.clone(), name), quantity).is_some() {
-                return Err(error("cbor_duplicate_asset", 0));
-            }
+            values.insert(hex::encode(bytes), quantity);
         }
+        policies.insert(policy, values);
     }
-    Ok(result
+    Ok(policies
         .into_iter()
-        .map(|((policy, name), quantity)| Asset {
-            policy,
-            name,
-            quantity,
+        .flat_map(|(policy, names)| {
+            names
+                .into_iter()
+                .filter(|(_, quantity)| *quantity != 0)
+                .map(move |(name, quantity)| Asset {
+                    policy: policy.clone(),
+                    name,
+                    quantity,
+                })
         })
         .collect())
 }
@@ -365,6 +363,43 @@ mod tests {
     }
 
     #[test]
+    fn historical_multiasset_helpers_follow_nested_map_and_zero_pruning_rules() {
+        // Standalone CBOR map conformance for our helper only, with no ledger
+        // transaction envelope or third-party decoder invocation.
+        let policy = "01".repeat(28);
+        let cases = [
+            (format!("a1581c{policy}a24000410102"), vec![("01", 2)]),
+            (format!("a1581c{policy}a240014000"), vec![]),
+            (
+                format!("a2581c{policy}a14001581c{policy}a1410103"),
+                vec![("01", 3)],
+            ),
+            (format!("a1581c{policy}a0"), vec![]),
+        ];
+        for (raw, expected) in cases {
+            let bytes = hex::decode(raw).unwrap();
+            let actual = assets(Item::parse(&bytes).unwrap(), false).unwrap();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|(name, quantity)| Asset {
+                        policy: policy.clone(),
+                        name: name.to_owned(),
+                        quantity
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        let raw = hex::decode(format!("a1581c{policy}a14020")).unwrap();
+        assert_eq!(
+            assets(Item::parse(&raw).unwrap(), true).unwrap()[0].quantity,
+            -1
+        );
+        assert!(assets(Item::parse(&raw).unwrap(), false).is_err());
+    }
+
+    #[test]
     fn ra_14_a_5_13_standard_input_set_tags_duplicates_and_domains() {
         let point = format!("825820{}00", "00".repeat(32));
         for raw in [format!("81{point}"), format!("d9010281{point}")] {
@@ -373,10 +408,8 @@ mod tests {
         }
         let duplicate = hex::decode(format!("82{point}{point}")).unwrap();
         assert_eq!(
-            input_set(Item::parse(&duplicate).unwrap())
-                .unwrap_err()
-                .code,
-            "cbor_duplicate_input"
+            input_set(Item::parse(&duplicate).unwrap()).unwrap().len(),
+            1
         );
         let overflow = hex::decode(format!("81825820{}1a00010000", "00".repeat(32))).unwrap();
         assert!(input_set(Item::parse(&overflow).unwrap()).is_err());

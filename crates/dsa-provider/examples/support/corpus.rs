@@ -144,6 +144,7 @@ fn compare(path: &Path, planning: bool) {
     let mut missing = BTreeSet::new();
     let mut actual = Rows::default();
     let mut shape_witnesses = BTreeMap::new();
+    let mut multi_input_transactions = 0usize;
     let (mut invalid_transactions, mut byron_outputs, mut pointer_outputs) =
         (0usize, 0usize, 0usize);
     let (mut decoded, mut compared, mut pallas_unavailable) = (0usize, 0usize, 0usize);
@@ -177,10 +178,21 @@ fn compare(path: &Path, planning: bool) {
             ) {
                 Ok(rows) => break rows,
                 Err(BuildError::Required(request)) => {
-                    if !recorded::load(&provider_path, &request, &transactions, &mut supplements)
-                        .unwrap()
+                    if !recorded::load(
+                        &provider_path,
+                        &request,
+                        block.height,
+                        &transactions,
+                        &mut supplements,
+                    )
+                    .unwrap()
                     {
-                        missing.insert(serde_json::to_string(&request).unwrap());
+                        missing.insert(
+                            serde_json::to_string(
+                                &serde_json::json!({"block":block.height,"request":request}),
+                            )
+                            .unwrap(),
+                        );
                         serde_json::to_writer_pretty(
                             File::create(path.join("missing-supplements.json")).unwrap(),
                             &missing,
@@ -249,6 +261,7 @@ fn compare(path: &Path, planning: bool) {
         known_datums.extend(rows.datum.iter().map(|datum| datum.hash.clone()));
         for (tx, raw) in transactions.iter().zip(&raw) {
             decoded += 1;
+            multi_input_transactions += usize::from(tx.ordinary.len() > 1);
             if !tx.valid {
                 invalid_transactions += 1;
                 shape_witnesses.entry("phase2_invalid").or_insert_with(
@@ -444,7 +457,7 @@ fn compare(path: &Path, planning: bool) {
         &shape_witnesses,
     )
     .unwrap();
-    let summary = serde_json::json!({"network":plan.network,"blocks":plan.blocks.len(),"decoded_transactions":decoded,"pallas_compared":compared,"pallas_unavailable":pallas_unavailable,"collateral_outputs_compared":collateral_outputs_compared,"fallback_outputs_compared":fallback_outputs_compared,"invalid_transactions":invalid_transactions,"byron_outputs":byron_outputs,"pointer_outputs":pointer_outputs,"tx":actual.tx.len(),"outputs":actual.tx_out.len(),"assets":actual.ma_tx_out.len(),"spends":actual.tx_in.len(),"datums":actual.datum.len(),"metadata":actual.tx_metadata.len(),"mints":actual.mint.len(),"differing_tables":differences,"result":if differences.is_empty(){"equal"}else{"different"}});
+    let summary = serde_json::json!({"network":plan.network,"blocks":plan.blocks.len(),"decoded_transactions":decoded,"pallas_compared":compared,"pallas_unavailable":pallas_unavailable,"collateral_outputs_compared":collateral_outputs_compared,"fallback_outputs_compared":fallback_outputs_compared,"invalid_transactions":invalid_transactions,"multi_input_transactions":multi_input_transactions,"byron_outputs":byron_outputs,"pointer_outputs":pointer_outputs,"tx":actual.tx.len(),"outputs":actual.tx_out.len(),"assets":actual.ma_tx_out.len(),"spends":actual.tx_in.len(),"datums":actual.datum.len(),"metadata":actual.tx_metadata.len(),"mints":actual.mint.len(),"differing_tables":differences,"result":if differences.is_empty(){"equal"}else{"different"}});
     serde_json::to_writer_pretty(
         File::create(path.join("comparison-result.json")).unwrap(),
         &summary,

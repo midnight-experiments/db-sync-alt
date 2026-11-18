@@ -13,11 +13,24 @@ use std::{fs::File, path::Path};
 pub fn load(
     root: &Path,
     request: &SupplementRequest,
+    height: u32,
     transactions: &[Transaction<'_>],
     supplements: &mut Supplements,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let path = match request {
-        SupplementRequest::Datum(hash) => root.join(format!("datums/{hash}.json")),
+        SupplementRequest::Datum(hash) => {
+            let shared = root.join(format!("datums/{hash}.json"));
+            if shared.exists() {
+                let value: Option<CborHex> = serde_json::from_reader(File::open(&shared)?)?;
+                if value.is_some() {
+                    shared
+                } else {
+                    root.join(format!("datums/{height}-{hash}.json"))
+                }
+            } else {
+                root.join(format!("datums/{height}-{hash}.json"))
+            }
+        }
         SupplementRequest::Metadata(hash) => root.join(format!("metadata/{hash}.json")),
         SupplementRequest::Output { transaction, .. } => {
             root.join(format!("outputs/{transaction}.json"))

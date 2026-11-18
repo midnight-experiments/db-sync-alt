@@ -25,5 +25,16 @@
     "mint": 4,
     "datum": 6
   },
-  "scope": "Public finalized ledger records and independently exported legacy schema5 rows. Support-only blocks supply datum bytes without asserting their row projection; the complete local corpus retains the older bridge asset-row differences."
+  "scope": "Public finalized ledger records and independently exported legacy schema5 rows. Support-only blocks supply datum bytes without asserting their row projection; the complete local corpus retains the older bridge asset-row differences.",
+  "coverage": {
+    "decoded_transactions": 20,
+    "pallas_compared": 20,
+    "pallas_unavailable": 0,
+    "invalid_transactions": 0,
+    "byron_outputs": 0,
+    "pointer_outputs": 0,
+    "collateral_outputs_compared": 9,
+    "fallback_outputs_compared": 0,
+    "multi_input_transactions": 13
+  }
 }

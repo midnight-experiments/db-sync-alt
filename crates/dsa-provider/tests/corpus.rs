@@ -113,6 +113,9 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
             "manifest {expected} count"
         );
     }
+    for (field, count) in manifest["coverage"].as_object().unwrap() {
+        assert_eq!(&summary[field], count, "manifest shape coverage {field}");
+    }
     assert!(summary["decoded_transactions"].as_u64().unwrap() > 0);
     assert_eq!(summary["pallas_unavailable"], 0);
 }

@@ -331,7 +331,13 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                     if !requests.insert(serde_json::to_string(&request)?) {
                         return Err("provider supplement failed to resolve requested fact".into());
                     }
-                    if recorded::load(&args.output, &request, &decoded, &mut supplements)? {
+                    if recorded::load(
+                        &args.output,
+                        &request,
+                        block.height,
+                        &decoded,
+                        &mut supplements,
+                    )? {
                         continue;
                     }
                     match &request {
@@ -342,7 +348,12 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                             else {
                                 return Err("unexpected provider datum reply".into());
                             };
-                            atomic_json(&args.output.join(format!("datums/{hash}.json")), &reply)?;
+                            atomic_json(
+                                &args
+                                    .output
+                                    .join(format!("datums/{}-{hash}.json", block.height)),
+                                &reply,
+                            )?;
                         }
                         SupplementRequest::Metadata(hash) => {
                             let Reply::Metadata(reply) =
@@ -372,7 +383,13 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                             )?;
                         }
                     }
-                    if !recorded::load(&args.output, &request, &decoded, &mut supplements)? {
+                    if !recorded::load(
+                        &args.output,
+                        &request,
+                        block.height,
+                        &decoded,
+                        &mut supplements,
+                    )? {
                         return Err("recorded provider supplement missing".into());
                     }
                 }

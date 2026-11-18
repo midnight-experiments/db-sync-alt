@@ -6,7 +6,7 @@ approved historical schema-5 backup. Each JSON bundle records a SHA-256 for
 every member. The adjacent manifest records the compressed digest, projection
 blocks, support-only blocks and expected row counts.
 
-The normal Rust test verifies the member digests and bundle limits, then runs
+The normal Rust test verifies the compressed digest, member digests, counts and bundle limits, then runs
 the same offline comparison used on the complete local corpus. It compares
 positional IDs and selected rows, datum preimage hashes and JSON values, and
 compares ordinary finalized transactions with Pallas 0.33.0. Identity sequence
@@ -19,10 +19,18 @@ The legacy SQL contract is pinned at
 `4d7cba2eee66b081c644fa8e2150025baf46a54f`; the target node is 2.1.101 at
 `86774edf8cc76345a5c3a4221f3fe80c094b1c33`.
 
-The Preprod subset has six positive row-projection blocks. One older block
-supplies original datum bytes only. Row assertions apply to the manifest's
-`projection_blocks`; support-only blocks provide preimages without asserting
-their row projection. The complete local corpus preserves the independent
+The Preprod subset has six positive row-projection blocks. It compares 20
+transactions, 13 with multiple ordinary inputs, and nine collateral-return
+bodies. These are valid transactions whose collateral returns have no chain
+effect. This subset has zero phase-2-invalid transactions, Byron or pointer
+outputs, fallback resolutions or stored bridge metadata rows. Separate adapter
+tests cover finalized provider output replies and a native invalid-projection
+model. The complete historical corpus supplies broader real-shape coverage.
+
+An older support block remains recorded with its original provenance. Causal
+replay uses only the current transaction's bytes, a requested recorded datum
+API response or an earlier successfully stored datum. Row assertions apply to
+the manifest's `projection_blocks`. The complete local corpus preserves the independent
 comparison of the older bridge outputs and their differing asset rows.
 
 Only public ledger responses and node-facing expected rows belong here.
