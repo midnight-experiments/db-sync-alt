@@ -452,6 +452,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn datum_selection_depends_on_reader_addresses_and_full_permissioned_unit() {
+        let profile = Profile::load("mainnet").unwrap();
+        let governance = Asset {
+            policy: profile.assets["council"].policy.clone(),
+            name: "ff".to_owned(),
+            quantity: 1,
+        };
+        let permissioned = &profile.assets["permissioned_candidates"];
+        let cn = &profile.assets["cnight"];
+        let cases = [
+            ("ordinary".to_owned(), governance.clone(), false),
+            (profile.addresses["council"].clone(), governance, true),
+            (
+                "ordinary".to_owned(),
+                Asset {
+                    policy: permissioned.policy.clone(),
+                    name: permissioned.name.clone(),
+                    quantity: 1,
+                },
+                true,
+            ),
+            (
+                "ordinary".to_owned(),
+                Asset {
+                    policy: cn.policy.clone(),
+                    name: cn.name.clone(),
+                    quantity: 1,
+                },
+                false,
+            ),
+        ];
+        let datum_hash = hash(&[0]);
+        for (index, (address, asset, required)) in cases.into_iter().enumerate() {
+            let tx = Transaction {
+                hash: format!("{index:02x}").repeat(32),
+                valid: true,
+                ordinary: Vec::new(),
+                collateral: Vec::new(),
+                reference: Vec::new(),
+                outputs: vec![Some(Output {
+                    address_raw: Vec::new(),
+                    address: Some(address),
+                    coin: 1,
+                    assets: vec![asset],
+                    data_hash: Some(datum_hash.clone()),
+                    inline_datum: None,
+                    classification_safe: true,
+                })],
+                collateral_output: None,
+                has_collateral_return: false,
+                mint: Vec::new(),
+                datums: BTreeMap::new(),
+                body: &[],
+                auxiliary: None,
+                auxiliary_hash: None,
+            };
+            let mut held = BTreeMap::new();
+            let mut supplements = Supplements::default();
+            if required {
+                assert_eq!(
+                    build_block(
+                        &profile,
+                        10,
+                        std::slice::from_ref(&tx),
+                        &mut held,
+                        &supplements
+                    )
+                    .unwrap_err(),
+                    BuildError::Required(SupplementRequest::Datum(datum_hash.clone()))
+                );
+                supplements
+                    .datums
+                    .insert(datum_hash.clone(), DatumAvailability::Present(vec![0]));
+            }
+            let rows = build_block(&profile, 10, &[tx], &mut held, &supplements).unwrap();
+            assert_eq!(rows.tx_out[0].data_hash.as_ref(), Some(&datum_hash));
+            assert_eq!(rows.ma_tx_out.len(), 1);
+            assert_eq!(
+                rows.datum.len(),
+                usize::from(required),
+                "an eligible token alone does not request an otherwise unread datum"
+            );
+        }
+    }
+
+    #[test]
     fn version_two_filters_every_address_and_preserves_full_asset_ordinals() {
         // Native selection model only, with no serialized ledger transaction.
         let mut profile = Profile::load("mainnet").unwrap();
