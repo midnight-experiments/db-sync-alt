@@ -22,6 +22,7 @@
 //! lock. Only after all hashes/sizes are known is a new complete file atomically
 //! published; an existing file is never overwritten. Every temporary is removed
 //! on error. Compression memory is bounded; whole tables are never buffered.
+//! Once COPY finishes, the read transaction commits before spool fsync/hash I/O.
 //! Temporary sections plus the final temporary output require roughly twice
 //! the compressed file size. Bytes copied into the final file are re-hashed.
 //! A directory fsync failure after publication is reported as published with
@@ -401,10 +402,8 @@ impl Store {
                 plain_bytes += chunk.len() as u64;
                 encoder.write_all(&chunk)?;
             }
-            let mut file = encoder.finish()?;
-            file.sync_all()?;
-            file.rewind()?;
-            let (compressed_bytes, sha256) = hash_reader(&mut file)?;
+            let file = encoder.finish()?;
+            let compressed_bytes = file.metadata()?.len();
             let rows = if table == MARKERS {
                 verified.protected_state.rows
             } else {
@@ -415,10 +414,24 @@ impl Store {
                 rows,
                 compressed_bytes,
                 plain_bytes,
-                sha256,
+                sha256: String::new(),
             });
         }
         tx.commit().await?;
+        // COPY fixed the source snapshot in private spool files. Avoid holding
+        // an idle transaction during local sync/hash I/O.
+        for section in &mut sections {
+            let mut file = File::options()
+                .read(true)
+                .write(true)
+                .open(staging.path().join(&section.table))?;
+            file.sync_all()?;
+            let (size, hash) = hash_reader(&mut file)?;
+            if size != section.compressed_bytes {
+                return Err(Error::Refusal("snapshot_spool_changed"));
+            }
+            section.sha256 = hash;
+        }
         let description = Description {
             database_format: DATABASE_FORMAT,
             network: profile.network.clone(),

@@ -879,7 +879,7 @@ async fn snapshot_preflight_limits_lock_and_relative_paths() -> Result {
         String::from_utf8(rejected.stderr)?.contains("snapshot_section_hash_mismatch"),
         "late corruption reached COPY trigger"
     );
-    client.batch_execute("DROP TRIGGER preflight_guard ON serve.block;DROP FUNCTION serve.preflight_guard();CREATE FUNCTION serve.timeout_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF current_setting('statement_timeout')='0' OR current_setting('idle_in_transaction_session_timeout')='0' THEN RAISE EXCEPTION 'caller timeout was disabled';END IF;RETURN NEW;END$$;CREATE TRIGGER timeout_guard BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.timeout_guard()").await?;
+    client.batch_execute("DROP TRIGGER preflight_guard ON serve.block;DROP FUNCTION serve.preflight_guard();CREATE FUNCTION serve.timeout_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF current_setting('statement_timeout')<>'2min' OR current_setting('idle_in_transaction_session_timeout')<>'2min' THEN RAISE EXCEPTION 'explicit120s timeouts were not applied to this restore session';END IF;RETURN NEW;END$$;CREATE TRIGGER timeout_guard BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.timeout_guard()").await?;
     let args = [
         "--file",
         good.to_str().unwrap(),
