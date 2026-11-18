@@ -1,0 +1,73 @@
+name: conversion-regression-controls
+on:
+  push:
+    branches: [validation/conversion-controls-6faf08e]
+permissions:
+  contents: read
+jobs:
+  baseline-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+    services:
+      postgres:
+        image: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: dsa_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e5ab3bb8824ebd16d24a6753b845e820fdd5f273
+          persist-credentials: false
+      - name: Overlay only pinned regression tests on unchanged first converter
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          test "$(git rev-parse HEAD)" = e5ab3bb8824ebd16d24a6753b845e820fdd5f273
+          git fetch --depth=1 origin 6faf08ef553d76fcc20b2d7bbadfa36bb0d86a96
+          git show 6faf08ef553d76fcc20b2d7bbadfa36bb0d86a96:crates/db-sync-alt/tests/conversion.rs > crates/db-sync-alt/tests/conversion.rs
+          test "$(git diff --name-only)" = crates/db-sync-alt/tests/conversion.rs
+          git diff --stat > "$RUNNER_TEMP/evidence/overlay.txt"
+          git rev-parse HEAD >> "$RUNNER_TEMP/evidence/overlay.txt"
+          sha256sum Cargo.lock crates/dsa-store/src/{convert,canonical,lib}.rs crates/db-sync-alt/tests/conversion.rs >> "$RUNNER_TEMP/evidence/overlay.txt"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
+      - name: Prove pinned regressions fail on first converter
+        shell: bash
+        env:
+          DSA_TEST_DATABASE: host=postgres user=postgres dbname=dsa_test sslmode=disable
+        run: |
+          set -euo pipefail
+          cargo test --locked -p db-sync-alt --test conversion --no-run 2>&1 | tee "$RUNNER_TEMP/evidence/build.log"
+          for test in \
+            convert_network_identity_rejects_shared_units_and_uses_positive_anchor \
+            convert_preflight_refusals_preserve_pristine_and_created_destinations \
+            convert_tls_default_refuses_plaintext_explicit_local_works \
+            convert_corrupt_selected_parents_are_not_silently_dropped \
+            convert_sparse_origins_continuous_suffix_and_missing_window_headers \
+            convert_source_statement_timeout_is_named_closed_and_retryable; do
+            set +e
+            cargo test --locked -p db-sync-alt --test conversion "$test" -- --ignored --exact --nocapture > "$RUNNER_TEMP/evidence/$test.log" 2>&1
+            code=$?
+            set -e
+            test "$code" = 101
+            grep -q 'test result: FAILED. 0 passed; 1 failed;' "$RUNNER_TEMP/evidence/$test.log"
+            echo "$test: expected baseline failure, exit=$code" | tee -a "$RUNNER_TEMP/evidence/result.txt"
+          done
+      - name: Hash evidence
+        if: always()
+        shell: bash
+        run: cd "$RUNNER_TEMP/evidence" && sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conversion-regression-controls-6faf08e
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
