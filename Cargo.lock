@@ -312,7 +312,9 @@ dependencies = [
  "clap",
  "dsa-chain",
  "dsa-store",
+ "hex",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-postgres",
 ]
@@ -382,6 +384,7 @@ name = "dsa-store"
 version = "0.5.0"
 dependencies = [
  "dsa-chain",
+ "hex",
  "rustls",
  "rustls-pemfile",
  "serde_json",

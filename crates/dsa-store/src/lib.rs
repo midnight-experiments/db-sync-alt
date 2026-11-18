@@ -1,5 +1,7 @@
 //! PostgreSQL layout, database identity and least-privilege node access.
 
+pub mod keep;
+
 use std::{io::BufReader, path::Path};
 
 use dsa_chain::{VERSION, profiles::Profile};

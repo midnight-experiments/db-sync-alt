@@ -19,3 +19,4 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring", "webpki-roots"] 
 webpki-roots = "1"
 tokio.workspace = true
 tokio-postgres.workspace = true
+hex = "0.4"
