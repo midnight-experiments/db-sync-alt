@@ -89,6 +89,7 @@ jobs:
           import hashlib,json,os,pathlib,subprocess
           e=pathlib.Path(os.environ['RUNNER_TEMP'])/'keep-evidence';log=e/'benchmark.log';objects=[]
           for line in log.read_text().splitlines():
+              line=line.removeprefix('test keep_rule_realistic_plans ... ')
               if line.startswith('{'):objects.append(json.loads(line))
           setup=next(x for x in objects if 'source_headers' in x)
           assert setup['source_headers']==1232170 and setup['source_outputs']==2464340 and setup['source_inputs']==2160000
