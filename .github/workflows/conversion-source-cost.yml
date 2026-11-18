@@ -70,7 +70,7 @@ jobs:
             -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target \
             -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
             -e DSA_CONVERSION_HEADERS=10000 "$RUST_IMAGE" \
-            sh -ec 'test_binary=$(find /target/debug/deps -maxdepth 1 -type f -executable -name "conversion-*"); test -n "$test_binary"; "$test_binary" convert_scaled_source_cost --ignored --exact --nocapture --test-threads=1'  2>&1 | tee "$RUNNER_TEMP/evidence/small.log"
+            sh -ec 'test_binary=$(find /target/debug -type f -executable -name "conversion-*"); test -n "$test_binary"; "$test_binary" convert_scaled_source_cost --ignored --exact --nocapture --test-threads=1'  2>&1 | tee "$RUNNER_TEMP/evidence/small.log"
       - name: Full generated source reader measurement
         shell: bash
         run: |
@@ -80,7 +80,7 @@ jobs:
             -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target \
             -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
             -e DSA_CONVERSION_HEADERS=2432170 "$RUST_IMAGE" \
-            sh -ec 'test_binary=$(find /target/debug/deps -maxdepth 1 -type f -executable -name "conversion-*"); test -n "$test_binary"; "$test_binary" convert_scaled_source_cost --ignored --exact --nocapture --test-threads=1'  2>&1 | tee "$RUNNER_TEMP/evidence/full.log"
+            sh -ec 'test_binary=$(find /target/debug -type f -executable -name "conversion-*"); test -n "$test_binary"; "$test_binary" convert_scaled_source_cost --ignored --exact --nocapture --test-threads=1'  2>&1 | tee "$RUNNER_TEMP/evidence/full.log"
       - name: Strict evidence readback
         shell: bash
         run: |
