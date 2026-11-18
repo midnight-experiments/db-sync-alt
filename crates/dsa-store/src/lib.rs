@@ -26,6 +26,12 @@ pub const NODE_RELATIONS: [&str; 11] = [
 ];
 const WRITER_NAMESPACE: i32 = 0x647361;
 const WRITER_LOCK: i32 = 1;
+const READER_SETTINGS: [&str; 4] = [
+    "statement_timeout",
+    "idle_in_transaction_session_timeout",
+    "search_path",
+    "default_transaction_read_only",
+];
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -294,10 +300,15 @@ async fn verify_reader<C: GenericClient>(client: &C, role: &str) -> Result<Value
         "SELECT s.setconfig FROM pg_db_role_setting s JOIN pg_roles r ON r.oid=s.setrole \
          WHERE r.rolname=$1 AND s.setdatabase IN (0,(SELECT oid FROM pg_database WHERE datname=current_database())) ORDER BY s.setdatabase", &[&role]
     ).await?;
-    let mut settings = serde_json::Map::new();
+    let mut settings = READER_SETTINGS
+        .into_iter()
+        .map(|name| (name.to_owned(), Value::Null))
+        .collect::<serde_json::Map<_, _>>();
     for row in rows {
         for item in row.get::<_, Option<Vec<String>>>(0).unwrap_or_default() {
-            if let Some((name, value)) = item.split_once('=') {
+            if let Some((name, value)) = item.split_once('=')
+                && READER_SETTINGS.contains(&name)
+            {
                 settings.insert(name.to_owned(), json!(value));
             }
         }
@@ -327,7 +338,11 @@ async fn verify_reader<C: GenericClient>(client: &C, role: &str) -> Result<Value
             });
         }
     }
-    if settings.get("search_path").and_then(Value::as_str) != Some("public") {
+    if settings
+        .get("search_path")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.replace([' ', '"'], "") != "public")
+    {
         warnings.push("reader_search_path_not_public".to_owned());
     }
     if limit < 0 {

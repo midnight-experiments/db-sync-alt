@@ -49,7 +49,7 @@ impl Database {
             "CREATE ROLE {owner} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; \
              CREATE ROLE {reader} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 40; \
              ALTER ROLE {reader} SET search_path=public; ALTER ROLE {reader} SET statement_timeout='60s'; \
-             ALTER ROLE {reader} SET idle_in_transaction_session_timeout='60s'; ALTER ROLE {reader} SET default_transaction_read_only=on"
+             ALTER ROLE {reader} SET idle_in_transaction_session_timeout='60s'; ALTER ROLE {reader} SET default_transaction_read_only=on; ALTER ROLE {reader} SET application_name=synthetic_reader"
         )).await?;
         admin
             .batch_execute(&format!("CREATE DATABASE {database} OWNER {owner}"))
@@ -125,6 +125,8 @@ impl Database {
         let result: Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(result["privileges"], "node_relations_only");
         assert_eq!(result["warnings"], json!([]));
+        assert_eq!(result["settings"].as_object().unwrap().len(), 5);
+        assert!(result["settings"].get("application_name").is_none());
         Ok(())
     }
 
@@ -379,6 +381,20 @@ async fn reader_refuses_extra_effective_privileges() -> Result {
         ))
         .await?;
     db.grant().await?;
+    db.admin
+        .batch_execute(&format!(
+            "ALTER ROLE {} SET search_path='\"public\"'",
+            db.reader
+        ))
+        .await?;
+    let quoted = store.check_reader(&profile, &db.reader).await?;
+    assert_eq!(quoted["warnings"], json!([]));
+    db.admin
+        .batch_execute(&format!("ALTER ROLE {} RESET ALL", db.reader))
+        .await?;
+    let unset = store.check_reader(&profile, &db.reader).await?;
+    assert_eq!(unset["settings"].as_object().unwrap().len(), 5);
+    assert!(unset["settings"]["statement_timeout"].is_null());
     let invalid = db
         .cli("grant-reader", "preprod", &["--role", &db.owner])
         .await?;
@@ -393,7 +409,8 @@ async fn identity_refusals_status_and_single_writer() -> Result {
     let db = Database::new().await?;
     let preprod = Profile::load("preprod")?;
     let mainnet = Profile::load("mainnet")?;
-    let admin_config: Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
+    let mut admin_config: Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
+    admin_config.ssl_mode(SslMode::Disable);
     let mut admin_store = Store::connect(admin_config, None).await?;
     assert!(matches!(
         admin_store.create(&preprod).await,
