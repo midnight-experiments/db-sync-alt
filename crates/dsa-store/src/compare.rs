@@ -33,6 +33,9 @@ use tokio_postgres::{
     types::{ToSql, Type},
 };
 
+/// Canonical observation encoding; independent of retained-data rule version.
+pub const OBSERVATION_FORMAT: u32 = 2;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct Cursor {
@@ -417,6 +420,8 @@ pub struct Case {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capture {
+    #[serde(default)]
+    pub observation_format: u32,
     pub keep_rule_version: i32,
     pub missing_policy: String,
     pub missing_tx_hash: String,
@@ -468,6 +473,7 @@ pub struct BridgeProbe {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    pub observation_format: u32,
     pub keep_rule_version: i32,
     pub missing_policy: String,
     pub missing_tx_hash: String,
@@ -759,8 +765,33 @@ async fn rows_limited(
         .filter(|column| *column.type_() == Type::JSONB || *column.type_() == Type::JSON)
         .map(|column| column.name().to_owned())
         .collect::<BTreeSet<_>>();
+    // to_jsonb(record) alone conflates SQL NULL with a non-NULL JSON null.
+    // Preserve that type distinction alongside JSON columns; nested values
+    // remain PostgreSQL text and are never decoded or recursively normalized.
+    let payload = if json_fields.is_empty() {
+        "to_jsonb(observation)".to_owned()
+    } else {
+        let mut flag_key = "__dsa_sql_nulls".to_owned();
+        while native.columns().iter().any(|c| c.name() == flag_key) {
+            flag_key.push('_');
+        }
+        let nulls = json_fields
+            .iter()
+            .map(|field| {
+                format!(
+                    "'{}',observation.\"{}\" IS NULL",
+                    field.replace('\'', "''"),
+                    field.replace('\"', "\"\"")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "to_jsonb(observation) || jsonb_build_object('{flag_key}',jsonb_build_object({nulls}))"
+        )
+    };
     let sql = format!(
-        "SELECT to_jsonb(observation)::text FROM ({}) observation",
+        "SELECT ({payload})::text FROM ({}) observation",
         statement.sql.trim().trim_end_matches(';')
     );
     let prepared = tx
@@ -1421,6 +1452,7 @@ pub async fn capture(
     }
     let mut result = Collector {
         capture: Capture {
+            observation_format: OBSERVATION_FORMAT,
             keep_rule_version: crate::KEEP_RULE_VERSION,
             missing_policy: hex::encode(&missing),
             missing_tx_hash: hex::encode(&missing_tx),
@@ -1907,6 +1939,9 @@ fn coverage(capture: &Capture) -> BTreeMap<String, QueryCoverage> {
 /// Only verified helper ID differences are informational. Case provenance,
 /// profile/positions and every other answer (including resolve_ident) are exact.
 pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
+    if a.observation_format != OBSERVATION_FORMAT || b.observation_format != OBSERVATION_FORMAT {
+        return Err(Error::Refusal("comparison_observation_format_mismatch"));
+    }
     if a.keep_rule_version != crate::KEEP_RULE_VERSION
         || b.keep_rule_version != crate::KEEP_RULE_VERSION
     {
@@ -1975,6 +2010,7 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     let info = differences.iter().filter(|d| d.informational).count();
     let probe_rows = keys_for_probe_rows(a, b);
     Ok(Report {
+        observation_format: OBSERVATION_FORMAT,
         missing_policy: a.missing_policy.clone(),
         missing_tx_hash:a.missing_tx_hash.clone(),
         candidate_address:a.candidate_address.clone(),

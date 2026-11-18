@@ -1036,6 +1036,24 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
         .output()
         .await?;
     assert_eq!(fresh.status.code(), Some(2));
+    let old_file = dir.path().join("old-observation.capture.json");
+    let mut old = capture.clone();
+    old["format"] = json!(1);
+    std::fs::write(&old_file, serde_json::to_vec(&old)?)?;
+    let refused = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "compare",
+            "--a-capture",
+            old_file.to_str().unwrap(),
+            "--b",
+            &target.dsn(true),
+            "--network",
+            "mainnet",
+        ])
+        .output()
+        .await?;
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("source_capture_format_mismatch"));
     let cases = capture["capture"]["cases"].as_object_mut().unwrap();
     let case = cases
         .values_mut()
@@ -1092,6 +1110,16 @@ async fn compare_preserves_json_numeric_spelling_but_normalizes_scalar_amounts()
     let json_scalar_decimal =
         compare::rows(&tx, &make("SELECT '1.0'::jsonb AS datum"), &[]).await?;
     assert_ne!(json_scalar_integer, json_scalar_decimal);
+    let sql_null = compare::rows(&tx, &make("SELECT NULL::jsonb AS datum"), &[]).await?;
+    let json_null = compare::rows(&tx, &make("SELECT 'null'::jsonb AS datum"), &[]).await?;
+    println!(
+        "{}",
+        json!({"event":"typed_json_null_comparison","different":sql_null!=json_null})
+    );
+    assert_ne!(
+        sql_null, json_null,
+        "SQL NULL must remain distinct from JSON null"
+    );
     tx.commit().await?;
     let output = f.tags["council_8"];
     let hash = f.chain.outputs[&output].datum_hash.as_ref().unwrap();

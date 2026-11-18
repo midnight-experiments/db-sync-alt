@@ -1,4 +1,4 @@
-//! Development source-answer file, format1 with an enforced keep-rule version.
+//! Development source-answer file, format2 with an enforced keep-rule version.
 //!
 //! A conversion captures the literal node answers in its source RR/RO snapshot,
 //! commits that source, then publishes this independently useful observation
@@ -22,7 +22,7 @@ use std::{
     io::{self, BufReader, Read, Write},
     path::Path,
 };
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MAX_BYTES: u64 = 1 << 30;
 #[derive(Serialize)]
 struct BorrowedEnvelope<'a> {
@@ -91,6 +91,9 @@ pub fn preflight(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 pub fn write(path: &Path, capture: &Capture) -> Result<Published, Error> {
+    if capture.observation_format != crate::compare::OBSERVATION_FORMAT {
+        return Err(Error::Refusal("comparison_observation_format_mismatch"));
+    }
     preflight(path)?;
     let sha256 = digest(capture)?;
     let parent = path
@@ -141,6 +144,9 @@ pub fn read(path: &Path, profile: &Profile) -> Result<Capture, Error> {
         .map_err(|_| Error::Refusal("invalid_source_capture_file"))?;
     if envelope.format != FORMAT {
         return Err(Error::Refusal("source_capture_format_mismatch"));
+    }
+    if envelope.capture.observation_format != crate::compare::OBSERVATION_FORMAT {
+        return Err(Error::Refusal("comparison_observation_format_mismatch"));
     }
     if envelope.capture.keep_rule_version != KEEP_RULE_VERSION {
         return Err(Error::Refusal("comparison_keep_rule_mismatch"));
