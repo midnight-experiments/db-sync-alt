@@ -1,0 +1,96 @@
+name: rule-v2-mutations
+on:
+  push:
+    branches: [validation/rule-v2-mutations-975f031]
+permissions:
+  contents: read
+jobs:
+  generated-negative-controls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PRODUCT_PIN: 975f0318ec72ba9f9245c76ebc549930e25c1bb9
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+      PG_IMAGE: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 975f0318ec72ba9f9245c76ebc549930e25c1bb9
+          persist-credentials: false
+      - name: Positive baselines and real source mutation failures
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess,time
+          repo=pathlib.Path.cwd();root=pathlib.Path(os.environ['RUNNER_TEMP']);out=root/'evidence';pin=os.environ['PRODUCT_PIN'];rust=os.environ['RUST_IMAGE'];pg=os.environ['PG_IMAGE']
+          for name in ['evidence','cargo','target']: (root/name).mkdir(exist_ok=True)
+          def run(args,**kw):return subprocess.run(args,text=True,check=True,**kw)
+          def git(*args):return subprocess.check_output(['git',*args],text=True)
+          assert git('rev-parse','HEAD').strip()==pin and not git('status','--porcelain').strip()
+          (out/'provenance.txt').write_text(git('rev-parse','HEAD')+git('ls-files'))
+          run(['docker','pull',rust]);run(['docker','pull',pg])
+          def build(package,test,label):
+           command=['docker','run','--rm','--name','dsa-mutation-build','--cpus','2','--memory','3g','--memory-swap','3g','-v',f'{repo}:/workspace:ro','-v',f'{root}/cargo:/cargo-cache','-v',f'{root}/target:/target','-w','/workspace','-e','CARGO_HOME=/cargo-cache','-e','CARGO_TARGET_DIR=/target',rust,'cargo','test','--locked','-p',package,'--test',test,'--no-run']
+           with (out/f'{label}-build.log').open('w')as log:run(command,stdout=log,stderr=subprocess.STDOUT)
+          def execute(test,name,label,ignored=True):
+           command=['docker','run','--rm','--name','dsa-mutation-test','--network','dsa-mutation-internal','--cpus','2','--memory','2g','--memory-swap','2g','-v',f'{repo}:/workspace:ro','-v',f'{root}/target:/target:ro','-w','/workspace','-e','DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable','-e','DSA_KEEP_CASES=4',rust,'sh','-ec',f'test_binary=$(find /target/debug -type f -executable -name "{test}-*"); test -n "$test_binary"; "$test_binary" {name} {"--ignored "if ignored else ""}--exact --nocapture --test-threads=1']
+           with (out/f'{label}.log').open('w')as log:r=subprocess.run(command,text=True,stdout=log,stderr=subprocess.STDOUT)
+           return r.returncode,(out/f'{label}.log').read_text()
+          summary=[]
+          try:
+           build('dsa-chain','asset_rule','baseline-assets');build('db-sync-alt','keep_rule','baseline-keep')
+           run(['docker','network','create','--internal','dsa-mutation-internal'])
+           run(['docker','run','-d','--name','dsa-mutation-postgres','--network','dsa-mutation-internal','--network-alias','postgres','--cpus','2','--memory','3g','--memory-swap','3g','--shm-size','256m','--tmpfs','/var/lib/postgresql/data:rw,size=2147483648','-e','POSTGRES_HOST_AUTH_METHOD=trust','-e','POSTGRES_DB=dsa_test',pg,'-c','jit=off','-c','max_wal_size=128MB','-c','checkpoint_timeout=30s'])
+           for _ in range(60):
+            if subprocess.run(['docker','exec','dsa-mutation-postgres','pg_isready','-U','postgres','-d','dsa_test'],stdout=subprocess.DEVNULL).returncode==0:break
+            time.sleep(1)
+           for name in ['keep_rule_v2_literal_governance_and_datum_edges','keep_rule_selection_entry_points','keep_rule_node_regressions','keep_rule_node_spend_regression']:
+            code,text=execute('keep_rule',name,'baseline-'+name);assert code==0 and 'test result: ok. 1 passed;'in text,name
+           code,text=execute('asset_rule','fixed_descriptors_equal_the_independent_pinned_network_sets','baseline-fixed',False);assert code==0
+           def drop_role(text,role):
+            begin=text.index('pub const FIXED_UNIT_ROLES');end=text.index('];',begin)+2
+            block=text[begin:end];assert block.count(f'"{role}"')==1
+            block=block.replace('[&str; 6]','[&str; 5]').replace(f'    "{role}",\n','')
+            assert f'"{role}"'not in block
+            return text[:begin]+block+text[end:]
+           def replace_once(old,new):
+            def apply(text):assert text.count(old)==1,(old,text.count(old));return text.replace(old,new,1)
+            return apply
+           mutations=[
+            ('drop-bridge-fixed','crates/dsa-chain/src/assets.rs',lambda s:drop_role(s,'bridge'),'dsa-chain','asset_rule','fixed_descriptors_equal_the_independent_pinned_network_sets',False),
+            ('drop-council-fixed','crates/dsa-chain/src/assets.rs',lambda s:drop_role(s,'council'),'dsa-chain','asset_rule','fixed_descriptors_equal_the_independent_pinned_network_sets',False),
+            ('governance-exact-only','crates/dsa-store/src/keep.rs',replace_once('catalogue.policy=ANY($6::bytea[]) OR ',''),'db-sync-alt','keep_rule','keep_rule_v2_literal_governance_and_datum_edges',True),
+            ('exact-units-policy-only','crates/dsa-store/src/keep.rs',replace_once('fixed.policy=catalogue.policy AND fixed.name=catalogue.name','fixed.policy=catalogue.policy'),'db-sync-alt','keep_rule','keep_rule_ten_thousand_chains',True),
+            ('all-assets-exception','crates/dsa-store/src/keep.sql',replace_once('AND __ELIGIBLE_ASSET__','AND true'),'db-sync-alt','keep_rule','keep_rule_selection_entry_points',True),
+            ('ordinary-governance-datum','crates/dsa-store/src/keep.sql',replace_once('AND (m.policy=$7::bytea AND m.name=$8::bytea)))','AND (m.policy=ANY($6::bytea[]) OR (m.policy=$7::bytea AND m.name=$8::bytea))))'),'db-sync-alt','keep_rule','keep_rule_selection_entry_points',True),
+            ('permissioned-newest-only','crates/dsa-store/src/keep.sql',replace_once('SELECT c.id,c.tx_id,c.block_id FROM permissioned_candidates c CROSS JOIN horizon h\n WHERE c.epoch_no>h.epoch-2\n UNION ',''),'db-sync-alt','keep_rule','keep_rule_node_regressions',True),
+            ('drop-window-spent-origin','crates/dsa-store/src/keep.sql',replace_once('AND i.id>=0 AND i.id<$1::bigint*16777216)','AND i.id>=0)'),'db-sync-alt','keep_rule','keep_rule_node_spend_regression',True),
+           ]
+           for label,path,mutate,package,test,name,ignored in mutations:
+            run(['git','restore','--source',pin,'--worktree','.'])
+            target=repo/path;original=target.read_text();changed=mutate(original);assert changed!=original
+            target.write_text(changed);(out/f'{label}.diff').write_text(git('diff','--',path))
+            build(package,test,label)
+            code,text=execute(test,name,label,ignored)
+            item={'label':label,'path':path,'test':name,'exit':code,'changed_sha256':hashlib.sha256(changed.encode()).hexdigest(),'expected_failure':code==101 and f'test {name} ...'in text and 'panicked at'in text and 'test result: FAILED. 0 passed; 1 failed;'in text};summary.append(item)
+            (out/'readback.json').write_text(json.dumps({'product_pin':pin,'passed':False,'controls':summary},indent=2)+'\n')
+            assert item['expected_failure'],item
+           run(['git','restore','--source',pin,'--worktree','.']);assert not git('status','--porcelain').strip()
+           (out/'readback.json').write_text(json.dumps({'product_pin':pin,'passed':True,'baseline_passed':True,'controls':summary},indent=2)+'\n')
+          finally:
+           subprocess.run(['git','restore','--source',pin,'--worktree','.'])
+           for name in ['dsa-mutation-postgres']:
+            with (out/f'{name}-inspect.json').open('w')as f:subprocess.run(['docker','inspect',name],text=True,stdout=f)
+            with (out/f'{name}.log').open('w')as f:subprocess.run(['docker','logs','--timestamps',name],text=True,stdout=f,stderr=subprocess.STDOUT)
+           subprocess.run(['docker','rm','-f','dsa-mutation-test','dsa-mutation-build','dsa-mutation-postgres']);subprocess.run(['docker','network','rm','dsa-mutation-internal'])
+           sums=[]
+           for p in sorted(out.iterdir()):
+            if p.name!='SHA256SUMS':sums.append(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name)
+           (out/'SHA256SUMS').write_text('\n'.join(sums)+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rule-v2-mutations-975f031
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
