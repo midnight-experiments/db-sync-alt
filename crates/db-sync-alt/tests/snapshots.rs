@@ -124,7 +124,7 @@ fn fixture(seed: u64) -> Fixture {
         });
     }
     // Deliberately mixed assets and non-dense original ordinals: snapshot must
-    // preserve them, regardless of Q18's future source projection decision.
+    // preserve eligible IDs with gaps after rule-2 source selection.
     let output = f.output(8, 0, 11, "ics", "ics", Some(999));
     f.add_asset(output, 9001, 19);
     f
@@ -342,7 +342,7 @@ async fn snapshot_corruption_refusal_retry_and_serving_protection() -> Result {
     ));
     cases.push((
         "rule",
-        rewrite_description(&bytes, |v| v["keep_rule_version"] = json!(999)),
+        rewrite_description(&bytes, |v| v["keep_rule_version"] = json!(1)),
     ));
     cases.push((
         "content",

@@ -19,7 +19,6 @@ use crate::{
 use chrono::NaiveDateTime;
 use dsa_chain::profiles::Profile;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -91,8 +90,13 @@ impl Positions {
             Ok(Cursor {
                 block: u32::try_from(rows[i].get::<_, i64>(0))
                     .map_err(|_| Error::Refusal("comparison_height_out_of_range"))?,
-                tx_index: u32::try_from(rows[i].get::<_, i64>(1) + 1)
-                    .map_err(|_| Error::Refusal("comparison_tx_count_out_of_range"))?,
+                tx_index: u32::try_from(
+                    rows[i]
+                        .get::<_, i64>(1)
+                        .checked_add(1)
+                        .ok_or(Error::Refusal("comparison_tx_count_out_of_range"))?,
+                )
+                .map_err(|_| Error::Refusal("comparison_tx_count_out_of_range"))?,
             })
         };
         let mut pairs = BTreeSet::new();
@@ -253,6 +257,7 @@ pub struct Case {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capture {
+    pub keep_rule_version: i32,
     pub node_commit: String,
     pub catalogue_sha256: String,
     pub profile_hash: String,
@@ -279,6 +284,7 @@ pub struct Difference {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    pub keep_rule_version: i32,
     pub matched: bool,
     pub node_commit: String,
     pub catalogue_sha256: String,
@@ -501,7 +507,8 @@ impl IdBounds {
                 .ok_or(Error::Refusal("comparison_bounds_missing"))?,
         )?;
         let id = |k: &str| {
-            value[k].as_i64()
+            value[k]
+                .as_i64()
                 .ok_or(Error::Refusal("comparison_invalid_bounds"))
         };
         Ok(Self {
@@ -590,11 +597,20 @@ async fn preflight(tx: &Transaction<'_>) -> Result<serde_json::Value, Error> {
         return Err(Error::Refusal("comparison_invalid_reader_role"));
     }
     let role: String = row.get(0);
-    let gates=tx.query("SELECT p.oid FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('chain','dsa') AND p.proname='gate' AND p.pronargs=0 AND p.prosecdef AND p.provolatile='s' AND p.prorettype=16",&[]).await?;
+    let gates=tx.query("SELECT p.oid,n.nspname::text,p.proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname IN ('chain','dsa') AND p.proname='gate' AND p.pronargs=0 AND p.prosecdef AND p.provolatile='s' AND p.prorettype=16",&[]).await?;
     if gates.len() != 1 {
         return Err(Error::Refusal("comparison_unsupported_gate"));
     }
     let gate: u32 = gates[0].get(0);
+    let schema: String = gates[0].get(1);
+    if schema == "dsa" {
+        let declared: Option<Vec<String>> = gates[0].get(2);
+        let expected = format!("dsa.keep_rule_version={}", crate::KEEP_RULE_VERSION);
+        if !declared.is_some_and(|v| v.contains(&expected)) {
+            return Err(Error::Refusal("comparison_keep_rule_mismatch"));
+        }
+    }
+
     let sql = include_str!("reader_check.sql")
         .replace("'dsa.gate()'::regprocedure", "$3::oid")
         .replace("'dsa.gate()'", "$3::oid");
@@ -607,7 +623,7 @@ async fn preflight(tx: &Transaction<'_>) -> Result<serde_json::Value, Error> {
     if !violations.is_empty() {
         return Err(Error::ReaderPrivileges(violations));
     }
-    tx.query_opt("SELECT id FROM public.block LIMIT 1", &[])
+    tx.query_opt("SELECT EXISTS(SELECT 1 FROM public.block)", &[])
         .await
         .map_err(|error| {
             if error.code().is_some_and(|c| c.code() == "55000") {
@@ -903,6 +919,7 @@ pub async fn capture(
     let entries = &cat.entries;
     let mut result = Collector {
         capture: Capture {
+            keep_rule_version: crate::KEEP_RULE_VERSION,
             node_commit: cat.node_commit.clone(),
             catalogue_sha256: hash(catalogue::GENERATED),
             profile_hash: profile.hash()?,
@@ -931,7 +948,8 @@ pub async fn capture(
         .find(|e| e.name == "resolve_ident" && e.kind == "read")
         .unwrap();
     let mut units = BTreeMap::new();
-    for (role, a) in &profile.assets {
+    for role in dsa_chain::assets::FIXED_UNIT_ROLES {
+        let a = &profile.assets[role];
         let data = result
             .add(
                 tx,
@@ -948,11 +966,20 @@ pub async fn capture(
         }
         let v: serde_json::Value = serde_json::from_str(&data[0])?;
         units.insert(
-            role.clone(),
+            role.to_owned(),
             v["id"]
                 .as_i64()
                 .ok_or(Error::Refusal("comparison_invalid_ident"))?,
         );
+    }
+    for alias in ["ics", "reserve"] {
+        if let Some((_, id)) = units
+            .iter()
+            .find(|(role, _)| profile.assets[*role].unit() == profile.assets[alias].unit())
+        {
+            let id = *id;
+            units.insert(alias.to_owned(), id);
+        }
     }
     let mut effective = options.clone();
     if effective.candidate_address == "__untracked_candidates__" {
@@ -1122,7 +1149,10 @@ pub async fn capture(
                 let mut seen = BTreeSet::new();
                 ["cnight", "bridge", "ics", "reserve"]
                     .into_iter()
-                    .filter(|role| seen.insert(profile.assets[*role].unit()))
+                    .filter(|role| {
+                        context.units.contains_key(*role)
+                            && seen.insert(profile.assets[*role].unit())
+                    })
                     .collect::<Vec<_>>()
             } else {
                 vec!["auth"]
@@ -1237,6 +1267,7 @@ pub async fn capture(
             .await?;
         let bridge_units = ["bridge", "ics", "reserve"]
             .into_iter()
+            .filter(|role| context.units.contains_key(*role))
             .map(|r| (profile.assets[r].unit(), r))
             .collect::<BTreeMap<_, _>>();
         for (unit, role) in bridge_units {
@@ -1278,6 +1309,11 @@ pub async fn capture(
 /// Only verified helper ID differences are informational. Case provenance,
 /// profile/positions and every other answer (including resolve_ident) are exact.
 pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
+    if a.keep_rule_version != crate::KEEP_RULE_VERSION
+        || b.keep_rule_version != crate::KEEP_RULE_VERSION
+    {
+        return Err(Error::Refusal("comparison_keep_rule_mismatch"));
+    }
     if a.node_commit != b.node_commit
         || a.catalogue_sha256 != b.catalogue_sha256
         || a.profile_hash != b.profile_hash
@@ -1330,6 +1366,7 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     }
     let info = differences.iter().filter(|d| d.informational).count();
     Ok(Report {
+        keep_rule_version: crate::KEEP_RULE_VERSION,
         matched: differences.iter().all(|d| d.informational),
         node_commit: a.node_commit.clone(),
         catalogue_sha256: a.catalogue_sha256.clone(),

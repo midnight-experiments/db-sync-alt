@@ -14,8 +14,8 @@
 //! accepting isolated older origin/epoch headers below a verified start anchor.
 //! Default H is the newest header at/before target.time-retention, found
 //! by indexed height bisection on monotone Cardano header times, without a time
-//! index or a block-rate estimate. Shorter source history clamps H to its first
-//! header. Report chosen times, elapsed target-H seconds, clamp and read cost.
+//! index or a block-rate estimate. Shorter source history clamps H to its verified
+//! continuous beginning, ignoring older isolated origin/epoch headers. Report chosen times, elapsed target-H seconds, clamp and read cost.
 //! Explicit --horizon-block takes precedence. Retention is still a duration:
 //! every retained window header gets first_served=publication time, preserving
 //! the full configured period after conversion, as after restore.
@@ -24,8 +24,8 @@
 //! canonical text and the old-spent marker in natural-key order. Rust never
 //! parses arbitrary datum/metadata JSON. Destination batches are bounded by rows
 //! and bytes; one supported row larger than the byte target travels alone.
-//! Every original ID/ordinal and full supplied asset payload survives. Q18 is
-//! deliberately upstream; the converter neither filters nor invents assets.
+//! Rule v2 filters asset rows at every address before loading, preserving the
+//! original IDs/ordinals and every retained payload. Output shells remain.
 //! Source and destination family/state digests and inserted counts must agree.
 //!
 //! stage_conversion accepts the caller's already-open readonly transaction. An
@@ -662,18 +662,14 @@ async fn supply(
     profile: &Profile,
     target: u32,
 ) -> Result<BTreeMap<String, String>, Error> {
-    let units = profile
-        .assets
-        .values()
-        .map(|asset| (asset.unit(), asset))
-        .collect::<BTreeMap<_, _>>();
+    let units = dsa_chain::assets::fixed_units(profile);
     let policies = units
-        .values()
-        .map(|a| hex::decode(&a.policy).map_err(|_| Error::Refusal("invalid_keep_profile")))
+        .iter()
+        .map(|u| hex::decode(&u[..56]).map_err(|_| Error::Refusal("invalid_keep_profile")))
         .collect::<Result<Vec<_>, _>>()?;
     let names = units
-        .values()
-        .map(|a| hex::decode(&a.name).map_err(|_| Error::Refusal("invalid_keep_profile")))
+        .iter()
+        .map(|u| hex::decode(&u[56..]).map_err(|_| Error::Refusal("invalid_keep_profile")))
         .collect::<Result<Vec<_>, _>>()?;
     let rows=source.query("WITH fixed AS(SELECT * FROM unnest($1::bytea[],$2::bytea[]) f(policy,name)) SELECT encode(f.policy,'hex')||encode(f.name,'hex'),trunc(coalesce(sum(a.quantity) FILTER(WHERE o.id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM public.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index AND i.id BETWEEN 0 AND $3::bigint*16777216+16777215)),0))::text FROM fixed f LEFT JOIN public.multi_asset m ON m.policy=f.policy AND m.name=f.name LEFT JOIN public.ma_tx_out a ON a.ident=m.id AND a.id BETWEEN 0 AND $3::bigint*68719476736+68719476735 LEFT JOIN public.tx_out o ON o.id=a.tx_out_id AND o.id BETWEEN 0 AND $3::bigint*16777216+16777215 GROUP BY f.policy,f.name ORDER BY f.policy,f.name",&[&policies,&names,&i64::from(target)]).await?;
     Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())

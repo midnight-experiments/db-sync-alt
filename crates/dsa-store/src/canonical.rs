@@ -115,9 +115,12 @@ pub(crate) fn selected_source(table: &str) -> Result<String, Error> {
         "NULL::text"
     };
     let extra = if table == "ma_tx_out" {
-        ", conversion_assets AS (SELECT id FROM keep_ma_tx_out UNION SELECT id FROM public.ma_tx_out WHERE id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735)"
+        format!(
+            ", conversion_assets AS (SELECT id FROM keep_ma_tx_out UNION SELECT a.id FROM public.ma_tx_out a WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND ({}))",
+            crate::keep::Selection::asset_predicate(crate::keep::SourceSchema::Public, "a")
+        )
     } else {
-        ""
+        String::new()
     };
     Ok(format!(
         "{}{extra}, h AS (SELECT $1::bigint AS height) SELECT to_jsonb({alias})::text,jsonb_build_array({payload})::text,{alias}.{key}::bigint,{marker} FROM {from} ORDER BY {order}",

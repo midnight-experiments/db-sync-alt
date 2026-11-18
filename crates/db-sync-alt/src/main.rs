@@ -388,7 +388,16 @@ async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
         let p: i64 = tx
             .query_one("SELECT id FROM public.block ORDER BY id DESC LIMIT 1", &[])
             .await
-            .map_err(|e| wrap("a", Error::Postgres(e)))?
+            .map_err(|e| {
+                wrap(
+                    "a",
+                    if e.code().is_some_and(|c| c.code() == "55000") {
+                        Error::Refusal("comparison_not_serving")
+                    } else {
+                        Error::Postgres(e)
+                    },
+                )
+            })?
             .get(0);
         let t = u32::try_from(p)
             .ok()
@@ -408,9 +417,16 @@ async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
     let left = capture(&tx, &profile, &positions, &options)
         .await
         .map_err(|e| wrap("a", e))?;
-    tx.commit()
-        .await
-        .map_err(|e| wrap("a", Error::Postgres(e)))?;
+    tx.commit().await.map_err(|e| {
+        wrap(
+            "a",
+            if e.code().is_some_and(|c| c.code() == "55000") {
+                Error::Refusal("comparison_not_serving")
+            } else {
+                Error::Postgres(e)
+            },
+        )
+    })?;
     options.check_chain_order = true;
     let tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
     let right = capture(&tx, &profile, &positions, &options)

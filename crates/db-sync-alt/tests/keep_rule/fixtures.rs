@@ -216,6 +216,7 @@ impl Fixture {
         if seed.is_multiple_of(17) {
             fixture.empty_epoch();
         }
+        fixture.token_rule_edges();
         fixture.reindex_ordinals();
         fixture
     }
@@ -360,6 +361,44 @@ impl Fixture {
             })
             .collect();
         f
+    }
+
+    /// Every generated proof includes foreign units around eligible original
+    /// ordinals at all address classes, plus the distinct Q4 datum boundary.
+    pub fn token_rule_edges(&mut self) {
+        for (id, policy, name) in [
+            (9010, "00".repeat(28), "".to_owned()),
+            (9011, "ff".repeat(28), "".to_owned()),
+            (
+                9012,
+                self.profile.assets["council"].policy.clone(),
+                "01".to_owned(),
+            ),
+        ] {
+            self.chain.assets.insert(id, Asset { policy, name });
+        }
+        for (index, role) in ["ics", "reserve", "other"].into_iter().enumerate() {
+            let out = self.output(8, 8, 20 + index as u16, role, "cnight", None);
+            self.add_asset(out, self.asset_id("auth"), 1);
+            self.add_asset(out, self.asset_id("bridge"), 2);
+            for (ordinal, asset) in [9010, 9001, 9011].into_iter().enumerate() {
+                self.add_asset(out, asset, 3 + ordinal as u16);
+            }
+            self.tags.insert(format!("v2_mixed_{role}"), out);
+        }
+        let ordinary = self.output(8, 10, 20, "other", "cnight", Some(90111));
+        self.add_asset(ordinary, 9012, 1);
+        self.tags
+            .insert("v2_plain_governance_unique_datum".to_owned(), ordinary);
+        let shared = self.output(8, 10, 21, "other", "cnight", Some(90112));
+        self.add_asset(shared, 9012, 1);
+        self.output(8, 10, 22, "mapping", "auth", Some(90112));
+        self.tags
+            .insert("v2_plain_governance_shared_datum".to_owned(), shared);
+        let shell = self.output(8, 10, 23, "reserve", "cnight", None);
+        self.chain.output_assets.retain(|_, a| a.output != shell);
+        self.add_asset(shell, 9010, 0);
+        self.tags.insert("v2_zero_eligible_shell".to_owned(), shell);
     }
 
     pub fn translate_heights(&mut self, offset: u32) {

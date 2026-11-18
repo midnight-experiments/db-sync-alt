@@ -18,7 +18,7 @@ use tokio_postgres::{Client, Config, GenericClient, Transaction, config::SslMode
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub const DATABASE_FORMAT: i32 = 1;
-pub const KEEP_RULE_VERSION: i32 = 1;
+pub const KEEP_RULE_VERSION: i32 = dsa_chain::assets::RULE_VERSION as i32;
 pub const NODE_RELATIONS: [&str; 11] = [
     "block",
     "tx",
@@ -251,7 +251,12 @@ impl Store {
         transaction
             .batch_execute(include_str!("layout.sql"))
             .await?;
-        transaction.batch_execute(include_str!("state.sql")).await?;
+        transaction
+            .batch_execute(
+                &include_str!("state.sql")
+                    .replace("__KEEP_RULE_VERSION__", &KEEP_RULE_VERSION.to_string()),
+            )
+            .await?;
         if indexes {
             transaction
                 .batch_execute(include_str!("indexes.sql"))

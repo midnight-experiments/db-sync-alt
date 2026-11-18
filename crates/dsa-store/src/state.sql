@@ -52,9 +52,10 @@ CREATE SEQUENCE dsa.pool_hash_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.epoch_stake_id_seq MINVALUE 1;
 REVOKE ALL ON ALL TABLES IN SCHEMA dsa FROM PUBLIC;
 CREATE FUNCTION dsa.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
-SET search_path=pg_catalog,dsa AS $$
+SET search_path=pg_catalog,dsa
+SET dsa.keep_rule_version='__KEEP_RULE_VERSION__' AS $$
 BEGIN
- IF NOT EXISTS(SELECT 1 FROM dsa.identity WHERE id=1 AND database_format=1 AND keep_rule_version=1) THEN
+ IF NOT EXISTS(SELECT 1 FROM dsa.identity WHERE id=1 AND database_format=1 AND keep_rule_version=current_setting('dsa.keep_rule_version')::integer) THEN
    RAISE EXCEPTION 'db_sync_alt_not_serving' USING ERRCODE='55000',DETAIL='identity';
  END IF;
  IF NOT EXISTS(SELECT 1 FROM dsa.position WHERE id=1 AND serving) THEN

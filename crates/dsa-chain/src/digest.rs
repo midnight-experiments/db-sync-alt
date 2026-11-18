@@ -33,8 +33,8 @@
 //! name, u64 row count and lowercase 64-byte hex family hash, each length-framed. Empty
 //! families participate. The internal family has its own equally framed root.
 //! This is independent of row identity allocation and
-//! binary COPY/compression ordering. Q18's projection decision is deliberately
-//! upstream: the digest consumes the selected rowset verbatim.
+//! binary COPY/compression ordering. Rule-2 token selection precedes hashing;
+//! the digest consumes that selected rowset verbatim, without renumbering.
 
 use std::collections::BTreeMap;
 

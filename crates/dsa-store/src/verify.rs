@@ -135,6 +135,44 @@ pub(crate) async fn verify<C: GenericClient>(
             return Err(Error::Refusal(error));
         }
     }
+    let invalid: bool = client
+        .query_one(
+            &format!(
+                "{} SELECT EXISTS(SELECT 1 FROM serve.ma_tx_out a WHERE NOT ({}))",
+                Selection::ctes_sql(SourceSchema::Serve),
+                Selection::asset_predicate(SourceSchema::Serve, "a")
+            ),
+            &selection.parameters(),
+        )
+        .await?
+        .get(0);
+    if invalid {
+        return Err(Error::Refusal("ineligible_asset_row"));
+    }
+    let addresses = [
+        "mapping",
+        "council",
+        "technical_committee",
+        "ics",
+        "reserve",
+    ]
+    .iter()
+    .map(|role| profile.addresses[*role].clone())
+    .collect::<Vec<_>>();
+    let pc = &profile.assets["permissioned_candidates"];
+    let pc_policy = hex::decode(&pc.policy).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
+    let pc_name = hex::decode(&pc.name).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
+    let extra_datum:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM serve.datum d WHERE NOT EXISTS(SELECT 1 FROM serve.tx_out o WHERE o.data_hash=d.hash AND (o.address=ANY($1::text[]) OR EXISTS(SELECT 1 FROM serve.ma_tx_out a JOIN serve.multi_asset m ON m.id=a.ident WHERE a.tx_out_id=o.id AND m.policy=$2::bytea AND m.name=$3::bytea))))",&[&addresses,&pc_policy,&pc_name]).await?.get(0);
+    if extra_datum {
+        return Err(Error::Refusal("extra_datum_row"));
+    }
+    let fixed = dsa_chain::assets::fixed_units(profile)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let extra:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM serve.multi_asset m WHERE NOT(encode(m.policy,'hex')||encode(m.name,'hex')=ANY($1::text[])) AND NOT EXISTS(SELECT 1 FROM serve.ma_tx_out a WHERE a.ident=m.id))",&[&fixed]).await?.get(0);
+    if extra {
+        return Err(Error::Refusal("extra_asset_descriptor"));
+    }
     let contiguous:bool=client.query_one("SELECT count(*)=$3::bigint-$1::bigint+1 AND count(*) FILTER(WHERE id>$3)=0 FROM serve.block WHERE id>=$1::bigint AND $2::bigint<=$3",&[&h,&t,&p]).await?.get(0);
     if !contiguous {
         return Err(Error::Refusal("header_gap"));
@@ -190,11 +228,7 @@ pub(crate) async fn verify<C: GenericClient>(
         }
     }
     let mut supply = BTreeMap::new();
-    let units = profile
-        .assets
-        .values()
-        .map(|a| a.unit())
-        .collect::<BTreeSet<_>>();
+    let units = dsa_chain::assets::fixed_units(profile);
     for row in client
         .query(
             "SELECT unit,trunc(quantity)::text FROM dsa.supply ORDER BY unit",

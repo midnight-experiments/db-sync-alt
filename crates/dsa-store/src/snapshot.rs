@@ -1,8 +1,8 @@
 //! Snapshot container and restore protocol, development format v1.
 //!
-//! This format is unreleased; Q18 does not freeze an asset projection or a real
-//! network golden digest. A snapshot preserves the complete selected rows and
-//! original asset ordinals, independently of how the producer selected them.
+//! Wire format 1 carries keep-rule version 2. Old rule-1 files are refused,
+//! never relabelled; regenerate by conversion from a genuine legacy source.
+//! Snapshots preserve all selected payloads and original pre-filter ordinals.
 //!
 //! File: eight-byte magic `DSASNAP\0`, u32 BE format number, u64 BE description
 //! byte length, SHA-256(description), then the UTF-8 JSON description. Description

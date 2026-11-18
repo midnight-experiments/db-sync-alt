@@ -443,8 +443,9 @@ async fn convert_corrupt_selected_parents_are_not_silently_dropped() -> Result {
             let id = dsa_chain::ids::asset_id(8, 0, 13, 19)?;
             source
                 .write(&format!(
-                    "INSERT INTO serve.ma_tx_out VALUES({id},1,{},9001)",
-                    dsa_chain::ids::output_id(8, 0, 13)?
+                    "INSERT INTO serve.ma_tx_out VALUES({id},1,{},{})",
+                    dsa_chain::ids::output_id(8, 0, 13)?,
+                    f.asset_id("cnight")
                 ))
                 .await?;
         }
@@ -1119,5 +1120,107 @@ async fn convert_source_preflight_rejects_extra_rights_empty_spends_and_old_sche
     assert_eq!(target.catalog().await?, before);
     source.cleanup().await?;
     target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_v2_historical_outpoint_tokens_and_original_ordinals_roundtrip() -> Result {
+    // Generated ledger rows seeded with the two public Q18 unit/outpoint facts;
+    // no historical dump, provider sample or fixed network digest is involved.
+    let mut f = fixture(402);
+    let facts = [
+        (
+            9020,
+            "ics",
+            "725c21c20c9193fe813d98cf886cd9e5e40187ac18cfc3be6e30bb349cbc90b4",
+            "475db387ba92282a387e9ddfb7f8d2fd297f9b660450005f3ed37550",
+        ),
+        (
+            9021,
+            "reserve",
+            "ed8a1f6afb4cb2b10e37e1092601a20a021da7231faafe10816f3c56bc3532d0",
+            "fb964a2751bb9cb9c7a6d1475d1ea4a3960820a0f318883647502426",
+        ),
+    ];
+    let mut originals = Vec::new();
+    for (ordinal, (id, role, hash, policy)) in facts.into_iter().enumerate() {
+        f.chain.assets.insert(
+            id,
+            dsa_chain::profiles::Asset {
+                policy: policy.to_owned(),
+                name: String::new(),
+            },
+        );
+        let out = f.output(8, 8 + ordinal as u16 * 2, 2, role, "cnight", None);
+        f.add_asset(out, id, 19);
+        originals.push((out, hash, id));
+    }
+    f.reindex_ordinals();
+    f.translate_heights(4_318_342);
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let mut expected = selected(&f.rows(), &keep(&f.chain, &f.profile, f.bounds)?);
+    for (out, hash, foreign) in originals {
+        let (height, index, _) = dsa_chain::ids::output_position(out)?;
+        let tx = dsa_chain::ids::transaction_id(height + 4_318_342, index)?;
+        source
+            .write(&format!(
+                "UPDATE serve.tx SET hash=decode('{hash}','hex') WHERE id={tx}"
+            ))
+            .await?;
+        for row in expected.get_mut("tx").unwrap() {
+            if row["id"] == tx {
+                row["hash"] = json!(format!("\\x{hash}"));
+            }
+        }
+        assert!(
+            !expected["ma_tx_out"]
+                .iter()
+                .any(|row| row["ident"] == foreign)
+        );
+        assert!(
+            !expected["multi_asset"]
+                .iter()
+                .any(|row| row["id"] == foreign)
+        );
+        assert!(
+            expected["tx_out"]
+                .iter()
+                .any(|row| row["tx_id"] == tx && row["index"] == 2)
+        );
+    }
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("v2.dsa");
+    let target = Database::new().await?;
+    let converted = target
+        .cli(
+            "convert",
+            "preprod",
+            &[
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                &f.bounds.horizon.to_string(),
+                "--snapshot",
+                file.to_str().unwrap(),
+            ],
+        )
+        .await?;
+    assert_eq!(target.rows().await?, expected);
+    let status = target.cli("status", "preprod", &[]).await?;
+    assert_eq!(status["identity"]["keep_rule_version"], 2);
+    let restored = Database::new().await?;
+    let result = restored
+        .cli("restore", "preprod", &file_args(&file))
+        .await?;
+    assert_eq!(
+        result["content_digest"],
+        converted["verified"]["content_digest"]
+    );
+    assert_eq!(restored.rows().await?, expected);
+    source.cleanup().await?;
+    target.cleanup().await?;
+    restored.cleanup().await?;
     Ok(())
 }

@@ -34,7 +34,11 @@ seeks and point reads, without materializing all historical headers.
 Each event in [horizon,target] receives first-served time when the conversion
 publishes. Header-only rows in (target,tip] do not receive first-served entries.
 This gives the full retention period after conversion, including a lagging
-source. The original selected rows, IDs and asset ordinals are preserved.
+source. Rule2 retains only the four exact configured token units and any name
+under the two configured governance policies, at every address. Output shells
+and data_hash remain; original selected payloads, IDs and pre-filter asset
+ordinals are preserved. The six fixed lookup descriptors retain their source
+IDs even without output references. Rule1 pruned sources cannot be relabelled.
 
 The source sends one natural-key stream per family. Destination batches use
 `--batch-rows` (default4096) and `--batch-bytes` (default4MiB); one larger

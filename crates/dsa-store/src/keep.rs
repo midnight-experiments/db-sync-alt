@@ -3,8 +3,6 @@
 //! prefix selection. Aggregates consume bounded materialized inputs, so they
 //! cannot turn into a backward min/max walk on source indexes.
 
-use std::collections::BTreeMap;
-
 use dsa_chain::{
     keep::{Bounds, RetainedRows, TABLES},
     profiles::Profile,
@@ -75,24 +73,39 @@ impl Selection {
             .assets
             .get("permissioned_candidates")
             .ok_or(Error::Refusal("invalid_keep_profile"))?;
-        let fixed: BTreeMap<_, _> = profile
-            .assets
-            .values()
-            .map(|asset| (asset.unit(), asset))
-            .collect();
+        let fixed = dsa_chain::assets::fixed_units(profile);
         let fixed_policies = fixed
-            .values()
-            .map(|asset| bytes(&asset.policy))
+            .iter()
+            .map(|unit| {
+                bytes(
+                    unit.get(..56)
+                        .ok_or(Error::Refusal("invalid_keep_profile"))?,
+                )
+            })
             .collect::<Result<_, _>>()?;
         let fixed_names = fixed
-            .values()
-            .map(|asset| bytes(&asset.name))
+            .iter()
+            .map(|unit| {
+                bytes(
+                    unit.get(56..)
+                        .ok_or(Error::Refusal("invalid_keep_profile"))?,
+                )
+            })
             .collect::<Result<_, _>>()?;
         Ok(Self {
             horizon: i64::from(bounds.horizon),
             target: i64::from(bounds.target),
             tip: i64::from(bounds.tip),
-            addresses: profile.addresses.values().cloned().collect(),
+            addresses: [
+                "mapping",
+                "council",
+                "technical_committee",
+                "ics",
+                "reserve",
+            ]
+            .iter()
+            .map(|role| profile.addresses[*role].clone())
+            .collect(),
             governance_addresses,
             governance_policies,
             permissioned_policy: bytes(&permissioned.policy)?,
@@ -117,8 +130,24 @@ impl Selection {
         ]
     }
 
+    /// Six fixed units include governance descriptors; their exact unit arms
+    /// are a subset of the two whole-policy arms. Unknown descriptors are kept
+    /// for closure refusal rather than classified as foreign by absence.
+    pub(crate) fn asset_predicate(schema: SourceSchema, alias: &str) -> String {
+        format!(
+            "{alias}.ident NOT IN(SELECT catalogue.id FROM {}.multi_asset catalogue) OR {alias}.ident IN(SELECT catalogue.id FROM {}.multi_asset catalogue WHERE catalogue.policy=ANY($6::bytea[]) OR EXISTS(SELECT 1 FROM unnest($9::bytea[],$10::bytea[]) fixed(policy,name) WHERE fixed.policy=catalogue.policy AND fixed.name=catalogue.name))",
+            schema.name(),
+            schema.name()
+        )
+    }
+
     pub fn ctes_sql(schema: SourceSchema) -> String {
-        include_str!("keep.sql").replace("__SOURCE__", schema.name())
+        include_str!("keep.sql")
+            .replace(
+                "__ELIGIBLE_ASSET__",
+                &format!("({})", Self::asset_predicate(schema, "a")),
+            )
+            .replace("__SOURCE__", schema.name())
     }
 
     /// One fixed query per schema/table. Execute once and consume its RowStream;

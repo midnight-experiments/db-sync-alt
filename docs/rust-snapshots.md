@@ -1,7 +1,9 @@
 # Development Rust snapshots
 
-This unreleased format preserves the supplied rowset, including original asset
-ordinals. It does not freeze a historical asset projection or a network digest.
+Wire format1 carries keep-rule version2 and preserves the selected payloads
+and original pre-filter asset ordinals. Rule1 files and databases are refused;
+regenerate by converting a genuine legacy schema5 source. No real-network
+golden digest is fixed.
 The format and natural-key encodings are documented in `dsa-store::snapshot`
 and `dsa-chain::digest`.
 

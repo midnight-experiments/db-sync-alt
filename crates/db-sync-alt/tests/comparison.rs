@@ -192,7 +192,7 @@ async fn compare_detects_removed_unspent_governance_changed_header_and_ident() -
     for mutation in ["unspent", "governance", "tx_count", "ident"] {
         let (source, target, f) = setup(305).await?;
         match mutation{
-   "unspent"=>{let out=f.chain.inputs.values().find(|i|f.chain.transactions[&i.transaction].block>=6&&f.chain.transactions[&f.chain.outputs[&i.output].transaction].block<6).unwrap().output;target.write(&format!("DELETE FROM serve.tx_out WHERE id={out}")).await?;},
+   "unspent"=>{let out=f.chain.inputs.values().find(|i|f.chain.transactions[&i.transaction].block>=6&&f.chain.transactions[&f.chain.outputs[&i.output].transaction].block<6&&f.chain.output_assets.values().any(|a|a.output==i.output&&f.chain.assets[&a.asset]==f.profile.assets["cnight"])).unwrap().output;target.write(&format!("DELETE FROM serve.tx_out WHERE id={out}")).await?;},
    "governance"=>{let policy=hex::decode(&f.profile.assets["council"].policy)?;let c=connect(&target.config).await?;c.execute("DELETE FROM serve.tx_out WHERE id=(SELECT o.id FROM serve.tx_out o JOIN serve.ma_tx_out a ON a.tx_out_id=o.id JOIN serve.multi_asset m ON m.id=a.ident JOIN serve.tx t ON t.id=o.tx_id WHERE m.policy=$1 ORDER BY t.id DESC LIMIT 1)",&[&policy]).await?;},
    "tx_count"=>target.write("UPDATE serve.block SET tx_count=tx_count+1 WHERE id=8").await?,
    "ident"=>target.write("UPDATE serve.multi_asset SET id=id+50000;UPDATE serve.ma_tx_out SET ident=ident+50000").await?,
@@ -506,6 +506,50 @@ async fn compare_catalogue_sqlx08_native_types_empty_serving_29x2() -> Result {
     tx.commit().await?;
     drop(reader);
     drop(sqlx);
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_refuses_rule_one_and_declared_stored_mismatch_even_empty() -> Result {
+    let (source, target, f) = setup(319).await?;
+    let mut reader = Reader::connect(source.reader_config(), None).await?;
+    let tx = reader.snapshot().await?;
+    let positions = Positions::generate(&tx, 6, 8, 500).await?;
+    let mut good = compare::capture(&tx, &f.profile, &positions, &Options::default()).await?;
+    tx.commit().await?;
+    let original = good.keep_rule_version;
+    good.keep_rule_version = 1;
+    assert!(matches!(
+        compare::compare(&good, &good),
+        Err(dsa_store::Error::Refusal("comparison_keep_rule_mismatch"))
+    ));
+    good.keep_rule_version = original;
+    drop(reader);
+    // No row may be required to force the actual identity gate. The compare
+    // preflight's independent EXISTS probe must execute on this empty view.
+    target.write("TRUNCATE serve.block").await?;
+    let c = connect(&target.config).await?;
+    for (stored, declared, expected) in [
+        (1, 1, "comparison_keep_rule_mismatch"),
+        (2, 1, "comparison_keep_rule_mismatch"),
+        (1, 2, "comparison_not_serving"),
+    ] {
+        c.batch_execute(&format!("UPDATE dsa.identity SET keep_rule_version={stored};ALTER FUNCTION dsa.gate() SET dsa.keep_rule_version='{declared}'")).await?;
+        let mut r = Reader::connect(target.reader_config(), None).await?;
+        let snapshot = r.snapshot().await?;
+        let error = compare::capture(&snapshot, &f.profile, &positions, &Options::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error,dsa_store::Error::Refusal(code) if code==expected),
+            "{error:?}"
+        );
+        snapshot.rollback().await?;
+    }
+    drop(c);
+    source.cleanup().await?;
     target.cleanup().await?;
     Ok(())
 }

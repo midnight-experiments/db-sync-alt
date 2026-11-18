@@ -431,7 +431,7 @@ async fn identity_refusals_status_and_single_writer() -> Result {
     for (column, value, code) in [
         ("database_format", "99", "unsupported_database_format"),
         ("profile_hash", "repeat('0',64)", "profile_hash_mismatch"),
-        ("keep_rule_version", "99", "keep_rule_version_mismatch"),
+        ("keep_rule_version", "1", "keep_rule_version_mismatch"),
     ] {
         // The owner session still holds its writer lock. Restore each identity
         // field after the named open refusal so the following case is independent.

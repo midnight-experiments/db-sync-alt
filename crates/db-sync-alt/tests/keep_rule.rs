@@ -328,6 +328,7 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
     fallback.no_window_spend();
     result.insert("no_spend_in_window", fallback);
     result.insert("spend_of_output_below_horizon", Fixture::base(2));
+    result.insert("v2_mixed_assets_and_q4_datums", Fixture::base(42));
     let mut first = Fixture::base(4);
     first.bounds.horizon = 6;
     result.insert("horizon_first_block_of_epoch", first);
@@ -427,6 +428,75 @@ fn named_keep_rule_edges() -> Result {
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn version_two_projection_and_q4_boundaries() -> Result {
+    for seed in [1, 2] {
+        let f = Fixture::base(seed);
+        let kept = keep(&f.chain, &f.profile, f.bounds)?;
+        let rule = dsa_chain::assets::AssetRule::from_profile(&f.profile);
+        for role in ["ics", "reserve", "other"] {
+            let output = f.tags[&format!("v2_mixed_{role}")];
+            let full = f
+                .chain
+                .output_assets
+                .iter()
+                .filter(|(_, a)| a.output == output)
+                .map(|(id, a)| {
+                    (
+                        *id,
+                        rule.allows(
+                            &f.chain.assets[&a.asset].policy,
+                            &f.chain.assets[&a.asset].name,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(kept["tx_out"].contains(&output));
+            assert!(full.iter().any(|(_, allowed)| !*allowed));
+            assert!(full.iter().any(|(_, allowed)| *allowed));
+            for (id, allowed) in full {
+                assert_eq!(kept["ma_tx_out"].contains(&id), allowed);
+            }
+        }
+        let shell = f.tags["v2_zero_eligible_shell"];
+        assert!(kept["tx_out"].contains(&shell));
+        assert!(
+            !kept["ma_tx_out"]
+                .iter()
+                .any(|id| f.chain.output_assets[id].output == shell)
+        );
+        let unique = f.tags["v2_plain_governance_unique_datum"];
+        assert!(f.chain.outputs[&unique].datum_hash.is_some());
+        assert!(kept["tx_out"].contains(&unique));
+        assert!(!kept["datum"].contains(&90111));
+        assert!(kept["datum"].contains(&90112));
+        assert!(kept["multi_asset"].contains(&9012));
+        assert!(!kept["multi_asset"].contains(&9010));
+        for unit in dsa_chain::assets::fixed_units(&f.profile) {
+            let id = f
+                .chain
+                .assets
+                .iter()
+                .find(|(_, asset)| asset.unit() == unit)
+                .unwrap()
+                .0;
+            assert!(kept["multi_asset"].contains(id));
+        }
+        // The old v1 per-output projection kept all these foreign rows. It is
+        // observably different and must never be relabelled as version two.
+        let v1 = f
+            .chain
+            .output_assets
+            .iter()
+            .filter(|(_, a)| kept["tx_out"].contains(&a.output))
+            .map(|(id, _)| *id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(kept["ma_tx_out"].is_subset(&v1));
+        assert_ne!(v1, kept["ma_tx_out"]);
+    }
     Ok(())
 }
 

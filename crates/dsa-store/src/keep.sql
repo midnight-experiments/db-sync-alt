@@ -93,7 +93,7 @@ keep_tx AS MATERIALIZED (
 keep_tx_in AS MATERIALIZED (SELECT id FROM window_inputs UNION SELECT id FROM fallback_input),
 keep_ma_tx_out AS MATERIALIZED (
  SELECT a.id FROM __SOURCE__.ma_tx_out a JOIN keep_tx_out o ON o.id=a.tx_out_id
- WHERE a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
+ WHERE a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735 AND __ELIGIBLE_ASSET__
 ),
 keep_multi_asset AS MATERIALIZED (
  SELECT m.id FROM unnest($9::bytea[],$10::bytea[]) f(policy,name)
@@ -107,7 +107,7 @@ keep_datum AS MATERIALIZED (
  WHERE o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND (o.address=ANY($4::text[]) OR EXISTS(
   SELECT 1 FROM __SOURCE__.ma_tx_out a JOIN __SOURCE__.multi_asset m ON m.id=a.ident
   WHERE a.tx_out_id=o.id AND a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
-  AND (m.policy=ANY($6::bytea[]) OR (m.policy=$7::bytea AND m.name=$8::bytea))))
+  AND (m.policy=$7::bytea AND m.name=$8::bytea)))
 ),
 keep_epoch_param AS MATERIALIZED (
  SELECT e.epoch_no::bigint AS id FROM __SOURCE__.epoch_param e CROSS JOIN horizon h WHERE e.epoch_no>=h.epoch-2

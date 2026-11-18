@@ -8,9 +8,19 @@ pub const RULE_VERSION: u32 = 2;
 
 /// Fixed descriptor/supply guarantee; transaction-asset eligibility remains
 /// AssetRule's four exact units plus the two governance policies.
-pub const FIXED_UNIT_ROLES: [&str;6] = ["cnight","auth","permissioned_candidates","bridge","council","technical_committee"];
-pub fn fixed_units(profile:&Profile)->BTreeSet<String> {
-    FIXED_UNIT_ROLES.iter().map(|role|profile.assets[*role].unit()).collect()
+pub const FIXED_UNIT_ROLES: [&str; 6] = [
+    "cnight",
+    "auth",
+    "permissioned_candidates",
+    "bridge",
+    "council",
+    "technical_committee",
+];
+pub fn fixed_units(profile: &Profile) -> BTreeSet<String> {
+    FIXED_UNIT_ROLES
+        .iter()
+        .map(|role| profile.assets[*role].unit())
+        .collect()
 }
 
 #[derive(Clone, Debug)]

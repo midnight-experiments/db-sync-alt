@@ -1,4 +1,4 @@
-//! Keep rule v1, bound to Midnight node 2.1.101.
+//! Keep rule v2, bound to Midnight node 2.1.101.
 //!
 //! H is the oldest event block, T the last served event block and P the stored
 //! header tip. All ranges include their endpoints. The input contains the full
@@ -17,8 +17,9 @@
 //!   transactions. `get_asset_spends` joins `tx_out.tx_id = tx_in.tx_out_id`
 //!   and the output index (`cnight_observation.rs:213-214`); it does not join the
 //!   creating header. Mapping deregistration has the same old-output dependency.
-//! * K4 keeps existing datums of retained outputs at a profile address, holding
-//!   a governance-policy asset or the exact permissioned-candidates unit.
+//! * K4 keeps existing datums of retained outputs at the mapping, governance,
+//!   ICS or reserve addresses, or holding the exact permissioned-candidates unit.
+//!   A governance-policy asset at an ordinary address does not retain its datum.
 //!   Registration/deregistration JOIN datum (`cnight_observation.rs:51,111`),
 //!   governance JOINs datum and permissioned candidates LEFT JOINs it.
 //! * K5 keeps every output in the newest eligible old governance transaction,
@@ -40,12 +41,20 @@
 //!   Nonce/stake bind `WHERE epoch_no = $1` and `WHERE es.epoch_no = $1`
 //!   (`candidates_data_source/db_model.rs:293,253`). The cursor's maximum size
 //!   uses `epoch_param.epoch_no = block.epoch_no` (`cnight_observation.rs:458`).
-//! * K9 keeps the profile units and every asset referenced by a retained row.
+//! * K9 keeps available fixed descriptors for six explicit profile roles and
+//!   every descriptor referenced by a retained row.
 //!   The cache resolves `WHERE policy = $1 AND name = $2` once
 //!   (`primitives/mainchain-follower/src/db/multi_asset_cache.rs:51`).
 //! * K10 keeps the newest old spend, its spending transaction, spent output and
 //!   output dependencies when H..T has no spend. The startup `EXISTS(SELECT 1
 //!   FROM tx_in)` chooses the node's spend path (`candidates_data_source/db_model.rs:90`).
+//!
+//! Per-output asset projection applies uniformly at every address, in every
+//! clause: only exact `cnight`, auth, permissioned_candidates
+//! and bridge units, or any name under the council/technical-committee policies.
+//! ICS/reserve have no all-assets exception. Original asset IDs and pre-filter
+//! ordinals are preserved, including gaps. Output shells are not discarded by
+//! this filter. Other profile-map keys add neither eligibility nor descriptors.
 //!
 //! A source with no spend anywhere cannot satisfy the serving invariant and
 //! remains subject to verification before publication. Selection invents no row.
@@ -349,35 +358,45 @@ pub fn keep(chain: &Chain, profile: &Profile, bounds: Bounds) -> Result<Retained
     let output_assets: BTreeSet<_> = chain
         .output_assets
         .iter()
-        .filter(|(_, row)| outputs.contains(&row.output))
+        .filter(|(_, row)| {
+            let asset = &chain.assets[&row.asset];
+            outputs.contains(&row.output)
+                && (["cnight", "auth", "permissioned_candidates", "bridge"]
+                    .iter()
+                    .any(|role| asset == &profile.assets[*role])
+                    || ["council", "technical_committee"]
+                        .iter()
+                        .any(|role| asset.policy == profile.assets[*role].policy))
+        })
         .map(|(id, _)| *id)
         .collect();
     let referenced_assets: BTreeSet<_> = output_assets
         .iter()
         .map(|id| chain.output_assets[id].asset)
         .collect();
-    let fixed_units: BTreeSet<_> = profile.assets.values().map(Asset::unit).collect();
+    let fixed_units = crate::assets::fixed_units(profile);
     let assets = chain
         .assets
         .iter()
         .filter(|(id, asset)| referenced_assets.contains(id) || fixed_units.contains(&asset.unit()))
         .map(|(id, _)| *id)
         .collect();
-    let addresses: BTreeSet<_> = profile.addresses.values().collect();
-    let governance: BTreeSet<_> = [
-        &profile.assets["council"].policy,
-        &profile.assets["technical_committee"].policy,
+    let addresses: BTreeSet<_> = [
+        "mapping",
+        "council",
+        "technical_committee",
+        "ics",
+        "reserve",
     ]
-    .into_iter()
+    .iter()
+    .map(|role| &profile.addresses[*role])
     .collect();
     let hashes: BTreeSet<_> = outputs
         .iter()
         .filter_map(|id| {
             let output = &chain.outputs[id];
             (addresses.contains(&output.address)
-                || chain.has_asset(*id, |asset| {
-                    governance.contains(&asset.policy) || asset == permissioned
-                }))
+                || chain.has_asset(*id, |asset| asset == permissioned))
             .then_some(output.datum_hash.as_ref())
             .flatten()
         })
