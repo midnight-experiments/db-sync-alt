@@ -18,11 +18,13 @@ use crate::{
 };
 use chrono::NaiveDateTime;
 use dsa_chain::profiles::Profile;
+use futures_util::{StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::Arc,
     time::Instant,
 };
 use tokio_postgres::{
@@ -255,7 +257,7 @@ pub struct Case {
     pub label: String,
     pub sql_sha256: String,
     pub ordered: bool,
-    pub rows: Vec<String>,
+    pub rows: Arc<Vec<String>>,
     pub elapsed_seconds: f64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +274,7 @@ pub struct Capture {
     pub newest_height: u32,
     pub cases: BTreeMap<String, Case>,
     pub chain_order_checked: bool,
+    pub unbounded_checked: bool,
     pub executions: usize,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +288,18 @@ pub struct Difference {
     pub first_index: usize,
     pub a: Option<String>,
     pub b: Option<String>,
+    pub a_row_sha256: Option<String>,
+    pub b_row_sha256: Option<String>,
+    pub preview_truncated: bool,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryCoverage {
+    pub group: String,
+    pub cases: usize,
+    pub nonempty_cases: usize,
+    pub paired_nonempty_cases: usize,
+    pub rows: usize,
+    pub unit_rows: BTreeMap<String, usize>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -293,6 +308,12 @@ pub struct Report {
     pub matched: bool,
     /// Actual row counts for each catalogue hit/miss label at both endpoints.
     pub probe_rows: BTreeMap<String, [usize; 2]>,
+    pub chain_order_checked_a: bool,
+    pub chain_order_checked_b: bool,
+    pub unbounded_checked_a: bool,
+    pub unbounded_checked_b: bool,
+    pub coverage_a: BTreeMap<String, QueryCoverage>,
+    pub coverage_b: BTreeMap<String, QueryCoverage>,
     pub node_commit: String,
     pub catalogue_sha256: String,
     pub network: String,
@@ -443,6 +464,15 @@ pub async fn rows(
     statement: &Statement,
     values: &[Bind],
 ) -> Result<Vec<String>, Error> {
+    rows_limited(tx, statement, values, usize::MAX, usize::MAX).await
+}
+async fn rows_limited(
+    tx: &Transaction<'_>,
+    statement: &Statement,
+    values: &[Bind],
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<Vec<String>, Error> {
     let sql = format!(
         "SELECT to_jsonb(observation)::text FROM ({}) observation",
         statement.sql.trim().trim_end_matches(';')
@@ -452,14 +482,26 @@ pub async fn rows(
         .await
         .map_err(|error| query_error(statement, error))?;
     let params = values.iter().map(Bind::sql).collect::<Vec<_>>();
-    let result = tx
-        .query(&prepared, &params)
+    let stream = tx
+        .query_raw(&prepared, params)
         .await
         .map_err(|error| query_error(statement, error))?;
-    let mut rows = result
-        .into_iter()
-        .map(|r| canonical_row(r.get::<_, &str>(0)))
-        .collect::<Result<Vec<_>, _>>()?;
+    pin_mut!(stream);
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(row) = stream.next().await {
+        let row = row.map_err(|error| query_error(statement, error))?;
+        let raw: &str = row.get(0);
+        if rows.len() >= max_rows || raw.len() > max_bytes.saturating_sub(bytes) {
+            return Err(Error::Refusal("comparison_capture_limit"));
+        }
+        let canonical = canonical_row(raw)?;
+        if canonical.len() > max_bytes.saturating_sub(bytes) {
+            return Err(Error::Refusal("comparison_capture_limit"));
+        }
+        bytes += canonical.len();
+        rows.push(canonical);
+    }
     if !ordered(&statement.sql) {
         rows.sort();
     }
@@ -879,12 +921,18 @@ impl Collector {
         s: &Statement,
         label: &str,
         values: &[Bind],
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Arc<Vec<String>>, Error> {
         let started = Instant::now();
         self.capture.executions += 1;
-        let data = rows(tx, s, values).await?;
-        self.record(s, label, data.clone(), started.elapsed().as_secs_f64())?;
-        Ok(data)
+        let data = rows_limited(
+            tx,
+            s,
+            values,
+            self.options.max_rows.saturating_sub(self.rows),
+            self.options.max_bytes.saturating_sub(self.bytes),
+        )
+        .await?;
+        self.record(s, label, data, started.elapsed().as_secs_f64())
     }
     fn record(
         &mut self,
@@ -892,12 +940,13 @@ impl Collector {
         label: &str,
         data: Vec<String>,
         elapsed: f64,
-    ) -> Result<(), Error> {
+    ) -> Result<Arc<Vec<String>>, Error> {
         self.rows += data.len();
         self.bytes += data.iter().map(String::len).sum::<usize>();
         if self.rows > self.options.max_rows || self.bytes > self.options.max_bytes {
             return Err(Error::Refusal("comparison_capture_limit"));
         }
+        let data = Arc::new(data);
         let key = format!("{}/{label}", s.id);
         if self
             .capture
@@ -910,7 +959,7 @@ impl Collector {
                     label: label.to_owned(),
                     sql_sha256: s.sha256.clone(),
                     ordered: ordered(&s.sql),
-                    rows: data,
+                    rows: Arc::clone(&data),
                     elapsed_seconds: elapsed,
                 },
             )
@@ -918,7 +967,7 @@ impl Collector {
         {
             return Err(Error::Refusal("comparison_duplicate_case"));
         }
-        Ok(())
+        Ok(data)
     }
     async fn bounds(
         &mut self,
@@ -993,6 +1042,10 @@ pub async fn capture(
     {
         return Err(Error::Refusal("comparison_target_not_final"));
     }
+    let duplicate:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM public.ma_tx_out WHERE id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 GROUP BY tx_out_id,ident HAVING count(*)>1)",&[&i64::from(positions.horizon),&i64::from(positions.target)]).await?.get(0);
+    if duplicate {
+        return Err(Error::Refusal("comparison_duplicate_asset_unit"));
+    }
     let cat = catalogue::catalogue();
     let entries = &cat.entries;
     let mut result = Collector {
@@ -1013,6 +1066,7 @@ pub async fn capture(
             newest_height: newest,
             cases: BTreeMap::new(),
             chain_order_checked: options.check_chain_order,
+            unbounded_checked: options.verify_unbounded,
             executions: 0,
         },
         rows: 0,
@@ -1244,6 +1298,7 @@ pub async fn capture(
             for role in roles {
                 let started = Instant::now();
                 let mut pages = Vec::new();
+                let mut page_bytes = 0usize;
                 let mut offset = 0;
                 loop {
                     let mut values = context.values(s, true, low, high, pair, offset)?;
@@ -1251,12 +1306,17 @@ pub async fn capture(
                         values[0] = Bind::I64(context.id(role)?);
                     }
                     result.capture.executions += 1;
-                    let page = rows(tx, s, &values).await?;
+                    let page = rows_limited(
+                        tx,
+                        s,
+                        &values,
+                        options.max_rows.saturating_sub(result.rows + pages.len()),
+                        options.max_bytes.saturating_sub(result.bytes + page_bytes),
+                    )
+                    .await?;
                     let count = page.len();
+                    page_bytes += page.iter().map(String::len).sum::<usize>();
                     pages.extend(page);
-                    if pages.len() > options.max_rows {
-                        return Err(Error::Refusal("comparison_capture_limit"));
-                    }
                     if count < options.page_rows as usize {
                         break;
                     }
@@ -1265,7 +1325,7 @@ pub async fn capture(
                         .ok_or(Error::Refusal("comparison_page_limit"))?;
                 }
                 if options.verify_unbounded {
-                    let mut unbounded = Vec::new();
+                    let mut compared = 0usize;
                     let mut offset = 0;
                     loop {
                         let mut values = context.values(
@@ -1280,12 +1340,14 @@ pub async fn capture(
                             values[0] = Bind::I64(context.id(role)?);
                         }
                         result.capture.executions += 1;
-                        let page = rows(tx, s, &values).await?;
+                        let page =
+                            rows_limited(tx, s, &values, options.max_rows, options.max_bytes)
+                                .await?;
                         let count = page.len();
-                        unbounded.extend(page);
-                        if unbounded.len() > options.max_rows {
-                            return Err(Error::Refusal("comparison_capture_limit"));
+                        if pages.get(compared..compared + count) != Some(page.as_slice()) {
+                            return Err(Error::Refusal("comparison_bounds_exclude_events"));
                         }
+                        compared += count;
                         if count < options.page_rows as usize {
                             break;
                         }
@@ -1293,7 +1355,7 @@ pub async fn capture(
                             .checked_add(options.page_rows)
                             .ok_or(Error::Refusal("comparison_page_limit"))?;
                     }
-                    if pages != unbounded {
+                    if compared != pages.len() {
                         return Err(Error::Refusal("comparison_bounds_exclude_events"));
                     }
                 }
@@ -1405,6 +1467,35 @@ fn keys_for_probe_rows(a: &Capture, b: &Capture) -> BTreeMap<String, [usize; 2]>
         })
         .collect()
 }
+fn coverage(capture: &Capture) -> BTreeMap<String, QueryCoverage> {
+    let mut result: BTreeMap<String, QueryCoverage> = BTreeMap::new();
+    for case in capture.cases.values() {
+        let stats = result.entry(case.query.clone()).or_default();
+        stats.group = case.group.clone();
+        stats.cases += 1;
+        stats.rows += case.rows.len();
+        if !case.rows.is_empty() {
+            stats.nonempty_cases += 1;
+            if case.label.starts_with("pair/") {
+                stats.paired_nonempty_cases += 1;
+            }
+        }
+        let unit = case
+            .label
+            .split_once("/unit/")
+            .map(|(_, unit)| unit.to_owned())
+            .or_else(|| {
+                case.label
+                    .split('/')
+                    .nth(2)
+                    .and_then(|role| capture.units.get(role).cloned())
+            });
+        if let Some(unit) = unit {
+            *stats.unit_rows.entry(unit).or_default() += case.rows.len();
+        }
+    }
+    result
+}
 /// Only verified helper ID differences are informational. Case provenance,
 /// profile/positions and every other answer (including resolve_ident) are exact.
 pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
@@ -1421,6 +1512,9 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
         || a.units != b.units
     {
         return Err(Error::Refusal("comparison_capture_context_mismatch"));
+    }
+    if !b.chain_order_checked {
+        return Err(Error::Refusal("comparison_destination_order_not_checked"));
     }
     let helpers = catalogue::catalogue()
         .entries
@@ -1460,8 +1554,12 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
             a_rows: x.len(),
             b_rows: y.len(),
             first_index: first,
-            a: x.get(first).cloned(),
-            b: y.get(first).cloned(),
+            a: x.get(first).map(|row| row.chars().take(4096).collect()),
+            b: y.get(first).map(|row| row.chars().take(4096).collect()),
+            a_row_sha256: x.get(first).map(|row| hash(row)),
+            b_row_sha256: y.get(first).map(|row| hash(row)),
+            preview_truncated: x.get(first).is_some_and(|row| row.chars().count() > 4096)
+                || y.get(first).is_some_and(|row| row.chars().count() > 4096),
         });
     }
     let info = differences.iter().filter(|d| d.informational).count();
@@ -1469,6 +1567,12 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     Ok(Report {
         missing_policy: a.missing_policy.clone(),
         probe_rows,
+        chain_order_checked_a: a.chain_order_checked,
+        chain_order_checked_b: b.chain_order_checked,
+        unbounded_checked_a: a.unbounded_checked,
+        unbounded_checked_b: b.unbounded_checked,
+        coverage_a: coverage(a),
+        coverage_b: coverage(b),
         keep_rule_version: crate::KEEP_RULE_VERSION,
         matched: differences.iter().all(|d| d.informational),
         node_commit: a.node_commit.clone(),

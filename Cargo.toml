@@ -12,7 +12,7 @@ repository = "https://github.com/midnight-experiments/db-sync-alt"
 [workspace.dependencies]
 dsa-chain = { path = "crates/dsa-chain" }
 dsa-store = { path = "crates/dsa-store" }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"
 thiserror = "2"

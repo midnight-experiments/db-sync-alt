@@ -35,7 +35,13 @@ checks event answers with bounds0..i64::MAX; use this on generated scratch data
 or under an explicit source-access budget. It adds reads.
 
 JSON stdout includes the pinned catalogue, selected units, positions, settings,
-query counts and the first differing rows for every mismatch. Exit0 means a
+query counts, actual per-query/unit row-hit coverage, both destination-order
+and unbounded-check flags, and the first differing rows for every mismatch.
+Acceptance requires destination B's chain-order check. Source A remains
+unscanned globally. A pruned asset table may have leading/interior ordinal gaps;
+order verification does not infer dense rank from filtered facts. First-row
+previews are capped at4096characters, with full-row SHA256 and an explicit
+truncation flag. Whole rows are still compared exactly. Exit0 means a
 match,2 means a real answer mismatch and1 means a refusal or query failure.
 Rule1 pruned stores and mismatched rule declarations/identity are refused.
 Genuine legacy schema5 readers remain supported. Preprod's empty-name cNIGHT
@@ -48,3 +54,10 @@ header answer. For an anchored conversion, a coordinator must call the reusable
 `Store::stage_conversion`, then compare that capture with the published target.
 The newest-header SQL is unchanged. The library accepts captured pairs without
 keeping a source transaction open during destination index/verification work.
+
+Capture streams each query and enforces row/UTF8 byte budgets before retaining
+its results. Paging accounts for previously retained rows; unbounded validation
+compares one page at a time against the native rows. Shared immutable row
+storage avoids result-vector clones. Defaults bound retained row text to512MiB
+and1million rows per endpoint; these limits are not a measured RSS guarantee.
+A7 records actual peak RSS/time for its500+ pairs and whole-window range.

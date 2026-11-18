@@ -175,6 +175,17 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
         let report = compare::compare(&left, &right)?;
         assert!(report.matched, "{}", serde_json::to_string(&report)?);
         assert_eq!(report.probe_rows.len(), 58);
+        assert!(!report.chain_order_checked_a);
+        assert!(report.chain_order_checked_b);
+        assert!(report.unbounded_checked_a && report.unbounded_checked_b);
+        let mut unchecked = right.clone();
+        unchecked.chain_order_checked = false;
+        assert!(matches!(
+            compare::compare(&left, &unchecked),
+            Err(dsa_store::Error::Refusal(
+                "comparison_destination_order_not_checked"
+            ))
+        ));
         for (key, counts) in &report.probe_rows {
             if key.starts_with("resolve_ident:") && key.ends_with("/miss") {
                 assert_eq!(*counts, [0, 0]);
@@ -863,6 +874,37 @@ async fn compare_optional_governance_descriptors_both_absent_and_one_sided() -> 
     assert!(report["differences"].as_array().unwrap().iter().any(|v| {
         v["query"].as_str().unwrap().starts_with("resolve_ident:") && v["informational"] == false
     }));
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_capture_row_and_byte_caps_refuse_before_accumulation() -> Result {
+    let (source, target, f) = setup(339).await?;
+    let mut r = Reader::connect(source.reader_config(), None).await?;
+    for (rows, bytes) in [(0, 1024), (1024, 1)] {
+        let tx = r.snapshot().await?;
+        let positions = Positions::generate(&tx, 6, 8, 500).await?;
+        let error = compare::capture(
+            &tx,
+            &f.profile,
+            &positions,
+            &Options {
+                max_rows: rows,
+                max_bytes: bytes,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            dsa_store::Error::Refusal("comparison_capture_limit")
+        ));
+        tx.rollback().await?;
+    }
     source.cleanup().await?;
     target.cleanup().await?;
     Ok(())
