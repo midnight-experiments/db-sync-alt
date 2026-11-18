@@ -168,6 +168,7 @@ impl LegacySource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceSettings {
     pub server_version_num: i32,
+    pub ssl: bool,
     pub work_mem: String,
     pub statement_timeout: String,
     pub idle_in_transaction_session_timeout: String,
@@ -308,7 +309,7 @@ async fn write_state(tx: &Transaction<'_>, state: &ServingState) -> Result<(), E
 }
 
 async fn settings(source: &Transaction<'_>) -> Result<SourceSettings, Error> {
-    let row=source.query_one("SELECT current_setting('server_version_num')::integer,current_setting('work_mem'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout'),current_setting('default_transaction_read_only'),current_setting('transaction_read_only'),current_setting('transaction_isolation')",&[]).await?;
+    let row=source.query_one("SELECT current_setting('server_version_num')::integer,current_setting('work_mem'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout'),current_setting('default_transaction_read_only'),current_setting('transaction_read_only'),current_setting('transaction_isolation'),coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()),false)",&[]).await?;
     let settings = SourceSettings {
         server_version_num: row.get(0),
         work_mem: row.get(1),
@@ -317,6 +318,7 @@ async fn settings(source: &Transaction<'_>) -> Result<SourceSettings, Error> {
         default_transaction_read_only: row.get(4),
         transaction_read_only: row.get(5),
         transaction_isolation: row.get(6),
+        ssl: row.get(7),
     };
     if !(170000..180000).contains(&settings.server_version_num) {
         return Err(Error::Refusal("postgresql_17_required"));

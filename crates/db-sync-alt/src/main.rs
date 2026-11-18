@@ -379,6 +379,8 @@ async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
     .await
     .map_err(|e| wrap("b", e))?;
     let tx = a.snapshot().await.map_err(|e| wrap("a", e))?;
+    let right_tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
+    let missing_policy = dsa_store::compare::choose_missing_policy(&[&tx, &right_tx]).await?;
     let positions = if let Some(p) = explicit {
         p
     } else {
@@ -409,32 +411,36 @@ async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
     };
     let mut options = Options {
         verify_unbounded: args.verify_unbounded,
+        missing_policy: Some(missing_policy),
         ..Default::default()
     };
     if let Some(address) = &args.candidate_address {
         options.candidate_address = address.clone();
     }
-    let left = capture(&tx, &profile, &positions, &options)
-        .await
-        .map_err(|e| wrap("a", e))?;
-    tx.commit().await.map_err(|e| {
-        wrap(
-            "a",
-            if e.code().is_some_and(|c| c.code() == "55000") {
-                Error::Refusal("comparison_not_serving")
-            } else {
-                Error::Postgres(e)
-            },
-        )
-    })?;
-    options.check_chain_order = true;
-    let tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
-    let right = capture(&tx, &profile, &positions, &options)
-        .await
-        .map_err(|e| wrap("b", e))?;
-    tx.commit()
-        .await
-        .map_err(|e| wrap("b", Error::Postgres(e)))?;
+    let mut right_options = options.clone();
+    right_options.check_chain_order = true;
+    // Both snapshots pin the same absence probe. Execute independently so one
+    // idle snapshot cannot expire merely while the other endpoint is captured.
+    let left_read = async {
+        let value = capture(&tx, &profile, &positions, &options)
+            .await
+            .map_err(|e| wrap("a", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| wrap("a", Error::Postgres(e)))?;
+        Ok::<_, Error>(value)
+    };
+    let right_read = async {
+        let value = capture(&right_tx, &profile, &positions, &right_options)
+            .await
+            .map_err(|e| wrap("b", e))?;
+        right_tx
+            .commit()
+            .await
+            .map_err(|e| wrap("b", Error::Postgres(e)))?;
+        Ok::<_, Error>(value)
+    };
+    let (left, right) = tokio::try_join!(left_read, right_read)?;
     let report = compare(&left, &right)?;
     eprintln!(
         "{}",

@@ -154,6 +154,8 @@ pub struct Options {
     pub max_rows: usize,
     pub max_bytes: usize,
     pub candidate_address: String,
+    /// Pin one valid absent policy for both independently exported captures.
+    pub missing_policy: Option<Vec<u8>>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -164,6 +166,7 @@ impl Default for Options {
             max_rows: 1_000_000,
             max_bytes: 512 * 1024 * 1024,
             candidate_address: "__untracked_candidates__".to_owned(),
+            missing_policy: None,
         }
     }
 }
@@ -258,6 +261,7 @@ pub struct Case {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capture {
     pub keep_rule_version: i32,
+    pub missing_policy: String,
     pub node_commit: String,
     pub catalogue_sha256: String,
     pub profile_hash: String,
@@ -285,7 +289,10 @@ pub struct Difference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub keep_rule_version: i32,
+    pub missing_policy: String,
     pub matched: bool,
+    /// Actual row counts for each catalogue hit/miss label at both endpoints.
+    pub probe_rows: BTreeMap<String, [usize; 2]>,
     pub node_commit: String,
     pub catalogue_sha256: String,
     pub network: String,
@@ -583,7 +590,7 @@ pub async fn validate_chain_order(tx: &Transaction<'_>) -> Result<(), Error> {
 }
 
 async fn preflight(tx: &Transaction<'_>) -> Result<serde_json::Value, Error> {
-    let settings=tx.query_one("SELECT jsonb_build_object('statement_timeout',current_setting('statement_timeout'),'idle_in_transaction_session_timeout',current_setting('idle_in_transaction_session_timeout'),'work_mem',current_setting('work_mem'),'default_transaction_read_only',current_setting('default_transaction_read_only'),'transaction_read_only',current_setting('transaction_read_only'),'transaction_isolation',current_setting('transaction_isolation'))",&[]).await?.get::<_,serde_json::Value>(0);
+    let settings=tx.query_one("SELECT jsonb_build_object('statement_timeout',current_setting('statement_timeout'),'idle_in_transaction_session_timeout',current_setting('idle_in_transaction_session_timeout'),'work_mem',current_setting('work_mem'),'ssl',coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()),false),'default_transaction_read_only',current_setting('default_transaction_read_only'),'transaction_read_only',current_setting('transaction_read_only'),'transaction_isolation',current_setting('transaction_isolation'))",&[]).await?.get::<_,serde_json::Value>(0);
     if settings["default_transaction_read_only"] != "on"
         || settings["transaction_read_only"] != "on"
         || settings["transaction_isolation"] != "repeatable read"
@@ -634,6 +641,49 @@ async fn preflight(tx: &Transaction<'_>) -> Result<serde_json::Value, Error> {
         })?;
     Ok(settings)
 }
+/// Deterministic, node-domain policy absent from every anchored reader.
+/// A conversion coordinator can choose from its source snapshot, then pass the
+/// same bytes in Options to the later converted capture. Independently chosen
+/// probes must agree or compare refuses a context mismatch.
+pub async fn choose_missing_policy(readers: &[&Transaction<'_>]) -> Result<Vec<u8>, Error> {
+    if readers.is_empty() {
+        return Err(Error::Refusal("comparison_probe_requires_reader"));
+    }
+    for (index, tx) in readers.iter().enumerate() {
+        preflight(tx)
+            .await
+            .map_err(|error| Error::ComparisonSource {
+                side: if index == 0 { "a" } else { "b" },
+                error: Box::new(error),
+            })?;
+    }
+    for counter in 0u32..1024 {
+        let policy = if counter == 0 {
+            vec![0; 28]
+        } else {
+            Sha256::digest(format!("db-sync-alt-missing-policy/{counter}")).to_vec()[..28].to_vec()
+        };
+        let mut absent = true;
+        for tx in readers {
+            if tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM public.multi_asset WHERE policy=$1::bytea)",
+                    &[&policy],
+                )
+                .await?
+                .get::<_, bool>(0)
+            {
+                absent = false;
+                break;
+            }
+        }
+        if absent {
+            return Ok(policy);
+        }
+    }
+    Err(Error::Refusal("comparison_no_missing_probe_policy"))
+}
+
 struct Context {
     horizon: Header,
     target: Header,
@@ -702,7 +752,10 @@ impl Context {
                         hex::decode(&a.policy)
                             .map_err(|_| Error::Refusal("invalid_keep_profile"))?
                     } else {
-                        vec![0; 28]
+                        self.options
+                            .missing_policy
+                            .clone()
+                            .expect("capture pins missing policy")
                     }),
                     Bytes(if hit {
                         hex::decode(&a.name).map_err(|_| Error::Refusal("invalid_keep_profile"))?
@@ -720,7 +773,10 @@ impl Context {
                         Bytes(if hit {
                             hex::decode(&a.policy).unwrap()
                         } else {
-                            vec![0; 28]
+                            self.options
+                                .missing_policy
+                                .clone()
+                                .expect("capture pins missing policy")
                         }),
                         Bytes(hex::decode(&a.name).unwrap()),
                         I32(epoch),
@@ -736,7 +792,10 @@ impl Context {
                 Bytes(if hit {
                     hex::decode(&self.profile.assets["council"].policy).unwrap()
                 } else {
-                    vec![0; 28]
+                    self.options
+                        .missing_policy
+                        .clone()
+                        .expect("capture pins missing policy")
                 }),
                 I32(reference),
             ],
@@ -898,6 +957,25 @@ pub async fn capture(
         return Err(Error::Refusal("invalid_comparison_page_size"));
     }
     let settings = preflight(tx).await?;
+    let mut effective = options.clone();
+    let missing = match &options.missing_policy {
+        Some(policy) if policy.len() == 28 => {
+            let present: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM public.multi_asset WHERE policy=$1::bytea)",
+                    &[policy],
+                )
+                .await?
+                .get(0);
+            if present {
+                return Err(Error::Refusal("comparison_probe_policy_present"));
+            }
+            policy.clone()
+        }
+        Some(_) => return Err(Error::Refusal("comparison_probe_policy_invalid")),
+        None => choose_missing_policy(&[tx]).await?,
+    };
+    effective.missing_policy = Some(missing.clone());
     let newest = tx
         .query_opt("SELECT id FROM public.block ORDER BY id DESC LIMIT 1", &[])
         .await?
@@ -920,6 +998,7 @@ pub async fn capture(
     let mut result = Collector {
         capture: Capture {
             keep_rule_version: crate::KEEP_RULE_VERSION,
+            missing_policy: hex::encode(&missing),
             node_commit: cat.node_commit.clone(),
             catalogue_sha256: hash(catalogue::GENERATED),
             profile_hash: profile.hash()?,
@@ -981,7 +1060,6 @@ pub async fn capture(
             units.insert(alias.to_owned(), id);
         }
     }
-    let mut effective = options.clone();
     if effective.candidate_address == "__untracked_candidates__" {
         effective.candidate_address = cat
             .candidate_addresses
@@ -1306,6 +1384,21 @@ pub async fn capture(
     if let Some(tx_hash)=tx.query_opt("SELECT hash::bytea FROM public.tx WHERE id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 ORDER BY id LIMIT 1",&[&i64::from(positions.horizon),&i64::from(positions.target)]).await?{let s=entries.iter().find(|s|s.name=="get_block_info_for_tx_hash").unwrap();result.add(tx,s,"window_transaction",&[Bind::Bytes(tx_hash.get(0))]).await?;}
     Ok(result.capture)
 }
+fn keys_for_probe_rows(a: &Capture, b: &Capture) -> BTreeMap<String, [usize; 2]> {
+    a.cases
+        .iter()
+        .filter(|(_, case)| case.label == "hit" || case.label == "miss")
+        .map(|(key, case)| {
+            (
+                key.clone(),
+                [
+                    case.rows.len(),
+                    b.cases.get(key).map_or(0, |v| v.rows.len()),
+                ],
+            )
+        })
+        .collect()
+}
 /// Only verified helper ID differences are informational. Case provenance,
 /// profile/positions and every other answer (including resolve_ident) are exact.
 pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
@@ -1314,7 +1407,8 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     {
         return Err(Error::Refusal("comparison_keep_rule_mismatch"));
     }
-    if a.node_commit != b.node_commit
+    if a.missing_policy != b.missing_policy
+        || a.node_commit != b.node_commit
         || a.catalogue_sha256 != b.catalogue_sha256
         || a.profile_hash != b.profile_hash
         || a.positions != b.positions
@@ -1365,7 +1459,10 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
         });
     }
     let info = differences.iter().filter(|d| d.informational).count();
+    let probe_rows = keys_for_probe_rows(a, b);
     Ok(Report {
+        missing_policy: a.missing_policy.clone(),
+        probe_rows,
         keep_rule_version: crate::KEEP_RULE_VERSION,
         matched: differences.iter().all(|d| d.informational),
         node_commit: a.node_commit.clone(),

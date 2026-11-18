@@ -248,6 +248,16 @@ async fn convert_network_identity_rejects_shared_units_and_uses_positive_anchor(
     f.translate_heights(offset);
     let source = Database::new().await?;
     source.legacy(&f).await?;
+    // A covered, wrong hash must refuse even with positive exclusive assets.
+    target
+        .refusal(
+            "preprod",
+            &source.dsn(true),
+            &["--horizon-block", &f.bounds.horizon.to_string()],
+            "source_start_anchor_mismatch",
+        )
+        .await?;
+    assert_eq!(target.catalog().await?, before);
     source
         .write(&format!(
             "UPDATE serve.block SET hash=decode('{}','hex') WHERE id={offset}",

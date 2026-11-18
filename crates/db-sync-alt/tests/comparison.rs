@@ -134,7 +134,26 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
                 .iter()
                 .any(|p| p.cursor.block == 6 && p.reference.block == 8)
         );
+        let missing = compare::choose_missing_policy(&[&ta]).await?;
+        assert_eq!(missing.len(), 28);
+        assert_ne!(missing, vec![0; 28], "fixture must exercise miss collision");
+        let collision = compare::capture(
+            &ta,
+            &f.profile,
+            &positions,
+            &Options {
+                missing_policy: Some(vec![0; 28]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            collision,
+            dsa_store::Error::Refusal("comparison_probe_policy_present")
+        ));
         let options = Options {
+            missing_policy: Some(missing),
             verify_unbounded: true,
             page_rows: 1,
             ..Default::default()
@@ -155,6 +174,20 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
         tb.commit().await?;
         let report = compare::compare(&left, &right)?;
         assert!(report.matched, "{}", serde_json::to_string(&report)?);
+        assert_eq!(report.probe_rows.len(), 58);
+        for (key, counts) in &report.probe_rows {
+            if key.starts_with("resolve_ident:") && key.ends_with("/miss") {
+                assert_eq!(*counts, [0, 0]);
+            }
+        }
+        let mut wrong_context = right.clone();
+        wrong_context.missing_policy = "fe".repeat(28);
+        assert!(matches!(
+            compare::compare(&left, &wrong_context),
+            Err(dsa_store::Error::Refusal(
+                "comparison_capture_context_mismatch"
+            ))
+        ));
         assert_eq!(report.units["bridge"], f.profile.assets["bridge"].unit());
         assert_eq!(report.units["ics"], f.profile.assets["ics"].unit());
         let seen = left
@@ -288,7 +321,11 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
         )
         .await?;
     source.write(&format!("INSERT INTO chain.generations VALUES(2,1,'ready','generated',0,0,{}, {},'{{}}');INSERT INTO serve.block VALUES({},decode('{}','hex'),1084,999999,{},timestamp '2026-01-02',0);UPDATE chain.integrity_state SET projection_generation=2,serve_generation=2;UPDATE chain.service_state SET canonical_ready=2,publication_serial=publication_serial+1",f.bounds.target+1,f.bounds.tip+1,f.bounds.tip+1,"cd".repeat(32),f.bounds.tip+1)).await?;
-    let left = compare::capture(&tx, &f.profile, &positions, &Options::default()).await?;
+    let options = Options {
+        missing_policy: Some(compare::choose_missing_policy(&[&tx]).await?),
+        ..Default::default()
+    };
+    let left = compare::capture(&tx, &f.profile, &positions, &options).await?;
     assert_eq!(left.newest_height, f.bounds.tip);
     tx.commit().await?;
     staged.finish(&f.profile).await?;
@@ -304,7 +341,7 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
         &positions,
         &Options {
             check_chain_order: true,
-            ..Default::default()
+            ..options
         },
     )
     .await?;
@@ -549,6 +586,125 @@ async fn compare_refuses_rule_one_and_declared_stored_mismatch_even_empty() -> R
         snapshot.rollback().await?;
     }
     drop(c);
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+/// Dedicated generated TLS/SCRAM Docker server: the normal service has no test
+/// certificate. On-demand validation must provide both public root paths.
+#[tokio::test]
+#[ignore = "requires generated TLS/SCRAM PostgreSQL17 and DSA_TLS roots"]
+async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
+    let root = std::env::var("DSA_TLS_ROOT_CERT")?;
+    let wrong_root = std::env::var("DSA_TLS_WRONG_ROOT_CERT")?;
+    let f = fixture(321);
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    let dir = tempfile::tempdir()?;
+    let password = dir.path().join("reader.password");
+    let wrong_password = dir.path().join("wrong.password");
+    std::fs::write(&password, "generated-tls-reader-password")?;
+    std::fs::write(&wrong_password, "generated-wrong-password")?;
+    source
+        .admin
+        .batch_execute(&format!(
+            "ALTER ROLE {} PASSWORD 'generated-tls-reader-password'",
+            source.reader
+        ))
+        .await?;
+    let a = source.dsn(true).replace(" sslmode=disable", "");
+    let converted = target
+        .cli(
+            "convert",
+            "mainnet",
+            &[
+                "--source",
+                &a,
+                "--source-password-file",
+                password.to_str().unwrap(),
+                "--source-tls-root-cert",
+                &root,
+                "--horizon-block",
+                "6",
+            ],
+        )
+        .await?;
+    assert_eq!(converted["source"]["settings"]["ssl"], true);
+    target
+        .cli("grant-reader", "mainnet", &["--role", &target.reader])
+        .await?;
+    target
+        .admin
+        .batch_execute(&format!(
+            "ALTER ROLE {} PASSWORD 'generated-tls-reader-password'",
+            target.reader
+        ))
+        .await?;
+    let b = target.dsn(true).replace(" sslmode=disable", "");
+    let before = target.rows().await?;
+    for case in ["verified", "wrong_ca", "wrong_host", "wrong_password"] {
+        let a = if case == "wrong_host" {
+            a.replace("host='postgres'", "host='wrong-host'")
+        } else {
+            a.clone()
+        };
+        let ca = if case == "wrong_ca" {
+            wrong_root.as_str()
+        } else {
+            root.as_str()
+        };
+        let pw = if case == "wrong_password" {
+            &wrong_password
+        } else {
+            &password
+        };
+        let out = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+            .args([
+                "compare",
+                "--a",
+                &a,
+                "--b",
+                &b,
+                "--network",
+                "mainnet",
+                "--positions",
+                "auto",
+                "--horizon-block",
+                "6",
+                "--a-tls-root-cert",
+                ca,
+                "--b-tls-root-cert",
+                &root,
+                "--a-password-file",
+                pw.to_str().unwrap(),
+                "--b-password-file",
+                password.to_str().unwrap(),
+            ])
+            .output()
+            .await?;
+        if case == "verified" {
+            assert!(
+                out.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let report: Value = serde_json::from_slice(&out.stdout)?;
+            assert_eq!(report["matched"], true);
+            assert_eq!(report["settings_a"]["ssl"], true);
+            assert_eq!(report["settings_b"]["ssl"], true);
+        } else {
+            assert_eq!(out.status.code(), Some(1), "accepted {case}");
+        }
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("generated-tls-reader-password"));
+        println!(
+            "{}",
+            json!({"event":"tls_case","case":case,"success":out.status.success()})
+        );
+    }
+    assert_eq!(target.rows().await?, before);
     source.cleanup().await?;
     target.cleanup().await?;
     Ok(())
