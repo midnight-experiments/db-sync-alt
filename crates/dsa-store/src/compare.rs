@@ -45,9 +45,23 @@ pub struct Pair {
     pub cursor: Cursor,
     pub reference: Cursor,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct EventAnchor {
+    pub kind: String,
+    pub unit: Option<String>,
+    pub block: u32,
+    pub tx_index: u32,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Positions {
+    #[serde(default)]
+    pub event_anchors: Vec<EventAnchor>,
+    #[serde(default)]
+    pub event_hint_queries: u32,
+    #[serde(default)]
+    pub witness_tx_hash: Option<String>,
     pub horizon: u32,
     pub target: u32,
     pub pairs: Vec<Pair>,
@@ -58,6 +72,14 @@ impl Positions {
             || self.target >= 134217728
             || self.pairs.is_empty()
             || self.pairs.len() > 10000
+        {
+            return Err(Error::Refusal("invalid_comparison_positions"));
+        }
+        if self.event_anchors.len() > 10000
+            || self
+                .witness_tx_hash
+                .as_ref()
+                .is_some_and(|h| h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()))
         {
             return Err(Error::Refusal("invalid_comparison_positions"));
         }
@@ -140,11 +162,123 @@ impl Positions {
                 });
             }
         }
+        let witness_tx_hash=tx.query_opt("SELECT encode(hash,'hex') FROM public.tx WHERE id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 ORDER BY id LIMIT 1",&[&i64::from(horizon),&i64::from(target)]).await?.map(|r|r.get(0));
         let out = Self {
+            event_anchors: vec![],
+            event_hint_queries: 1,
+            witness_tx_hash,
             horizon,
             target,
             pairs: pairs.into_iter().collect(),
         };
+        out.validate()?;
+        Ok(out)
+    }
+    /// Uniform whole-window/epoch pairs plus bounded actual event witnesses.
+    /// Limits are per class; missing classes are reported as genuinely quiet.
+    pub async fn generate_with_events(
+        tx: &Transaction<'_>,
+        profile: &Profile,
+        horizon: u32,
+        target: u32,
+        max_pairs: usize,
+    ) -> Result<Self, Error> {
+        let mut out = Self::generate(tx, horizon, target, max_pairs).await?;
+        let mut pairs = out.pairs.iter().cloned().collect::<BTreeSet<_>>();
+        let mut anchors = BTreeSet::new();
+        let h = i64::from(horizon);
+        let t = i64::from(target);
+        let limit = max_pairs.min(16) as i64;
+        let mut remember = |kind: &str,
+                            unit: Option<String>,
+                            rows: Vec<tokio_postgres::Row>|
+         -> Result<(), Error> {
+            for row in rows {
+                let block = u32::try_from(row.try_get::<_, i64>(0)?)
+                    .map_err(|_| Error::Refusal("comparison_height_out_of_range"))?;
+                let index = u32::try_from(row.try_get::<_, i64>(1)?)
+                    .map_err(|_| Error::Refusal("comparison_tx_count_out_of_range"))?;
+                if block < horizon || block > target || index >= 4096 {
+                    return Err(Error::Refusal("comparison_invalid_event_anchor"));
+                }
+                pairs.insert(Pair {
+                    cursor: Cursor {
+                        block,
+                        tx_index: index,
+                    },
+                    reference: Cursor {
+                        block,
+                        tx_index: index + 1,
+                    },
+                });
+                anchors.insert(EventAnchor {
+                    kind: kind.to_owned(),
+                    unit: unit.clone(),
+                    block,
+                    tx_index: index,
+                });
+            }
+            Ok(())
+        };
+        let units = ["cnight", "bridge"]
+            .into_iter()
+            .map(|role| profile.assets[role].clone())
+            .map(|a| (a.unit(), a))
+            .collect::<BTreeMap<_, _>>();
+        for (unit, asset) in units {
+            let policy =
+                hex::decode(asset.policy).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
+            let name =
+                hex::decode(asset.name).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
+            let creates=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.ma_tx_out a JOIN public.multi_asset m ON m.id=a.ident JOIN public.tx_out o ON o.id=a.tx_out_id JOIN public.tx t ON t.id=o.tx_id WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND m.policy=$3::bytea AND m.name=$4::bytea ORDER BY t.id LIMIT $5::bigint",&[&h,&t,&policy,&name,&limit]).await?;
+            out.event_hint_queries += 1;
+            remember("asset_create", Some(unit.clone()), creates)?;
+            let spends=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.tx_in i JOIN public.tx t ON t.id=i.tx_in_id JOIN public.tx_out o ON o.tx_id=i.tx_out_id AND o.index=i.tx_out_index JOIN public.ma_tx_out a ON a.tx_out_id=o.id JOIN public.multi_asset m ON m.id=a.ident WHERE i.id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND m.policy=$3::bytea AND m.name=$4::bytea ORDER BY t.id LIMIT $5::bigint",&[&h,&t,&policy,&name,&limit]).await?;
+            out.event_hint_queries += 1;
+            remember("asset_spend", Some(unit), spends)?;
+        }
+        let auth = &profile.assets["auth"];
+        let policy =
+            hex::decode(&auth.policy).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
+        let name = hex::decode(&auth.name).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
+        let mapping = &profile.addresses["mapping"];
+        let registrations=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.ma_tx_out a JOIN public.multi_asset m ON m.id=a.ident JOIN public.tx_out o ON o.id=a.tx_out_id JOIN public.datum d ON d.hash=o.data_hash JOIN public.tx t ON t.id=o.tx_id WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND m.policy=$3::bytea AND m.name=$4::bytea AND o.address=$5::text AND a.quantity=1 ORDER BY t.id LIMIT $6::bigint",&[&h,&t,&policy,&name,&mapping,&limit]).await?;
+        out.event_hint_queries += 1;
+        remember("registration", Some(auth.unit()), registrations)?;
+        let deregistrations=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.tx_in i JOIN public.tx t ON t.id=i.tx_in_id JOIN public.tx_out o ON o.tx_id=i.tx_out_id AND o.index=i.tx_out_index JOIN public.datum d ON d.hash=o.data_hash WHERE i.id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.address=$3::text ORDER BY t.id LIMIT $4::bigint",&[&h,&t,&mapping,&limit]).await?;
+        out.event_hint_queries += 1;
+        remember("deregistration", None, deregistrations)?;
+        let bridge=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.tx_out o JOIN public.tx t ON t.id=o.tx_id WHERE o.id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.address=$3::text ORDER BY t.id LIMIT $4::bigint",&[&h,&t,&profile.addresses["ics"],&limit]).await?;
+        out.event_hint_queries += 1;
+        remember(
+            "bridge_output",
+            Some(profile.assets["bridge"].unit()),
+            bridge,
+        )?;
+        out.pairs = pairs.into_iter().collect();
+        out.event_anchors = anchors.into_iter().collect();
+        if out.witness_tx_hash.is_none() {
+            let tip = target
+                .checked_add(profile.cardano.security_parameter)
+                .ok_or(Error::Refusal("comparison_target_not_final"))?;
+            let selection = crate::keep::Selection::new(
+                profile,
+                dsa_chain::keep::Bounds {
+                    horizon,
+                    target,
+                    tip,
+                },
+            )?;
+            let sql = format!(
+                "{} SELECT encode(t.hash,'hex') FROM public.tx t JOIN keep_tx k ON k.id=t.id JOIN keep_block b ON b.id=t.block_id WHERE t.id BETWEEN 0 AND $2::bigint*4096+4095 ORDER BY t.id DESC LIMIT 1",
+                crate::keep::Selection::ctes_sql(crate::keep::SourceSchema::Public)
+            );
+            out.witness_tx_hash = tx
+                .query_opt(&sql, &selection.parameters())
+                .await?
+                .map(|r| r.get(0));
+            out.event_hint_queries += 1;
+        }
         out.validate()?;
         Ok(out)
     }
@@ -159,6 +293,7 @@ pub struct Options {
     pub candidate_address: String,
     /// Pin one valid absent policy for both independently exported captures.
     pub missing_policy: Option<Vec<u8>>,
+    pub missing_tx_hash: Option<Vec<u8>>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -170,6 +305,7 @@ impl Default for Options {
             max_bytes: 512 * 1024 * 1024,
             candidate_address: "__untracked_candidates__".to_owned(),
             missing_policy: None,
+            missing_tx_hash: None,
         }
     }
 }
@@ -268,6 +404,9 @@ pub struct Case {
 pub struct Capture {
     pub keep_rule_version: i32,
     pub missing_policy: String,
+    pub missing_tx_hash: String,
+    pub candidate_address: String,
+    pub transaction_hit_available: bool,
     pub node_commit: String,
     pub catalogue_sha256: String,
     pub profile_hash: String,
@@ -306,9 +445,20 @@ pub struct QueryCoverage {
     pub unit_rows: BTreeMap<String, usize>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeProbe {
+    pub metadata_key: i64,
+    pub metadata_key_source: String,
+    pub checkpoint_mode: String,
+    pub asset_source: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub keep_rule_version: i32,
     pub missing_policy: String,
+    pub missing_tx_hash: String,
+    pub candidate_address: String,
+    pub transaction_hit_available_a: bool,
+    pub transaction_hit_available_b: bool,
     pub matched: bool,
     /// Actual row counts for each catalogue hit/miss label at both endpoints.
     pub probe_rows: BTreeMap<String, [usize; 2]>,
@@ -318,6 +468,7 @@ pub struct Report {
     pub unbounded_checked_b: bool,
     pub coverage_a: BTreeMap<String, QueryCoverage>,
     pub coverage_b: BTreeMap<String, QueryCoverage>,
+    pub bridge_probe: BridgeProbe,
     pub node_commit: String,
     pub catalogue_sha256: String,
     pub network: String,
@@ -851,6 +1002,42 @@ pub async fn choose_missing_policy(readers: &[&Transaction<'_>]) -> Result<Vec<u
     Err(Error::Refusal("comparison_no_missing_probe_policy"))
 }
 
+pub async fn choose_missing_transaction_hash(
+    readers: &[&Transaction<'_>],
+) -> Result<Vec<u8>, Error> {
+    if readers.is_empty() {
+        return Err(Error::Refusal("comparison_probe_requires_reader"));
+    }
+    for tx in readers {
+        preflight(tx).await?;
+    }
+    for counter in 0u32..1024 {
+        let value = if counter == 0 {
+            vec![0; 32]
+        } else {
+            Sha256::digest(format!("db-sync-alt-missing-transaction/{counter}")).to_vec()
+        };
+        let mut absent = true;
+        for tx in readers {
+            if tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM public.tx WHERE hash=$1::bytea)",
+                    &[&value],
+                )
+                .await?
+                .get::<_, bool>(0)
+            {
+                absent = false;
+                break;
+            }
+        }
+        if absent {
+            return Ok(value);
+        }
+    }
+    Err(Error::Refusal("comparison_no_missing_transaction_hash"))
+}
+
 struct Context {
     horizon: Header,
     target: Header,
@@ -911,7 +1098,26 @@ impl Context {
                 }
             }
             "get_block_by_hash" | "get_epoch_for_block_hash" => vec![Bytes(h)],
-            "get_block_info_for_tx_hash" => vec![Bytes(vec![0; 32])], // Meaningful tx hits are added from actual window transactions.
+            "get_block_info_for_tx_hash" => vec![Bytes(if hit {
+                self.positions
+                    .witness_tx_hash
+                    .as_ref()
+                    .map(|h| {
+                        hex::decode(h).map_err(|_| Error::Refusal("invalid_comparison_positions"))
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        self.options
+                            .missing_tx_hash
+                            .clone()
+                            .expect("capture pins missing tx hash")
+                    })
+            } else {
+                self.options
+                    .missing_tx_hash
+                    .clone()
+                    .expect("capture pins missing tx hash")
+            })],
             "resolve_ident" => {
                 let a = &self.profile.assets["cnight"];
                 vec![
@@ -1150,6 +1356,24 @@ pub async fn capture(
         None => choose_missing_policy(&[tx]).await?,
     };
     effective.missing_policy = Some(missing.clone());
+    let missing_tx = match &options.missing_tx_hash {
+        Some(value) if value.len() == 32 => {
+            let present: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM public.tx WHERE hash=$1::bytea)",
+                    &[value],
+                )
+                .await?
+                .get(0);
+            if present {
+                return Err(Error::Refusal("comparison_probe_transaction_present"));
+            }
+            value.clone()
+        }
+        Some(_) => return Err(Error::Refusal("comparison_probe_transaction_invalid")),
+        None => choose_missing_transaction_hash(&[tx]).await?,
+    };
+    effective.missing_tx_hash = Some(missing_tx.clone());
     let newest = tx
         .query_opt("SELECT id FROM public.block ORDER BY id DESC LIMIT 1", &[])
         .await?
@@ -1173,10 +1397,20 @@ pub async fn capture(
     }
     let cat = catalogue::catalogue();
     let entries = &cat.entries;
+    if effective.candidate_address == "__untracked_candidates__" {
+        effective.candidate_address = cat
+            .candidate_addresses
+            .get(&profile.network)
+            .ok_or(Error::Refusal("comparison_unknown_network_inputs"))?
+            .clone();
+    }
     let mut result = Collector {
         capture: Capture {
             keep_rule_version: crate::KEEP_RULE_VERSION,
             missing_policy: hex::encode(&missing),
+            missing_tx_hash: hex::encode(&missing_tx),
+            candidate_address: effective.candidate_address.clone(),
+            transaction_hit_available: false,
             node_commit: cat.node_commit.clone(),
             catalogue_sha256: hash(catalogue::GENERATED),
             profile_hash: profile.hash()?,
@@ -1245,13 +1479,6 @@ pub async fn capture(
             units.insert(alias.to_owned(), id);
         }
     }
-    if effective.candidate_address == "__untracked_candidates__" {
-        effective.candidate_address = cat
-            .candidate_addresses
-            .get(&profile.network)
-            .ok_or(Error::Refusal("comparison_unknown_network_inputs"))?
-            .clone();
-    }
     let context = Context {
         first_epoch: (h.epoch - 2).max(0),
         horizon: h,
@@ -1273,9 +1500,20 @@ pub async fn capture(
     for s in entries.iter().filter(|s| s.kind == "read") {
         for hit in [true, false] {
             let values = context.values(s, hit, low, high, first, 0)?;
-            let data = result
-                .add(tx, s, if hit { "hit" } else { "miss" }, &values)
-                .await?;
+            let label = if hit
+                && s.name == "get_block_info_for_tx_hash"
+                && positions.witness_tx_hash.is_none()
+            {
+                "unavailable"
+            } else if hit {
+                "hit"
+            } else {
+                "miss"
+            };
+            let data = result.add(tx, s, label, &values).await?;
+            if hit && s.name == "get_block_info_for_tx_hash" {
+                result.capture.transaction_hit_available = !data.is_empty();
+            }
             if hit && s.group == "startup" {
                 let v: serde_json::Value = serde_json::from_str(
                     data.first()
@@ -1365,9 +1603,39 @@ pub async fn capture(
             *values
                 .last_mut()
                 .ok_or(Error::Refusal("comparison_invalid_epoch_bind"))? = Bind::I32(epoch);
-            result
+            let data = result
                 .add(tx, s, &format!("epoch/{epoch}"), &values)
                 .await?;
+            if s.name == "get_latest_block_for_epoch" {
+                if let Some(row) = data.first() {
+                    let row: serde_json::Value = serde_json::from_str(row)?;
+                    let block = row["block_no"]
+                        .as_i64()
+                        .ok_or(Error::Refusal("comparison_invalid_epoch_header"))?;
+                    let block = i32::try_from(block)
+                        .map_err(|_| Error::Refusal("comparison_height_out_of_range"))?;
+                    for candidates in entries.iter().filter(|e| {
+                        e.kind == "read"
+                            && [
+                                "get_utxos_for_address_tx_in_enabled",
+                                "get_utxos_for_address_tx_in_consumed",
+                            ]
+                            .contains(&e.name.as_str())
+                    }) {
+                        result
+                            .add(
+                                tx,
+                                candidates,
+                                &format!("epoch/{epoch}/{}/candidates", s.id),
+                                &[
+                                    Bind::Text(context.options.candidate_address.clone()),
+                                    Bind::I32(block),
+                                ],
+                            )
+                            .await?;
+                    }
+                }
+            }
         }
     }
     for (n, pair) in positions.pairs.iter().enumerate() {
@@ -1573,14 +1841,14 @@ pub async fn capture(
                 .await?;
         }
     }
-    // Resolve an actually present window transaction for the bridge checkpoint helper.
-    if let Some(tx_hash)=tx.query_opt("SELECT hash::bytea FROM public.tx WHERE id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 ORDER BY id LIMIT 1",&[&i64::from(positions.horizon),&i64::from(positions.target)]).await?{let s=entries.iter().find(|s|s.name=="get_block_info_for_tx_hash").unwrap();result.add(tx,s,"window_transaction",&[Bind::Bytes(tx_hash.get(0))]).await?;}
     Ok(result.capture)
 }
 fn keys_for_probe_rows(a: &Capture, b: &Capture) -> BTreeMap<String, [usize; 2]> {
     a.cases
         .iter()
-        .filter(|(_, case)| case.label == "hit" || case.label == "miss")
+        .filter(|(_, case)| {
+            case.label == "hit" || case.label == "miss" || case.label == "unavailable"
+        })
         .map(|(key, case)| {
             (
                 key.clone(),
@@ -1629,7 +1897,9 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     {
         return Err(Error::Refusal("comparison_keep_rule_mismatch"));
     }
-    if a.missing_policy != b.missing_policy
+    if a.missing_tx_hash != b.missing_tx_hash
+        || a.candidate_address != b.candidate_address
+        || a.missing_policy != b.missing_policy
         || a.node_commit != b.node_commit
         || a.catalogue_sha256 != b.catalogue_sha256
         || a.profile_hash != b.profile_hash
@@ -1691,6 +1961,10 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     let probe_rows = keys_for_probe_rows(a, b);
     Ok(Report {
         missing_policy: a.missing_policy.clone(),
+        missing_tx_hash:a.missing_tx_hash.clone(),
+        candidate_address:a.candidate_address.clone(),
+        transaction_hit_available_a:a.transaction_hit_available,
+        transaction_hit_available_b:b.transaction_hit_available,
         probe_rows,
         chain_order_checked_a: a.chain_order_checked,
         chain_order_checked_b: b.chain_order_checked,
@@ -1698,6 +1972,7 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
         unbounded_checked_b: b.unbounded_checked,
         coverage_a: coverage(a),
         coverage_b: coverage(b),
+        bridge_probe:BridgeProbe {metadata_key:6500973,metadata_key_source:"node86774edf: partner-chains/toolkit/smart-contracts/plutus-data/src/bridge.rs:6 TOKEN_TRANSFER_METADATUM_KEY; db_model.rs:889 binding".to_owned(),checkpoint_mode:"synthetic Block(cursor.block-1), unlimited raw SQL range".to_owned(),asset_source:"pinned profile shipped bridge genesis plus separate ICS/reserve inputs; current runtime checkpoint/asset not measured".to_owned()},
         keep_rule_version: crate::KEEP_RULE_VERSION,
         matched: differences.iter().all(|d| d.informational),
         node_commit: a.node_commit.clone(),

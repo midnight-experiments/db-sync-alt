@@ -376,8 +376,9 @@ async fn database_command(
                 let tx = source.snapshot().await?;
                 let staged = store.stage_conversion(profile, &tx, &options).await?;
                 let state = &staged.source().state;
-                let positions = dsa_store::compare::Positions::generate(
+                let positions = dsa_store::compare::Positions::generate_with_events(
                     &tx,
+                    profile,
                     state.horizon.height,
                     state.target.height,
                     500,
@@ -427,11 +428,11 @@ async fn database_command(
     }
 }
 
-fn hex_policy(value: &str) -> Result<Vec<u8>, Error> {
-    if value.len() != 56 {
+fn hex_bytes(value: &str, bytes: usize) -> Result<Vec<u8>, Error> {
+    if value.len() != bytes * 2 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::Refusal("comparison_probe_policy_invalid"));
     }
-    (0..56)
+    (0..bytes * 2)
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&value[i..i + 2], 16)
@@ -494,6 +495,13 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
             return Err(Error::Refusal("source_capture_has_no_connection"));
         }
         let left = dsa_store::source_capture::read(file, &profile)?;
+        if args
+            .candidate_address
+            .as_ref()
+            .is_some_and(|a| a != &left.candidate_address)
+        {
+            return Err(Error::Refusal("comparison_capture_context_mismatch"));
+        }
         let positions = if let Some(positions) = explicit {
             if positions != left.positions {
                 return Err(Error::Refusal("comparison_capture_context_mismatch"));
@@ -522,7 +530,9 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
         let mut options = Options {
             check_chain_order: true,
             verify_unbounded: args.verify_unbounded,
-            missing_policy: Some(hex_policy(&left.missing_policy)?),
+            missing_policy: Some(hex_bytes(&left.missing_policy, 28)?),
+            missing_tx_hash: Some(hex_bytes(&left.missing_tx_hash, 32)?),
+            candidate_address: left.candidate_address.clone(),
             ..Default::default()
         };
         if let Some(address) = &args.candidate_address {
@@ -571,6 +581,8 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
     let tx = a.snapshot().await.map_err(|e| wrap("a", e))?;
     let right_tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
     let missing_policy = dsa_store::compare::choose_missing_policy(&[&tx, &right_tx]).await?;
+    let missing_tx_hash =
+        dsa_store::compare::choose_missing_transaction_hash(&[&tx, &right_tx]).await?;
     let positions = if let Some(p) = explicit {
         p
     } else {
@@ -595,13 +607,14 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
             .ok()
             .and_then(|p| p.checked_sub(profile.cardano.security_parameter))
             .ok_or(Error::Refusal("comparison_target_not_final"))?;
-        Positions::generate(&tx, h, t, args.max_pairs as usize)
+        Positions::generate_with_events(&tx, &profile, h, t, args.max_pairs as usize)
             .await
             .map_err(|e| wrap("a", e))?
     };
     let mut options = Options {
         verify_unbounded: args.verify_unbounded,
         missing_policy: Some(missing_policy),
+        missing_tx_hash: Some(missing_tx_hash),
         ..Default::default()
     };
     if let Some(address) = &args.candidate_address {

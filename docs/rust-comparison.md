@@ -13,8 +13,17 @@ and idle-transaction timeout overrides apply only to these connections;
 positive configured limits otherwise remain in force.
 
 Auto positions include consecutive cursor/reference pairs spread across the
-whole window, a spanning pair and every epoch boundary. `--max-pairs` controls
-the consecutive sample. An explicit positions JSON file has `horizon`, `target`
+whole window, a spanning pair and every epoch boundary. Bounded source reads
+also add real transaction pairs for each create/spend unit, auth registration,
+mapping deregistration and ICS output class. Both Preprod units receive their
+own witnesses. `--max-pairs` controls the uniform sample; up to16 witnesses per
+class are additional. These hint reads are counted separately from node queries.
+Both registered-candidate SQL variants also execute at every actual epoch-end
+header returned by each literal header-query variant, preserving raw results.
+The registered-candidate input and actual transaction witness are pinned.
+If no transaction with a retained header exists, that probe explicitly reports
+hit-unavailable and executes a verified absent32-byte hash rather than calling
+zero a successful hit. Event classes with no available events remain quiet. An explicit positions JSON file has `horizon`, `target`
 and a `pairs` array, each containing `cursor` and `reference` objects with
 `block` and `tx_index`. Explicit pairs must stay within the window and order
 cursor before reference. All catalogue queries also receive hit/miss inputs;

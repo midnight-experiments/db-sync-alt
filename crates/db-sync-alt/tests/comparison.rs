@@ -1149,3 +1149,131 @@ async fn compare_interrupt_and_deadline_cancel_own_queries_and_release_snapshots
     target.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_event_anchors_real_transaction_witness_and_full_window_coverage() -> Result {
+    let mut f = fixture(352);
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    target
+        .cli(
+            "convert",
+            "preprod",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )
+        .await?;
+    target
+        .cli("grant-reader", "preprod", &["--role", &target.reader])
+        .await?;
+    let output = cli(&source, &target, &f.profile, &[]).await?;
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let positions = &report["positions"];
+    assert!(
+        positions["pairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["cursor"]["block"] == 6
+                && p["cursor"]["tx_index"] == 0
+                && p["reference"]["block"] == 8)
+    );
+    assert!(positions["event_hint_queries"].as_u64().unwrap() > 0);
+    assert!(positions["witness_tx_hash"].as_str().unwrap().len() == 64);
+    let anchors = positions["event_anchors"].as_array().unwrap();
+    for unit in [
+        f.profile.assets["cnight"].unit(),
+        f.profile.assets["bridge"].unit(),
+    ] {
+        assert!(
+            anchors
+                .iter()
+                .any(|v| v["kind"] == "asset_create" && v["unit"] == unit)
+        );
+        assert!(
+            report["coverage_a"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .any(|(query, v)| query.starts_with("get_asset_creates:")
+                    && v["unit_rows"][&unit].as_u64().is_some_and(|n| n > 0))
+        );
+    }
+    assert!(report["transaction_hit_available_a"].as_bool().unwrap());
+    assert!(report["transaction_hit_available_b"].as_bool().unwrap());
+    assert_eq!(report["bridge_probe"]["metadata_key"], 6500973);
+    let witness = positions["witness_tx_hash"].as_str().unwrap();
+    let row=connect(&source.config).await?.query_one("SELECT EXISTS(SELECT 1 FROM serve.tx t JOIN serve.block b ON b.id=t.block_id WHERE t.hash=decode($1,'hex'))",&[&witness]).await?;
+    assert!(row.get::<_, bool>(0));
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_more_than_five_hundred_pairs_and_quiet_event_classes() -> Result {
+    let mut f = fixture(353);
+    f.bounds.target = 610;
+    f.bounds.tip = 610 + f.profile.cardano.security_parameter;
+    for height in 0..=f.bounds.tip {
+        f.chain
+            .blocks
+            .entry(i64::from(height))
+            .or_insert(dsa_chain::keep::Header {
+                epoch: Some((height / 2) as i32),
+                slot: Some(i64::from(height) * 100 + 1),
+            });
+    }
+    f.chain.epochs.extend(0..=305);
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    target
+        .cli(
+            "convert",
+            "mainnet",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )
+        .await?;
+    target
+        .cli("grant-reader", "mainnet", &["--role", &target.reader])
+        .await?;
+    let began = std::time::Instant::now();
+    let output = cli(&source, &target, &f.profile, &[]).await?;
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(report["positions"]["pairs"].as_array().unwrap().len() >= 500);
+    assert!(
+        report["coverage_a"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .any(|(query, v)| query.starts_with("get_asset_creates:")
+                && v["paired_nonempty_cases"].as_u64().is_some_and(|v| v > 0))
+    );
+    // Most of this generated window is quiet. It remains a valid comparison;
+    // absence of events in a class/interval is not fabricated into a hit.
+    assert_eq!(report["matched"], true);
+    println!(
+        "{}",
+        json!({"event":"generated_500_pair_comparison","pairs":report["positions"]["pairs"].as_array().unwrap().len(),"executions":report["executions"],"wall_seconds":began.elapsed().as_secs_f64(),"event_anchors":report["positions"]["event_anchors"].as_array().unwrap().len()})
+    );
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
