@@ -1,7 +1,7 @@
 name: reader-controls
 on:
   push:
-    branches: ['validation/b2-mainnet-subset-beaaa0b']
+    branches: ['validation/b2-mainnet-subset-1f50c4d']
     paths: ['.github/workflows/reader-controls.yml']
 permissions:
   contents: read
