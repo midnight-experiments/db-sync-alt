@@ -27,7 +27,10 @@ outputs, fallback resolutions or stored bridge metadata rows. Separate adapter
 tests cover finalized provider output replies and a native invalid-projection
 model. The complete historical corpus supplies broader real-shape coverage.
 
-An older support block remains recorded with its original provenance. Causal
+An older support block remains recorded with its original provenance. Two
+outputs in that block separately exercise the version 2 asset predicate. Their
+address relevance is preserved and their unrelated empty-name tokens are
+excluded. The six-block row projection and decoder counts exclude this block. Causal
 replay uses only the current transaction's bytes, a requested recorded datum
 API response or an earlier successfully stored datum. Explicit404 replies are
 scoped to their requesting block, so a later spend can discover the preimage. Row assertions apply to

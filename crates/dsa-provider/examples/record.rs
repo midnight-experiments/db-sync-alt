@@ -338,7 +338,9 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                         block.height,
                         &decoded,
                         &mut supplements,
-                    )? {
+                    )?
+                    .is_some()
+                    {
                         continue;
                     }
                     match &request {
@@ -400,7 +402,9 @@ async fn record(args: &Args, plan: &Plan, base: &str) -> Result<(), Box<dyn std:
                         block.height,
                         &decoded,
                         &mut supplements,
-                    )? {
+                    )?
+                    .is_some()
+                    {
                         return Err("recorded provider supplement missing".into());
                     }
                 }

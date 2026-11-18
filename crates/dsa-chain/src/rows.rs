@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    assets::AssetRule,
     cbor::{Error, error},
     datum, ids,
     profiles::Profile,
@@ -168,8 +169,7 @@ impl<'a> HeldChanges<'a> {
 pub struct Selection<'a> {
     profile: &'a Profile,
     addresses: BTreeSet<String>,
-    units: BTreeSet<String>,
-    governance_policies: BTreeSet<String>,
+    assets: AssetRule,
 }
 
 impl<'a> Selection<'a> {
@@ -177,15 +177,11 @@ impl<'a> Selection<'a> {
         Self {
             profile,
             addresses: profile.addresses.values().cloned().collect(),
-            units: profile.assets.values().map(|a| a.unit()).collect(),
-            governance_policies: ["council", "technical_committee"]
-                .iter()
-                .map(|k| profile.assets[*k].policy.clone())
-                .collect(),
+            assets: AssetRule::from_profile(profile),
         }
     }
     pub fn required(&self, asset: &Asset) -> bool {
-        self.units.contains(&asset.unit()) || self.governance_policies.contains(&asset.policy)
+        self.assets.allows(&asset.policy, &asset.name)
     }
     pub fn relevant(&self, output: &Output) -> bool {
         output
@@ -193,11 +189,6 @@ impl<'a> Selection<'a> {
             .as_ref()
             .is_some_and(|a| self.addresses.contains(a))
             || output.assets.iter().any(|a| self.required(a))
-    }
-    fn keep_all_assets(&self, output: &Output) -> bool {
-        ["ics", "reserve"]
-            .iter()
-            .any(|k| output.address.as_ref() == self.profile.addresses.get(*k))
     }
     fn needs_datum(&self, output: &Output) -> bool {
         output
@@ -404,7 +395,7 @@ fn build_rows(
                 consumed_by_tx_id: None,
             });
             for (n, asset) in output.assets.iter().enumerate() {
-                if selection.keep_all_assets(output) || selection.required(asset) {
+                if selection.required(asset) {
                     rows.ma_tx_out.push(AssetRow {
                         id: id(ids::asset_id(height, tx_index, index, ordinal(n)?))?,
                         quantity: asset.quantity.to_string(),
@@ -459,6 +450,122 @@ fn build_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_two_filters_every_address_and_preserves_full_asset_ordinals() {
+        // Native selection model only, with no serialized ledger transaction.
+        let mut profile = Profile::load("mainnet").unwrap();
+        for (role, policy) in [
+            ("cnight", "40"),
+            ("auth", "80"),
+            ("permissioned_candidates", "c0"),
+            ("bridge", "e0"),
+            ("council", "60"),
+            ("technical_committee", "a0"),
+        ] {
+            profile.assets.get_mut(role).unwrap().policy = policy.repeat(28);
+        }
+        let required = |role: &str| Asset {
+            policy: profile.assets[role].policy.clone(),
+            name: profile.assets[role].name.clone(),
+            quantity: 1,
+        };
+        let foreign = |policy: &str| Asset {
+            policy: policy.repeat(28),
+            name: String::new(),
+            quantity: 1,
+        };
+        let assets = vec![
+            foreign("20"),
+            required("cnight"),
+            foreign("50"),
+            Asset {
+                policy: "60".repeat(28),
+                name: "ff".to_owned(),
+                quantity: 1,
+            },
+            required("auth"),
+            foreign("90"),
+            required("permissioned_candidates"),
+            required("bridge"),
+            foreign("f0"),
+        ];
+        let addresses = [
+            profile.addresses["ics"].clone(),
+            profile.addresses["reserve"].clone(),
+            profile.addresses["mapping"].clone(),
+            "unrelated".to_owned(),
+            profile.addresses["ics"].clone(),
+            "unrelated".to_owned(),
+        ];
+        let transactions: Vec<_> = addresses
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| Transaction {
+                hash: format!("{index:02x}").repeat(32),
+                valid: true,
+                ordinary: Vec::new(),
+                collateral: Vec::new(),
+                reference: Vec::new(),
+                outputs: vec![Some(Output {
+                    address_raw: Vec::new(),
+                    address: Some(address),
+                    coin: 100,
+                    assets: if index < 4 {
+                        assets.clone()
+                    } else {
+                        vec![foreign("20")]
+                    },
+                    data_hash: None,
+                    inline_datum: None,
+                    classification_safe: true,
+                })],
+                collateral_output: None,
+                has_collateral_return: false,
+                mint: Vec::new(),
+                datums: BTreeMap::new(),
+                body: &[],
+                auxiliary: None,
+                auxiliary_hash: None,
+            })
+            .collect();
+        let mut supplements = Supplements::default();
+        for tx in &transactions {
+            supplements.metadata.insert(tx.hash.clone(), None);
+        }
+        let rows = build_block(
+            &profile,
+            10,
+            &transactions,
+            &mut BTreeMap::new(),
+            &supplements,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.tx_out.len(),
+            5,
+            "address-relevant outputs survive with zero retained token rows"
+        );
+        assert_eq!(rows.ma_tx_out.len(), 20);
+        for (transaction, chunk) in rows.ma_tx_out.chunks_exact(5).enumerate() {
+            for (row, ordinal) in chunk.iter().zip([1, 3, 4, 6, 7]) {
+                assert_eq!(
+                    row.id,
+                    (10i64 << 36) | ((transaction as i64) << 24) | ordinal,
+                    "asset IDs retain the ordinal in the complete sorted pre-filter list"
+                );
+            }
+        }
+        assert!(
+            !rows
+                .ma_tx_out
+                .iter()
+                .any(|row| row.policy == "20".repeat(28)
+                    || row.policy == "50".repeat(28)
+                    || row.policy == "90".repeat(28)
+                    || row.policy == "f0".repeat(28))
+        );
+    }
 
     #[test]
     fn requested_datums_distinguish_unknown_404_stored_and_later_reveal() {

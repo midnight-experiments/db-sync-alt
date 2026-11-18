@@ -7,7 +7,11 @@ use dsa_chain::{
 fn configured_full_units_and_all_governance_names_are_retained() {
     assert_eq!(RULE_VERSION, 2);
     for network in ["mainnet", "preprod", "preview"] {
-        let profile = if network=="preview" {serde_json::from_str(include_str!("../profiles/preview.json")).unwrap()} else {Profile::load(network).unwrap()};
+        let profile = if network == "preview" {
+            serde_json::from_str(include_str!("../profiles/preview.json")).unwrap()
+        } else {
+            Profile::load(network).unwrap()
+        };
         let rule = AssetRule::from_profile(&profile);
         for role in ["cnight", "auth", "permissioned_candidates", "bridge"] {
             let asset = &profile.assets[role];
@@ -57,9 +61,16 @@ fn ics_and_reserve_role_entries_add_no_token_exception() {
 
 #[test]
 fn fixed_descriptors_use_six_roles_without_alias_exceptions() {
- let mut profile=Profile::load("preprod").unwrap();let expected=fixed_units(&profile);
- profile.assets.insert("not_a_required_role".to_owned(),dsa_chain::profiles::Asset{policy:"ff".repeat(28),name:"ab".to_owned()});
- profile.assets.get_mut("ics").unwrap().policy="ee".repeat(28);
- profile.assets.get_mut("reserve").unwrap().name="ff".to_owned();
- assert_eq!(fixed_units(&profile),expected);
+    let mut profile = Profile::load("preprod").unwrap();
+    let expected = fixed_units(&profile);
+    profile.assets.insert(
+        "not_a_required_role".to_owned(),
+        dsa_chain::profiles::Asset {
+            policy: "ff".repeat(28),
+            name: "ab".to_owned(),
+        },
+    );
+    profile.assets.get_mut("ics").unwrap().policy = "ee".repeat(28);
+    profile.assets.get_mut("reserve").unwrap().name = "ff".to_owned();
+    assert_eq!(fixed_units(&profile), expected);
 }

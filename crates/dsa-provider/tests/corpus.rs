@@ -117,6 +117,48 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
                 .exists()
         );
     }
+    // These real bootstrap outpoints exercise token selection separately from
+    // projection-row and shape counts. Their original block remains support-only.
+    let profile = dsa_chain::profiles::Profile::load("preprod").unwrap();
+    let selection = dsa_chain::rows::Selection::new(&profile);
+    let bootstrap: Vec<dsa_provider::types::TransactionCbor> = serde_json::from_slice(
+        &std::fs::read(scratch.path().join("provider/transactions/4318350.json")).unwrap(),
+    )
+    .unwrap();
+    for (hash, policy) in [
+        (
+            "ed8a1f6afb4cb2b10e37e1092601a20a021da7231faafe10816f3c56bc3532d0",
+            "fb964a2751bb9cb9c7a6d1475d1ea4a3960820a0f318883647502426",
+        ),
+        (
+            "725c21c20c9193fe813d98cf886cd9e5e40187ac18cfc3be6e30bb349cbc90b4",
+            "475db387ba92282a387e9ddfb7f8d2fd297f9b660450005f3ed37550",
+        ),
+    ] {
+        let record = bootstrap
+            .iter()
+            .find(|record| record.tx_hash.as_str() == hash)
+            .unwrap();
+        let bytes = hex::decode(record.cbor.as_str()).unwrap();
+        let tx = dsa_chain::transaction::decode(&bytes, hash).unwrap();
+        let supplements = dsa_chain::rows::Supplements::default();
+        let outputs = dsa_chain::rows::effective_outputs(&tx, &supplements).unwrap();
+        let output = outputs.iter().find(|(index, _)| *index == 2).unwrap().1;
+        assert!(
+            selection.relevant(output),
+            "the address retains the original output"
+        );
+        let foreign = output
+            .assets
+            .iter()
+            .find(|asset| asset.policy == policy && asset.name.is_empty())
+            .unwrap();
+        assert_eq!(foreign.quantity, 1);
+        assert!(
+            !selection.required(foreign),
+            "v2 omits the observed foreign bootstrap token at its original outpoint"
+        );
+    }
     corpus::run_mode(scratch.path(), true);
     let missing: Vec<String> = serde_json::from_slice(
         &std::fs::read(scratch.path().join("missing-supplements.json")).unwrap(),
@@ -124,6 +166,31 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
     .unwrap();
     assert!(missing.is_empty(), "required API recordings: {missing:?}");
     corpus::run(scratch.path());
+    for line in std::fs::read_to_string(scratch.path().join("supplement-requests.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            heights.contains(&entry["block"]),
+            "successful requests belong to a projection block"
+        );
+        let source = &entry["recording"];
+        let bytes = std::fs::read(
+            scratch
+                .path()
+                .join("provider")
+                .join(source["response_path"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            source["response_sha256"].as_str().unwrap()
+        );
+        if source["capture"]["format"] == "blockfrost-datum-capture-v1" {
+            assert_eq!(entry["request"]["Datum"], source["capture"]["datum_hash"]);
+        }
+    }
     let summary: serde_json::Value = serde_json::from_slice(
         &std::fs::read(scratch.path().join("comparison-result.json")).unwrap(),
     )

@@ -172,22 +172,38 @@ fn recorded_404_is_scoped_to_the_requesting_block() {
     // A legacy unscoped negative response cannot establish current absence.
     std::fs::write(scratch.path().join(format!("datums/{hash}.json")), "null").unwrap();
     let mut supplements = Supplements::default();
-    assert!(!recorded::load(scratch.path(), &request, 10, &[], &mut supplements).unwrap());
+    assert!(
+        !recorded::load(scratch.path(), &request, 10, &[], &mut supplements)
+            .unwrap()
+            .is_some()
+    );
     std::fs::write(
         scratch.path().join(format!("datums/10-{hash}.json")),
         "null",
     )
     .unwrap();
-    assert!(recorded::load(scratch.path(), &request, 10, &[], &mut supplements).unwrap());
+    assert!(
+        recorded::load(scratch.path(), &request, 10, &[], &mut supplements)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(supplements.datums[&hash], DatumAvailability::NotFound);
     let mut later = Supplements::default();
-    assert!(!recorded::load(scratch.path(), &request, 11, &[], &mut later).unwrap());
+    assert!(
+        !recorded::load(scratch.path(), &request, 11, &[], &mut later)
+            .unwrap()
+            .is_some()
+    );
     std::fs::write(
         scratch.path().join(format!("datums/11-{hash}.json")),
         "\"00\"",
     )
     .unwrap();
-    assert!(recorded::load(scratch.path(), &request, 11, &[], &mut later).unwrap());
+    assert!(
+        recorded::load(scratch.path(), &request, 11, &[], &mut later)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(later.datums[&hash], DatumAvailability::Present(vec![0]));
     std::fs::write(
         scratch.path().join(format!("datums/12-{hash}.json")),
@@ -226,7 +242,8 @@ fn shared_positive_datum_requires_bound_capture_provenance() {
             &[],
             &mut Supplements::default()
         )
-        .unwrap(),
+        .unwrap()
+        .is_some(),
         "an unproven shared200 must not silently supply a historical request"
     );
     // Native capture-metadata model. Actual corpus provenance records its real
@@ -235,7 +252,11 @@ fn shared_positive_datum_requires_bound_capture_provenance() {
     let provenance = file.with_extension("provenance.json");
     std::fs::write(&provenance, serde_json::to_vec(&capture).unwrap()).unwrap();
     let mut known = Supplements::default();
-    assert!(recorded::load(scratch.path(), &request, 10, &[], &mut known).unwrap());
+    assert!(
+        recorded::load(scratch.path(), &request, 10, &[], &mut known)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(known.datums[&hash], DatumAvailability::Present(vec![0]));
     capture["response_observed_no_later_than_unix"] = serde_json::json!(u64::MAX);
     std::fs::write(&provenance, serde_json::to_vec(&capture).unwrap()).unwrap();

@@ -8,7 +8,7 @@ use dsa_provider::{
     supplements::resolve_outputs,
     types::{CborHex, Metadata, TransactionOutputs},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -68,13 +68,20 @@ fn verified_shared_datum(path: &Path, hash: &str) -> Result<bool, Box<dyn std::e
     Ok(true)
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecordingSource {
+    response_path: String,
+    response_sha256: String,
+    capture: Option<serde_json::Value>,
+}
+
 pub fn load(
     root: &Path,
     request: &SupplementRequest,
     height: u32,
     transactions: &[Transaction<'_>],
     supplements: &mut Supplements,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<Option<RecordingSource>, Box<dyn std::error::Error>> {
     let path = match request {
         SupplementRequest::Datum(hash) => {
             let shared = root.join(format!("datums/{hash}.json"));
@@ -95,12 +102,32 @@ pub fn load(
         }
     };
     if !path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
-    let file = File::open(path)?;
+    let bytes = std::fs::read(&path)?;
+    let source_hash = format!("{:x}", Sha256::digest(&bytes));
+    let capture_path = path.with_extension("provenance.json");
+    let capture_path = if capture_path.exists() {
+        capture_path
+    } else {
+        path.with_extension("capture.json")
+    };
+    let capture: Option<serde_json::Value> = if capture_path.exists() {
+        Some(serde_json::from_reader(File::open(capture_path)?)?)
+    } else {
+        None
+    };
+    if let Some(capture) = &capture
+        && capture
+            .get("response_sha256")
+            .and_then(|value| value.as_str())
+            .is_some_and(|expected| expected != source_hash)
+    {
+        return Err("recorded_datum_capture_bytes_changed".into());
+    }
     match request {
         SupplementRequest::Datum(hash) => {
-            let datum: Option<CborHex> = serde_json::from_reader(file)?;
+            let datum: Option<CborHex> = serde_json::from_slice(&bytes)?;
             let availability = match datum {
                 Some(raw) => {
                     let bytes = hex::decode(raw.as_str())?;
@@ -114,7 +141,7 @@ pub fn load(
             supplements.datums.insert(hash.clone(), availability);
         }
         SupplementRequest::Metadata(hash) => {
-            let entries: Vec<Metadata> = serde_json::from_reader(file)?;
+            let entries: Vec<Metadata> = serde_json::from_slice(&bytes)?;
             let matches: Vec<_> = entries
                 .into_iter()
                 .filter(|m| m.label.0 == 6500973)
@@ -128,7 +155,7 @@ pub fn load(
             );
         }
         SupplementRequest::Output { transaction, index } => {
-            let reply: TransactionOutputs = serde_json::from_reader(file)?;
+            let reply: TransactionOutputs = serde_json::from_slice(&bytes)?;
             let tx = transactions
                 .iter()
                 .find(|tx| tx.hash == *transaction)
@@ -140,5 +167,9 @@ pub fn load(
             supplements.outputs.insert(transaction.clone(), outputs);
         }
     }
-    Ok(true)
+    Ok(Some(RecordingSource {
+        response_path: path.strip_prefix(root)?.to_string_lossy().into_owned(),
+        response_sha256: source_hash,
+        capture,
+    }))
 }

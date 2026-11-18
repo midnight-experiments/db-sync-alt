@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    assets::fixed_units,
     ids,
     profiles::Profile,
     rows::{self, BuildError, HeldChanges, HeldOutput, Selection, Supplements},
@@ -84,10 +85,6 @@ pub struct BlockEffects {
 pub struct SupplyOutput<'a> {
     pub output: &'a Output,
     pub spent: bool,
-}
-
-fn fixed_units(profile: &Profile) -> BTreeSet<String> {
-    profile.assets.values().map(|asset| asset.unit()).collect()
 }
 
 fn add_assets(

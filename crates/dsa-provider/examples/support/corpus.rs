@@ -2,7 +2,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
+    fs::{File, OpenOptions},
+    io::Write,
     path::Path,
 };
 
@@ -144,6 +145,12 @@ fn compare(path: &Path, planning: bool) {
     let mut datum_bytes = BTreeMap::<String, usize>::new();
     let mut large_datums = BTreeMap::new();
     let mut missing = BTreeSet::new();
+    let mut request_trace = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path.join("supplement-requests.jsonl"))
+        .unwrap();
     let mut actual = Rows::default();
     let mut shape_witnesses = BTreeMap::new();
     let mut multi_input_transactions = 0usize;
@@ -189,7 +196,7 @@ fn compare(path: &Path, planning: bool) {
                         "cached supplement did not satisfy repeated request at block {}: {request:?}",
                         block.height
                     );
-                    if !recorded::load(
+                    if let Some(source) = recorded::load(
                         &provider_path,
                         &request,
                         block.height,
@@ -198,6 +205,10 @@ fn compare(path: &Path, planning: bool) {
                     )
                     .unwrap()
                     {
+                        serde_json::to_writer(&mut request_trace,&serde_json::json!({"block":block.height,"request":request,"recording":source})).unwrap();
+                        request_trace.write_all(b"\n").unwrap();
+                        request_trace.flush().unwrap();
+                    } else {
                         missing.insert(
                             serde_json::to_string(
                                 &serde_json::json!({"block":block.height,"request":request}),
