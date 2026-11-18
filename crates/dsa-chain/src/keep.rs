@@ -15,11 +15,11 @@
 //!   (`reference/primitives/mainchain-follower/src/db/queries/cnight_observation.rs:163`).
 //! * K3 keeps old outputs without a spend before H, their assets and creating
 //!   transactions. `get_asset_spends` joins `tx_out.tx_id = tx_in.tx_out_id`
-//!   and the output index (`cnight_observation.rs:214`); it does not join the
+//!   and the output index (`cnight_observation.rs:213-214`); it does not join the
 //!   creating header. Mapping deregistration has the same old-output dependency.
 //! * K4 keeps existing datums of retained outputs at a profile address, holding
 //!   a governance-policy asset or the exact permissioned-candidates unit.
-//!   Registration/deregistration JOIN datum (`cnight_observation.rs:54,114`),
+//!   Registration/deregistration JOIN datum (`cnight_observation.rs:51,111`),
 //!   governance JOINs datum and permissioned candidates LEFT JOINs it.
 //! * K5 keeps every output in the newest eligible old governance transaction,
 //!   with its transaction/header/assets/datum. Eligibility includes a datum row:
@@ -30,7 +30,7 @@
 //! * K6 keeps the newest old permissioned transaction at epoch <= epoch(H)-2,
 //!   every later eligible old output, and their headers. Match the exact unit:
 //!   `WHERE ma_tx_out.ident = $1 AND origin_block.epoch_no <= $2`
-//!   (`candidates_data_source/db_model.rs:279-280`). Its ORDER BY
+//!   (`candidates_data_source/db_model.rs:278-279`). Its ORDER BY
 //!   also omits output index, so complete newest transaction ties stay.
 //! * K7 keeps the latest non-NULL-slot header at or before each preceding epoch
 //!   cutoff, epoch(H)-2 and epoch(H)-1. Empty epochs can use an earlier header:
@@ -91,12 +91,22 @@ impl Bounds {
         }
         Ok(())
     }
+
+    pub fn validate_profile(self, profile: &Profile) -> Result<(), KeepError> {
+        self.validate()?;
+        if self.tip - self.target != profile.cardano.security_parameter {
+            return Err(KeepError::Target);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum KeepError {
     #[error("invalid_keep_bounds")]
     Bounds,
+    #[error("invalid_keep_target")]
+    Target,
     #[error("missing_horizon_epoch")]
     Horizon,
     #[error("incomplete_chain_model")]
@@ -213,7 +223,7 @@ impl Chain {
 }
 
 pub fn keep(chain: &Chain, profile: &Profile, bounds: Bounds) -> Result<RetainedRows, KeepError> {
-    bounds.validate()?;
+    bounds.validate_profile(profile)?;
     chain.validate()?;
     let h = i64::from(bounds.horizon);
     let t = i64::from(bounds.target);

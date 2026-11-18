@@ -32,9 +32,12 @@ governance_candidates AS MATERIALIZED (
  WHERE EXISTS(SELECT 1 FROM __SOURCE__.ma_tx_out a JOIN __SOURCE__.multi_asset m ON m.id=a.ident
   WHERE a.tx_out_id=o.id AND m.policy=g.policy AND a.id>=0 AND a.id<$1::bigint*68719476736)
 ),
+governance_last_transactions AS MATERIALIZED (
+ SELECT body,max(tx_id) AS tx_id FROM governance_candidates GROUP BY body
+),
 governance_carry AS MATERIALIZED (
  SELECT c.id,c.tx_id,c.block_id FROM governance_candidates c
- WHERE NOT EXISTS(SELECT 1 FROM governance_candidates n WHERE n.body=c.body AND n.tx_id>c.tx_id)
+ JOIN governance_last_transactions last ON last.body=c.body AND last.tx_id=c.tx_id
 ),
 permissioned_candidates AS MATERIALIZED (
  SELECT o.id,o.tx_id,t.block_id,b.epoch_no FROM __SOURCE__.multi_asset m
@@ -44,22 +47,34 @@ permissioned_candidates AS MATERIALIZED (
  JOIN __SOURCE__.block b ON b.id=t.block_id AND b.id>=0 AND b.id<$1::bigint
  WHERE m.policy=$7::bytea AND m.name=$8::bytea
 ),
+permissioned_last_transaction AS MATERIALIZED (
+ SELECT max(c.tx_id) AS tx_id FROM permissioned_candidates c CROSS JOIN horizon h WHERE c.epoch_no<=h.epoch-2
+),
 permissioned_carry AS MATERIALIZED (
  SELECT c.id,c.tx_id,c.block_id FROM permissioned_candidates c CROSS JOIN horizon h
- WHERE c.epoch_no>h.epoch-2 OR (c.epoch_no<=h.epoch-2 AND NOT EXISTS(
-  SELECT 1 FROM permissioned_candidates n WHERE n.epoch_no<=h.epoch-2 AND n.tx_id>c.tx_id))
+ WHERE c.epoch_no>h.epoch-2
+ UNION SELECT c.id,c.tx_id,c.block_id FROM permissioned_candidates c JOIN permissioned_last_transaction last ON last.tx_id=c.tx_id
 ),
 epoch_cutoffs AS (SELECT epoch-2 AS epoch FROM horizon UNION ALL SELECT epoch-1 FROM horizon),
+old_headers AS MATERIALIZED (
+ SELECT id,epoch_no,slot_no FROM __SOURCE__.block WHERE id>=0 AND id<$1::bigint
+),
+epoch_last_slots AS MATERIALIZED (
+ SELECT e.epoch,max(b.slot_no) AS slot_no FROM epoch_cutoffs e
+ JOIN old_headers b ON b.epoch_no<=e.epoch AND b.slot_no IS NOT NULL GROUP BY e.epoch
+),
 epoch_headers AS MATERIALIZED (
- SELECT b.id FROM __SOURCE__.block b CROSS JOIN epoch_cutoffs e
- WHERE b.id>=0 AND b.id<$1::bigint AND b.epoch_no<=e.epoch AND b.slot_no IS NOT NULL
- AND NOT EXISTS(SELECT 1 FROM __SOURCE__.block n
-  WHERE n.id>=0 AND n.id<$1::bigint AND n.epoch_no<=e.epoch AND n.slot_no IS NOT NULL AND n.slot_no>b.slot_no)
+ SELECT b.id FROM old_headers b JOIN epoch_last_slots e ON b.epoch_no<=e.epoch AND b.slot_no=e.slot_no
+),
+fallback_candidates AS MATERIALIZED (
+ SELECT id,tx_in_id,tx_out_id,tx_out_index FROM __SOURCE__.tx_in
+ WHERE id>=0 AND id<$1::bigint*16777216 AND NOT EXISTS(SELECT 1 FROM window_inputs)
+),
+fallback_last_id AS MATERIALIZED (
+ SELECT max(id) AS id FROM fallback_candidates
 ),
 fallback_input AS MATERIALIZED (
- SELECT i.id,i.tx_in_id,i.tx_out_id,i.tx_out_index FROM __SOURCE__.tx_in i
- WHERE i.id>=0 AND i.id<$1::bigint*16777216 AND NOT EXISTS(SELECT 1 FROM window_inputs)
- AND NOT EXISTS(SELECT 1 FROM __SOURCE__.tx_in n WHERE n.id>i.id AND n.id<$1::bigint*16777216)
+ SELECT i.* FROM fallback_candidates i JOIN fallback_last_id last ON i.id=last.id
 ),
 keep_tx_out AS MATERIALIZED (
  SELECT id FROM window_outputs UNION SELECT id FROM old_unspent

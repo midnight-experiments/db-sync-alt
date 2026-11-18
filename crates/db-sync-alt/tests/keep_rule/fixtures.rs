@@ -16,6 +16,7 @@ pub struct Fixture {
     pub bounds: Bounds,
     pub tags: BTreeMap<String, i64>,
     pub seed: u64,
+    pub quantities: BTreeMap<i64, u64>,
 }
 struct Random(u64);
 impl Random {
@@ -35,7 +36,7 @@ fn binary(value: &str) -> String {
 }
 
 impl Fixture {
-    pub fn generated(seed: u64) -> Self {
+    pub fn base(seed: u64) -> Self {
         let mut random = Random(
             seed.wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407),
@@ -58,6 +59,7 @@ impl Fixture {
             bounds,
             tags: BTreeMap::new(),
             seed,
+            quantities: BTreeMap::new(),
         };
         let units: BTreeMap<_, _> = fixture
             .profile
@@ -218,6 +220,206 @@ impl Fixture {
         fixture
     }
 
+    /// Random topology with a small complete observation window. Old history,
+    /// gaps, epoch lengths, source extent and payloads vary independently.
+    pub fn generated(seed: u64) -> Self {
+        let mut f = Self::base(seed);
+        let mut random = Random(seed.wrapping_add(0x9e3779b97f4a7c15));
+        let offset = random.next(9) as u32;
+        let mut positions = BTreeMap::new();
+        let mut height = offset;
+        for old in 0..=10_i64 {
+            positions.insert(old, height);
+            height += 1 + random.next(3) as u32;
+        }
+        let target = positions[&8];
+        let tip = target + 2;
+        let horizon = target - random.next(3) as u32;
+        let epoch_length = 1 + random.next(u64::from(tip + 5)) as u32;
+        let mut transactions = BTreeMap::new();
+        let mut tx_ids = BTreeMap::new();
+        let mut tx_positions = BTreeMap::new();
+        for (old, tx) in &f.chain.transactions {
+            let index = tx.index + random.next(2) as u16;
+            let block = positions[&tx.block];
+            let id = ids::transaction_id(block, index).unwrap();
+            tx_ids.insert(*old, id);
+            tx_positions.insert(*old, (block, index));
+            transactions.insert(
+                id,
+                Transaction {
+                    block: i64::from(block),
+                    index,
+                },
+            );
+        }
+        let mut outputs = BTreeMap::new();
+        let mut out_ids = BTreeMap::new();
+        for (old, output) in &f.chain.outputs {
+            let (height, tx) = tx_positions[&output.transaction];
+            let index = output.index + random.next(2) as u16 * 32;
+            let id = ids::output_id(height, tx, index).unwrap();
+            let mut output = output.clone();
+            output.transaction = tx_ids[&output.transaction];
+            output.index = index;
+            out_ids.insert(*old, id);
+            outputs.insert(id, output);
+        }
+        for input in f.chain.inputs.values_mut() {
+            input.transaction = tx_ids[&input.transaction];
+            input.output = out_ids[&input.output];
+        }
+        for row in f.chain.output_assets.values_mut() {
+            row.output = out_ids[&row.output];
+        }
+        f.chain.metadata = f
+            .chain
+            .metadata
+            .values()
+            .map(|tx| (tx_ids[tx], tx_ids[tx]))
+            .collect();
+        for id in f.tags.values_mut() {
+            *id = out_ids[id];
+        }
+        f.chain.transactions = transactions;
+        f.chain.outputs = outputs;
+        f.chain.blocks.clear();
+        for block in 0..=tip {
+            let mut epoch = Some((block / epoch_length) as i32);
+            let mut slot = Some(i64::from(block) * 100 + 1);
+            if block < horizon && random.next(19) == 0 {
+                epoch = None;
+            }
+            if block < horizon && random.next(11) == 0 {
+                slot = None;
+            }
+            f.chain
+                .blocks
+                .insert(i64::from(block), Header { epoch, slot });
+        }
+        f.bounds = Bounds {
+            horizon,
+            target,
+            tip,
+        };
+        // Real source shapes can contain post-target event rows. K1 keeps these
+        // headers while K2 must still end at T, including for future spends.
+        let post = f.output(target + 1, 2, 0, "ics", "bridge", Some(600));
+        let old = f.tags["ordinary_0_0"];
+        f.spend(target + 1, 2, 0, old);
+        f.tags.insert("post_target_output".to_owned(), post);
+        if seed.is_multiple_of(7) {
+            f.chain
+                .transactions
+                .retain(|_, tx| tx.block < i64::from(horizon) || tx.block > i64::from(target));
+            f.chain
+                .outputs
+                .retain(|_, output| f.chain.transactions.contains_key(&output.transaction));
+            f.chain.inputs.retain(|_, input| {
+                f.chain.transactions.contains_key(&input.transaction)
+                    && f.chain.outputs.contains_key(&input.output)
+            });
+            f.chain
+                .output_assets
+                .retain(|_, row| f.chain.outputs.contains_key(&row.output));
+            f.chain
+                .metadata
+                .retain(|_, tx| f.chain.transactions.contains_key(tx));
+        }
+        f.chain.epochs = f
+            .chain
+            .blocks
+            .values()
+            .filter_map(|header| header.epoch)
+            .collect();
+        f.chain.stakes.clear();
+        for epoch in &f.chain.epochs {
+            for pool in &f.chain.pools {
+                if random.next(5) != 0 {
+                    f.chain.stakes.insert(
+                        i64::from(*epoch) * 100 + pool,
+                        Stake {
+                            epoch: *epoch,
+                            pool: *pool,
+                        },
+                    );
+                }
+            }
+        }
+        f.reindex_ordinals();
+        f.quantities = f
+            .chain
+            .output_assets
+            .keys()
+            .map(|id| {
+                let asset = &f.chain.assets[&f.chain.output_assets[id].asset];
+                let singleton = ["council", "technical_committee", "permissioned_candidates"]
+                    .iter()
+                    .any(|role| f.profile.assets[*role] == *asset);
+                (*id, if singleton { 1 } else { 1 + random.next(3) })
+            })
+            .collect();
+        f
+    }
+
+    pub fn translate_heights(&mut self, offset: u32) {
+        let tx_ids: BTreeMap<_, _> = self
+            .chain
+            .transactions
+            .iter()
+            .map(|(id, tx)| {
+                (
+                    *id,
+                    ids::transaction_id(tx.block as u32 + offset, tx.index).unwrap(),
+                )
+            })
+            .collect();
+        let out_ids: BTreeMap<_, _> = self
+            .chain
+            .outputs
+            .iter()
+            .map(|(id, out)| (*id, tx_ids[&out.transaction] * 4096 + i64::from(out.index)))
+            .collect();
+        self.chain.blocks = std::mem::take(&mut self.chain.blocks)
+            .into_iter()
+            .map(|(id, header)| (id + i64::from(offset), header))
+            .collect();
+        self.chain.transactions = std::mem::take(&mut self.chain.transactions)
+            .into_iter()
+            .map(|(id, mut tx)| {
+                tx.block += i64::from(offset);
+                (tx_ids[&id], tx)
+            })
+            .collect();
+        self.chain.outputs = std::mem::take(&mut self.chain.outputs)
+            .into_iter()
+            .map(|(id, mut output)| {
+                output.transaction = tx_ids[&output.transaction];
+                (out_ids[&id], output)
+            })
+            .collect();
+        for input in self.chain.inputs.values_mut() {
+            input.transaction = tx_ids[&input.transaction];
+            input.output = out_ids[&input.output];
+        }
+        for row in self.chain.output_assets.values_mut() {
+            row.output = out_ids[&row.output];
+        }
+        self.chain.metadata = self
+            .chain
+            .metadata
+            .values()
+            .map(|tx| (tx_ids[tx], tx_ids[tx]))
+            .collect();
+        for id in self.tags.values_mut() {
+            *id = out_ids[id];
+        }
+        self.bounds.horizon += offset;
+        self.bounds.target += offset;
+        self.bounds.tip += offset;
+        self.reindex_ordinals();
+    }
+
     pub fn ensure_transaction(&mut self, height: u32, index: u16) -> i64 {
         let id = ids::transaction_id(height, index).unwrap();
         self.chain.transactions.entry(id).or_insert(Transaction {
@@ -366,7 +568,7 @@ impl Fixture {
     pub fn rows(&self) -> Rows {
         let c = &self.chain;
         let mut rows = BTreeMap::new();
-        rows.insert("block".to_owned(),c.blocks.iter().map(|(id,b)|json!({"id":id,"hash":binary(&hash(self.seed,*id+10000)),"epoch_no":b.epoch,"slot_no":b.slot,"block_no":id,"time":format!("2026-01-01T00:00:{id:02}"),"tx_count":7})).collect());
+        rows.insert("block".to_owned(),c.blocks.iter().map(|(id,b)|json!({"id":id,"hash":binary(&hash(self.seed,*id+10000)),"epoch_no":b.epoch,"slot_no":b.slot,"block_no":id,"time":format!("2026-01-{:02}T{:02}:{:02}:{:02}",1+(id/86400)%28,(id/3600)%24,(id/60)%60,id%60),"tx_count":c.transactions.values().filter(|tx|tx.block==*id).map(|tx|i64::from(tx.index)+1).max().unwrap_or(0)})).collect());
         rows.insert("tx".to_owned(),c.transactions.iter().map(|(id,t)|json!({"id":id,"hash":binary(&hash(self.seed,*id+20000)),"block_id":t.block,"block_index":t.index,"valid_contract":id%3!=0})).collect());
         rows.insert("tx_out".to_owned(),c.outputs.iter().map(|(id,o)|json!({"id":id,"tx_id":o.transaction,"index":o.index,"address":o.address,"value":id%1000+1,"data_hash":o.datum_hash.as_ref().map(|hash|binary(hash)),"consumed_by_tx_id":Value::Null})).collect());
         rows.insert("tx_in".to_owned(),c.inputs.iter().map(|(id,i)| {
@@ -376,7 +578,7 @@ impl Fixture {
             "ma_tx_out".to_owned(),
             c.output_assets
                 .iter()
-                .map(|(id, a)| json!({"id":id,"quantity":1,"tx_out_id":a.output,"ident":a.asset}))
+                .map(|(id, a)| json!({"id":id,"quantity":self.quantities.get(id).copied().unwrap_or(1),"tx_out_id":a.output,"ident":a.asset}))
                 .collect(),
         );
         rows.insert(

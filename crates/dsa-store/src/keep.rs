@@ -1,5 +1,7 @@
 //! SQL selection for the pure keep rule. Table queries preserve source payloads
-//! and accept an inclusive ID interval after the ten shared rule parameters.
+//! and stream once per family. Destination batches never re-execute the source
+//! prefix selection. Aggregates consume bounded materialized inputs, so they
+//! cannot turn into a backward min/max walk on source indexes.
 
 use std::collections::BTreeMap;
 
@@ -7,7 +9,7 @@ use dsa_chain::{
     keep::{Bounds, RetainedRows, TABLES},
     profiles::Profile,
 };
-use tokio_postgres::{GenericClient, types::ToSql};
+use tokio_postgres::{GenericClient, RowStream, types::ToSql};
 
 use crate::Error;
 
@@ -25,6 +27,7 @@ impl SourceSchema {
     }
 }
 
+#[derive(Debug)]
 pub struct Selection {
     horizon: i64,
     target: i64,
@@ -44,9 +47,12 @@ fn bytes(value: &str) -> Result<Vec<u8>, Error> {
 
 impl Selection {
     pub fn new(profile: &Profile, bounds: Bounds) -> Result<Self, Error> {
-        bounds
-            .validate()
-            .map_err(|_| Error::Refusal("invalid_keep_bounds"))?;
+        bounds.validate_profile(profile).map_err(|error| {
+            Error::Refusal(match error {
+                dsa_chain::keep::KeepError::Target => "invalid_keep_target",
+                _ => "invalid_keep_bounds",
+            })
+        })?;
         let mut governance_addresses = Vec::new();
         let mut governance_policies = Vec::new();
         for body in ["council", "technical_committee"] {
@@ -111,22 +117,13 @@ impl Selection {
         ]
     }
 
-    pub fn row_parameters<'a>(
-        &'a self,
-        lower: &'a i64,
-        upper: &'a i64,
-    ) -> Vec<&'a (dyn ToSql + Sync)> {
-        let mut params = self.parameters();
-        params.extend([lower as &(dyn ToSql + Sync), upper as &(dyn ToSql + Sync)]);
-        params
-    }
-
     pub fn ctes_sql(schema: SourceSchema) -> String {
         include_str!("keep.sql").replace("__SOURCE__", schema.name())
     }
 
-    /// Each schema/table pair has one fixed query text. Callers can stream rows
-    /// in bounded ID batches through the normal PostgreSQL query/COPY paths.
+    /// One fixed query per schema/table. Execute once and consume its RowStream;
+    /// batch destination writes without rerunning the source selection. This
+    /// needs no source TEMP privilege, DDL or writable transaction.
     pub fn rows_sql(&self, schema: SourceSchema, table: &str) -> Result<String, Error> {
         if !TABLES.contains(&table) {
             return Err(Error::Refusal("invalid_keep_table"));
@@ -137,11 +134,22 @@ impl Selection {
             "id"
         };
         Ok(format!(
-            "{} SELECT s.* FROM {}.{table} s JOIN keep_{table} k ON k.id=s.{key} \
-                    WHERE s.{key}>=$11::bigint AND s.{key}<=$12::bigint ORDER BY s.{key}",
+            "{} SELECT s.* FROM {}.{table} s JOIN keep_{table} k ON k.id=s.{key} ORDER BY s.{key}",
             Self::ctes_sql(schema),
             schema.name()
         ))
+    }
+
+    pub async fn stream_rows<C: GenericClient>(
+        &self,
+        client: &C,
+        schema: SourceSchema,
+        table: &str,
+    ) -> Result<RowStream, Error> {
+        self.validate_source(client, schema).await?;
+        Ok(client
+            .query_raw(&self.rows_sql(schema, table)?, self.parameters())
+            .await?)
     }
 
     pub async fn validate_source<C: GenericClient>(
@@ -164,8 +172,8 @@ impl Selection {
         Ok(())
     }
 
-    /// Collect identifiers for validation. Conversion can stream `rows_sql`
-    /// instead of materializing all retained identifiers in process memory.
+    /// Small-source validation only. Refuse above 100,000 total retained keys
+    /// before constructing JSON. Production conversion uses `stream_rows`.
     pub async fn collect_ids<C: GenericClient>(
         &self,
         client: &C,
@@ -173,11 +181,19 @@ impl Selection {
     ) -> Result<RetainedRows, Error> {
         self.validate_source(client, schema).await?;
         let entries=TABLES.iter().map(|table|format!("'{table}',(SELECT coalesce(jsonb_agg(id ORDER BY id),'[]'::jsonb) FROM keep_{table})")).collect::<Vec<_>>().join(",");
+        let counts = TABLES
+            .iter()
+            .map(|table| format!("(SELECT count(*) FROM keep_{table})"))
+            .collect::<Vec<_>>()
+            .join("+");
         let sql = format!(
-            "{} SELECT jsonb_build_object({entries})",
+            "{} SELECT CASE WHEN {counts}>100000 THEN NULL ELSE jsonb_build_object({entries}) END",
             Self::ctes_sql(schema)
         );
         let row = client.query_one(&sql, &self.parameters()).await?;
-        Ok(serde_json::from_value(row.get(0))?)
+        let value = row
+            .get::<_, Option<serde_json::Value>>(0)
+            .ok_or(Error::Refusal("keep_validation_too_large"))?;
+        Ok(serde_json::from_value(value)?)
     }
 }

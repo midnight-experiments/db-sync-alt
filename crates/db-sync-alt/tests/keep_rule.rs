@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, Config, NoTls, config::SslMode};
 
 use fixtures::{Fixture, Rows, selected};
+use futures_util::TryStreamExt;
 use queries::{IdBounds, Queries};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn StdError>>;
@@ -38,6 +39,7 @@ struct Database {
     kept_queries: Queries,
     database: String,
     owner: String,
+    reader: Option<String>,
 }
 impl Database {
     async fn new(profile: &dsa_chain::profiles::Profile) -> Result<Self> {
@@ -85,6 +87,7 @@ impl Database {
             kept_queries,
             database,
             owner,
+            reader: None,
         })
     }
 
@@ -108,8 +111,8 @@ impl Database {
         self.store
             .client()
             .execute(
-                "UPDATE dsa.position SET horizon_height=$1::integer,updated_at=now() WHERE id=1",
-                &[&(fixture.bounds.horizon as i32)],
+                "UPDATE dsa.position SET horizon_height=$1::integer,target_height=$2::integer,tip_height=$3::integer,updated_at=now() WHERE id=1",
+                &[&(fixture.bounds.horizon as i32),&(fixture.bounds.target as i32),&(fixture.bounds.tip as i32)],
             )
             .await?;
         let rows = fixture.rows();
@@ -148,6 +151,11 @@ impl Database {
         self.admin
             .batch_execute(&format!("DROP ROLE {}", self.owner))
             .await?;
+        if let Some(reader) = self.reader {
+            self.admin
+                .batch_execute(&format!("DROP ROLE {reader}"))
+                .await?;
+        }
         Ok(())
     }
 }
@@ -226,7 +234,7 @@ fn bound_value(value: IdBounds) -> Value {
 
 fn named_cases() -> BTreeMap<&'static str, Fixture> {
     let mut result = BTreeMap::new();
-    let mut empty_window = Fixture::generated(101);
+    let mut empty_window = Fixture::base(101);
     let h = i64::from(empty_window.bounds.horizon);
     empty_window.chain.transactions.retain(|_, tx| tx.block < h);
     empty_window.chain.outputs.retain(|_, output| {
@@ -251,7 +259,7 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
         .metadata
         .retain(|_, tx| empty_window.chain.transactions.contains_key(tx));
     result.insert("empty_event_window", empty_window);
-    let mut shared = Fixture::generated(3);
+    let mut shared = Fixture::base(3);
     let removed = shared.tags["mapping_0"];
     let retained = shared.tags["mapping_1"];
     let shared_hash = shared.chain.datums[&301].hash.clone();
@@ -264,35 +272,35 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
     shared.spend(2, 4, 0, removed);
     shared.reindex_ordinals();
     result.insert("shared_datum_and_creating_transaction", shared);
-    let mut fallback = Fixture::generated(1);
+    let mut fallback = Fixture::base(1);
     fallback.no_window_spend();
     result.insert("no_spend_in_window", fallback);
-    result.insert("spend_of_output_below_horizon", Fixture::generated(2));
-    let mut first = Fixture::generated(4);
+    result.insert("spend_of_output_below_horizon", Fixture::base(2));
+    let mut first = Fixture::base(4);
     first.bounds.horizon = 6;
     result.insert("horizon_first_block_of_epoch", first);
-    let mut permissioned = Fixture::generated(5);
+    let mut permissioned = Fixture::base(5);
     permissioned.bounds.horizon = 6;
     result.insert("permissioned_across_four_epochs", permissioned);
-    let mut governance = Fixture::generated(6);
+    let mut governance = Fixture::base(6);
     governance.bounds.horizon = 6;
     governance.missing_governance_datum();
     governance.reindex_ordinals();
     result.insert("missing_governance_datum_preimage", governance);
-    let mut empty = Fixture::generated(7);
+    let mut empty = Fixture::base(7);
     empty.empty_epoch();
     result.insert("empty_preceding_epoch", empty);
-    let mut null_slot = Fixture::generated(8);
+    let mut null_slot = Fixture::base(8);
     null_slot.chain.blocks.get_mut(&3).unwrap().slot = None;
     result.insert("null_epoch_end_slot", null_slot);
     result.insert(
         "same_permissioned_policy_other_asset_name",
-        Fixture::generated(9),
+        Fixture::base(9),
     );
-    let mut advanced = Fixture::generated(10);
+    let mut advanced = Fixture::base(10);
     advanced.bounds.horizon = 7;
     result.insert("new_governance_record_below_horizon", advanced);
-    let mut null_value = Fixture::generated(12);
+    let mut null_value = Fixture::base(12);
     null_value.bounds.horizon = 7;
     let out = null_value.tags["council_6"];
     null_value.chain.datums.insert(
@@ -355,7 +363,7 @@ fn named_keep_rule_edges() -> Result {
         }
         assert!(kept["block"].iter().any(|height| *height >= h));
     }
-    let fixture = Fixture::generated(1);
+    let fixture = Fixture::base(1);
     assert!(
         Selection::new(
             &fixture.profile,
@@ -429,7 +437,15 @@ async fn verify_observations(
     };
     for start in fixture.bounds.horizon as i32..=fixture.bounds.target as i32 {
         for end in start..=fixture.bounds.target as i32 {
-            for index in 0..=8_i32 {
+            let max_index = fixture
+                .chain
+                .transactions
+                .values()
+                .filter(|tx| tx.block == i64::from(start))
+                .map(|tx| i32::from(tx.index) + 1)
+                .max()
+                .unwrap_or(0);
+            for index in 0..=max_index {
                 let (full, kept, unbounded_full, unbounded_kept) = tokio::try_join!(
                     queries::events(
                         &db.full_queries,
@@ -505,9 +521,43 @@ async fn keep_rule_ten_thousand_chains() -> Result {
     let begin = Instant::now();
     let mut digest = Sha256::new();
     let mut total = Counts::default();
+    let mut topologies = std::collections::BTreeSet::new();
+    let mut empty_windows = 0_u64;
+    let mut null_epoch_cases = 0_u64;
+    let mut post_target_cases = 0_u64;
+    let mut varied_quantities = 0_u64;
     for seed in start..start + cases {
         let fixture = Fixture::generated(seed);
         assert_canonical_ids(&fixture);
+        let b = fixture.bounds;
+        topologies.insert((
+            b.horizon,
+            b.target,
+            b.tip,
+            fixture.chain.blocks[&i64::from(b.horizon)].epoch.unwrap() - 2,
+        ));
+        empty_windows += u64::from(
+            !fixture
+                .chain
+                .transactions
+                .values()
+                .any(|tx| tx.block >= i64::from(b.horizon) && tx.block <= i64::from(b.target)),
+        );
+        null_epoch_cases += u64::from(
+            fixture
+                .chain
+                .blocks
+                .values()
+                .any(|header| header.epoch.is_none()),
+        );
+        post_target_cases += u64::from(
+            fixture
+                .chain
+                .transactions
+                .values()
+                .any(|tx| tx.block > i64::from(b.target)),
+        );
+        varied_quantities += u64::from(fixture.quantities.values().any(|quantity| *quantity != 1));
         let (rows, kept_ids) = db.replace(&fixture).await?;
         assert_eq!(
             rows,
@@ -540,6 +590,10 @@ async fn keep_rule_ten_thousand_chains() -> Result {
     }
     println!(
         "{}",
+        json!({"generator_coverage":{"distinct_bounds_epoch_cutoffs":topologies.len(),"minimum_tip":topologies.iter().map(|x|x.2).min(),"maximum_tip":topologies.iter().map(|x|x.2).max(),"minimum_epoch_cutoff":topologies.iter().map(|x|x.3).min(),"maximum_epoch_cutoff":topologies.iter().map(|x|x.3).max(),"empty_event_windows":empty_windows,"null_epoch_cases":null_epoch_cases,"post_target_cases":post_target_cases,"non_unit_quantities":varied_quantities}})
+    );
+    println!(
+        "{}",
         json!({"cases":cases,"seed_start":start,"seconds":begin.elapsed().as_secs_f64(),"positions":total.positions,"node_queries":total.node_queries,"helper_id_differences":total.helper_differences,"helper_examples":total.helper_examples,"selected_rows_sha256":format!("{:x}",digest.finalize())})
     );
     db.cleanup().await
@@ -548,7 +602,7 @@ async fn keep_rule_ten_thousand_chains() -> Result {
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_node_regressions() -> Result {
-    let db = Database::new(&Fixture::generated(1).profile).await?;
+    let db = Database::new(&Fixture::base(1).profile).await?;
     for (name, fixture) in named_cases() {
         let (_, ids) = db.replace(&fixture).await?;
         // Deliberately compare node observations independently of the model.
@@ -580,8 +634,8 @@ async fn keep_rule_node_regressions() -> Result {
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_selection_entry_points() -> Result {
-    let fixture = Fixture::generated(18);
-    let db = Database::new(&fixture.profile).await?;
+    let fixture = Fixture::base(18);
+    let mut db = Database::new(&fixture.profile).await?;
     for (name, fixture) in named_cases() {
         let (rows, _) = db.replace(&fixture).await?;
         assert_eq!(
@@ -603,30 +657,64 @@ async fn keep_rule_selection_entry_points() -> Result {
                 "SELECT to_jsonb(r) FROM ({}) r",
                 selection.rows_sql(schema, table)?
             );
-            let middle = ids[table]
+            let actual = db
+                .store
+                .client()
+                .query(&sql, &selection.parameters())
+                .await?
                 .iter()
-                .nth(ids[table].len() / 2)
-                .copied()
-                .unwrap_or(0);
-            let mut actual = Vec::new();
-            for (lower, upper) in [(0, middle), (middle + 1, i64::MAX)] {
-                actual.extend(
-                    db.store
-                        .client()
-                        .query(&sql, &selection.row_parameters(&lower, &upper))
-                        .await?
-                        .iter()
-                        .map(|row| row.get::<_, Value>(0)),
-                );
-            }
+                .map(|row| row.get::<_, Value>(0))
+                .collect::<Vec<_>>();
             assert_eq!(
                 actual,
                 expected[table],
-                "{table} {} streamed ranges",
+                "{table} {} one source query",
                 schema.name()
             );
+            let stream = selection
+                .stream_rows(db.store.client(), schema, table)
+                .await?;
+            tokio::pin!(stream);
+            let mut count = 0;
+            while let Some(row) = stream.try_next().await? {
+                assert_eq!(
+                    row.columns().len(),
+                    expected[table][0].as_object().unwrap().len()
+                );
+                count += 1;
+            }
+            assert_eq!(count, expected[table].len());
         }
     }
+    let reader = format!("{}_reader", db.owner);
+    db.admin.batch_execute(&format!("CREATE ROLE {reader} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; ALTER ROLE {reader} SET default_transaction_read_only=on")).await?;
+    db.store.grant_reader(&fixture.profile, &reader).await?;
+    let mut config: Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
+    config.user(&reader).dbname(&db.database);
+    let reader_client = connect(config, "public", true).await?;
+    assert!(
+        !reader_client
+            .query_one(
+                "SELECT has_database_privilege(current_user,current_database(),'TEMP')",
+                &[]
+            )
+            .await?
+            .get::<_, bool>(0)
+    );
+    queries::reader_probes(&reader_client).await?;
+    for table in TABLES {
+        let stream = selection
+            .stream_rows(&reader_client, SourceSchema::Public, table)
+            .await?;
+        tokio::pin!(stream);
+        let mut count = 0;
+        while stream.try_next().await?.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, expected[table].len());
+    }
+    drop(reader_client);
+    db.reader = Some(reader);
     assert!(
         selection
             .rows_sql(SourceSchema::Serve, "tx; DROP SCHEMA serve")
@@ -666,7 +754,7 @@ async fn keep_rule_selection_entry_points() -> Result {
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_node_spend_regression() -> Result {
-    let fixture = Fixture::generated(2);
+    let fixture = Fixture::base(2);
     let db = Database::new(&fixture.profile).await?;
     db.replace(&fixture).await?;
     let wide = (
@@ -714,10 +802,11 @@ async fn keep_rule_node_spend_regression() -> Result {
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_partial_order_witnesses() -> Result {
-    // This is a schema-valid ambiguity probe, not a claim that the native
-    // policies permit two matching outputs in a real Cardano transaction.
-    let mut fixture = Fixture::generated(24);
+    // A schema-only ambiguity control. The deployed singleton-token policies
+    // exclude these ties on a valid chain; selection still preserves all ties.
+    let mut fixture = Fixture::base(24);
     fixture.bounds.horizon = 6;
+    fixture.chain.blocks.get_mut(&3).unwrap().slot = fixture.chain.blocks[&2].slot;
     let governance = fixture.output(4, 0, 7, "council", "council", Some(707));
     let old_governance = fixture.tags["council_4"];
     fixture
@@ -794,5 +883,304 @@ async fn keep_rule_partial_order_witnesses() -> Result {
         "{}",
         json!({"identical_logical_data_partial_order":observations})
     );
+    db.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn keep_rule_height_limit_and_collector_guard() -> Result {
+    let mut fixture = Fixture::base(42);
+    fixture.translate_heights(dsa_chain::ids::HEIGHT_LIMIT - 11);
+    for height in [fixture.bounds.target, fixture.bounds.tip] {
+        let output = fixture.output(height, 4095, 4095, "other", "cnight", None);
+        fixture
+            .chain
+            .output_assets
+            .retain(|_, row| row.output != output);
+        fixture.chain.output_assets.insert(
+            dsa_chain::ids::asset_id(height, 4095, 4095, 4095)?,
+            dsa_chain::keep::OutputAsset {
+                output,
+                asset: fixture.asset_id("cnight"),
+            },
+        );
+    }
+    assert_canonical_ids(&fixture);
+    let db = Database::new(&fixture.profile).await?;
+    let (rows, _) = db.replace(&fixture).await?;
+    assert_eq!(
+        rows,
+        selected(
+            &fixture.rows(),
+            &keep(&fixture.chain, &fixture.profile, fixture.bounds)?
+        )
+    );
+    let selection = Selection::new(&fixture.profile, fixture.bounds)?;
+    for table in TABLES {
+        let stream = selection
+            .stream_rows(db.store.client(), SourceSchema::Serve, table)
+            .await?;
+        tokio::pin!(stream);
+        let mut count = 0;
+        while stream.try_next().await?.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, rows[table].len());
+    }
+    assert!(
+        Selection::new(
+            &fixture.profile,
+            Bounds {
+                horizon: 1,
+                target: 2,
+                tip: 5
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("invalid_keep_target")
+    );
+    db.replace(&Fixture::base(42)).await?;
+    db.store.client().batch_execute("INSERT INTO serve.block SELECT i,decode(md5(i::text)||md5(i::text),'hex'),0,i,i,timestamp '2026-01-01',0 FROM generate_series(11,100002) i").await?;
+    let selection = Selection::new(
+        &fixture.profile,
+        Bounds {
+            horizon: 0,
+            target: 100000,
+            tip: 100002,
+        },
+    )?;
+    assert!(
+        selection
+            .collect_ids(db.store.client(), SourceSchema::Serve)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("keep_validation_too_large")
+    );
+    let stream = selection
+        .stream_rows(db.store.client(), SourceSchema::Serve, "block")
+        .await?;
+    tokio::pin!(stream);
+    let mut count = 0;
+    while stream.try_next().await?.is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 100003);
+    db.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn keep_rule_page_and_bridge_checkpoints() -> Result {
+    let db = Database::new(&Fixture::base(2).profile).await?;
+    let wide = (
+        IdBounds {
+            tx: 0,
+            output: 0,
+            asset: 0,
+            input: 0,
+        },
+        IdBounds {
+            tx: i64::MAX,
+            output: i64::MAX,
+            asset: i64::MAX,
+            input: i64::MAX,
+        },
+    );
+    for fixture in [
+        Fixture::base(2),
+        Fixture::generated(3),
+        Fixture::generated(4),
+    ] {
+        db.replace(&fixture).await?;
+        let h = fixture.bounds.horizon as i32;
+        let t = fixture.bounds.target as i32;
+        for end in h..=t {
+            let max = fixture
+                .chain
+                .transactions
+                .values()
+                .filter(|tx| tx.block == i64::from(end))
+                .map(|tx| i32::from(tx.index) + 1)
+                .max()
+                .unwrap_or(0);
+            for end_index in 0..=max {
+                let range = (h, 0, end, end_index);
+                let all = queries::paged_events(
+                    &db.full_queries,
+                    &db.full,
+                    &fixture,
+                    range,
+                    (1000, 0),
+                    wide,
+                )
+                .await?;
+                for (limit, offset) in [(1, 0), (1, 1), (2, 1), (1, 1000)] {
+                    let (full, kept) = tokio::try_join!(
+                        queries::paged_events(
+                            &db.full_queries,
+                            &db.full,
+                            &fixture,
+                            range,
+                            (limit, offset),
+                            wide
+                        ),
+                        queries::paged_events(
+                            &db.kept_queries,
+                            &db.kept,
+                            &fixture,
+                            range,
+                            (limit, offset),
+                            wide
+                        )
+                    )?;
+                    assert_eq!(full, kept, "end/page cut {range:?} {limit}/{offset}");
+                    for (name, rows) in &full {
+                        assert_eq!(
+                            *rows,
+                            all[name]
+                                .iter()
+                                .skip(offset as usize)
+                                .take(limit as usize)
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            "{name} pagination"
+                        );
+                    }
+                }
+            }
+        }
+        let ics = &fixture.profile.addresses["ics"];
+        let reserve = &fixture.profile.addresses["reserve"];
+        let policy = hex::decode(&fixture.profile.assets["bridge"].policy)?;
+        let name = hex::decode(&fixture.profile.assets["bridge"].name)?;
+        let metadata = 6500973_i64;
+        for block in h..=t {
+            let max = fixture
+                .chain
+                .transactions
+                .values()
+                .filter(|tx| tx.block == i64::from(block))
+                .map(|tx| i32::from(tx.index) + 1)
+                .max()
+                .unwrap_or(0);
+            let mut checkpoints = vec![
+                queries::Checkpoint::Block(block - 1),
+                queries::Checkpoint::Block(block),
+            ];
+            for index in 0..=max {
+                checkpoints.extend([
+                    queries::Checkpoint::Tx(block, index),
+                    queries::Checkpoint::TxReserveTransfer(block, index),
+                ]);
+            }
+            for checkpoint in checkpoints {
+                let params: [&(dyn tokio_postgres::types::ToSql + Sync); 6] =
+                    [ics, reserve, &policy, &name, &metadata, &t];
+                let all = db
+                    .full_queries
+                    .bridge_rows(&db.full, checkpoint, None, &params)
+                    .await?;
+                for limit in [None, Some(1), Some(2)] {
+                    let (full, kept) = tokio::try_join!(
+                        db.full_queries
+                            .bridge_rows(&db.full, checkpoint, limit, &params),
+                        db.kept_queries
+                            .bridge_rows(&db.kept, checkpoint, limit, &params)
+                    )?;
+                    assert_eq!(full, kept, "bridge {checkpoint:?} {limit:?}");
+                    assert_eq!(
+                        full,
+                        all.iter()
+                            .take(limit.map_or(usize::MAX, |n| n as usize))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+    db.cleanup().await
+}
+
+#[tokio::test]
+#[ignore = "on-demand realistic PostgreSQL plan check"]
+async fn keep_rule_realistic_plans() -> Result {
+    let profile = dsa_chain::profiles::Profile::load("mainnet")?;
+    let db = Database::new(&profile).await?;
+    let horizon = 1_200_000_u32;
+    let target = horizon + 30_009;
+    let tip = target + profile.cardano.security_parameter;
+    let started = Instant::now();
+    for first in (0..=tip).step_by(20000) {
+        let last = (first + 19999).min(tip);
+        db.store.client().batch_execute(&format!("INSERT INTO serve.block SELECT i,decode(md5(i::text)||md5(i::text),'hex'),i/21600,i*20,i,timestamp '2026-01-01'+i*interval '20 seconds',3 FROM generate_series({first}::bigint,{last}::bigint) i; INSERT INTO serve.tx SELECT i*4096+j,decode(md5((i*4096+j)::text)||md5((i*4096+j)::text),'hex'),i,j,true FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.tx_out SELECT (i*4096+j)*4096,i*4096+j,0,'external',1,NULL,NULL FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.ma_tx_out SELECT ((i*4096+j)*4096)*4096,1,(i*4096+j)*4096,1 FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j); INSERT INTO serve.tx_in SELECT (i*4096)*4096+j/2,i*4096,(i-1)*4096+j,0 FROM generate_series({first}::bigint,{last}::bigint) i CROSS JOIN (VALUES(0),(2)) ordinal(j) WHERE i>0 AND i<{horizon} AND i%10<>0")).await?;
+    }
+    let asset = &profile.assets["cnight"];
+    db.store
+        .client()
+        .execute(
+            "INSERT INTO serve.multi_asset VALUES(1,$1,$2)",
+            &[&hex::decode(&asset.policy)?, &hex::decode(&asset.name)?],
+        )
+        .await?;
+    db.store.client().batch_execute("ANALYZE serve.block; ANALYZE serve.tx; ANALYZE serve.tx_out; ANALYZE serve.tx_in; ANALYZE serve.ma_tx_out; ANALYZE serve.multi_asset").await?;
+    println!(
+        "{}",
+        json!({"realistic_setup_seconds":started.elapsed().as_secs_f64(),"source_headers":tip+1,"source_outputs":(tip+1)*2,"source_inputs":2*(horizon-1-(horizon-1)/10)})
+    );
+    let selection = Selection::new(
+        &profile,
+        Bounds {
+            horizon,
+            target,
+            tip,
+        },
+    )?;
+    for table in ["block", "tx_out", "tx_in"] {
+        for forced in [false, true] {
+            db.store
+                .client()
+                .batch_execute(if forced {
+                    "SET enable_seqscan=off"
+                } else {
+                    "SET enable_seqscan=on"
+                })
+                .await?;
+            let analyze = if forced { "" } else { "ANALYZE, BUFFERS," };
+            let sql = format!(
+                "EXPLAIN ({analyze} FORMAT JSON) SELECT count(*) FROM ({}) rows",
+                selection.rows_sql(SourceSchema::Serve, table)?
+            );
+            let plan: Value = db
+                .store
+                .client()
+                .query_one(&sql, &selection.parameters())
+                .await?
+                .get(0);
+            fn check(value: &Value) {
+                if let Some(object) = value.as_object() {
+                    assert_ne!(
+                        object.get("Scan Direction").and_then(Value::as_str),
+                        Some("Backward"),
+                        "unbounded extrema walk"
+                    );
+                    for child in object.values() {
+                        check(child);
+                    }
+                } else if let Some(array) = value.as_array() {
+                    for child in array {
+                        check(child);
+                    }
+                }
+            }
+            check(&plan);
+            println!(
+                "{}",
+                json!({"realistic_plan_family":table,"forced_index_plan":forced,"explain":plan})
+            );
+        }
+    }
     db.cleanup().await
 }

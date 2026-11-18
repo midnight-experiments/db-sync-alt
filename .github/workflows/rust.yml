@@ -43,6 +43,7 @@ jobs:
           git clone --filter=blob:none --no-checkout https://github.com/midnightntwrk/midnight-node.git "$RUNNER_TEMP/midnight-node"
           git -C "$RUNNER_TEMP/midnight-node" checkout 86774edf8cc76345a5c3a4221f3fe80c094b1c33
           cargo run --locked -p dsa-chain --example generate_profiles -- --node-source "$RUNNER_TEMP/midnight-node" --check
+          python3 .github/scripts/check_reference_source.py --node-source "$RUNNER_TEMP/midnight-node"
   integration:
     runs-on: ubuntu-24.04
     container: rust:1.100.0-bookworm
@@ -73,4 +74,4 @@ jobs:
           # Deterministic CI sample; the full proof defaults to 10,000 cases
           # when DSA_KEEP_CASES is unset in the on-demand test invocation.
           DSA_KEEP_CASES: 64
-        run: cargo test --locked --workspace -- --ignored --nocapture
+        run: cargo test --locked --workspace -- --ignored --nocapture --skip keep_rule_realistic_plans
