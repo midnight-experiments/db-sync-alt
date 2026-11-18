@@ -448,7 +448,7 @@ async fn old_enough(
     Ok(source.query_one("SELECT extract(epoch FROM (($2::text::timestamptz AT TIME ZONE 'UTC')-time)) >= $3::bigint FROM public.block WHERE id=$1", &[&i64::from(height), &target.time, &retention]).await?.get(0))
 }
 
-async fn network_evidence(
+pub(crate) async fn network_evidence(
     source: &Transaction<'_>,
     profile: &Profile,
     tip: u32,

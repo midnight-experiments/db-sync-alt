@@ -2,6 +2,7 @@
 
 mod canonical;
 pub mod catalogue;
+pub mod compare;
 pub mod convert;
 pub mod keep;
 pub mod snapshot;
@@ -48,6 +49,16 @@ pub enum Error {
     ReaderPrivileges(Vec<String>),
     #[error("database_error")]
     Postgres(#[from] tokio_postgres::Error),
+    #[error("comparison_query_failed")]
+    ComparisonQuery {
+        query: String,
+        sqlstate: Option<String>,
+    },
+    #[error("comparison_source_failed")]
+    ComparisonSource {
+        side: &'static str,
+        error: Box<Error>,
+    },
     #[error("profile_error")]
     Profile(#[from] serde_json::Error),
     #[error("snapshot_io_error")]
@@ -85,6 +96,12 @@ impl Error {
             } => {
                 let code = error.code().map(|code| code.code());
                 json!({"error":if code==Some("57014") {"source_statement_timeout"} else {"source_read_failed"},"family":family,"elapsed_seconds":elapsed_seconds,"sqlstate":code})
+            }
+            Self::ComparisonQuery { query, sqlstate } => {
+                json!({"error":if sqlstate.as_deref()==Some("55000"){"comparison_not_serving"}else if sqlstate.as_deref()==Some("57014"){"comparison_statement_timeout"}else{"comparison_query_failed"},"query":query,"sqlstate":sqlstate})
+            }
+            Self::ComparisonSource { side, error } => {
+                json!({"error":"comparison_source_failed","side":side,"cause":error.report()})
             }
             Self::Io(error) => {
                 json!({"error":"snapshot_io_error","kind":format!("{:?}",error.kind())})

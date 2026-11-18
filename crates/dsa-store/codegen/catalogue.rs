@@ -24,6 +24,7 @@ pub struct Catalogue {
     pub node_commit: String,
     pub files: BTreeMap<String, String>,
     pub entries: Vec<Statement>,
+    pub candidate_addresses: BTreeMap<String, String>,
 }
 pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -268,9 +269,29 @@ pub fn extract(root: &Path) -> Catalogue {
     }
     let mut entries = entries.into_values().collect::<Vec<_>>();
     entries.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut candidate_addresses = BTreeMap::new();
+    for net in ["mainnet", "preprod", "preview"] {
+        let file = format!("res/{net}/registered-candidates-addresses.json");
+        let bytes = fs::read(root.join(&file)).unwrap();
+        let digest = hash(&bytes);
+        assert_eq!(
+            manifest["files"][&file]["sha256"].as_str(),
+            Some(digest.as_str())
+        );
+        hashes.insert(file, digest);
+        let args: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        candidate_addresses.insert(
+            net.to_owned(),
+            args["committee_candidates_address"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
     Catalogue {
         node_commit: manifest["commit"].as_str().unwrap().to_owned(),
         files: hashes,
         entries,
+        candidate_addresses,
     }
 }

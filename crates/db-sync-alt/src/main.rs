@@ -32,8 +32,44 @@ struct DatabaseArguments {
     idle_transaction_timeout_seconds: Option<u32>,
 }
 
+#[derive(Args)]
+struct CompareArguments {
+    #[arg(long)]
+    a: String,
+    #[arg(long)]
+    b: String,
+    #[arg(long)]
+    network: String,
+    /// JSON positions file, or auto with --horizon-block.
+    #[arg(long)]
+    positions: String,
+    #[arg(long)]
+    horizon_block: Option<u32>,
+    #[arg(long,default_value_t=500,value_parser=clap::value_parser!(u32).range(1..=5000))]
+    max_pairs: u32,
+    #[arg(long)]
+    a_password_file: Option<PathBuf>,
+    #[arg(long)]
+    b_password_file: Option<PathBuf>,
+    #[arg(long)]
+    a_tls_root_cert: Option<PathBuf>,
+    #[arg(long)]
+    b_tls_root_cert: Option<PathBuf>,
+    #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+    statement_timeout_seconds: Option<u32>,
+    #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+    idle_transaction_timeout_seconds: Option<u32>,
+    /// Scratch verification: repeat events with bounds0..i64::MAX.
+    #[arg(long)]
+    verify_unbounded: bool,
+    #[arg(long)]
+    candidate_address: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Compare the exact node catalogue on two public-reader snapshots.
+    Compare(CompareArguments),
     /// Print a supported network's node profile.
     Profile {
         #[arg(long)]
@@ -111,7 +147,11 @@ async fn main() -> std::process::ExitCode {
     match execute(Arguments::parse().command).await {
         Ok(value) => {
             println!("{value}");
-            std::process::ExitCode::SUCCESS
+            if value.get("matched") == Some(&Value::Bool(false)) {
+                std::process::ExitCode::from(2)
+            } else {
+                std::process::ExitCode::SUCCESS
+            }
         }
         Err(error) => {
             eprintln!("{}", error.report());
@@ -122,6 +162,7 @@ async fn main() -> std::process::ExitCode {
 
 async fn execute(command: Command) -> Result<Value, Error> {
     let (database, operation) = match &command {
+        Command::Compare(args) => return compare_command(args).await,
         Command::Profile { network } => return Ok(serde_json::to_value(profile(network)?)?),
         Command::Create { database } => (database, "create"),
         Command::Status { database } => (database, "status"),
@@ -258,6 +299,130 @@ async fn database_command(
         Command::GrantReader {
             role, check: false, ..
         } => store.grant_reader(profile, role).await,
-        Command::Profile { .. } => unreachable!("profile commands require no database"),
+        Command::Profile { .. } | Command::Compare(_) => {
+            unreachable!("handled before database commands")
+        }
     }
+}
+
+async fn compare_command(args: &CompareArguments) -> Result<Value, Error> {
+    use dsa_store::compare::{Options, Positions, Reader, capture, compare};
+    fn config(
+        text: &str,
+        password: Option<&std::path::Path>,
+    ) -> Result<tokio_postgres::Config, Error> {
+        let mut config = tokio_postgres::Config::from_str(text)
+            .map_err(|_| Error::Refusal("invalid_comparison_configuration"))?;
+        if config.get_password().is_some() {
+            return Err(Error::Refusal("comparison_password_requires_file"));
+        }
+        if let Some(path) = password {
+            let value = std::fs::read_to_string(path)
+                .map_err(|_| Error::Refusal("invalid_comparison_password_file"))?;
+            let value = value.trim_end_matches(['\r', '\n']);
+            if value.contains(['\r', '\n', '\0']) {
+                return Err(Error::Refusal("invalid_comparison_password_file"));
+            }
+            config.password(value);
+        }
+        Ok(config)
+    }
+    let wrap = |side, error| Error::ComparisonSource {
+        side,
+        error: Box::new(error),
+    };
+    let profile = profile(&args.network)?;
+    let explicit = if args.positions == "auto" {
+        None
+    } else {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&args.positions)
+            .map_err(|_| Error::Refusal("invalid_comparison_positions_file"))?
+            .take(1_048_577)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Error::Refusal("invalid_comparison_positions_file"))?;
+        if bytes.len() > 1_048_576 {
+            return Err(Error::Refusal("comparison_positions_file_too_large"));
+        }
+        let positions: Positions = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Refusal("invalid_comparison_positions_file"))?;
+        positions.validate()?;
+        if args.horizon_block.is_some_and(|h| h != positions.horizon) {
+            return Err(Error::Refusal("comparison_horizon_mismatch"));
+        }
+        Some(positions)
+    };
+    eprintln!("{}", json!({"operation":"compare","event":"started"}));
+    let mut a = Reader::connect(
+        config(&args.a, args.a_password_file.as_deref()).map_err(|e| wrap("a", e))?,
+        args.a_tls_root_cert.as_deref(),
+    )
+    .await
+    .map_err(|e| wrap("a", e))?;
+    let mut b = Reader::connect(
+        config(&args.b, args.b_password_file.as_deref()).map_err(|e| wrap("b", e))?,
+        args.b_tls_root_cert.as_deref(),
+    )
+    .await
+    .map_err(|e| wrap("b", e))?;
+    a.limits(
+        args.statement_timeout_seconds,
+        args.idle_transaction_timeout_seconds,
+    )
+    .await
+    .map_err(|e| wrap("a", e))?;
+    b.limits(
+        args.statement_timeout_seconds,
+        args.idle_transaction_timeout_seconds,
+    )
+    .await
+    .map_err(|e| wrap("b", e))?;
+    let tx = a.snapshot().await.map_err(|e| wrap("a", e))?;
+    let positions = if let Some(p) = explicit {
+        p
+    } else {
+        let h = args
+            .horizon_block
+            .ok_or(Error::Refusal("comparison_horizon_required"))?;
+        let p: i64 = tx
+            .query_one("SELECT id FROM public.block ORDER BY id DESC LIMIT 1", &[])
+            .await
+            .map_err(|e| wrap("a", Error::Postgres(e)))?
+            .get(0);
+        let t = u32::try_from(p)
+            .ok()
+            .and_then(|p| p.checked_sub(profile.cardano.security_parameter))
+            .ok_or(Error::Refusal("comparison_target_not_final"))?;
+        Positions::generate(&tx, h, t, args.max_pairs as usize)
+            .await
+            .map_err(|e| wrap("a", e))?
+    };
+    let mut options = Options {
+        verify_unbounded: args.verify_unbounded,
+        ..Default::default()
+    };
+    if let Some(address) = &args.candidate_address {
+        options.candidate_address = address.clone();
+    }
+    let left = capture(&tx, &profile, &positions, &options)
+        .await
+        .map_err(|e| wrap("a", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| wrap("a", Error::Postgres(e)))?;
+    options.check_chain_order = true;
+    let tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
+    let right = capture(&tx, &profile, &positions, &options)
+        .await
+        .map_err(|e| wrap("b", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| wrap("b", Error::Postgres(e)))?;
+    let report = compare(&left, &right)?;
+    eprintln!(
+        "{}",
+        json!({"operation":"compare","event":"finished","matched":report.matched,"differing_cases":report.differences.iter().filter(|d|!d.informational).count(),"helper_id_differences":report.helper_id_differences})
+    );
+    Ok(serde_json::to_value(report)?)
 }

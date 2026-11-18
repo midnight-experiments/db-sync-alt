@@ -8,7 +8,10 @@
     "primitives/mainchain-follower/src/db/multi_asset_cache.rs": "78ba4fc3a0ec63ab43364b0a8b8c428f7accebd6da3a6e6f97598ba17bdf3bc3",
     "primitives/mainchain-follower/src/db/queries/cnight_observation.rs": "42a1b5f5683e958e37ff7f294e4a11036af4a38300c3a6678d80021ea55d0226",
     "primitives/mainchain-follower/src/db/queries/federated_authority_observation.rs": "eaf508cb65ca614f980f554cf271d3c647bf0741430387616c9c2ec469ecf571",
-    "primitives/mainchain-follower/src/db/types.rs": "333f3a8305b8bcdb7844a2b2cf70483d0f9551a5bb79e86be29110061c149673"
+    "primitives/mainchain-follower/src/db/types.rs": "333f3a8305b8bcdb7844a2b2cf70483d0f9551a5bb79e86be29110061c149673",
+    "res/mainnet/registered-candidates-addresses.json": "28a3f5b3000b7ea8cf0ba5b0f2be3fdd3083fd9b1d02fd659f4be5e6857f8446",
+    "res/preprod/registered-candidates-addresses.json": "900912785e45734c6867a906023c33d36fe39059bb6eef21ab99b4edc3f09120",
+    "res/preview/registered-candidates-addresses.json": "e0e6e1723f6d7e6586f5a157b1527d257511b1bb613d046ea5b346c003c8aa8e"
   },
   "entries": [
     {
@@ -947,5 +950,10 @@
         }
       ]
     }
-  ]
+  ],
+  "candidate_addresses": {
+    "mainnet": "addr1w9cky55qfmt98yvf0yxa0rzvynm7ag5c8c2f3xwsaja8y5cwpj7fy",
+    "preprod": "addr_test1wr4zpkfvylru9y3zahezf6vvfz7hlhf2pa4h9vxq70xwqzszre3qk",
+    "preview": "addr_test1wz5ax0hjvhx2uqef8sqrxnmfywd37hea4truhqxu4yxp9hsvggkfm"
+  }
 }

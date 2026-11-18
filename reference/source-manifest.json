@@ -42,6 +42,21 @@
       "source": "partner-chains/toolkit/committee-selection/authority-selection-inherents/src/authority_selection_inputs.rs",
       "sha256": "415cc2bfc7cf8dab6316284206c42a5295aea22b2cdb21025d01d2e38d689360",
       "git_blob_sha1": "f1ee9694dbc5173684e5e539a4f64b7117e5354f"
+    },
+    "res/mainnet/registered-candidates-addresses.json": {
+      "source": "res/mainnet/registered-candidates-addresses.json",
+      "sha256": "28a3f5b3000b7ea8cf0ba5b0f2be3fdd3083fd9b1d02fd659f4be5e6857f8446",
+      "git_blob_sha1": "9eff5d9fbe53d74f1e78cb327b27075528ce721a"
+    },
+    "res/preprod/registered-candidates-addresses.json": {
+      "source": "res/preprod/registered-candidates-addresses.json",
+      "sha256": "900912785e45734c6867a906023c33d36fe39059bb6eef21ab99b4edc3f09120",
+      "git_blob_sha1": "2fd1405d3b455d1f03171f50f1082abb0a1c5d42"
+    },
+    "res/preview/registered-candidates-addresses.json": {
+      "source": "res/preview/registered-candidates-addresses.json",
+      "sha256": "e0e6e1723f6d7e6586f5a157b1527d257511b1bb613d046ea5b346c003c8aa8e",
+      "git_blob_sha1": "dd455867e342a234865f24d61921329961b781ed"
     }
   }
 }
