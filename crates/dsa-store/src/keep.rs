@@ -140,6 +140,19 @@ impl Selection {
         ))
     }
 
+    /// Selection over an already pruned owned store. Its sparse before-H spend
+    /// bits prevent exceptional carry outputs from being reclassified by K3.
+    /// This does not change complete-source public/serve selection or perform
+    /// expiry/deletion; a writer must preserve markers before dropping spends.
+    pub fn pruned_rows_sql(&self, table: &str) -> Result<String, Error> {
+        let sql = self.rows_sql(SourceSchema::Serve, table)?;
+        let predicate = "AND NOT EXISTS(SELECT 1 FROM serve.tx_in i\n";
+        if sql.matches(predicate).count() != 1 {
+            return Err(Error::Refusal("invalid_keep_marker_template"));
+        }
+        Ok(sql.replace(predicate,"AND NOT EXISTS(SELECT 1 FROM dsa.consumed_before_horizon c WHERE c.tx_out_id=o.id)\n AND NOT EXISTS(SELECT 1 FROM serve.tx_in i\n"))
+    }
+
     pub async fn stream_rows<C: GenericClient>(
         &self,
         client: &C,

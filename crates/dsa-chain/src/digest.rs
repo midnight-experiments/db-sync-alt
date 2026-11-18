@@ -27,8 +27,66 @@
 //! A family SHA-256 hashes `DSA-family-v1\0`, its UTF-8 name framed by a u64
 //! big-endian length, then each canonical row framed by its u64 byte length.
 //! The root hashes `DSA-content-v1\0` and each lexicographically ordered family
-//! name, u64 row count and 32-byte family hash, each field length-framed. Empty
+//! name, u64 row count and lowercase 64-byte hex family hash, each length-framed. Empty
 //! families participate. The internal family has its own equally framed root.
 //! This is independent of row identity allocation and
 //! binary COPY/compression ordering. Q18's projection decision is deliberately
 //! upstream: the digest consumes the selected rowset verbatim.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyDigest {
+    pub rows: u64,
+    pub sha256: String,
+}
+
+pub struct FamilyHasher {
+    hash: Sha256,
+    rows: u64,
+}
+
+fn framed(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+}
+
+impl FamilyHasher {
+    pub fn new(name: &str) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"DSA-family-v1\0");
+        framed(&mut hash, name.as_bytes());
+        Self { hash, rows: 0 }
+    }
+
+    pub fn row(&mut self, value: &Value) -> Result<(), serde_json::Error> {
+        framed(&mut self.hash, &serde_json::to_vec(value)?);
+        self.rows += 1;
+        Ok(())
+    }
+
+    pub fn finish(self) -> FamilyDigest {
+        FamilyDigest {
+            rows: self.rows,
+            sha256: format!("{:x}", self.hash.finalize()),
+        }
+    }
+}
+
+pub fn root(families: &BTreeMap<String, FamilyDigest>) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"DSA-content-v1\0");
+    for (name, family) in families {
+        framed(&mut hash, name.as_bytes());
+        framed(&mut hash, &family.rows.to_be_bytes());
+        // Hash bytes represented by the lowercase SHA-256 hex are unambiguous;
+        // the representation is framed exactly like every other root field.
+        framed(&mut hash, family.sha256.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}

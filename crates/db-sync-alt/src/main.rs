@@ -43,6 +43,25 @@ enum Command {
         #[command(flatten)]
         database: DatabaseArguments,
     },
+    /// Verify logical content, supply, references and positional integrity.
+    Verify {
+        #[command(flatten)]
+        database: DatabaseArguments,
+    },
+    /// Write a new snapshot of one consistent serving database state.
+    Snapshot {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Restore a snapshot into an empty database, then verify and serve.
+    Restore {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Grant and check an existing node reader's exact privileges.
     GrantReader {
         #[command(flatten)]
@@ -74,6 +93,9 @@ async fn execute(command: Command) -> Result<Value, Error> {
         Command::Profile { network } => return Ok(serde_json::to_value(profile(network)?)?),
         Command::Create { database } => (database, "create"),
         Command::Status { database } => (database, "status"),
+        Command::Verify { database } => (database, "verify"),
+        Command::Snapshot { database, .. } => (database, "snapshot"),
+        Command::Restore { database, .. } => (database, "restore"),
         Command::GrantReader { database, .. } => (database, "grant-reader"),
     };
     let profile = profile(&database.network)?;
@@ -124,6 +146,13 @@ async fn database_command(
             store.status(profile).await
         }
         Command::Status { .. } => store.status(profile).await,
+        Command::Verify { .. } => Ok(serde_json::to_value(store.verify(profile).await?)?),
+        Command::Snapshot { file, .. } => {
+            Ok(serde_json::to_value(store.snapshot(profile, file).await?)?)
+        }
+        Command::Restore { file, .. } => {
+            Ok(serde_json::to_value(store.restore(profile, file).await?)?)
+        }
         Command::GrantReader {
             role, check: true, ..
         } => store.check_reader(profile, role).await,

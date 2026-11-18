@@ -39,6 +39,17 @@ CREATE TABLE dsa.calls (
  day date PRIMARY KEY,
  requests bigint NOT NULL CHECK(requests>=0)
 );
+-- Only exceptional retained old outputs need this bit after their spend expires.
+-- Public consumed_by_tx_id remains NULL; presence means consumed before H.
+CREATE TABLE dsa.consumed_before_horizon (
+ tx_out_id bigint PRIMARY KEY CHECK(tx_out_id>=0)
+);
+-- Served identity columns deliberately retain the legacy no-default shape.
+-- Writers allocate identities explicitly using these private sequences.
+CREATE SEQUENCE dsa.multi_asset_id_seq MINVALUE 1;
+CREATE SEQUENCE dsa.datum_id_seq MINVALUE 1;
+CREATE SEQUENCE dsa.pool_hash_id_seq MINVALUE 1;
+CREATE SEQUENCE dsa.epoch_stake_id_seq MINVALUE 1;
 REVOKE ALL ON ALL TABLES IN SCHEMA dsa FROM PUBLIC;
 CREATE FUNCTION dsa.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path=pg_catalog,dsa AS $$

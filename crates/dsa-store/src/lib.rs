@@ -1,6 +1,9 @@
 //! PostgreSQL layout, database identity and least-privilege node access.
 
+mod canonical;
 pub mod keep;
+pub mod snapshot;
+pub mod verify;
 
 use std::{io::BufReader, path::Path};
 
@@ -45,6 +48,8 @@ pub enum Error {
     Postgres(#[from] tokio_postgres::Error),
     #[error("profile_error")]
     Profile(#[from] serde_json::Error),
+    #[error("snapshot_io_error")]
+    Io(#[from] std::io::Error),
 }
 
 impl Error {
@@ -153,6 +158,14 @@ impl Store {
     }
 
     pub async fn create(&mut self, profile: &Profile) -> Result<(), Error> {
+        self.create_layout(profile, true).await
+    }
+
+    pub(crate) async fn create_layout(
+        &mut self,
+        profile: &Profile,
+        indexes: bool,
+    ) -> Result<(), Error> {
         let profile_hash = profile.hash()?;
         let transaction = self.writer_transaction().await?;
         let occupied: bool = transaction.query_one(
@@ -179,9 +192,11 @@ impl Store {
             .batch_execute(include_str!("layout.sql"))
             .await?;
         transaction.batch_execute(include_str!("state.sql")).await?;
-        transaction
-            .batch_execute(include_str!("indexes.sql"))
-            .await?;
+        if indexes {
+            transaction
+                .batch_execute(include_str!("indexes.sql"))
+                .await?;
+        }
         transaction.batch_execute(include_str!("views.sql")).await?;
         transaction.execute(
             "INSERT INTO dsa.identity(id,database_format,network,profile_hash,keep_rule_version,tool_version,node_release,origin) \

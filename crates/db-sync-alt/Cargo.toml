@@ -22,3 +22,4 @@ tokio = { workspace = true, features = ["process"] }
 sha2.workspace = true
 hex = "0.4"
 futures-util = "0.3"
+tempfile = "3"
