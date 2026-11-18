@@ -15,7 +15,7 @@ pub(crate) fn query(table: &str) -> Result<String, Error> {
             "t.hash",
         ),
         "tx_out" => (
-            "encode(t.hash,'hex'),o.index,o.address,o.value::text,encode(o.data_hash,'hex'),o.consumed_by_tx_id",
+            "encode(t.hash,'hex'),o.index,o.address,trunc(o.value)::text,encode(o.data_hash,'hex'),o.consumed_by_tx_id",
             "serve.tx_out o JOIN serve.tx t ON t.id=o.tx_id",
             "t.hash,o.index",
         ),
@@ -25,7 +25,7 @@ pub(crate) fn query(table: &str) -> Result<String, Error> {
             "t.hash,origin.hash,i.tx_out_index",
         ),
         "ma_tx_out" => (
-            "encode(t.hash,'hex'),o.index,encode(m.policy,'hex'),encode(m.name,'hex'),a.quantity::text,CASE WHEN a.id>=h.height*68719476736 THEN a.id-a.tx_out_id*4096 ELSE NULL END",
+            "encode(t.hash,'hex'),o.index,encode(m.policy,'hex'),encode(m.name,'hex'),trunc(a.quantity)::text,CASE WHEN a.id>=h.height*68719476736 THEN a.id-a.tx_out_id*4096 ELSE NULL END",
             "serve.ma_tx_out a JOIN serve.tx_out o ON o.id=a.tx_out_id JOIN serve.tx t ON t.id=o.tx_id JOIN serve.multi_asset m ON m.id=a.ident CROSS JOIN h",
             "t.hash,o.index,m.policy,m.name",
         ),
@@ -46,12 +46,12 @@ pub(crate) fn query(table: &str) -> Result<String, Error> {
             "p.hash_raw",
         ),
         "epoch_stake" => (
-            "s.epoch_no,encode(p.hash_raw,'hex'),s.amount::text",
+            "s.epoch_no,encode(p.hash_raw,'hex'),trunc(s.amount)::text",
             "serve.epoch_stake s JOIN serve.pool_hash p ON p.id=s.pool_id",
             "s.epoch_no,p.hash_raw,s.amount",
         ),
         "tx_metadata" => (
-            "encode(t.hash,'hex'),m.key::text,m.json",
+            "encode(t.hash,'hex'),trunc(m.key)::text,m.json",
             "serve.tx_metadata m JOIN serve.tx t ON t.id=m.tx_id",
             "t.hash,m.key",
         ),

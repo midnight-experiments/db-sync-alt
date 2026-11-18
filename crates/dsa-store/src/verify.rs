@@ -198,7 +198,7 @@ pub(crate) async fn verify<C: GenericClient>(
         .collect::<BTreeSet<_>>();
     for row in client
         .query(
-            "SELECT unit,quantity::text FROM dsa.supply ORDER BY unit",
+            "SELECT unit,trunc(quantity)::text FROM dsa.supply ORDER BY unit",
             &[],
         )
         .await?
@@ -208,7 +208,7 @@ pub(crate) async fn verify<C: GenericClient>(
         if !units.contains(&unit) {
             return Err(Error::Refusal("unknown_supply_unit"));
         }
-        let actual:String=client.query_one("SELECT coalesce(sum(a.quantity),0)::text FROM serve.ma_tx_out a JOIN serve.multi_asset m ON m.id=a.ident JOIN serve.tx_out o ON o.id=a.tx_out_id WHERE encode(m.policy,'hex')||encode(m.name,'hex')=$1 AND NOT EXISTS(SELECT 1 FROM serve.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index) AND NOT EXISTS(SELECT 1 FROM dsa.consumed_before_horizon c WHERE c.tx_out_id=o.id)",&[&unit]).await?.get(0);
+        let actual:String=client.query_one("SELECT trunc(coalesce(sum(a.quantity),0))::text FROM serve.ma_tx_out a JOIN serve.multi_asset m ON m.id=a.ident JOIN serve.tx_out o ON o.id=a.tx_out_id WHERE encode(m.policy,'hex')||encode(m.name,'hex')=$1 AND NOT EXISTS(SELECT 1 FROM serve.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index) AND NOT EXISTS(SELECT 1 FROM dsa.consumed_before_horizon c WHERE c.tx_out_id=o.id)",&[&unit]).await?.get(0);
         if quantity != actual {
             return Err(Error::Refusal("supply_mismatch"));
         }

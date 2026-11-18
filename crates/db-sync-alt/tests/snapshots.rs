@@ -406,6 +406,13 @@ async fn snapshot_digest_identity_independence_and_payload_sensitivity() -> Resu
     let after = db.cli("verify", &f.profile.network, &[]).await?;
     assert_eq!(before["content_digest"], after["content_digest"]);
     assert_eq!(before["state_digest"], after["state_digest"]);
+    // The domains are integral; numeric display scale is not a logical amount.
+    // Physical COPY continues to preserve the source's actual numeric value.
+    client.batch_execute("UPDATE serve.tx_out SET value=value::numeric(30,2);UPDATE serve.ma_tx_out SET quantity=quantity::numeric(30,2);UPDATE serve.epoch_stake SET amount=amount::numeric(30,2);UPDATE dsa.supply SET quantity=quantity::numeric(30,2)").await?;
+    assert_eq!(
+        after["content_digest"],
+        db.cli("verify", &f.profile.network, &[]).await?["content_digest"]
+    );
     let output: i64 = client
         .query_one(
             "SELECT id FROM serve.tx_out WHERE id>=8*16777216 ORDER BY id LIMIT 1",
@@ -522,7 +529,7 @@ async fn snapshot_verify_named_corruptions() -> Result {
             "referential_closure_failed",
         ),
         (
-            format!("DELETE FROM serve.block WHERE id={}", f.bounds.horizon + 1),
+            format!("DELETE FROM serve.block WHERE id={}", f.bounds.target + 1),
             "header_gap",
         ),
         (

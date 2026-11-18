@@ -1,7 +1,7 @@
 //! Canonical content digest, development format v1 (not a released file contract).
 //!
 //! Each family is a stream of JSON arrays in its natural-key order. SQL supplies
-//! byte strings as lowercase hex, integral amounts as decimal strings, and
+//! byte strings as lowercase hex, integral amounts as scale-zero decimal strings, and
 //! timestamps as integer microseconds since the PostgreSQL epoch. SQL NULL is
 //! JSON null. Object keys are recursively sorted; arrays retain order. Numbers
 //! retain their exact decimal representation, never passing through an f64.
