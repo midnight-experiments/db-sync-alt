@@ -59,6 +59,12 @@ pub enum Error {
         content_digest: String,
         state_digest: String,
     },
+    #[error("source_read_failed")]
+    SourceRead {
+        family: &'static str,
+        elapsed_seconds: f64,
+        error: tokio_postgres::Error,
+    },
 }
 
 impl Error {
@@ -70,6 +76,14 @@ impl Error {
             }
             Self::Postgres(error) => {
                 json!({"error": "database_error", "sqlstate": error.code().map(|code| code.code())})
+            }
+            Self::SourceRead {
+                family,
+                elapsed_seconds,
+                error,
+            } => {
+                let code = error.code().map(|code| code.code());
+                json!({"error":if code==Some("57014") {"source_statement_timeout"} else {"source_read_failed"},"family":family,"elapsed_seconds":elapsed_seconds,"sqlstate":code})
             }
             Self::Io(error) => {
                 json!({"error":"snapshot_io_error","kind":format!("{:?}",error.kind())})

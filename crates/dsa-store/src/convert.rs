@@ -783,13 +783,29 @@ impl Store {
         for table in NODE_RELATIONS {
             let sql = selection.conversion_rows_sql(table)?;
             let started = Instant::now();
-            let rows = source.query_raw(&sql, selection.parameters()).await?;
+            let sql_sha256 = format!("{:x}", Sha256::digest(sql.as_bytes()));
+            eprintln!(
+                "{}",
+                json!({"operation":"convert","event":"source_family_started","family":table,"sql_sha256":sql_sha256})
+            );
+            let rows = source
+                .query_raw(&sql, selection.parameters())
+                .await
+                .map_err(|error| Error::SourceRead {
+                    family: table,
+                    elapsed_seconds: started.elapsed().as_secs_f64(),
+                    error,
+                })?;
             pin_mut!(rows);
             let mut digest = FamilyHasher::new(table);
             let mut batch = Batch::new();
             let (mut count, mut bytes) = (0, 0);
             while let Some(row) = rows.next().await {
-                let row = row?;
+                let row = row.map_err(|error| Error::SourceRead {
+                    family: table,
+                    elapsed_seconds: started.elapsed().as_secs_f64(),
+                    error,
+                })?;
                 let original: &str = row.try_get(0)?;
                 let canonical: &str = row.try_get(1)?;
                 let key: i64 = row.try_get(2)?;
@@ -819,6 +835,10 @@ impl Store {
             batch.flush(&tx, table).await?;
             let elapsed = started.elapsed().as_secs_f64();
             report.longest_family_seconds = report.longest_family_seconds.max(elapsed);
+            eprintln!(
+                "{}",
+                json!({"operation":"convert","event":"source_family_finished","family":table,"rows":count,"jsonb_utf8_bytes":bytes,"batches":batch.batches,"elapsed_seconds":elapsed,"sql_sha256":sql_sha256})
+            );
             report.families.insert(
                 table.to_owned(),
                 FamilyCost {
@@ -826,7 +846,7 @@ impl Store {
                     jsonb_utf8_bytes: bytes,
                     batches: batch.batches,
                     elapsed_seconds: elapsed,
-                    sql_sha256: format!("{:x}", Sha256::digest(sql.as_bytes())),
+                    sql_sha256,
                 },
             );
             families.insert(table.to_owned(), digest.finish());

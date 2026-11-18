@@ -869,3 +869,386 @@ async fn convert_late_snapshot_failure_reports_published_digest_and_recovery() -
     target.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_large_lossless_rows_and_k10_fallback() -> Result {
+    let mut f = fixture(221);
+    f.no_window_spend();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    // Use our own supported structured JSONB, never third-party reproduction.
+    let nested = format!(
+        "{}340282366920938463463374607431768211456{}",
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    source.write(&format!("UPDATE serve.datum SET value='{nested}'::jsonb;UPDATE serve.tx_metadata SET json=jsonb_build_object('structured','{nested}'::jsonb,'bytes',repeat('x',8192));UPDATE serve.tx_out SET value=(value::text||'.00000')::numeric")).await?;
+    let target = Database::new().await?;
+    let converted = target
+        .cli(
+            "convert",
+            "mainnet",
+            &[
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                "6",
+                "--batch-bytes",
+                "1024",
+                "--batch-rows",
+                "2",
+            ],
+        )
+        .await?;
+    let c = connect(&target.config).await?;
+    let original = connect(&source.config).await?;
+    for table in ["datum", "tx_metadata", "tx_out"] {
+        let rows = c
+            .query(
+                &format!("SELECT id,to_jsonb(r)::text FROM serve.{table} r ORDER BY id"),
+                &[],
+            )
+            .await?;
+        for row in rows {
+            let text: String = original
+                .query_one(
+                    &format!("SELECT to_jsonb(r)::text FROM serve.{table} r WHERE id=$1"),
+                    &[&row.get::<_, i64>(0)],
+                )
+                .await?
+                .get(0);
+            assert_eq!(row.get::<_, String>(1), text);
+        }
+    }
+    let expected = keep(&f.chain, &f.profile, f.bounds)?;
+    let count: i64 = c
+        .query_one("SELECT count(*) FROM serve.tx_in", &[])
+        .await?
+        .get(0);
+    assert_eq!(count as usize, expected["tx_in"].len());
+    assert_eq!(count, 1);
+    assert!(
+        converted["source"]["families"]["datum"]["jsonb_utf8_bytes"]
+            .as_u64()
+            .unwrap()
+            > 1024
+    );
+    assert!(
+        converted["source"]["families"]["datum"]["batches"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    drop(c);
+    drop(original);
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_source_statement_timeout_is_named_closed_and_retryable() -> Result {
+    let f = fixture(223);
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    let barrier = source.barrier().await?;
+    let child = target.start_cli(
+        "convert",
+        "mainnet",
+        &[
+            "--source",
+            &source.dsn(true),
+            "--horizon-block",
+            "6",
+            "--source-statement-timeout-seconds",
+            "1",
+        ],
+    )?;
+    source.wait_barrier().await?;
+    let report = failure(&child.wait_with_output().await?)?;
+    assert_eq!(report["error"], "source_statement_timeout");
+    assert_eq!(report["family"], "block");
+    assert_eq!(report["sqlstate"], "57014");
+    assert!(report["elapsed_seconds"].as_f64().unwrap() >= 0.9);
+    barrier
+        .query_one("SELECT pg_advisory_unlock(726,1)", &[])
+        .await?;
+    target.closed_empty().await?;
+    target
+        .cli(
+            "convert",
+            "mainnet",
+            &[
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                "6",
+                "--source-statement-timeout-seconds",
+                "60",
+            ],
+        )
+        .await?;
+    drop(barrier);
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_destination_termination_stream_finish_and_post_source_commit_kill() -> Result {
+    for mode in ["stream", "finish", "kill"] {
+        let f = fixture(225);
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let target = Database::new().await?;
+        target.cli("create", "mainnet", &[]).await?;
+        let owner = connect(&target.config).await?;
+        let table = if mode == "stream" {
+            "serve.block"
+        } else {
+            "dsa.first_served"
+        };
+        owner.batch_execute(&format!("CREATE FUNCTION dsa.test_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(726,2);RETURN NEW;END$$;CREATE TRIGGER test_barrier BEFORE INSERT ON {table} FOR EACH STATEMENT EXECUTE FUNCTION dsa.test_barrier()")).await?;
+        owner
+            .query_one("SELECT pg_advisory_lock(726,2)", &[])
+            .await?;
+        let mut child = target.start_cli(
+            "convert",
+            "mainnet",
+            &[
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                "6",
+                "--batch-rows",
+                "2",
+            ],
+        )?;
+        let started = Instant::now();
+        let pid = loop {
+            if let Some(r)=target.admin.query_opt("SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory'",&[&target.name]).await? {break r.get::<_,i32>(0);}
+            if started.elapsed() > Duration::from_secs(10) {
+                return Err(format!("no destination {mode} barrier").into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        if mode != "stream" {
+            let source_idle:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND state='idle' AND xact_start IS NULL)",&[&source.name]).await?.get(0);
+            assert!(
+                source_idle,
+                "source transaction must be committed before finish barrier"
+            );
+        }
+        if mode == "kill" {
+            child.kill().await?;
+        } else {
+            target
+                .admin
+                .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+                .await?;
+        }
+        owner
+            .query_one("SELECT pg_advisory_unlock(726,2)", &[])
+            .await?;
+        assert!(!child.wait_with_output().await?.status.success());
+        target.closed_empty().await?;
+        owner
+            .batch_execute(&format!(
+                "DROP TRIGGER test_barrier ON {table};DROP FUNCTION dsa.test_barrier()"
+            ))
+            .await?;
+        let retried = target
+            .cli(
+                "convert",
+                "mainnet",
+                &["--source", &source.dsn(true), "--horizon-block", "6"],
+            )
+            .await?;
+        let pristine = Database::new().await?;
+        let oracle = pristine
+            .cli(
+                "convert",
+                "mainnet",
+                &["--source", &source.dsn(true), "--horizon-block", "6"],
+            )
+            .await?;
+        assert_eq!(
+            retried["verified"]["content_digest"],
+            oracle["verified"]["content_digest"]
+        );
+        assert_eq!(
+            retried["verified"]["state_digest"],
+            oracle["verified"]["state_digest"]
+        );
+        drop(owner);
+        pristine.cleanup().await?;
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}
+
+/// On-demand only: all data are deterministic/generated; normal branch CI
+/// excludes this test. Hosted runs archive its full JSON plans and SQL hashes.
+#[tokio::test]
+#[ignore = "on-demand generated multi-million-header source cost"]
+async fn convert_scaled_source_cost() -> Result {
+    let headers: u32 = std::env::var("DSA_CONVERSION_HEADERS")
+        .unwrap_or_else(|_| "2432170".to_owned())
+        .parse()?;
+    assert!(headers >= 10000);
+    let offset = 13_200_000;
+    let mut f = fixture(227);
+    f.translate_heights(offset);
+    let p = offset + headers - 1;
+    let t = p - f.profile.cardano.security_parameter;
+    let h = t - 30009.min(headers / 10);
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let began = Instant::now();
+    // The real Mainnet source's physical header count is about1.2M, despite its
+    // height near14M. Here header count, height, and density are all explicit.
+    source.write(&format!("UPDATE serve.block SET epoch_no=(id-{offset})/20000,slot_no=id*20,time=timestamp '2026-01-01'+(id-{offset})*interval '20seconds'")).await?;
+    let asset = f.asset_id("cnight");
+    let mut counts = BTreeMap::new();
+    for low in (offset..=p).step_by(5000) {
+        let high = (low + 4999).min(p);
+        source.write(&format!("INSERT INTO serve.block SELECT n,decode(md5('block/'||n::text)||md5('block2/'||n::text),'hex'),(n-{offset})/20000,n*20,n,timestamp '2026-01-01'+(n-{offset})*interval '20seconds',0 FROM generate_series({low}::bigint,{high}::bigint)n ON CONFLICT DO NOTHING;
+          INSERT INTO serve.tx SELECT n*4096+7,decode(md5('tx/'||n::text)||md5('tx2/'||n::text),'hex'),n,7,true FROM generate_series({low}::bigint,least({high},{t})::bigint)n WHERE n%2=0;
+          INSERT INTO serve.tx_out SELECT n*16777216+7*4096,n*4096+7,0,'external-'||(n%10007)::text,1,NULL,NULL FROM generate_series({low}::bigint,least({high},{t})::bigint)n WHERE n%2=0;
+          INSERT INTO serve.ma_tx_out SELECT (n*16777216+7*4096)*4096,1,n*16777216+7*4096,{asset} FROM generate_series({low}::bigint,least({high},{t})::bigint)n WHERE n%2=0;
+          INSERT INTO serve.tx SELECT (n+1)*4096+8,decode(md5('spend/'||n::text)||md5('spend2/'||n::text),'hex'),n+1,8,true FROM generate_series({low}::bigint,least({high},{h}-2)::bigint)n WHERE n%2=0 AND n%10<>0;
+          INSERT INTO serve.tx_in SELECT (n+1)*16777216+8*4096,(n+1)*4096+8,n*4096+7,0 FROM generate_series({low}::bigint,least({high},{h}-2)::bigint)n WHERE n%2=0 AND n%10<>0")).await?;
+        if (low - offset).is_multiple_of(100000) {
+            println!(
+                "{}",
+                json!({"event":"cost_fixture_progress","last_header":high,"elapsed_seconds":began.elapsed().as_secs_f64()})
+            );
+        }
+    }
+    let owner = connect(&source.config).await?;
+    for table in TABLES {
+        owner
+            .batch_execute(&format!("ANALYZE serve.{table}"))
+            .await?;
+        counts.insert(
+            table,
+            owner
+                .query_one(&format!("SELECT count(*) FROM serve.{table}"), &[])
+                .await?
+                .get::<_, i64>(0),
+        );
+    }
+    assert_eq!(counts["block"], i64::from(headers));
+    println!(
+        "{}",
+        json!({"event":"cost_fixture_ready","headers":headers,"physical_rows":counts,"H":h,"T":t,"P":p,"setup_seconds":began.elapsed().as_secs_f64()})
+    );
+    let mut config = source.reader_config();
+    config.options("-c work_mem=4MB -c jit=off -c max_parallel_workers_per_gather=0");
+    for limit in [None, Some(300)] {
+        let target = Database::new().await?;
+        let mut source_session = LegacySource::connect(config.clone(), None).await?;
+        source_session.limits(limit, Some(300)).await?;
+        source
+            .admin
+            .batch_execute("SELECT pg_stat_clear_snapshot()")
+            .await?;
+        let before: i64 = source
+            .admin
+            .query_one(
+                "SELECT temp_bytes FROM pg_stat_database WHERE datname=$1",
+                &[&source.name],
+            )
+            .await?
+            .get(0);
+        let started = Instant::now();
+        let mut store = Store::connect(target.config.clone(), None).await?;
+        let result = store
+            .convert(
+                &f.profile,
+                &mut source_session,
+                &ConvertOptions {
+                    horizon_block: Some(h),
+                    ..Default::default()
+                },
+            )
+            .await;
+        // Flush this generated source backend's statistics before measuring;
+        // this does not write any served/source relation or alter server config.
+        drop(source_session);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        source
+            .admin
+            .batch_execute("SELECT pg_stat_clear_snapshot()")
+            .await?;
+        let after: i64 = source
+            .admin
+            .query_one(
+                "SELECT temp_bytes FROM pg_stat_database WHERE datname=$1",
+                &[&source.name],
+            )
+            .await?
+            .get(0);
+        match result {
+            Ok(result) => println!(
+                "{}",
+                json!({"event":"cost_conversion","explicit_statement_seconds":limit,"elapsed_seconds":started.elapsed().as_secs_f64(),"source_temp_bytes_delta":after-before,"result":result})
+            ),
+            Err(error) => {
+                println!(
+                    "{}",
+                    json!({"event":"cost_conversion_failure","explicit_statement_seconds":limit,"elapsed_seconds":started.elapsed().as_secs_f64(),"source_temp_bytes_delta":after-before,"error":error.report()})
+                );
+                if limit.is_some() {
+                    return Err(error.into());
+                }
+                assert_eq!(error.report()["error"], "source_statement_timeout");
+                target.closed_empty().await?;
+            }
+        }
+        drop(store);
+        target.cleanup().await?;
+    }
+    let mut session = LegacySource::connect(config, None).await?;
+    session.limits(Some(300), Some(300)).await?;
+    let selection = dsa_store::keep::Selection::new(
+        &f.profile,
+        dsa_chain::keep::Bounds {
+            horizon: h,
+            target: t,
+            tip: p,
+        },
+    )?;
+    // Both K10 paths on the same generated source; no fixture normalization.
+    for present in [false, true] {
+        if present {
+            source.write(&format!("INSERT INTO serve.tx VALUES({}::bigint*4096+8,decode('{}','hex'),{h},8,true);INSERT INTO serve.tx_in VALUES({}::bigint*16777216+8*4096,{}::bigint*4096+8,{}::bigint*4096+7,0)",h,"ac".repeat(32),h,h,offset)).await?;
+        }
+        let tx = session.snapshot().await?;
+        let settings:Value=tx.query_one("SELECT jsonb_build_object('statement_timeout',current_setting('statement_timeout'),'work_mem',current_setting('work_mem'),'jit',current_setting('jit'),'parallel',current_setting('max_parallel_workers_per_gather'),'server_version',current_setting('server_version'))",&[]).await?.get(0);
+        for table in ["block", "tx_out", "tx_in"] {
+            let sql = selection.conversion_rows_sql(table)?;
+            let plan: Value = tx
+                .query_one(
+                    &format!("EXPLAIN(ANALYZE,BUFFERS,SETTINGS,FORMAT JSON) {sql}"),
+                    &selection.parameters(),
+                )
+                .await?
+                .get(0);
+            println!(
+                "{}",
+                json!({"event":"cost_plan","family":table,"window_spend_present":present,"settings":settings,"sql_sha256":format!("{:x}",<sha2::Sha256 as sha2::Digest>::digest(sql.as_bytes())),"plan":plan})
+            );
+        }
+        tx.commit().await?;
+    }
+    drop(session);
+    drop(owner);
+    source.cleanup().await?;
+    Ok(())
+}
