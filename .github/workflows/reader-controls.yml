@@ -1,0 +1,130 @@
+name: reader-controls
+on:
+  push:
+    branches: ['validation/b2-v2-b3-controls-9d71ae1']
+    paths: ['.github/workflows/reader-controls.yml']
+permissions:
+  contents: read
+jobs:
+  reader:
+    runs-on: ubuntu-24.04
+    container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: 1.100.0
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TARGET_DIR: /tmp/reader-target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 9d71ae13dcf0dc913d364c5ea595d848305de538
+          persist-credentials: false
+      - name: Verify normal reader tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/reader-artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = 9d71ae13dcf0dc913d364c5ea595d848305de538
+          cargo test --locked -p dsa-chain -p dsa-provider --lib --tests -- --nocapture 2>&1 | tee /tmp/reader-artifacts/positive.log
+      - name: Build pinned recording and comparison tools
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,shutil,subprocess
+          from pathlib import Path
+          out=Path('/tmp/reader-artifacts')
+          result=subprocess.run(['cargo','build','--locked','-p','dsa-provider','--example','record','--example','compare_corpus','--message-format=json'],capture_output=True,text=True)
+          (out/'build.stderr').write_text(result.stderr)
+          (out/'build.jsonl').write_text(result.stdout)
+          result.check_returncode()
+          binaries={}
+          for line in result.stdout.splitlines():
+              row=json.loads(line)
+              if row.get('reason')=='compiler-artifact' and row.get('executable') and row['target']['name'] in {'record','compare_corpus'}:
+                  name=row['target']['name']
+                  shutil.copy2(row['executable'],out/name)
+                  binaries[name]={'bytes':(out/name).stat().st_size,'sha256':hashlib.sha256((out/name).read_bytes()).hexdigest()}
+          assert set(binaries)=={'record','compare_corpus'}
+          metadata={'source_head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'source_status':subprocess.check_output(['git','status','--porcelain'],text=True),'workflow_head':os.environ['GITHUB_SHA'],'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'cargo':subprocess.check_output(['cargo','-V'],text=True),'container_image':'rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea','profile':'dev with debug=0','binaries':binaries}
+          assert metadata['source_status']==''
+          (out/'tools-manifest.json').write_text(json.dumps(metadata,indent=2)+'\n')
+          PY
+      - name: Demonstrate reader regression controls
+        run: |
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+          out=Path('/tmp/reader-artifacts')
+          results=[]
+          def control(name,path,mutate,args,needle):
+              source=Path(path)
+              original=source.read_text()
+              try:
+                  altered=mutate(original)
+                  assert altered!=original,name+' did not mutate source'
+                  source.write_text(altered)
+                  result=subprocess.run(['cargo','test','--locked',*args,'--','--nocapture'],capture_output=True,text=True)
+                  log=result.stdout+result.stderr
+                  (out/(name+'.log')).write_text(log)
+                  assert result.returncode!=0 and needle in log and 'test result: FAILED' in log,name+' did not fail at its expected regression assertion'
+                  results.append({'control':name,'exit':result.returncode,'expected_assertion':needle,'result':'detected'})
+              finally:
+                  source.write_text(original)
+          rows='crates/dsa-chain/src/rows.rs'
+          def partial_held(text):
+              before='let rows = build_rows(profile, height, transactions, &mut staged, supplements)?;'
+              assert text.count(before)==1
+              text=text.replace(before,'let rows = build_rows(profile, height, transactions, &mut staged, supplements);')
+              before='    Ok(rows)\n}\n\nfn build_rows('
+              assert text.count(before)==1
+              return text.replace(before,'    rows\n}\n\nfn build_rows(')
+          control('partial-held-on-error',rows,partial_held,['-p','dsa-chain','--lib','failed_later_transaction_preserves_held_and_retry_matches_clean_block'],'failure must leave the entire original held set unchanged')
+          def missing_datum(text):
+              before='''        (None, None) => {
+                      return Err(BuildError::Required(SupplementRequest::Datum(
+                          expected.clone(),
+                      )));
+                  }'''
+              # Match the Rust source indentation independently of this YAML block.
+              start=text.index('        (None, None) => {')
+              end=text.index('\n        }',start)+len('\n        }')
+              return text[:start]+'        (None, None) => return Ok(()),'+text[end:]
+          control('unrequested-datum-succeeds',rows,missing_datum,['-p','dsa-chain','--lib','requested_datums_distinguish_unknown_404_stored_and_later_reveal'],'called `Result::unwrap_err()` on an `Ok` value')
+          transaction='crates/dsa-chain/src/transaction.rs'
+          def reject_repeated_set(text):
+              before='inputs.insert(Outpoint { hash, index });'
+              assert text.count(before)==1
+              return text.replace(before,'if !inputs.insert(Outpoint { hash, index }) {return Err(error("cbor_duplicate_input",0));}')
+          control('historical-set-rejected',transaction,reject_repeated_set,['-p','dsa-chain','--lib','ra_14_a_5_13_standard_input_set_tags_duplicates_and_domains'],'cbor_duplicate_input')
+          def reject_zero(text):
+              before='            let quantity = quantity.integer()?;'
+              assert text.count(before)==1
+              return text.replace(before,before+'\n            if quantity==0 {return Err(error("cbor_asset_quantity",0));}')
+          control('historical-zero-rejected',transaction,reject_zero,['-p','dsa-chain','--lib','historical_multiasset_helpers_follow_nested_map_and_zero_pruning_rules'],'cbor_asset_quantity')
+          manifest='crates/dsa-provider/tests/fixtures/preprod-corpus.manifest.json'
+          def wrong_digest(text):
+              row=json.loads(text)
+              row['compressed_sha256']='0'*64
+              return json.dumps(row)
+          control('untrusted-compressed-digest',manifest,wrong_digest,['-p','dsa-provider','--test','corpus'],'assertion `left == right` failed')
+          def replace_unique(text,before,after):
+              assert text.count(before)==1,before
+              return text.replace(before,after)
+          control('address-token-exception',rows,lambda text:replace_unique(text,'if selection.required(asset) {','if selection.required(asset) || output.address.as_ref()==profile.addresses.get("ics") || output.address.as_ref()==profile.addresses.get("reserve") {'),['-p','dsa-chain','--lib','version_two_filters_every_address_and_preserves_full_asset_ordinals'],'assertion `left == right` failed')
+          control('shared-positive-without-provenance','crates/dsa-provider/examples/support/recorded.rs',lambda text:replace_unique(text,'return Ok(false);','return Ok(true);'),['-p','dsa-provider','--test','supplements','shared_positive_datum_requires_bound_capture_provenance'],'an unproven shared200 must not silently supply a historical request')
+          checks='crates/dsa-chain/src/checks.rs'
+          fault_test=['-p','dsa-chain','--test','checks','each_planted_block_fault_names_the_block_or_transaction']
+          for name,condition in [('asset-balance-unchecked','input.checked_add(minted) != Some(output)'),('transaction-count-unchecked','transactions.len() != header.transaction_count'),('body-hash-unchecked','transaction::hash(tx.body) != tx.hash'),('header-height-unchecked','header.height != expected'),('header-parent-unchecked','header.previous_hash.as_ref() != Some(&previous.hash)'),('target-overlap-unchecked','header.height <= previous_target')]:
+              control(name,checks,lambda text,condition=condition:replace_unique(text,'if '+condition+' {','if false {'),fault_test,'called `Result::unwrap_err()` on an `Ok` value')
+          control('supply-ledger-unchecked',checks,lambda text:replace_unique(text,'if *expected != actual {','if false {'),['-p','dsa-chain','--test','checks','supply_detects_an_unbooked_mint_and_excludes_old_spent_carry_records'],'called `Result::unwrap_err()` on an `Ok` value')
+          (out/'controls.json').write_text(json.dumps(results,indent=2)+'\n')
+          assert subprocess.check_output(['git','status','--porcelain'],text=True)==''
+          PY
+      - name: Upload public source verification and pinned tools
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b2-v2-reader-tools-9d71ae1
+          path: /tmp/reader-artifacts/
+          retention-days: 3
+          if-no-files-found: error
