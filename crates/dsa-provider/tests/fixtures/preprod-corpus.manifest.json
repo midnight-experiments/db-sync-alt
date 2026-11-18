@@ -1,0 +1,29 @@
+{
+  "format": "recorded-corpus-v1",
+  "network": "preprod",
+  "projection_blocks": [
+    4349638,
+    4349642,
+    5225025,
+    5380834,
+    5380847,
+    5384721
+  ],
+  "datum_support_blocks": [
+    4318350
+  ],
+  "files": 21,
+  "raw_bundle_bytes": 288390,
+  "compressed_bytes": 47807,
+  "compressed_sha256": "e43107f69a0d4b1369fd9c1764e97944758de57159a68271b12379d057f38277",
+  "expected": {
+    "tx": 6,
+    "tx_out": 7,
+    "ma_tx_out": 7,
+    "tx_in": 8,
+    "tx_metadata": 0,
+    "mint": 4,
+    "datum": 6
+  },
+  "scope": "Public finalized ledger records and independently exported legacy schema5 rows. Support-only blocks supply datum bytes without asserting their row projection; the complete local corpus retains the older bridge asset-row differences."
+}

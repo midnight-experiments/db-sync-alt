@@ -25,6 +25,8 @@ httpdate = "1"
 tokio = { workspace = true, features = ["sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
+sha2.workspace = true
+flate2 = "1"
 pallas-traverse = "=0.33.0"
 dsa-chain.workspace = true
 clap.workspace = true

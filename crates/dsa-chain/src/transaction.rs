@@ -43,6 +43,17 @@ pub struct Output {
     pub classification_safe: bool,
 }
 
+impl Output {
+    pub fn check_inline_hash(&self) -> Result<(), Error> {
+        if let Some(bytes) = &self.inline_datum
+            && self.data_hash.as_deref() != Some(hash(bytes).as_str())
+        {
+            return Err(error("provider_inline_datum_hash_mismatch", 0));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct Transaction<'a> {
     pub hash: String,
@@ -315,6 +326,28 @@ pub fn decode<'a>(raw: &'a [u8], expected_hash: &str) -> Result<Transaction<'a>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ra_14_b_1_7_inline_bytes_match_hash_even_when_value_not_stored() {
+        let mut output = Output {
+            address_raw: Vec::new(),
+            address: Some("ordinary".to_owned()),
+            coin: 1,
+            assets: Vec::new(),
+            data_hash: None,
+            inline_datum: Some(vec![0]),
+            classification_safe: true,
+        };
+        assert_eq!(
+            output.check_inline_hash().unwrap_err().code,
+            "provider_inline_datum_hash_mismatch"
+        );
+        output.data_hash = Some("00".repeat(32));
+        assert!(output.check_inline_hash().is_err());
+        output.data_hash =
+            Some("03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".to_owned());
+        output.check_inline_hash().unwrap();
+    }
 
     #[test]
     fn ra_14_a_4_4_interpreted_map_keys_are_semantically_unique() {

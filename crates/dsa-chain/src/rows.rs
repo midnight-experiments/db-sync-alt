@@ -248,6 +248,7 @@ pub fn build_block(
                         .and_then(|m| m.get(&index))
                 })
                 .ok_or_else(|| error("provider_output_resolution_required", 0))?;
+            output.check_inline_hash()?;
             if selection.relevant(output) {
                 kept_outputs.push((index, output));
             }
@@ -361,6 +362,82 @@ pub fn build_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ra_14_c_3_invalid_projection_uses_collateral_return_and_collateral_only() {
+        // Typed row-projection model only. This is never serialized as a
+        // ledger transaction or passed to a provider or third-party decoder.
+        let profile = Profile::load("mainnet").unwrap();
+        let output = Output {
+            address_raw: Vec::new(),
+            address: Some(profile.addresses["mapping"].clone()),
+            coin: 100,
+            assets: vec![Asset {
+                policy: profile.assets["cnight"].policy.clone(),
+                name: profile.assets["cnight"].name.clone(),
+                quantity: 1,
+            }],
+            data_hash: None,
+            inline_datum: None,
+            classification_safe: true,
+        };
+        let ordinary = Outpoint {
+            hash: "01".repeat(32),
+            index: 1,
+        };
+        let collateral = Outpoint {
+            hash: "02".repeat(32),
+            index: 2,
+        };
+        let tx = Transaction {
+            hash: "03".repeat(32),
+            valid: false,
+            ordinary: vec![ordinary.clone()],
+            collateral: vec![collateral.clone()],
+            reference: Vec::new(),
+            outputs: vec![None, None, None],
+            collateral_output: Some(output.clone()),
+            has_collateral_return: true,
+            mint: vec![Asset {
+                policy: profile.assets["cnight"].policy.clone(),
+                name: profile.assets["cnight"].name.clone(),
+                quantity: 999,
+            }],
+            datums: BTreeMap::new(),
+            body: &[],
+            auxiliary: None,
+            auxiliary_hash: None,
+        };
+        let mut held = BTreeMap::from([
+            (
+                ordinary.clone(),
+                HeldOutput {
+                    transaction_id: 1,
+                    output: output.clone(),
+                },
+            ),
+            (
+                collateral.clone(),
+                HeldOutput {
+                    transaction_id: 2,
+                    output,
+                },
+            ),
+        ]);
+        let rows = build_block(&profile, 10, &[tx], &mut held, &Supplements::default()).unwrap();
+        assert_eq!(rows.tx.len(), 1);
+        assert!(!rows.tx[0].valid_contract);
+        assert_eq!(rows.tx_in.len(), 1);
+        assert_eq!(rows.tx_in[0].tx_out_id, 2);
+        assert_eq!(rows.tx_in[0].tx_out_index, 2);
+        assert_eq!(rows.tx_out.len(), 1);
+        assert_eq!(rows.tx_out[0].index, 3);
+        assert_eq!(rows.tx_out[0].id, ids::output_id(10, 0, 3).unwrap());
+        assert!(rows.mint.is_empty());
+        assert!(rows.tx_metadata.is_empty());
+        assert!(held.contains_key(&ordinary));
+        assert!(!held.contains_key(&collateral));
+    }
 
     #[test]
     fn ra_14_c_2_14_and_d_2_1_full_units_and_governance_policies() {
