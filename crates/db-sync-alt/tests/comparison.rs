@@ -1518,3 +1518,78 @@ async fn compare_source_capture_path_preflight_preserves_pristine_destination() 
     target.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_no_window_transactions_uses_carried_witness_or_explicit_unavailable() -> Result {
+    for carried in [true, false] {
+        let mut f = fixture(363);
+        f.chain.transactions.retain(|_, t| carried && t.block < 6);
+        f.chain
+            .outputs
+            .retain(|_, o| f.chain.transactions.contains_key(&o.transaction));
+        f.chain
+            .output_assets
+            .retain(|_, a| f.chain.outputs.contains_key(&a.output));
+        f.chain.inputs.retain(|_, i| {
+            f.chain.transactions.contains_key(&i.transaction)
+                && f.chain.outputs.contains_key(&i.output)
+        });
+        f.chain
+            .metadata
+            .retain(|_, transaction| f.chain.transactions.contains_key(transaction));
+        f.reindex_ordinals();
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let target = Database::new().await?;
+        target
+            .cli(
+                "convert",
+                "mainnet",
+                &["--source", &source.dsn(true), "--horizon-block", "6"],
+            )
+            .await?;
+        target
+            .cli("grant-reader", "mainnet", &["--role", &target.reader])
+            .await?;
+        let output = cli(&source, &target, &f.profile, &[]).await?;
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["matched"], true);
+        assert_eq!(report["transaction_hit_available_a"], carried);
+        assert_eq!(report["transaction_hit_available_b"], carried);
+        assert!(
+            report["positions"]["event_anchors"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        if carried {
+            let hash = report["positions"]["witness_tx_hash"].as_str().unwrap();
+            let row=connect(&target.config).await?.query_one("SELECT b.block_no::bigint FROM serve.tx t JOIN serve.block b ON b.id=t.block_id WHERE t.hash=decode($1,'hex')",&[&hash]).await?;
+            assert!(row.get::<_, i64>(0) < 6);
+        } else {
+            assert!(report["positions"]["witness_tx_hash"].is_null());
+            assert!(
+                report["probe_rows"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .any(|key| key.starts_with("get_block_info_for_tx_hash:")
+                        && key.ends_with("/unavailable"))
+            );
+        }
+        println!(
+            "{}",
+            json!({"event":"quiet_comparison","carried_witness":carried,"transaction_hit_available_a":report["transaction_hit_available_a"],"transaction_hit_available_b":report["transaction_hit_available_b"]})
+        );
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}

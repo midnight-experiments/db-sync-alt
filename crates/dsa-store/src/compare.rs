@@ -285,7 +285,7 @@ impl Positions {
                 },
             )?;
             let sql = format!(
-                "{} SELECT encode(t.hash,'hex') FROM public.tx t JOIN keep_tx k ON k.id=t.id JOIN keep_block b ON b.id=t.block_id WHERE t.id BETWEEN 0 AND $2::bigint*4096+4095 ORDER BY t.id DESC LIMIT 1",
+                "{}, witness_candidates AS MATERIALIZED (SELECT t.id,t.hash FROM public.tx t JOIN keep_tx k ON k.id=t.id JOIN keep_block b ON b.id=t.block_id WHERE t.id BETWEEN 0 AND $2::bigint*4096+4095) SELECT encode(hash,'hex') FROM witness_candidates ORDER BY id DESC LIMIT 1",
                 crate::keep::Selection::ctes_sql(crate::keep::SourceSchema::Public)
             );
             out.witness_tx_hash = tx
