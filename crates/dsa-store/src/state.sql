@@ -51,6 +51,9 @@ CREATE SEQUENCE dsa.datum_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.pool_hash_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.epoch_stake_id_seq MINVALUE 1;
 REVOKE ALL ON ALL TABLES IN SCHEMA dsa FROM PUBLIC;
+-- Register a USERSET custom placeholder before PostgreSQL validates function
+-- SET options for the non-superuser layout owner. Transaction-local only.
+SET LOCAL dsa.keep_rule_version='__KEEP_RULE_VERSION__';
 CREATE FUNCTION dsa.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path=pg_catalog,dsa
 SET dsa.keep_rule_version='__KEEP_RULE_VERSION__' AS $$
