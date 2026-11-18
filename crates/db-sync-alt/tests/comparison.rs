@@ -909,3 +909,108 @@ async fn compare_capture_row_and_byte_caps_refuse_before_accumulation() -> Resul
     target.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_cli_capture_from_conversion_survives_source_advancement_and_integrity() -> Result {
+    let mut f = fixture(345);
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("source.capture.json");
+    let converted = target
+        .cli(
+            "convert",
+            "mainnet",
+            &[
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                "6",
+                "--capture-source",
+                file.to_str().unwrap(),
+            ],
+        )
+        .await?;
+    assert!(file.is_file());
+    assert!(converted.get("source_capture").is_some());
+    target
+        .cli("grant-reader", "mainnet", &["--role", &target.reader])
+        .await?;
+    source.write(&format!("INSERT INTO chain.generations VALUES(2,1,'ready','generated',0,0,{}, {},'{{}}');INSERT INTO serve.block VALUES({},decode('{}','hex'),1084,999999,{},timestamp '2026-01-02',0);UPDATE chain.integrity_state SET projection_generation=2,serve_generation=2;UPDATE chain.service_state SET canonical_ready=2,publication_serial=publication_serial+1",f.bounds.target+1,f.bounds.tip+1,f.bounds.tip+1,"cd".repeat(32),f.bounds.tip+1)).await?;
+    let output = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "compare",
+            "--a-capture",
+            file.to_str().unwrap(),
+            "--b",
+            &target.dsn(true),
+            "--network",
+            "mainnet",
+            "--positions",
+            "auto",
+            "--verify-unbounded",
+        ])
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["matched"], true);
+    assert_eq!(report["newest_a"], report["newest_b"]);
+    assert_eq!(report["chain_order_checked_b"], true);
+    let mut capture: Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+    let positions = dir.path().join("positions.json");
+    std::fs::write(
+        &positions,
+        serde_json::to_vec(&capture["capture"]["positions"])?,
+    )?;
+    let fresh = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "compare",
+            "--a",
+            &source.dsn(true),
+            "--b",
+            &target.dsn(true),
+            "--network",
+            "mainnet",
+            "--positions",
+            positions.to_str().unwrap(),
+        ])
+        .output()
+        .await?;
+    assert_eq!(fresh.status.code(), Some(2));
+    let cases = capture["capture"]["cases"].as_object_mut().unwrap();
+    let case = cases
+        .values_mut()
+        .find(|v| !v["rows"].as_array().unwrap().is_empty())
+        .unwrap();
+    case["rows"][0] = json!("{\"tampered\":true}");
+    let tampered = dir.path().join("tampered.capture.json");
+    std::fs::write(&tampered, serde_json::to_vec(&capture)?)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "compare",
+            "--a-capture",
+            tampered.to_str().unwrap(),
+            "--b",
+            &target.dsn(true),
+            "--network",
+            "mainnet",
+            "--positions",
+            "auto",
+        ])
+        .output()
+        .await?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("source_capture_hash_mismatch"));
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
