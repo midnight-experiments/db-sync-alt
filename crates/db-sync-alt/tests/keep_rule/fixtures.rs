@@ -225,6 +225,7 @@ impl Fixture {
     /// gaps, epoch lengths, source extent and payloads vary independently.
     pub fn generated(seed: u64) -> Self {
         let mut f = Self::base(seed);
+        f.expanded_token_rule_edges();
         let mut random = Random(seed.wrapping_add(0x9e3779b97f4a7c15));
         let offset = random.next(9) as u32;
         let mut positions = BTreeMap::new();
@@ -408,6 +409,95 @@ impl Fixture {
         self.chain.output_assets.retain(|_, a| a.output != shell);
         self.add_asset(shell, 9010, 0);
         self.tags.insert("v2_zero_eligible_shell".to_owned(), shell);
+    }
+
+    /// Review regressions vary names/content independently of chain topology.
+    pub fn expanded_token_rule_edges(&mut self) {
+        for (body_index, body) in ["council", "technical_committee"].into_iter().enumerate() {
+            let asset = 9030 + body_index as i64;
+            self.chain.assets.insert(
+                asset,
+                Asset {
+                    policy: self.profile.assets[body].policy.clone(),
+                    name: format!("a5{:016x}", self.seed),
+                },
+            );
+            for (kind, height) in [("carry", self.bounds.horizon - 1), ("live", 8)] {
+                let index = 12 + body_index as u16 * 2;
+                let datum = 90200 + body_index as i64 * 10 + if kind == "live" { 1 } else { 0 };
+                let out = self.output(height, index, 20, body, body, Some(datum));
+                self.chain.output_assets.retain(|_, a| a.output != out);
+                self.add_asset(out, asset, 0);
+                if kind == "carry" {
+                    self.spend(height, 18 + body_index as u16 * 2, 0, out);
+                }
+                self.tags.insert(format!("v2_{body}_{kind}_alt"), out);
+            }
+        }
+        let mut wrong_units = BTreeSet::new();
+        for (index, role) in ["cnight", "auth", "permissioned_candidates", "bridge"]
+            .into_iter()
+            .enumerate()
+        {
+            let unit = &self.profile.assets[role];
+            let asset = Asset {
+                policy: unit.policy.clone(),
+                name: format!("{}ff{:02x}", unit.name, self.seed % 251),
+            };
+            if !wrong_units.insert(asset.unit()) {
+                continue;
+            }
+            let id = 9040 + index as i64;
+            self.chain.assets.insert(id, asset);
+            let out = self.output(
+                8,
+                22,
+                index as u16,
+                "other",
+                role,
+                Some(90400 + index as i64),
+            );
+            self.chain.output_assets.retain(|_, a| a.output != out);
+            self.add_asset(out, id, 0);
+            // Wrong names cannot acquire Q4's permissioned-unit datum reason.
+            self.tags.insert(format!("v2_wrong_name_{role}"), out);
+        }
+        for (index, role) in [
+            "mapping",
+            "council",
+            "technical_committee",
+            "ics",
+            "reserve",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let datum = 90300 + index as i64;
+            let out = self.output(8, 24, index as u16, role, "cnight", Some(datum));
+            self.chain.output_assets.retain(|_, a| a.output != out);
+            if role == "mapping" {
+                self.spend(8, 29, 0, out);
+            }
+            self.tags.insert(format!("v2_datum_only_{role}"), out);
+        }
+        let pc = self.output(8, 26, 0, "other", "permissioned_candidates", Some(90310));
+        self.tags
+            .insert("v2_plain_permissioned_datum".to_owned(), pc);
+        // Variation includes eligible membership, not merely quantities/topology.
+        if self.seed.is_multiple_of(2) {
+            let out = self.tags["v2_mixed_other"];
+            let auth = self.asset_id("auth");
+            self.chain
+                .output_assets
+                .retain(|_, a| a.output != out || a.asset != auth);
+        }
+        if self.seed.is_multiple_of(3) {
+            let out = self.tags["v2_mixed_ics"];
+            self.chain
+                .output_assets
+                .retain(|_, a| a.output != out || a.asset != 9001);
+        }
+        self.reindex_ordinals();
     }
 
     pub fn translate_heights(&mut self, offset: u32) {

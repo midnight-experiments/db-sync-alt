@@ -1040,6 +1040,12 @@ pub async fn capture(
                 ],
             )
             .await?;
+        if data.is_empty() && ["council", "technical_committee"].contains(&role) {
+            // These fixed descriptors are retained when available, but the node
+            // governance query resolves a policy directly rather than this ID.
+            // The recorded exact lookup still catches one-sided presence.
+            continue;
+        }
         if data.len() != 1 {
             return Err(Error::Refusal("comparison_missing_profile_unit"));
         }

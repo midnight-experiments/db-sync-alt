@@ -709,3 +709,155 @@ async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
     target.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
+    for scenario in [
+        "window_datum",
+        "epoch_minus_two_spent",
+        "old_origin_header",
+        "funding_inputs",
+    ] {
+        let mut f = fixture(331);
+        let address = dsa_store::catalogue::catalogue().candidate_addresses["mainnet"].clone();
+        let height = match scenario {
+            "window_datum" => 7,
+            "epoch_minus_two_spent" => 1,
+            "old_origin_header" => 0,
+            _ => 3,
+        };
+        let out = f.output(
+            height,
+            12,
+            20,
+            "other",
+            "cnight",
+            if scenario == "window_datum" {
+                Some(99011)
+            } else {
+                None
+            },
+        );
+        f.chain.outputs.get_mut(&out).unwrap().address = address.clone();
+        if scenario == "epoch_minus_two_spent" {
+            f.spend(4, 30, 0, out);
+        }
+        if scenario == "funding_inputs" {
+            f.spend(3, 12, 0, f.tags["ordinary_0_0"]);
+        }
+        f.reindex_ordinals();
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let target = Database::new().await?;
+        target
+            .cli(
+                "convert",
+                "mainnet",
+                &["--source", &source.dsn(true), "--horizon-block", "6"],
+            )
+            .await?;
+        target
+            .cli("grant-reader", "mainnet", &["--role", &target.reader])
+            .await?;
+        let mut a = Reader::connect(source.reader_config(), None).await?;
+        let mut b = Reader::connect(target.reader_config(), None).await?;
+        let ta = a.snapshot().await?;
+        let tb = b.snapshot().await?;
+        let reference = if scenario == "epoch_minus_two_spent" {
+            3
+        } else {
+            8
+        };
+        let catalogue = dsa_store::catalogue::catalogue();
+        for name in [
+            "get_utxos_for_address_tx_in_enabled",
+            "get_utxos_for_address_tx_in_consumed",
+        ] {
+            let sql = catalogue
+                .entries
+                .iter()
+                .find(|e| e.kind == "read" && e.name == name)
+                .unwrap();
+            let values = [Bind::Text(address.clone()), Bind::I32(reference)];
+            let left = compare::rows(&ta, sql, &values).await?;
+            let right = compare::rows(&tb, sql, &values).await?;
+            assert_eq!(left.len(), 1, "{scenario}/{name}");
+            assert_ne!(
+                left, right,
+                "Q19 counterexample {scenario}/{name} disappeared"
+            );
+            println!(
+                "{}",
+                json!({"event":"q19_literal_counterexample","scenario":scenario,"query":name,"sql_sha256":sql.sha256,"address":address,"reference_block":reference,"horizon":6,"source_rows":left,"converted_rows":right})
+            );
+        }
+        ta.commit().await?;
+        tb.commit().await?;
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_optional_governance_descriptors_both_absent_and_one_sided() -> Result {
+    let mut f = fixture(333);
+    let roles = ["council", "technical_committee"];
+    let fixed = roles.map(|role| f.asset_id(role));
+    // Alternate-name tokens still answer the policy query. The fixed empty-name
+    // descriptors are genuinely absent from this otherwise supported source.
+    for (index, role) in roles.into_iter().enumerate() {
+        let alternate = 9200 + index as i64;
+        f.chain.assets.insert(
+            alternate,
+            dsa_chain::profiles::Asset {
+                policy: f.profile.assets[role].policy.clone(),
+                name: "fe".to_owned(),
+            },
+        );
+        for row in f.chain.output_assets.values_mut() {
+            if row.asset == fixed[index] {
+                row.asset = alternate;
+            }
+        }
+        f.chain.assets.remove(&fixed[index]);
+    }
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    target
+        .cli(
+            "convert",
+            "mainnet",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )
+        .await?;
+    target
+        .cli("grant-reader", "mainnet", &["--role", &target.reader])
+        .await?;
+    let out = cli(&source, &target, &f.profile, &[]).await?;
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let policy = &f.profile.assets["council"].policy;
+    target
+        .write(&format!(
+            "INSERT INTO serve.multi_asset VALUES(9800,decode('{policy}','hex'),''::bytea)"
+        ))
+        .await?;
+    let out = cli(&source, &target, &f.profile, &[]).await?;
+    assert_eq!(out.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    assert!(report["differences"].as_array().unwrap().iter().any(|v| {
+        v["query"].as_str().unwrap().starts_with("resolve_ident:") && v["informational"] == false
+    }));
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}

@@ -329,6 +329,10 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
     result.insert("no_spend_in_window", fallback);
     result.insert("spend_of_output_below_horizon", Fixture::base(2));
     result.insert("v2_mixed_assets_and_q4_datums", Fixture::base(42));
+    let mut expanded = Fixture::base(42);
+    expanded.bounds.horizon = 6;
+    expanded.expanded_token_rule_edges();
+    result.insert("v2_all_unit_policies_governance_and_datums", expanded);
     let mut first = Fixture::base(4);
     first.bounds.horizon = 6;
     result.insert("horizon_first_block_of_epoch", first);
@@ -500,6 +504,99 @@ fn version_two_projection_and_q4_boundaries() -> Result {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn keep_rule_v2_literal_governance_and_datum_edges() -> Result {
+    for seed in [41, 42] {
+        let mut f = Fixture::base(seed);
+        f.bounds.horizon = 6;
+        f.expanded_token_rule_edges();
+        let kept = keep(&f.chain, &f.profile, f.bounds)?;
+        for role in [
+            "mapping",
+            "council",
+            "technical_committee",
+            "ics",
+            "reserve",
+        ] {
+            let out = f.tags[&format!("v2_datum_only_{role}")];
+            assert!(kept["tx_out"].contains(&out));
+            let hash = f.chain.outputs[&out].datum_hash.as_ref().unwrap();
+            let datum = f
+                .chain
+                .datums
+                .iter()
+                .find(|(_, d)| &d.hash == hash)
+                .unwrap()
+                .0;
+            assert!(kept["datum"].contains(datum));
+            assert!(
+                !kept["ma_tx_out"]
+                    .iter()
+                    .any(|id| f.chain.output_assets[id].output == out)
+            );
+        }
+        assert!(kept["datum"].contains(&90310));
+        for (role, out) in f
+            .tags
+            .iter()
+            .filter(|(tag, _)| tag.starts_with("v2_wrong_name_"))
+        {
+            assert!(kept["tx_out"].contains(out), "{role}");
+            let hash = f.chain.outputs[out].datum_hash.as_ref().unwrap();
+            let datum = f
+                .chain
+                .datums
+                .iter()
+                .find(|(_, d)| &d.hash == hash)
+                .unwrap()
+                .0;
+            assert!(
+                !kept["datum"].contains(datum),
+                "wrong unit cannot grant datum retention: {role}"
+            );
+            assert!(
+                !kept["ma_tx_out"]
+                    .iter()
+                    .any(|id| f.chain.output_assets[id].output == *out),
+                "{role}"
+            );
+        }
+        let db = Database::new(&f.profile).await?;
+        db.replace(&f).await?;
+        for (body_index, body) in ["council", "technical_committee"].into_iter().enumerate() {
+            for (kind, reference) in [("carry", 6_i32), ("live", 8_i32)] {
+                let output = f.tags[&format!("v2_{body}_{kind}_alt")];
+                assert!(kept["tx_out"].contains(&output));
+                let tx = f.chain.outputs[&output].transaction;
+                let height = f.chain.transactions[&tx].block;
+                let rows = f.rows();
+                let expected = json!({"full_datum":{"constructor":0,"fields":[{"int":90200+body_index as i64*10+if kind=="live" {1}else{0}}]},"block_number":height,"block_hash":rows["block"].iter().find(|r|r["id"]==height).unwrap()["hash"],"tx_index_in_block":12+body_index*2,"tx_hash":rows["tx"].iter().find(|r|r["id"]==tx).unwrap()["hash"],"utxo_index":20});
+                let policy = hex::decode(&f.profile.assets[body].policy)?;
+                for (queries, client) in
+                    [(&db.full_queries, &db.full), (&db.kept_queries, &db.kept)]
+                {
+                    let answer = queries
+                        .rows(
+                            client,
+                            "get_governance_body_utxo",
+                            &[&f.profile.addresses[body], &policy, &reference],
+                        )
+                        .await?;
+                    assert_eq!(
+                        answer,
+                        vec![expected.clone()],
+                        "{body}/{kind} literal policy-only answer"
+                    );
+                }
+            }
+        }
+        verify_observations(&db, &f, &kept).await?;
+        db.cleanup().await?;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Counts {
     positions: u64,
@@ -651,6 +748,17 @@ async fn keep_rule_ten_thousand_chains() -> Result {
     for seed in start..start + cases {
         let fixture = Fixture::generated(seed);
         assert_canonical_ids(&fixture);
+        let retained = keep(&fixture.chain, &fixture.profile, fixture.bounds)?;
+        let shared = dsa_chain::assets::AssetRule::from_profile(&fixture.profile);
+        for (id, row) in &fixture.chain.output_assets {
+            let asset = &fixture.chain.assets[&row.asset];
+            assert_eq!(
+                retained["ma_tx_out"].contains(id),
+                retained["tx_out"].contains(&row.output)
+                    && shared.allows(&asset.policy, &asset.name),
+                "shared predicate seed{seed} asset{id}"
+            );
+        }
         let b = fixture.bounds;
         topologies.insert((
             b.horizon,
