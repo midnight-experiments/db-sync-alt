@@ -107,61 +107,76 @@ impl Positions {
         if !(1..=5000).contains(&max_pairs) || horizon > target {
             return Err(Error::Refusal("invalid_comparison_positions"));
         }
-        let rows=tx.query("SELECT id,tx_count::bigint,epoch_no::integer FROM public.block WHERE id BETWEEN $1 AND $2 ORDER BY id",&[&i64::from(horizon),&i64::from(target)]).await?;
-        if rows.len() as u64 != u64::from(target) - u64::from(horizon) + 1 {
-            return Err(Error::Refusal("comparison_header_gap"));
+        let h = i64::from(horizon);
+        let t = i64::from(target);
+        let n = usize::try_from(u64::from(target) - u64::from(horizon) + 1)
+            .map_err(|_| Error::Refusal("invalid_comparison_positions"))?;
+        let mut uniform_edges = BTreeSet::new();
+        if n > 1 {
+            let count = (n - 1).min(max_pairs);
+            for i in 0..count {
+                uniform_edges.insert(if count == 1 {
+                    0
+                } else {
+                    i * (n - 2) / (count - 1)
+                });
+            }
         }
-        let end = |i: usize| -> Result<Cursor, Error> {
-            Ok(Cursor {
-                block: u32::try_from(rows[i].get::<_, i64>(0))
-                    .map_err(|_| Error::Refusal("comparison_height_out_of_range"))?,
+        let prepared = tx.prepare("SELECT id,tx_count::bigint,epoch_no::integer FROM public.block WHERE id BETWEEN $1 AND $2 ORDER BY id").await?;
+        let parameters: [&(dyn ToSql + Sync); 2] = [&h, &t];
+        let stream = tx.query_raw(&prepared, parameters).await?;
+        pin_mut!(stream);
+        let start = Cursor {
+            block: horizon,
+            tx_index: 0,
+        };
+        let mut pairs = BTreeSet::new();
+        let mut previous: Option<(Cursor, Option<i32>)> = None;
+        let mut seen = 0usize;
+        while let Some(row) = stream.next().await {
+            let row = row?;
+            let block = u32::try_from(row.try_get::<_, i64>(0)?)
+                .map_err(|_| Error::Refusal("comparison_height_out_of_range"))?;
+            if seen >= n || u64::from(block) != u64::from(horizon) + seen as u64 {
+                return Err(Error::Refusal("comparison_header_gap"));
+            }
+            let end = Cursor {
+                block,
                 tx_index: u32::try_from(
-                    rows[i]
-                        .get::<_, i64>(1)
+                    row.try_get::<_, i64>(1)?
                         .checked_add(1)
                         .ok_or(Error::Refusal("comparison_tx_count_out_of_range"))?,
                 )
                 .map_err(|_| Error::Refusal("comparison_tx_count_out_of_range"))?,
-            })
-        };
-        let mut pairs = BTreeSet::new();
-        let n = rows.len();
-        pairs.insert(Pair {
-            cursor: Cursor {
-                block: horizon,
-                tx_index: 0,
-            },
-            reference: end(0)?,
-        });
-        pairs.insert(Pair {
-            cursor: Cursor {
-                block: horizon,
-                tx_index: 0,
-            },
-            reference: end(n - 1)?,
-        });
-        if n > 1 {
-            let count = (n - 1).min(max_pairs);
-            for i in 0..count {
-                let a = if count == 1 {
-                    0
-                } else {
-                    i * (n - 2) / (count - 1)
-                };
+            };
+            let epoch: Option<i32> = row.try_get(2)?;
+            if seen == 0 {
                 pairs.insert(Pair {
-                    cursor: end(a)?,
-                    reference: end(a + 1)?,
+                    cursor: start,
+                    reference: end,
                 });
             }
-        }
-        for i in 1..n {
-            if rows[i].get::<_, Option<i32>>(2) != rows[i - 1].get::<_, Option<i32>>(2) {
+            if let Some((before, previous_epoch)) = previous
+                && (uniform_edges.contains(&(seen - 1)) || previous_epoch != epoch)
+            {
                 pairs.insert(Pair {
-                    cursor: end(i - 1)?,
-                    reference: end(i)?,
+                    cursor: before,
+                    reference: end,
                 });
             }
+            if pairs.len() > 10000 {
+                return Err(Error::Refusal("invalid_comparison_positions"));
+            }
+            previous = Some((end, epoch));
+            seen += 1;
         }
+        if seen != n {
+            return Err(Error::Refusal("comparison_header_gap"));
+        }
+        pairs.insert(Pair {
+            cursor: start,
+            reference: previous.ok_or(Error::Refusal("comparison_header_gap"))?.0,
+        });
         let witness_tx_hash=tx.query_opt("SELECT encode(hash,'hex') FROM public.tx WHERE id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 ORDER BY id LIMIT 1",&[&i64::from(horizon),&i64::from(target)]).await?.map(|r|r.get(0));
         let out = Self {
             event_anchors: vec![],
@@ -310,7 +325,7 @@ impl Default for Options {
     }
 }
 /// Same TLS/credential handling as Store, default RO forced even if role default
-/// is off. Session timeouts are inherited unless explicit positive limits set.
+/// is off. Positive timeouts are inherited; an unlimited 0 receives a 60s bound.
 pub struct Reader {
     store: Store,
 }
@@ -1606,34 +1621,34 @@ pub async fn capture(
             let data = result
                 .add(tx, s, &format!("epoch/{epoch}"), &values)
                 .await?;
-            if s.name == "get_latest_block_for_epoch" {
-                if let Some(row) = data.first() {
-                    let row: serde_json::Value = serde_json::from_str(row)?;
-                    let block = row["block_no"]
-                        .as_i64()
-                        .ok_or(Error::Refusal("comparison_invalid_epoch_header"))?;
-                    let block = i32::try_from(block)
-                        .map_err(|_| Error::Refusal("comparison_height_out_of_range"))?;
-                    for candidates in entries.iter().filter(|e| {
-                        e.kind == "read"
-                            && [
-                                "get_utxos_for_address_tx_in_enabled",
-                                "get_utxos_for_address_tx_in_consumed",
-                            ]
-                            .contains(&e.name.as_str())
-                    }) {
-                        result
-                            .add(
-                                tx,
-                                candidates,
-                                &format!("epoch/{epoch}/{}/candidates", s.id),
-                                &[
-                                    Bind::Text(context.options.candidate_address.clone()),
-                                    Bind::I32(block),
-                                ],
-                            )
-                            .await?;
-                    }
+            if s.name == "get_latest_block_for_epoch"
+                && let Some(row) = data.first()
+            {
+                let row: serde_json::Value = serde_json::from_str(row)?;
+                let block = row["block_no"]
+                    .as_i64()
+                    .ok_or(Error::Refusal("comparison_invalid_epoch_header"))?;
+                let block = i32::try_from(block)
+                    .map_err(|_| Error::Refusal("comparison_height_out_of_range"))?;
+                for candidates in entries.iter().filter(|e| {
+                    e.kind == "read"
+                        && [
+                            "get_utxos_for_address_tx_in_enabled",
+                            "get_utxos_for_address_tx_in_consumed",
+                        ]
+                        .contains(&e.name.as_str())
+                }) {
+                    result
+                        .add(
+                            tx,
+                            candidates,
+                            &format!("epoch/{epoch}/{}/candidates", s.id),
+                            &[
+                                Bind::Text(context.options.candidate_address.clone()),
+                                Bind::I32(block),
+                            ],
+                        )
+                        .await?;
                 }
             }
         }
@@ -1972,7 +1987,7 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
         unbounded_checked_b: b.unbounded_checked,
         coverage_a: coverage(a),
         coverage_b: coverage(b),
-        bridge_probe:BridgeProbe {metadata_key:6500973,metadata_key_source:"node86774edf: partner-chains/toolkit/smart-contracts/plutus-data/src/bridge.rs:6 TOKEN_TRANSFER_METADATUM_KEY; db_model.rs:889 binding".to_owned(),checkpoint_mode:"synthetic Block(cursor.block-1), unlimited raw SQL range".to_owned(),asset_source:"pinned profile shipped bridge genesis plus separate ICS/reserve inputs; current runtime checkpoint/asset not measured".to_owned()},
+        bridge_probe:BridgeProbe {metadata_key:6500973,metadata_key_source:"node 86774edf: partner-chains/toolkit/smart-contracts/plutus-data/src/bridge.rs:6 TOKEN_TRANSFER_METADATUM_KEY; db_model.rs:889 binding".to_owned(),checkpoint_mode:"synthetic Block(cursor.block-1), unlimited raw SQL range".to_owned(),asset_source:"pinned profile shipped bridge genesis plus separate ICS/reserve inputs; current runtime checkpoint/asset not measured".to_owned()},
         keep_rule_version: crate::KEEP_RULE_VERSION,
         matched: differences.iter().all(|d| d.informational),
         node_commit: a.node_commit.clone(),

@@ -626,6 +626,7 @@ async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
         ))
         .await?;
     let a = source.dsn(true).replace(" sslmode=disable", "");
+    let captured = dir.path().join("tls-source.capture.json");
     let converted = target
         .cli(
             "convert",
@@ -639,6 +640,8 @@ async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
                 &root,
                 "--horizon-block",
                 "6",
+                "--capture-source",
+                captured.to_str().unwrap(),
             ],
         )
         .await?;
@@ -715,6 +718,34 @@ async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
             json!({"event":"tls_case","case":case,"success":out.status.success()})
         );
     }
+    let from_capture = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "compare",
+            "--a-capture",
+            captured.to_str().unwrap(),
+            "--b",
+            &b,
+            "--network",
+            "mainnet",
+            "--positions",
+            "auto",
+            "--b-tls-root-cert",
+            &root,
+            "--b-password-file",
+            password.to_str().unwrap(),
+        ])
+        .output()
+        .await?;
+    assert!(
+        from_capture.status.success(),
+        "{}",
+        String::from_utf8_lossy(&from_capture.stderr)
+    );
+    let report: Value = serde_json::from_slice(&from_capture.stdout)?;
+    assert_eq!(report["settings_a"]["ssl"], true);
+    assert_eq!(report["settings_b"]["ssl"], true);
+    assert_eq!(report["matched"], true);
+    println!("{}", json!({"event":"tls_source_capture","success":true}));
     assert_eq!(target.rows().await?, before);
     source.cleanup().await?;
     target.cleanup().await?;
@@ -811,6 +842,25 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
         }
         ta.commit().await?;
         tb.commit().await?;
+        let actual = cli(&source, &target, &f.profile, &[]).await?;
+        assert_eq!(
+            actual.status.code(),
+            Some(2),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        let report: Value = serde_json::from_slice(&actual.stdout)?;
+        assert!(report["differences"].as_array().unwrap().iter().any(|d| {
+            d["query"]
+                .as_str()
+                .unwrap()
+                .starts_with("get_utxos_for_address_")
+                && d["informational"] == false
+        }));
+        println!(
+            "{}",
+            json!({"event":"q19_cli_counterexample","scenario":scenario,"exit":actual.status.code()})
+        );
         source.cleanup().await?;
         target.cleanup().await?;
     }
@@ -1157,6 +1207,8 @@ async fn compare_event_anchors_real_transaction_witness_and_full_window_coverage
     f.reindex_ordinals();
     let source = Database::new().await?;
     source.legacy(&f).await?;
+    // A valid32-byte all-zero fixture hash collides with the first miss probe.
+    source.write("UPDATE serve.tx SET hash=decode(repeat('00',32),'hex') WHERE id=(SELECT min(id) FROM serve.tx WHERE id BETWEEN 6::bigint*4096 AND 8::bigint*4096+4095)").await?;
     let target = Database::new().await?;
     target
         .cli(
@@ -1210,6 +1262,8 @@ async fn compare_event_anchors_real_transaction_witness_and_full_window_coverage
     assert!(report["transaction_hit_available_a"].as_bool().unwrap());
     assert!(report["transaction_hit_available_b"].as_bool().unwrap());
     assert_eq!(report["bridge_probe"]["metadata_key"], 6500973);
+    assert_ne!(report["missing_tx_hash"], "00".repeat(32));
+    assert_eq!(positions["witness_tx_hash"], "00".repeat(32));
     let witness = positions["witness_tx_hash"].as_str().unwrap();
     let row=connect(&source.config).await?.query_one("SELECT EXISTS(SELECT 1 FROM serve.tx t JOIN serve.block b ON b.id=t.block_id WHERE t.hash=decode($1,'hex'))",&[&witness]).await?;
     assert!(row.get::<_, bool>(0));
@@ -1273,6 +1327,193 @@ async fn compare_more_than_five_hundred_pairs_and_quiet_event_classes() -> Resul
         "{}",
         json!({"event":"generated_500_pair_comparison","pairs":report["positions"]["pairs"].as_array().unwrap().len(),"executions":report["executions"],"wall_seconds":began.elapsed().as_secs_f64(),"event_anchors":report["positions"]["event_anchors"].as_array().unwrap().len()})
     );
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_cli_refuses_helper_sentinel_that_violates_the_native_guarantee() -> Result {
+    let (source, target, f) = setup(355).await?;
+    let c = connect(&source.config).await?;
+    let original: String = c
+        .query_one(
+            "SELECT pg_get_functiondef('chain.gate()'::regprocedure)",
+            &[],
+        )
+        .await?
+        .get(0);
+    // A deliberately faulty source produces empty helper subqueries only. The
+    // original node SQL is unchanged; the independent relationship read sees
+    // the real preceding facts and must reject the fabricated zero sentinel.
+    let altered = original.replace(
+        " RETURN true;",
+        " IF position('low_tx.tx_id' in current_query())>0 THEN RETURN false; END IF; RETURN true;",
+    );
+    assert_ne!(altered, original);
+    c.batch_execute(&altered).await?;
+    let output = cli(&source, &target, &f.profile, &[]).await?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("comparison_invalid_bounds"));
+    c.batch_execute(&original).await?;
+    assert!(
+        cli(&source, &target, &f.profile, &[])
+            .await?
+            .status
+            .success()
+    );
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_reader_limits_fill_zero_and_preserve_positive_owner_settings() -> Result {
+    let (source, target, _) = setup(357).await?;
+    for (statement, idle, expected_statement, expected_idle) in
+        [(0, 0, 60000i64, 60000i64), (1234, 2345, 1234, 2345)]
+    {
+        source.admin.batch_execute(&format!("ALTER ROLE {} SET statement_timeout='{statement}ms';ALTER ROLE {} SET idle_in_transaction_session_timeout='{idle}ms'",source.reader,source.reader)).await?;
+        let mut reader = Reader::connect(source.reader_config(), None).await?;
+        let tx = reader.snapshot().await?;
+        let row = tx.query_one("SELECT (extract(epoch FROM current_setting('statement_timeout')::interval)*1000)::bigint,(extract(epoch FROM current_setting('idle_in_transaction_session_timeout')::interval)*1000)::bigint", &[]).await?;
+        assert_eq!(row.get::<_, i64>(0), expected_statement);
+        assert_eq!(row.get::<_, i64>(1), expected_idle);
+        tx.commit().await?;
+        let legacy = LegacySource::connect(source.reader_config(), None).await?;
+        let row = legacy.client().query_one("SELECT (extract(epoch FROM current_setting('statement_timeout')::interval)*1000)::bigint,(extract(epoch FROM current_setting('idle_in_transaction_session_timeout')::interval)*1000)::bigint", &[]).await?;
+        assert_eq!(row.get::<_, i64>(0), expected_statement);
+        assert_eq!(row.get::<_, i64>(1), expected_idle);
+    }
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_peer_backend_failure_cancels_the_other_active_query() -> Result {
+    use std::time::{Duration, Instant};
+    let (source, target, f) = setup(359).await?;
+    let left_barrier = source.barrier().await?;
+    let right_barrier = connect(&target.config).await?;
+    let original: String = right_barrier
+        .query_one("SELECT pg_get_functiondef('dsa.gate()'::regprocedure)", &[])
+        .await?
+        .get(0);
+    let altered = original.replace(" RETURN true;", " IF position('to_jsonb' in current_query())>0 THEN PERFORM pg_advisory_xact_lock(726,1); END IF; RETURN true;");
+    assert_ne!(altered, original);
+    right_barrier.batch_execute(&altered).await?;
+    right_barrier
+        .query_one("SELECT pg_advisory_lock(726,1)", &[])
+        .await?;
+    let child = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "compare",
+            "--a",
+            &source.dsn(true),
+            "--b",
+            &target.dsn(true),
+            "--network",
+            &f.profile.network,
+            "--positions",
+            "auto",
+            "--horizon-block",
+            "6",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let began = Instant::now();
+    let right_pid = loop {
+        let waiting=source.admin.query("SELECT datname,pid FROM pg_stat_activity WHERE datname=ANY($1::text[]) AND application_name='db-sync-alt-compare' AND wait_event='advisory'",&[&vec![source.name.clone(),target.name.clone()]]).await?;
+        if waiting.len() == 2 {
+            break waiting
+                .iter()
+                .find(|r| r.get::<_, String>(0) == target.name)
+                .unwrap()
+                .get::<_, i32>(1);
+        }
+        if began.elapsed() > Duration::from_secs(10) {
+            return Err("both comparison queries did not reach their owned barriers".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let stop = Instant::now();
+    assert!(
+        source
+            .admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&right_pid])
+            .await?
+            .get::<_, bool>(0)
+    );
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await??;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cancel_request"));
+    loop {
+        let left:i64=source.admin.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=ANY($1::text[]) AND application_name='db-sync-alt-compare'",&[&vec![source.name.clone(),target.name.clone()]]).await?.get(0);
+        if left == 0 {
+            break;
+        }
+        if stop.elapsed() > Duration::from_secs(5) {
+            return Err("peer backend failure left a comparison backend/snapshot".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    println!(
+        "{}",
+        json!({"event":"comparison_peer_backend_failure","release_seconds":stop.elapsed().as_secs_f64()})
+    );
+    left_barrier
+        .query_one("SELECT pg_advisory_unlock(726,1)", &[])
+        .await?;
+    right_barrier
+        .query_one("SELECT pg_advisory_unlock(726,1)", &[])
+        .await?;
+    drop(left_barrier);
+    drop(right_barrier);
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_source_capture_path_preflight_preserves_pristine_destination() -> Result {
+    let mut f = fixture(361);
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    let before = target.catalog().await?;
+    let dir = tempfile::tempdir()?;
+    let existing = dir.path().join("existing.capture");
+    std::fs::write(&existing, b"preserved")?;
+    let missing = dir.path().join("absent/observations.json");
+    for (file, error) in [
+        (&existing, "source_capture_exists"),
+        (&missing, "invalid_source_capture_path"),
+    ] {
+        target
+            .refusal(
+                &f.profile.network,
+                &source.dsn(true),
+                &[
+                    "--horizon-block",
+                    "6",
+                    "--capture-source",
+                    file.to_str().unwrap(),
+                ],
+                error,
+            )
+            .await?;
+        assert_eq!(before, target.catalog().await?);
+        assert_eq!(std::fs::read(&existing)?, b"preserved");
+    }
     source.cleanup().await?;
     target.cleanup().await?;
     Ok(())
