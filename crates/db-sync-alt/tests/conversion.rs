@@ -766,10 +766,10 @@ async fn commit_reply_proxy(
                                 }
                                 let mut body = vec![0; n - 4];
                                 client_read.read_exact(&mut body).await?;
-                                if tag == [b'Q'] && body.starts_with(b"UPDATE dsa.position SET serving=true") {
+                                if tag == *b"Q" && body.starts_with(b"UPDATE dsa.position SET serving=true") {
                                     publishing = true;
                                 }
-                                if publishing && tag == [b'Q'] && body == b"COMMIT\0" {
+                                if publishing && tag == *b"Q" && body == b"COMMIT\0" {
                                     committing.store(true, std::sync::atomic::Ordering::SeqCst);
                                 }
                                 server_write.write_all(&tag).await?;
