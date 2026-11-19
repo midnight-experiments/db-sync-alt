@@ -1522,15 +1522,15 @@ async fn supply_source_realistic_cost() -> Result {
     let began = Instant::now();
     for low in (i64::from(offset)..=i64::from(p)).step_by(10000) {
         let high = (low + 9999).min(i64::from(p));
-        source.write(&format!("INSERT INTO serve.block SELECT n,decode(md5('supplyblock/'||n::text)||md5('supplyblock2/'||n::text),'hex'),(n-{offset})/20000,n*20,n,timestamp '2026-01-01'+(n-{offset})*interval '20 seconds',0 FROM generate_series({low},{high})n ON CONFLICT DO NOTHING")).await?;
+        source.write(&format!("INSERT INTO serve.block SELECT n,decode(md5('supplyblock/'||n::text)||md5('supplyblock2/'||n::text),'hex'),(n-{offset})/20000,n*20,n,timestamp '2026-01-01'+(n-{offset})*interval '20 seconds',0 FROM generate_series({low}::bigint,{high}::bigint)n ON CONFLICT DO NOTHING")).await?;
     }
     for low in (0..generated).step_by(10000) {
         let high = (low + 9999).min(generated - 1);
-        source.write(&format!("WITH coordinates AS(SELECT DISTINCT {offset}+13+n/3 h FROM generate_series({low},{high})n) INSERT INTO serve.tx SELECT h*4096+100,decode(md5('supplytx/'||h::text)||md5('supplytx2/'||h::text),'hex'),h,100,true FROM coordinates ON CONFLICT DO NOTHING;
-        INSERT INTO serve.tx_out SELECT ({offset}+13+n/3)*16777216+100*4096+n%3,({offset}+13+n/3)*4096+100,(n%3)::smallint,'holder-'||(n%10007)::text,1,NULL,NULL FROM generate_series({low},{high})n;
-        INSERT INTO serve.ma_tx_out SELECT (({offset}+13+n/3)*16777216+100*4096+n%3)*4096,1,({offset}+13+n/3)*16777216+100*4096+n%3,{asset} FROM generate_series({low},{high})n;
-        WITH coordinates AS(SELECT DISTINCT {offset}+14+n/3 h FROM generate_series({low},least({high},{spent}-1))n) INSERT INTO serve.tx SELECT h*4096+101,decode(md5('supplyspend/'||h::text)||md5('supplyspend2/'||h::text),'hex'),h,101,true FROM coordinates ON CONFLICT DO NOTHING;
-        INSERT INTO serve.tx_in SELECT ({offset}+14+n/3)*16777216+101*4096+n%3,({offset}+14+n/3)*4096+101,({offset}+13+n/3)*4096+100,(n%3)::smallint FROM generate_series({low},least({high},{spent}-1))n")).await?;
+        source.write(&format!("WITH coordinates AS(SELECT DISTINCT {offset}+13+n/3 h FROM generate_series({low}::bigint,{high}::bigint)n) INSERT INTO serve.tx SELECT h*4096+100,decode(md5('supplytx/'||h::text)||md5('supplytx2/'||h::text),'hex'),h,100,true FROM coordinates ON CONFLICT DO NOTHING;
+        INSERT INTO serve.tx_out SELECT ({offset}+13+n/3)*16777216+100*4096+n%3,({offset}+13+n/3)*4096+100,(n%3)::smallint,'holder-'||(n%10007)::text,1,NULL,NULL FROM generate_series({low}::bigint,{high}::bigint)n;
+        INSERT INTO serve.ma_tx_out SELECT (({offset}+13+n/3)*16777216+100*4096+n%3)*4096,1,({offset}+13+n/3)*16777216+100*4096+n%3,{asset} FROM generate_series({low}::bigint,{high}::bigint)n;
+        WITH coordinates AS(SELECT DISTINCT {offset}+14+n/3 h FROM generate_series({low}::bigint,least({high}::bigint,{spent}::bigint-1))n) INSERT INTO serve.tx SELECT h*4096+101,decode(md5('supplyspend/'||h::text)||md5('supplyspend2/'||h::text),'hex'),h,101,true FROM coordinates ON CONFLICT DO NOTHING;
+        INSERT INTO serve.tx_in SELECT ({offset}+14+n/3)*16777216+101*4096+n%3,({offset}+14+n/3)*4096+101,({offset}+13+n/3)*4096+100,(n%3)::smallint FROM generate_series({low}::bigint,least({high}::bigint,{spent}::bigint-1))n")).await?;
         if low % 100000 == 0 {
             println!(
                 "{}",
