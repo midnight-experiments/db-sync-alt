@@ -200,6 +200,10 @@ pub struct SourceReport {
     pub preflight_seconds: f64,
     pub network_read_seconds: f64,
     pub supply_read_seconds: f64,
+    pub supply_batches: u64,
+    /// Raw asset rows paged before filtering; includes foreign units.
+    pub supply_rows: u64,
+    pub longest_supply_page_seconds: f64,
     pub bounds_read_seconds: f64,
     pub horizon_read_seconds: f64,
     pub horizon_point_queries: u32,
@@ -677,6 +681,9 @@ async fn source_report(
         preflight_seconds,
         network_read_seconds,
         supply_read_seconds: 0.0,
+        supply_batches: 0,
+        supply_rows: 0,
+        longest_supply_page_seconds: 0.0,
         bounds_read_seconds,
         horizon_read_seconds: horizon_started.elapsed().as_secs_f64(),
         horizon_point_queries: point_queries,
@@ -691,11 +698,18 @@ async fn source_report(
     })
 }
 
+#[derive(Default)]
+struct SupplyCost {
+    batches: u64,
+    rows: u64,
+    longest_seconds: f64,
+}
+
 async fn supply(
     source: &Transaction<'_>,
     profile: &Profile,
     target: u32,
-) -> Result<BTreeMap<String, String>, Error> {
+) -> Result<(BTreeMap<String, String>, SupplyCost), Error> {
     let units = dsa_chain::assets::fixed_units(profile);
     let policies = units
         .iter()
@@ -705,8 +719,68 @@ async fn supply(
         .iter()
         .map(|u| hex::decode(&u[56..]).map_err(|_| Error::Refusal("invalid_keep_profile")))
         .collect::<Result<Vec<_>, _>>()?;
-    let rows=source.query("WITH fixed AS(SELECT * FROM unnest($1::bytea[],$2::bytea[]) f(policy,name)) SELECT encode(f.policy,'hex')||encode(f.name,'hex'),trunc(coalesce(sum(a.quantity) FILTER(WHERE o.id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM public.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index AND i.id BETWEEN 0 AND $3::bigint*16777216+16777215)),0))::text FROM fixed f LEFT JOIN public.multi_asset m ON m.policy=f.policy AND m.name=f.name LEFT JOIN public.ma_tx_out a ON a.ident=m.id AND a.id BETWEEN 0 AND $3::bigint*68719476736+68719476735 LEFT JOIN public.tx_out o ON o.id=a.tx_out_id AND o.id BETWEEN 0 AND $3::bigint*16777216+16777215 GROUP BY f.policy,f.name ORDER BY f.policy,f.name",&[&policies,&names,&i64::from(target)]).await?;
-    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    let mut amounts = units
+        .iter()
+        .map(|u| (u.clone(), "0".to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let sql = include_str!("conversion_supply.sql");
+    let sql_sha256 = format!("{:x}", Sha256::digest(sql.as_bytes()));
+    let started = Instant::now();
+    let mut after_id = -1_i64;
+    let mut cost = SupplyCost::default();
+    eprintln!(
+        "{}",
+        json!({"event":"source_supply_started","operation":"convert","target":target,"page_rows":4096,"sql_sha256":sql_sha256})
+    );
+    loop {
+        let previous = units.iter().map(|u| amounts[u].clone()).collect::<Vec<_>>();
+        let page_started = Instant::now();
+        eprintln!(
+            "{}",
+            json!({"event":"source_supply_page_started","operation":"convert","page":cost.batches,"after_asset_id":after_id,"target":target,"sql_sha256":sql_sha256})
+        );
+        let rows = source
+            .query(
+                sql,
+                &[&policies, &names, &i64::from(target), &after_id, &previous],
+            )
+            .await
+            .map_err(|error| Error::SourceRead {
+                family: "supply",
+                elapsed_seconds: page_started.elapsed().as_secs_f64(),
+                error,
+            })?;
+        let elapsed = page_started.elapsed().as_secs_f64();
+        let first = rows.first().ok_or(Error::Refusal("invalid_supply_page"))?;
+        let last: Option<i64> = first.get(2);
+        let count: i64 = first.get(3);
+        if !(0..=4096).contains(&count)
+            || (count == 0) != last.is_none()
+            || last.is_some_and(|id| id <= after_id)
+        {
+            return Err(Error::Refusal("invalid_supply_page"));
+        }
+        amounts = rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+        if amounts.keys().ne(units.iter()) {
+            return Err(Error::Refusal("invalid_supply_page"));
+        }
+        cost.batches += 1;
+        cost.rows += count as u64;
+        cost.longest_seconds = cost.longest_seconds.max(elapsed);
+        eprintln!(
+            "{}",
+            json!({"event":"source_supply_page_finished","operation":"convert","page":cost.batches-1,"after_asset_id":after_id,"last_asset_id":last,"rows":count,"elapsed_seconds":elapsed,"sql_sha256":sql_sha256})
+        );
+        match last {
+            Some(id) => after_id = id,
+            None => break,
+        }
+    }
+    eprintln!(
+        "{}",
+        json!({"event":"source_supply_finished","operation":"convert","batches":cost.batches,"rows":cost.rows,"elapsed_seconds":started.elapsed().as_secs_f64(),"longest_page_seconds":cost.longest_seconds,"sql_sha256":sql_sha256})
+    );
+    Ok((amounts, cost))
 }
 
 struct Batch {
@@ -814,8 +888,11 @@ impl Store {
         self.conversion_destination_preflight(profile).await?;
         let mut report = source_report(source, profile, options).await?;
         let supply_started = Instant::now();
-        let amounts = supply(source, profile, report.state.target.height).await?;
+        let (amounts, supply_cost) = supply(source, profile, report.state.target.height).await?;
         report.supply_read_seconds = supply_started.elapsed().as_secs_f64();
+        report.supply_batches = supply_cost.batches;
+        report.supply_rows = supply_cost.rows;
+        report.longest_supply_page_seconds = supply_cost.longest_seconds;
         let prepare_started = Instant::now();
         self.prepare_destination(profile, "convert_failed").await?;
         let destination = DestinationCost {

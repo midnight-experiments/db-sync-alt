@@ -1243,3 +1243,180 @@ async fn convert_v2_historical_outpoint_tokens_and_original_ordinals_roundtrip()
     restored.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Result {
+    let mut f = fixture(401);
+    let mut added = Vec::new();
+    for n in 0..4300_u16 {
+        let out = f.output(7, 100 + n / 4000, n % 4000, "other", "cnight", None);
+        for asset in f
+            .chain
+            .output_assets
+            .values_mut()
+            .filter(|a| a.output == out)
+        {
+            asset.asset = 9001;
+        }
+        added.push(out);
+    }
+    let cn = f.asset_id("cnight");
+    for out in &added[100..103] {
+        for asset in f
+            .chain
+            .output_assets
+            .values_mut()
+            .filter(|a| a.output == *out)
+        {
+            asset.asset = cn;
+        }
+    }
+    f.spend(7, 200, 0, added[100]);
+    f.spend(8, 200, 0, added[101]);
+    f.spend(9, 200, 0, added[102]);
+    // An absent optional fixed descriptor must still produce a zero supply.
+    let absent = f.asset_id("technical_committee");
+    f.chain.output_assets.retain(|_, a| a.asset != absent);
+    f.chain.assets.remove(&absent);
+    f.reindex_ordinals();
+    let boundary = f.chain.output_assets.keys().copied().nth(4095).unwrap();
+    let after_boundary = f.chain.output_assets.keys().copied().nth(4096).unwrap();
+    f.chain.output_assets.get_mut(&boundary).unwrap().asset = cn;
+    f.chain
+        .output_assets
+        .get_mut(&after_boundary)
+        .unwrap()
+        .asset = cn;
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    source.write(&format!("UPDATE serve.ma_tx_out SET quantity=18446744073709551615 WHERE id IN ({boundary},{after_boundary})")).await?;
+    let before = source.catalog().await?;
+    let mut reader = LegacySource::connect(source.reader_config(), None).await?;
+    let tx = reader.snapshot().await?;
+    let units = dsa_chain::assets::fixed_units(&f.profile);
+    let policies = units
+        .iter()
+        .map(|u| hex::decode(&u[..56]))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let names = units
+        .iter()
+        .map(|u| hex::decode(&u[56..]))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let expected = tx
+        .query(
+            include_str!("common/source_supply_unpaged.sql"),
+            &[&policies, &names, &8_i64],
+        )
+        .await?
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        expected[&f.profile.assets["technical_committee"].unit()],
+        "0"
+    );
+    assert!(expected[&f.profile.assets["cnight"].unit()].parse::<i128>()? > i128::from(u64::MAX));
+    let sql = include_str!("../../dsa-store/src/conversion_supply.sql");
+    let mut previous = vec!["0".to_owned(); units.len()];
+    let mut after = -1_i64;
+    let mut total = 0_i64;
+    let mut pages = 0;
+    let mut actual: BTreeMap<String, String>;
+    loop {
+        let plan: Value = tx
+            .query_one(
+                &format!("EXPLAIN(ANALYZE,BUFFERS,SETTINGS,FORMAT JSON) {sql}"),
+                &[&policies, &names, &8_i64, &after, &previous],
+            )
+            .await?
+            .get(0);
+        fn page_limit(v: &Value) -> bool {
+            if let Some(o) = v.as_object() {
+                if o.get("Subplan Name").and_then(Value::as_str) == Some("CTE page") {
+                    return o.get("Node Type").and_then(Value::as_str) == Some("Limit")
+                        && o["Actual Rows"].as_u64().unwrap() <= 4096;
+                }
+                return o.values().any(page_limit);
+            }
+            v.as_array().is_some_and(|a| a.iter().any(page_limit))
+        }
+        assert!(page_limit(&plan), "unbounded raw asset page: {plan}");
+        let rows = tx
+            .query(sql, &[&policies, &names, &8_i64, &after, &previous])
+            .await?;
+        let count: i64 = rows[0].get(3);
+        let last: Option<i64> = rows[0].get(2);
+        assert!(count <= 4096);
+        actual = rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect();
+        previous = units.iter().map(|u| actual[u].clone()).collect();
+        total += count;
+        pages += 1;
+        println!(
+            "{}",
+            json!({"event":"supply_page_plan","page":pages,"rows":count,"after_id":after,"last_id":last,"plan":plan})
+        );
+        if let Some(id) = last {
+            assert!(id > after);
+            after = id;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+    assert!(pages >= 3);
+    let total_expected:i64=tx.query_one("SELECT count(*) FROM public.ma_tx_out WHERE id BETWEEN 0 AND 8::bigint*68719476736+68719476735",&[]).await?.get(0);
+    assert_eq!(total, total_expected);
+    // PostgreSQL numeric accumulation also accepts a prior sum wider than u128.
+    let wide = "340282366920938463463374607431768211456".to_owned();
+    let previous = vec![wide.clone(); units.len()];
+    let result = tx
+        .query(sql, &[&policies, &names, &8_i64, &after, &previous])
+        .await?;
+    assert!(result.iter().all(|r| r.get::<_, String>(1) == wide));
+    tx.commit().await?;
+    drop(reader);
+    let target = Database::new().await?;
+    let output = target
+        .start_cli(
+            "convert",
+            "mainnet",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )?
+        .wait_with_output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let converted: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(converted["verified"]["supply"], json!(expected));
+    assert_eq!(converted["source"]["supply_rows"], total_expected);
+    assert_eq!(converted["source"]["supply_batches"], pages);
+    assert_eq!(converted["source"]["settings"]["statement_timeout"], "1min");
+    assert!(
+        converted["source"]["longest_supply_page_seconds"]
+            .as_f64()
+            .unwrap()
+            < 60.0
+    );
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if let Ok(event) = serde_json::from_str::<Value>(line)
+            && event["event"] == "source_supply_page_finished"
+        {
+            assert!(event["rows"].as_i64().unwrap() <= 4096);
+        }
+    }
+    assert_eq!(source.catalog().await?, before);
+    println!(
+        "{}",
+        json!({"event":"supply_page_cli_regression","rows":total_expected,"pages":pages,"boundary_id":boundary,"after_boundary_id":after_boundary,"source":converted["source"],"supply":expected})
+    );
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}

@@ -87,3 +87,5 @@ conversion snapshot for a later `compare --a-capture FILE --b '<reader DSN>'`.
 See [comparison](rust-comparison.md) for publication/failure ordering and source
 advancement. It adds the configured catalogue read workload to conversion;
 real-source access budgets must include those reads.
+
+Supply preflight is a whole-source operation within the same read-only snapshot. It pages the indexed unique ma_tx_out.id in ascending order, at most4096 raw rows before unit filtering, through the target bound. Each page checks only those outputs and their target-bounded spend lookups. Foreign-only pages still advance the cursor; missing fixed units stay zero. Prior totals and page sums are combined as PostgreSQL numeric values passed as text, without Rust integer/float conversion. The source statement and overall limits remain in force. Source reports include raw supply rows, page count and longest page time; structured progress records identify each page and the SQL hash.
