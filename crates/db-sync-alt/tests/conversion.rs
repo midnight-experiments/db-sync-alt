@@ -805,6 +805,7 @@ async fn commit_reply_proxy(
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
 async fn convert_deadline_and_term_after_publication_report_unknown_then_verify() -> Result {
+    use tokio::io::AsyncReadExt;
     for signal in [false, true] {
         let f = fixture(220);
         let source = Database::new().await?;
@@ -837,6 +838,17 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
+        // Progress output must not become the backpressure being tested.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stdout = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        let stderr = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
         let observer = connect(&target.config).await?;
         let start = Instant::now();
         loop {
@@ -871,8 +883,12 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
                     .success()
             );
         }
-        let output =
-            tokio::time::timeout(Duration::from_secs(16), child.wait_with_output()).await??;
+        let status = tokio::time::timeout(Duration::from_secs(16), child.wait()).await??;
+        let output = std::process::Output {
+            status,
+            stdout: stdout.await??,
+            stderr: stderr.await??,
+        };
         let report = failure(&output)?;
         assert_eq!(
             report["error"],
