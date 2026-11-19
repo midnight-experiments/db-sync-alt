@@ -831,6 +831,7 @@ async fn convert_source_statement_timeout_is_named_closed_and_retryable() -> Res
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
 async fn convert_destination_termination_stream_finish_and_post_source_commit_kill() -> Result {
+    use tokio::io::AsyncReadExt;
     for mode in ["stream", "finish", "kill"] {
         let f = fixture(225);
         let source = Database::new().await?;
@@ -838,15 +839,12 @@ async fn convert_destination_termination_stream_finish_and_post_source_commit_ki
         let target = Database::new().await?;
         target.cli("create", "mainnet", &[]).await?;
         let owner = connect(&target.config).await?;
-        let table = if mode == "stream" {
-            "serve.block"
-        } else {
-            "dsa.first_served"
-        };
-        owner.batch_execute(&format!("CREATE FUNCTION dsa.test_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(726,2);RETURN NEW;END$$;CREATE TRIGGER test_barrier BEFORE INSERT ON {table} FOR EACH STATEMENT EXECUTE FUNCTION dsa.test_barrier()")).await?;
-        owner
-            .query_one("SELECT pg_advisory_lock(726,2)", &[])
-            .await?;
+        if mode != "stream" {
+            owner.batch_execute("CREATE FUNCTION dsa.test_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(726,2);RETURN NEW;END$$;CREATE TRIGGER test_barrier BEFORE INSERT ON dsa.first_served FOR EACH STATEMENT EXECUTE FUNCTION dsa.test_barrier()").await?;
+            owner
+                .query_one("SELECT pg_advisory_lock(726,2)", &[])
+                .await?;
+        }
         let mut child = target.start_cli(
             "convert",
             "mainnet",
@@ -859,21 +857,39 @@ async fn convert_destination_termination_stream_finish_and_post_source_commit_ki
                 "2",
             ],
         )?;
+        // Per-page progress must be consumed while the synchronization observer
+        // runs, rather than letting a full pipe stop the child before its gate.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let output = tokio::spawn(async move {
+            let mut b = Vec::new();
+            stdout.read_to_end(&mut b).await.map(|_| b)
+        });
+        let errors = tokio::spawn(async move {
+            let mut b = Vec::new();
+            stderr.read_to_end(&mut b).await.map(|_| b)
+        });
         let started = Instant::now();
         let pid = loop {
-            if let Some(r)=target.admin.query_opt("SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory'",&[&target.name]).await? {break r.get::<_,i32>(0);}
+            let sql = if mode == "stream" {
+                "SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND query LIKE 'COPY pg_temp.block%' AND xact_start IS NOT NULL"
+            } else {
+                "SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory'"
+            };
+            if let Some(row) = target.admin.query_opt(sql, &[&target.name]).await? {
+                break row.get::<_, i32>(0);
+            }
             if started.elapsed() > Duration::from_secs(10) {
                 return Err(format!("no destination {mode} barrier").into());
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        if mode != "stream" {
-            let source_idle:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND state='idle' AND xact_start IS NULL)",&[&source.name]).await?.get(0);
-            assert!(
-                source_idle,
-                "source transaction must be committed before finish barrier"
-            );
-        }
+        let source_open:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+        assert_eq!(
+            source_open,
+            mode == "stream",
+            "source snapshot phase at {mode}"
+        );
         if mode == "kill" {
             child.kill().await?;
         } else {
@@ -882,16 +898,42 @@ async fn convert_destination_termination_stream_finish_and_post_source_commit_ki
                 .query_one("SELECT pg_terminate_backend($1)", &[&pid])
                 .await?;
         }
-        owner
-            .query_one("SELECT pg_advisory_unlock(726,2)", &[])
-            .await?;
-        assert!(!child.wait_with_output().await?.status.success());
+        if mode != "stream" {
+            owner
+                .query_one("SELECT pg_advisory_unlock(726,2)", &[])
+                .await?;
+        }
+        let status = child.wait().await?;
+        let stdout = output.await??;
+        let stderr = errors.await??;
+        assert!(
+            !status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        let released = Instant::now();
+        loop {
+            let held:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+            if !held {
+                break;
+            }
+            assert!(
+                released.elapsed() < Duration::from_secs(3),
+                "source snapshot leaked after {mode}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         target.closed_empty().await?;
-        owner
-            .batch_execute(&format!(
-                "DROP TRIGGER test_barrier ON {table};DROP FUNCTION dsa.test_barrier()"
-            ))
-            .await?;
+        let temporary:i64=target.admin.query_one("SELECT count(*) FROM pg_class c JOIN pg_roles r ON r.oid=c.relowner WHERE c.relpersistence='t' AND r.rolname=$1",&[&target.owner]).await?.get(0);
+        assert_eq!(temporary, 0, "temporary staging leaked after {mode}");
+        if mode != "stream" {
+            owner.batch_execute("DROP TRIGGER test_barrier ON dsa.first_served;DROP FUNCTION dsa.test_barrier()").await?;
+        }
+        println!(
+            "{}",
+            json!({"event":"staged_conversion_cancellation","phase":mode,"source_transaction_released":true,"temporary_relations_remaining":temporary,"serving_partial":false})
+        );
         let retried = target
             .cli(
                 "convert",

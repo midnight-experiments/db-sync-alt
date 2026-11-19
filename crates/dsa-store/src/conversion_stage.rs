@@ -396,7 +396,7 @@ pub(crate) async fn select(
     }).collect::<Vec<_>>().join(" UNION ALL ");
     eprintln!(
         "{}",
-        json!({"event":"conversion_local_selection_started","source_active":false,"temporary_relation_bytes":raw.temporary_bytes})
+        json!({"event":"conversion_local_selection_started","source_reads_required":false,"temporary_relation_bytes":raw.temporary_bytes})
     );
     destination
         .execute(
