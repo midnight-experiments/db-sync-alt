@@ -1,77 +1,115 @@
-name: rust
+name: a5-supply-cost
 on:
   push:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'profiles/**'
-      - 'reference/**'
-      - '.github/workflows/rust.yml'
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'profiles/**'
-      - 'reference/**'
-      - '.github/workflows/rust.yml'
+    branches: [validation/a5-supply-6f4ea47]
 permissions:
   contents: read
 jobs:
-  check:
+  generated-supply:
     runs-on: ubuntu-24.04
-    container: rust:1.100.0-bookworm
-    timeout-minutes: 15
+    timeout-minutes: 40
+    env:
+      PRODUCT_PIN: 6f4ea4773b66dd7c851dd66848bae537a6fd7af7
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+      PG_IMAGE: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: 6f4ea4773b66dd7c851dd66848bae537a6fd7af7
           persist-credentials: false
-      - name: Install the pinned toolchain
+      - name: Pinned public generated-source provenance and build
+        shell: bash
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          rustup show active-toolchain
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
-      - run: python3 .github/scripts/check_public_source.py
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
-      - name: Check generated profiles against the node sources
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP"/{evidence,cargo,target}
+          { git rev-parse HEAD; test "$(git rev-parse HEAD)" = "$PRODUCT_PIN"; test -z "$(git status --porcelain)"; git ls-files -z | xargs -0 sha256sum; uname -a; nproc; free -b; df -B1 "$RUNNER_TEMP"; docker version; docker context show; } > "$RUNNER_TEMP/evidence/provenance.txt"
+          docker pull "$RUST_IMAGE"
+          docker pull "$PG_IMAGE"
+          docker image inspect "$RUST_IMAGE" "$PG_IMAGE" > "$RUNNER_TEMP/evidence/images.json"
+          docker run --rm --name dsa-supply-build --cpus 2 --memory 4g --memory-swap 4g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target -e CARGO_BUILD_JOBS=2 "$RUST_IMAGE" \
+            sh -ec 'rustc -Vv; cargo test --locked -p db-sync-alt --test conversion --no-run' 2>&1 | tee "$RUNNER_TEMP/evidence/build.log"
+      - name: Generate and measure real-shaped source with unchanged reader limits
+        shell: bash
         run: |
-          git clone --filter=blob:none --no-checkout https://github.com/midnightntwrk/midnight-node.git "$RUNNER_TEMP/midnight-node"
-          git -C "$RUNNER_TEMP/midnight-node" checkout 86774edf8cc76345a5c3a4221f3fe80c094b1c33
-          cargo run --locked -p dsa-chain --example generate_profiles -- --node-source "$RUNNER_TEMP/midnight-node" --check
-          python3 .github/scripts/check_reference_source.py --node-source "$RUNNER_TEMP/midnight-node"
-  integration:
-    runs-on: ubuntu-24.04
-    container: rust:1.100.0-bookworm
-    timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_DB: dsa_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
+          set -euo pipefail
+          docker network create --internal dsa-supply-network
+          docker volume create dsa-supply-pgdata
+          docker run -d --name dsa-supply-postgres --network dsa-supply-network --network-alias postgres \
+            --cpus 1 --memory 1g --memory-swap 1g --shm-size 128m \
+            -v dsa-supply-pgdata:/var/lib/postgresql/data \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=dsa_test "$PG_IMAGE" \
+            -c max_wal_size=256MB -c min_wal_size=32MB -c checkpoint_timeout=30s
+          for i in $(seq 1 60); do if docker exec dsa-supply-postgres pg_isready -U postgres -d dsa_test; then break; fi; sleep 1; done
+          docker inspect dsa-supply-postgres > "$RUNNER_TEMP/evidence/startup-inspect.json"
+          docker exec dsa-supply-postgres psql -U postgres -d dsa_test -XAtc "SELECT jsonb_object_agg(name,setting) FROM pg_settings WHERE name IN ('server_version','work_mem','shared_buffers','jit','statement_timeout','synchronous_commit','fsync','full_page_writes','max_wal_size','checkpoint_timeout')" > "$RUNNER_TEMP/evidence/pg-settings.json"
+          docker run --rm --name dsa-supply-test --network dsa-supply-network --cpus 2 --memory 1g --memory-swap 1g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/target:/target:ro" -w /workspace \
+            -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' \
+            -e DSA_CONVERSION_SUPPLY_ONLY=1 -e DSA_SUPPLY_ROWS=2630984 "$RUST_IMAGE" \
+            sh -ec 'test_binary=$(find /target/debug -type f -executable -name "conversion-*"); test -n "$test_binary"; timeout --signal=TERM --kill-after=10s 1800s "$test_binary" convert_scaled_source_cost --ignored --exact --nocapture --test-threads=1' \
+            2>&1 | tee "$RUNNER_TEMP/evidence/supply-cost.log"
+      - name: Strict result readback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,os,hashlib
+          p=Path(os.environ['RUNNER_TEMP'])/'evidence';events=[];d=json.JSONDecoder()
+          for line in (p/'supply-cost.log').read_text().splitlines():
+              i=line.find('{"')
+              if i<0:continue
+              try:x,_=d.raw_decode(line[i:])
+              except ValueError:continue
+              if isinstance(x,dict)and'event'in x:events.append(x)
+          result=next(x for x in events if x['event']=='supply_cost_result');assert result['status']=='PASS';assert result['rows']==2630984;assert result['pages']==644;assert result['final_statement_timeout']=='1min';assert result['longest_page_seconds']<60
+          fixture=next(x for x in events if x['event']=='supply_cost_fixture');assert fixture['counts']['ma_tx_out']==2630984;assert fixture['counts']['tx_in']==2386344;assert fixture['counts']['block']==1202855
+          pages=[x for x in events if x['event']=='supply_cost_page'];assert len(pages)==result['pages'];assert sum(x['rows']for x in pages)==2630984;assert all(0<=x['rows']<=4096 and x['elapsed_seconds']<60 for x in pages)
+          plans=[x for x in events if x['event']=='supply_cost_page_plan'];assert len(plans)>=3
+          def walk(v):
+              if isinstance(v,dict):
+                  yield v
+                  for x in v.values():yield from walk(x)
+              elif isinstance(v,list):
+                  for x in v:yield from walk(x)
+          plan_rows=[]
+          for x in plans:
+              scans=[v for v in walk(x['plan'])if v.get('Relation Name')=='ma_tx_out'];assert scans
+              for v in scans:assert v['Node Type']in('Index Scan','Index Only Scan')and v.get('Scan Direction')=='Forward'and v['Actual Rows']<=4096
+              assert not any(v.get('Scan Direction')=='Backward'for v in walk(x['plan']))
+              plan_rows.append({'page':x['page'],'asset_scans':scans})
+          old=next(x for x in events if x['event']=='supply_cost_old');assert old['outcome']in('complete','57014')
+          (p/'validation.json').write_text(json.dumps({'status':'PASS','source_pin':os.environ['PRODUCT_PIN'],'fixture':fixture,'old':old,'result':result,'representative_plans':plan_rows,'host_timings':'isolated GitHub hosted SSD; separate from guarded local archive','sha256':hashlib.sha256((p/'supply-cost.log').read_bytes()).hexdigest()},indent=2)+'\n')
+          PY
+      - name: Preserve raw server/resource evidence and hashes
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          docker logs dsa-supply-postgres > "$RUNNER_TEMP/evidence/postgres.log" 2>&1 || true
+          docker inspect dsa-supply-postgres > "$RUNNER_TEMP/evidence/final-inspect.json" || true
+          docker stats --no-stream --format '{{json .}}' dsa-supply-postgres > "$RUNNER_TEMP/evidence/final-stats.json" || true
+          docker exec dsa-supply-postgres du -sb /var/lib/postgresql/data > "$RUNNER_TEMP/evidence/final-disk.txt" || true
+          docker exec dsa-supply-postgres psql -U postgres -d dsa_test -XAtc 'SELECT datname,temp_files,temp_bytes FROM pg_stat_database' > "$RUNNER_TEMP/evidence/temp-statistics.txt" || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,os
+          p=Path(os.environ['RUNNER_TEMP'])/'evidence'
+          with(p/'SHA256SUMS').open('w')as out:
+              for f in sorted(p.iterdir()):
+                  if f.is_file()and f.name!='SHA256SUMS':out.write(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.name+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          persist-credentials: false
-      - name: Install the pinned toolchain
+          name: a5-supply-cost-6f4ea47
+          path: ${{ runner.temp }}/evidence
+          retention-days: 30
+      - name: Remove generated-only resources
+        if: always()
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          rustup show active-toolchain
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
-      - name: PostgreSQL integration tests
-        env:
-          DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
-          # Deterministic CI sample; the full proof defaults to 10,000 cases
-          # when DSA_KEEP_CASES is unset in the on-demand test invocation.
-          DSA_KEEP_CASES: 64
-        run: cargo test --locked --workspace -- --ignored --nocapture --skip keep_rule_realistic_plans --skip convert_scaled_source_cost --skip compare_cli_tls_reader_files_and_certificate_identity
+          docker rm -f dsa-supply-build dsa-supply-test dsa-supply-postgres || true
+          docker volume rm dsa-supply-pgdata || true
+          docker network rm dsa-supply-network || true
