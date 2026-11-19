@@ -8,7 +8,7 @@ RUST='rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff
 PG='postgres:17.11-bookworm@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675'
 PREFIX='dsa-whole-'+os.environ['GITHUB_RUN_ID'];NETWORK=PREFIX+'-net';NAMES={k:PREFIX+'-'+k for k in ['source','destination','restored','worker']};VOLUMES={k:PREFIX+'-'+k+'-data' for k in ['source','destination','restored']};IDS={};STOP=threading.Event()
 def call(args,**kw):return subprocess.run(args,check=True,text=True,**kw)
-def output(args):return subprocess.check_output(args,text=True)
+def output(args):return subprocess.check_output(args,text=True,stderr=subprocess.STDOUT)
 def docker(*args):return output(['docker',*args])
 def save(name,value):(OUT/name).write_text(json.dumps(value,indent=2)+'\n')
 def inspect(name):return json.loads(docker('inspect',name))[0]
@@ -42,7 +42,7 @@ def probe(name,read,write):
  call(['docker','exec','-u','postgres',name,'rm','--','/var/lib/postgresql/data/whole-qualification-probe'])
  return {'admission':admitted,'probes':results}
 
-PG_QUERY="""SELECT json_build_object('at',clock_timestamp(),'database',current_database(),'database_bytes',pg_database_size(current_database()),'temporary_relations_bytes',coalesce((SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname LIKE 'pg_temp_%'),0),'stats',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database()),'sessions',(SELECT json_agg(json_build_object('pid',pid,'application_name',application_name,'state',state,'wait_type',wait_event_type,'wait',wait_event,'xact_start',xact_start,'backend_xmin',backend_xmin,'query_start',query_start,'query',left(query,250))) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()))"""
+PG_QUERY="""SELECT json_build_object('at',clock_timestamp(),'database',current_database(),'database_bytes',pg_database_size(current_database()),'temporary_relations_bytes',coalesce((SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname LIKE 'pg_temp_%' AND c.relkind IN('r','m')),0),'stats',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database()),'sessions',(SELECT json_agg(json_build_object('pid',pid,'application_name',application_name,'state',state,'wait_type',wait_event_type,'wait',wait_event,'xact_start',xact_start,'backend_xmin',backend_xmin,'query_start',query_start,'query',left(query,250))) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()))"""
 def monitor():
  with (OUT/'telemetry.jsonl').open('w') as log:
   while not STOP.wait(2):
@@ -59,9 +59,9 @@ def monitor():
      if d['State']['Running']:
       path=cg(name);data['memory_current']=stat_file(path/'memory.current');data['memory_peak']=stat_file(path/'memory.peak');data['io_stat']=io_stat(path);data['io_max']=stat_file(path/'io.max');data['cpu_stat']=stat_file(path/'cpu.stat')
       if role!='worker':
-       data['volume_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data').split()[0]);database=databases.get(role)
+       data['volume_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data').split()[0]);data['volume_allocated_bytes']=int(docker('exec',name,'du','-sB1','/var/lib/postgresql/data').split()[0]);data['wal_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data/pg_wal').split()[0]);database=databases.get(role)
        if database:
-        query=docker('exec',name,'psql','-XAt','-v','ON_ERROR_STOP=1','-U','postgres','-d',database,'-c',PG_QUERY).strip();data['database']=json.loads(query)
+        query=docker('exec','-e','PGOPTIONS=-c statement_timeout=1500',name,'psql','-XAt','-v','ON_ERROR_STOP=1','-U','postgres','-d',database,'-c',PG_QUERY).strip();data['database']=json.loads(query)
     except Exception as error:data['observation_error']=type(error).__name__+':'+str(error)[:400]
     record['containers'][role]=data
    record['evidence_bytes']=sum(p.stat().st_size for p in OUT.rglob('*') if p.is_file())
@@ -94,13 +94,13 @@ try:
  # Destination is slowed from its first write. Population itself is source-only;
  # source write cap is positively installed after generated setup/checkpoint.
  admission={role:probe(NAMES[role],4*1048576,2*1048576) for role in ['destination','restored']};save('destination-io-admission.json',admission)
- worker=['docker','run','-d','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e','DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,binary,'--ignored','--exact','whole_conversion_qualification','--nocapture']
+ worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e','DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,binary,'--ignored','--exact','whole_conversion_qualification','--nocapture']
  IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False
  while inspect(NAMES['worker'])['State']['Running']:
   if not admitted and (OUT/'fixture-ready.json').exists():
    admission['source']=probe(NAMES['source'],None,2*1048576);save('io-admission.json',admission);save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
   time.sleep(1)
- save('worker-exit.json',inspect(NAMES['worker'])['State']);assert inspect(NAMES['worker'])['State']['ExitCode']==0,'qualification binary failed'
+ save('worker-exit.json',inspect(NAMES['worker'])['State']);print(docker('logs',NAMES['worker']),flush=True);assert inspect(NAMES['worker'])['State']['ExitCode']==0,'qualification binary failed'
  save('qualification-success.json',{'source':PIN,'config':CONFIG,'admitted':admitted,'generated_only':True,'historical_acceptance':False})
 finally:
  STOP.set()
@@ -122,5 +122,7 @@ finally:
  # Do not upload full generated DBs, test executables or bulk snapshots.
  for name in ['source.capture.json','converted.snapshot','explicit.snapshot']:
   path=OUT/name
-  if path.exists():save(name+'.manifest.json',{'bytes':path.stat().st_size,'sha256':hashlib.sha256(path.read_bytes()).hexdigest()});path.unlink()
+  if path.exists():
+   try:save(name+'.manifest.json',{'bytes':path.stat().st_size,'sha256':hashlib.sha256(path.read_bytes()).hexdigest()});path.unlink()
+   except OSError as error:save(name+'.retention-error.json',{'error':str(error)});call(['sudo','chmod','u+r,g+r,o+r',str(path)]);path.unlink()
  save('SHA256SUMS.json',{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in OUT.iterdir() if p.is_file() and p.name!='SHA256SUMS.json'})

@@ -117,15 +117,18 @@ async fn compare(capture: &Path, database: &Database, name: &str) -> Result<Valu
         .await?;
     std::fs::write(directory().join(format!("{name}.stdout")), &output.stdout)?;
     std::fs::write(directory().join(format!("{name}.stderr")), &output.stderr)?;
-    let value: Value = serde_json::from_slice(&output.stdout)?;
     save(
         &format!("{name}.measurement.json"),
         &json!({"wall_seconds":started.elapsed().as_secs_f64(),"exit_code":output.status.code()}),
     )?;
     assert!(
         output.status.success(),
-        "{name} failed; raw report preserved"
+        "{name} failed ({:?}); stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
+    let value: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(value["matched"], true);
     assert_eq!(value["chain_order_checked_b"], true);
     assert!(value["positions"]["pairs"].as_array().unwrap().len() >= 500);
