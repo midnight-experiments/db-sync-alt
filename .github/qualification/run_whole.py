@@ -4,6 +4,7 @@ import hashlib,json,os,re,shutil,subprocess,sys,time,threading
 from pathlib import Path
 ROOT=Path(os.environ['GITHUB_WORKSPACE']);OUT=Path(os.environ['RUNNER_TEMP'])/'whole-evidence';OUT.mkdir(exist_ok=True)
 CONFIG=json.loads((ROOT/'.github/qualification/config.json').read_text());PIN=CONFIG['source'];MODE=CONFIG['mode'];DIVISOR=CONFIG['divisor'];assert re.fullmatch('[0-9a-f]{40}',PIN)
+FOCUS=CONFIG.get('target')=='index';TEST='a7_index_generated' if FOCUS else 'a7_whole_generated';HARNESS='a7_index.rs' if FOCUS else 'a7_whole.rs'
 RUST='rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea'
 PG='postgres:17.11-bookworm@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675'
 PREFIX='dsa-whole-'+os.environ['GITHUB_RUN_ID'];NETWORK=PREFIX+'-net';NAMES={k:PREFIX+'-'+k for k in ['source','destination','restored','worker']};VOLUMES={k:PREFIX+'-'+k+'-data' for k in ['source','destination','restored']};IDS={};STOP=threading.Event()
@@ -42,7 +43,7 @@ def probe(name,read,write):
  call(['docker','exec','-u','postgres',name,'rm','--','/var/lib/postgresql/data/whole-qualification-probe'])
  return {'admission':admitted,'probes':results}
 
-PG_QUERY="""SELECT json_build_object('at',clock_timestamp(),'database',current_database(),'database_bytes',pg_database_size(current_database()),'temporary_relations_bytes',coalesce((SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname LIKE 'pg_temp_%' AND c.relkind IN('r','m')),0),'stats',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database()),'sessions',(SELECT json_agg(json_build_object('pid',pid,'application_name',application_name,'state',state,'wait_type',wait_event_type,'wait',wait_event,'xact_start',xact_start,'backend_xmin',backend_xmin,'query_start',query_start,'state_change',state_change,'idle_seconds',CASE WHEN state LIKE 'idle%' THEN extract(epoch FROM clock_timestamp()-state_change) ELSE 0 END,'query',left(query,16384))) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()))"""
+PG_QUERY="""SELECT json_build_object('at',clock_timestamp(),'database',current_database(),'database_bytes',pg_database_size(current_database()),'temporary_relations_bytes',coalesce((SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname LIKE 'pg_temp_%' AND c.relkind IN('r','m')),0),'index_progress',(SELECT json_agg(row_to_json(i)) FROM pg_stat_progress_create_index i WHERE datname=current_database()),'stats',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database()),'sessions',(SELECT json_agg(json_build_object('pid',pid,'application_name',application_name,'state',state,'wait_type',wait_event_type,'wait',wait_event,'xact_start',xact_start,'backend_xmin',backend_xmin,'query_start',query_start,'state_change',state_change,'idle_seconds',CASE WHEN state LIKE 'idle%' THEN extract(epoch FROM clock_timestamp()-state_change) ELSE 0 END,'query',left(query,16384))) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()))"""
 def monitor():
  with (OUT/'telemetry.jsonl').open('w') as log:
   offset=0;phase=None
@@ -91,14 +92,14 @@ thread=None
 try:
  # Product files are the explicit untouched pin, with only one opt-in test copy.
  assert output(['git','-C',str(ROOT/'product'),'rev-parse','HEAD']).strip()==PIN
- shutil.copy2(ROOT/'.github/qualification/a7_whole.rs',ROOT/'product/crates/db-sync-alt/tests/a7_whole_generated.rs')
+ shutil.copy2(ROOT/'.github/qualification'/HARNESS,ROOT/'product/crates/db-sync-alt/tests'/(TEST+'.rs'))
  tracked=output(['git','-C',str(ROOT/'product'),'diff','--name-only']);assert tracked==''
- save('source.json',{'product_head':PIN,'wrapper_head':os.environ['GITHUB_SHA'],'product_tracked_diff':tracked,'injected_test_sha256':hashlib.sha256((ROOT/'.github/qualification/a7_whole.rs').read_bytes()).hexdigest(),'config':CONFIG,'synthetic':True})
+ save('source.json',{'product_head':PIN,'wrapper_head':os.environ['GITHUB_SHA'],'product_tracked_diff':tracked,'injected_test_sha256':hashlib.sha256((ROOT/'.github/qualification'/HARNESS).read_bytes()).hexdigest(),'config':CONFIG,'synthetic':True})
  call(['docker','pull',RUST]);call(['docker','pull',PG]);save('images.json',json.loads(docker('image','inspect',RUST,PG)))
  target=Path(os.environ['RUNNER_TEMP'])/'whole-target';target.mkdir(exist_ok=True)
- build=['docker','run','--rm','--name',PREFIX+'-build','-e','CARGO_TARGET_DIR=/work/target','-e','CARGO_PROFILE_RELEASE_DEBUG=0','--mount',f'type=bind,src={ROOT}/product,dst=/work/product','--mount',f'type=bind,src={target},dst=/work/target','-w','/work/product',RUST,'cargo','test','--locked','--release','-p','db-sync-alt','--test','a7_whole_generated','--no-run','--message-format=json']
+ build=['docker','run','--rm','--name',PREFIX+'-build','-e','CARGO_TARGET_DIR=/work/target','-e','CARGO_PROFILE_RELEASE_DEBUG=0','--mount',f'type=bind,src={ROOT}/product,dst=/work/product','--mount',f'type=bind,src={target},dst=/work/target','-w','/work/product',RUST,'cargo','test','--locked','--release','-p','db-sync-alt','--test',TEST,'--no-run','--message-format=json']
  with (OUT/'build.stdout').open('w') as stdout,(OUT/'build.stderr').open('w') as stderr:call(build,stdout=stdout,stderr=stderr)
- binaries=[json.loads(line) for line in (OUT/'build.stdout').read_text().splitlines() if line.startswith('{')];binary=[r['executable'] for r in binaries if r.get('reason')=='compiler-artifact' and r['target']['name']=='a7_whole_generated' and r.get('executable')][0]
+ binaries=[json.loads(line) for line in (OUT/'build.stdout').read_text().splitlines() if line.startswith('{')];binary=[r['executable'] for r in binaries if r.get('reason')=='compiler-artifact' and r['target']['name']==TEST and r.get('executable')][0]
  save('binaries.json',{'test_binary':binary,'cli_sha256':hashlib.sha256((target/'release/db-sync-alt').read_bytes()).hexdigest(),'test_sha256':hashlib.sha256((target/Path(binary).relative_to('/work/target')).read_bytes()).hexdigest()})
  docker('network','create',NETWORK)
  for role in ['source','destination','restored']:
@@ -107,15 +108,25 @@ try:
  save('startup-inspect.json',[inspect(NAMES[r]) for r in ['source','destination','restored']])
  # Destination is slowed from its first write. Population itself is source-only;
  # source write cap is positively installed after generated setup/checkpoint.
- admission={role:probe(NAMES[role],4*1048576,2*1048576) for role in ['destination','restored']};save('destination-io-admission.json',admission)
- worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e','DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,binary,'--ignored','--exact','whole_conversion_qualification','--nocapture']
- IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False
+ admission={} if FOCUS else {role:probe(NAMES[role],4*1048576,2*1048576) for role in ['destination','restored']};save('destination-io-admission.json',admission)
+ worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,binary,'--ignored','--exact',('private_index_focus' if FOCUS else 'whole_conversion_qualification'),'--nocapture']
+ IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False;reclaimed_nonce=None
  while inspect(NAMES['worker'])['State']['Running']:
   if not admitted and (OUT/'fixture-ready.json').exists():
-   admission['source']=probe(NAMES['source'],None,2*1048576);save('io-admission.json',admission);save('baseline-volumes.json',{role:{'allocated_bytes':int(docker('exec',NAMES[role],'du','-sB1','/var/lib/postgresql/data').split()[0]),'apparent_bytes':int(docker('exec',NAMES[role],'du','-sb','/var/lib/postgresql/data').split()[0])} for role in ['source','destination','restored']});save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
+   admission.update({'destination':probe(NAMES['destination'],4*1048576,2*1048576)}) if FOCUS else admission.update({'source':probe(NAMES['source'],None,2*1048576)});save('io-admission.json',admission);save('baseline-volumes.json',{role:{'allocated_bytes':int(docker('exec',NAMES[role],'du','-sB1','/var/lib/postgresql/data').split()[0]),'apparent_bytes':int(docker('exec',NAMES[role],'du','-sb','/var/lib/postgresql/data').split()[0])} for role in ['source','destination','restored']});save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
+  if FOCUS and admitted and (OUT/'reclaim-request.json').exists():
+   request=json.loads((OUT/'reclaim-request.json').read_text())
+   if request['nonce']!=reclaimed_nonce:
+    path=cg(NAMES['destination'])
+    def memory_stat():return {k:int(v) for k,v in (line.split() for line in (path/'memory.stat').read_text().splitlines())}
+    before=memory_stat();start=time.monotonic();result=subprocess.run(['sudo','tee',str(path/'memory.reclaim')],input=str(request['bytes'])+'\n',text=True,capture_output=True,timeout=240);after=memory_stat()
+    # Partial reclaim can returnEAGAIN; admit only a measured meaningful clean-file drop.
+    admitted_cold=before.get('file',0)>=128*1048576 and after.get('file',0)<=max(128*1048576,before.get('file',0)//2)
+    value={**request,'before':before,'after':after,'returncode':result.returncode,'stderr':result.stderr,'seconds':time.monotonic()-start,'cgroup':str(path),'matched_cold_admitted':admitted_cold,'scope':'owned PG cgroup only; no global drop_caches'}
+    save('reclaim-'+request['label']+'.json',value);save('reclaim-result.json',value);reclaimed_nonce=request['nonce']
   time.sleep(1)
  save('worker-exit.json',inspect(NAMES['worker'])['State']);print(docker('logs',NAMES['worker']),flush=True);assert inspect(NAMES['worker'])['State']['ExitCode']==0,'qualification binary failed'
- save('qualification-success.json',{'source':PIN,'config':CONFIG,'admitted':admitted,'generated_only':True,'historical_acceptance':False})
+ save(('index-experiment-success.json' if FOCUS else 'qualification-success.json'),{'source':PIN,'config':CONFIG,'admitted':admitted,'generated_only':True,'historical_acceptance':False})
 finally:
  STOP.set()
  if thread:thread.join(timeout=30)
@@ -164,7 +175,7 @@ finally:
       actual_copy_queries.setdefault(role,query)
    simultaneous.append({'unix':point['unix'],'allocated_pgdata_plus_evidence_bytes':peak,'incremental_work_bytes_above_existing_source':incremental})
   events=[]
-  for line in (OUT/'convert.stderr').read_text().splitlines():
+  for line in ((OUT/'convert.stderr').read_text() if (OUT/'convert.stderr').exists() else '').splitlines():
    try:events.append(json.loads(line))
    except ValueError:pass
   pages=[event for event in events if event.get('event')=='source_page_finished']
