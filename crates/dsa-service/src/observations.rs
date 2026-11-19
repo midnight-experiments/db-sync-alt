@@ -111,7 +111,8 @@ pub async fn migrate(transaction: &Transaction<'_>) -> Result<(), Error> {
 /// raw sources tied to the same pages/supplements used by row construction.
 pub struct ObservedBlock {
     header: Header,
-    inventory: CapturedBlock,
+    inventory: Option<CapturedBlock>,
+    captured: Option<dsa_chain::inventory::CapturedTransactions>,
     supplements: Supplements,
     sources: Vec<RawResponse>,
     outputs: Vec<dsa_provider::types::TransactionOutputs>,
@@ -130,7 +131,8 @@ impl ObservedBlock {
         .map_err(Error::Invalid)?;
         Ok(Self {
             header,
-            inventory,
+            inventory: Some(inventory),
+            captured: None,
             supplements: Supplements::default(),
             sources: Vec::new(),
             outputs: Vec::new(),
@@ -139,9 +141,12 @@ impl ObservedBlock {
     pub fn push(&mut self, captured: CapturedReply) -> Result<(), Error> {
         let (endpoint, reply, raw) = captured.into_parts();
         match (endpoint, reply) {
-            (Endpoint::BlockCbor { .. }, Reply::Transactions(page)) => {
-                self.inventory.push(page).map_err(Error::Invalid)?
-            }
+            (Endpoint::BlockCbor { .. }, Reply::Transactions(page)) => self
+                .inventory
+                .as_mut()
+                .ok_or(Error::Invalid("provider_page_after_complete"))?
+                .push(page)
+                .map_err(Error::Invalid)?,
             (Endpoint::Datum(hash), Reply::Datum(value)) => {
                 let availability = if let Some(value) = value {
                     let bytes = hex_bytes(value.as_str())?;
@@ -196,18 +201,36 @@ impl ObservedBlock {
             .or_insert(rows::DatumAvailability::Stored);
     }
     pub fn prepare<'a>(
-        mut self,
+        &'a mut self,
         profile: &Profile,
         previous: &Header,
         previous_target: u32,
         held: &'a mut BTreeMap<Outpoint, HeldOutput>,
         pending: &BTreeSet<Shape>,
     ) -> Result<Publication<'a>, Error> {
-        let captured = self.inventory.finish().map_err(Error::Invalid)?;
-        let decoded = captured
+        if self.captured.is_none() {
+            if !self
+                .inventory
+                .as_ref()
+                .is_some_and(CapturedBlock::is_complete)
+            {
+                return Err(Error::Invalid("provider_transaction_count_mismatch"));
+            }
+            self.captured = Some(
+                self.inventory
+                    .take()
+                    .ok_or(Error::Invalid("provider_inventory_missing"))?
+                    .finish()
+                    .map_err(Error::Invalid)?,
+            );
+        }
+        let decoded = self
+            .captured
+            .as_ref()
+            .ok_or(Error::Invalid("provider_inventory_missing"))?
             .decode()
             .map_err(|_| Error::Invalid("provider_transaction_decode"))?;
-        for outputs in self.outputs {
+        for outputs in self.outputs.drain(..) {
             let tx = decoded
                 .transactions()
                 .iter()
@@ -256,7 +279,7 @@ impl ObservedBlock {
             network: profile.network.clone(),
             prepared,
             observations,
-            sources: self.sources,
+            sources: &mut self.sources,
             limitations,
         })
     }
@@ -387,7 +410,7 @@ pub struct Publication<'a> {
     network: String,
     prepared: PreparedBlock<'a>,
     observations: Vec<(Shape, Observation)>,
-    sources: Vec<RawResponse>,
+    sources: &'a mut Vec<RawResponse>,
     limitations: Vec<&'static str>,
 }
 impl Publication<'_> {
@@ -460,6 +483,17 @@ impl Publication<'_> {
             count += 1;
         }
         Ok(count)
+    }
+    /// Terminal normal publication: a source/staging/COMMIT failure owns and
+    /// drops the SQL transaction and leaves the held overlay unapplied.
+    pub async fn commit(
+        mut self,
+        transaction: Transaction<'_>,
+        inserted: InsertedRows,
+    ) -> Result<Rows, Error> {
+        self.stage_witnesses(&transaction, &inserted).await?;
+        transaction.commit().await?;
+        Ok(self.prepared.commit())
     }
     pub fn apply_held(self) -> Rows {
         self.prepared.commit()

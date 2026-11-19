@@ -57,7 +57,7 @@ impl RawResponse {
     pub fn received_at(&self) -> u64 {
         self.received_at
     }
-    pub fn reader(&mut self) -> io::Result<Box<dyn Read + '_>> {
+    pub fn reader(&mut self) -> io::Result<Box<dyn Read + Send + '_>> {
         match &mut self.body {
             Body::Buffered(bytes) => Ok(Box::new(io::Cursor::new(bytes))),
             Body::Spooled(file) => {

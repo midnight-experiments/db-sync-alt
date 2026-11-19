@@ -253,7 +253,7 @@ async fn actual_decoder_and_projection_enforce_boundaries_and_excluded_facts() {
         (10001, true, true, false, 2),
     ] {
         let fixture = fixture(size, stored, valid, bridge);
-        let block = capture(&fixture, &pending).await;
+        let mut block = capture(&fixture, &pending).await;
         let mut held = BTreeMap::new();
         let publication = block
             .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
@@ -296,16 +296,16 @@ async fn insert_selected(
 ) -> InsertedRows {
     let mut inserted = InsertedRows::default();
     for row in &rows.tx {
-        transaction.execute("INSERT INTO serve.tx(id,hash,block_id,block_index,valid_contract) VALUES($1,decode($2,'hex'),$3,$4,$5)",&[&row.id,&row.hash,&row.block_id,&i32::from(row.block_index),&row.valid_contract]).await.unwrap();
+        transaction.execute("INSERT INTO serve.tx(id,hash,block_id,block_index,valid_contract) VALUES($1,decode($2,'hex'),$3,$4::integer,$5)",&[&row.id,&row.hash,&row.block_id,&i32::from(row.block_index),&row.valid_contract]).await.unwrap();
     }
     for row in &rows.tx_out {
-        let returned=transaction.query_one("INSERT INTO serve.tx_out(id,tx_id,index,address,value,data_hash) VALUES($1,$2,$3,$4,$5::text::numeric,decode($6,'hex')) RETURNING id",&[&row.id,&row.tx_id,&(row.index as i16),&row.address,&row.value,&row.data_hash]).await.unwrap();
+        let returned=transaction.query_one("INSERT INTO serve.tx_out(id,tx_id,index,address,value,data_hash) VALUES($1,$2,$3::smallint,$4,$5::text::numeric,decode($6,'hex')) RETURNING id",&[&row.id,&row.tx_id,&(row.index as i16),&row.address,&row.value,&row.data_hash]).await.unwrap();
         inserted.output_returned(&returned).unwrap();
     }
     for row in &rows.tx_in {
         transaction
             .execute(
-                "INSERT INTO serve.tx_in(id,tx_in_id,tx_out_id,tx_out_index) VALUES($1,$2,$3,$4)",
+                "INSERT INTO serve.tx_in(id,tx_in_id,tx_out_id,tx_out_index) VALUES($1,$2,$3,$4::smallint)",
                 &[
                     &row.id,
                     &row.tx_in_id,
@@ -321,7 +321,7 @@ async fn insert_selected(
             .value
             .as_ref()
             .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap());
-        if let Some(returned)=transaction.query_opt("INSERT INTO serve.datum(id,hash,value) VALUES($1,decode($2,'hex'),$3) ON CONFLICT DO NOTHING RETURNING hash",&[&(index as i64+1),&row.hash,&json]).await.unwrap(){inserted.datum_returned(&returned).unwrap();}
+        if let Some(returned)=transaction.query_opt("INSERT INTO serve.datum(id,hash,value) VALUES($1,decode($2,'hex'),$3) ON CONFLICT DO NOTHING RETURNING hash::bytea AS hash",&[&(index as i64+1),&row.hash,&json]).await.unwrap(){inserted.datum_returned(&returned).unwrap();}
     }
     for row in &rows.tx_metadata {
         let json = row
@@ -365,8 +365,8 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
     let pending = observations::pending(&observations::status(&client).await.unwrap());
     assert_eq!(pending.len(), 3);
     let mut held = BTreeMap::new();
-    let mut never_stored = capture(&fixture, &pending)
-        .await
+    let mut captured_block = capture(&fixture, &pending).await;
+    let mut never_stored = captured_block
         .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
         .unwrap();
     let transaction = client.transaction().await.unwrap();
@@ -383,8 +383,8 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
         observations::pending(&observations::status(&client).await.unwrap()).len(),
         3
     );
-    let mut failed = capture(&fixture, &pending)
-        .await
+    let mut captured_block = capture(&fixture, &pending).await;
+    let mut failed = captured_block
         .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
         .unwrap();
     let transaction = client.transaction().await.unwrap();
@@ -426,8 +426,8 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
             .get::<_, i64>(0),
         0
     );
-    let mut retry = capture(&fixture, &pending)
-        .await
+    // Retry the preserved original capture after COMMIT failure: no re-fetch.
+    let retry = captured_block
         .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
         .unwrap();
     let transaction = client.transaction().await.unwrap();
@@ -435,21 +435,29 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
     let savepoint = transaction.transaction().await.unwrap();
     let inserted = insert_selected(&savepoint, retry.rows()).await;
     savepoint.commit().await.unwrap();
-    assert_eq!(
-        retry
-            .stage_witnesses(&transaction, &inserted)
-            .await
-            .unwrap(),
-        3
-    );
-    transaction.commit().await.unwrap();
-    retry.apply_held();
+    assert_eq!(retry.observation_count(), 3);
+    retry.commit(transaction, inserted).await.unwrap();
     assert_eq!(held.len(), 1);
     let first = observations::status(&client).await.unwrap();
     assert!(observations::pending(&first).is_empty());
     drop(client);
     client = connect(&config).await;
     assert_eq!(observations::status(&client).await.unwrap(), first);
+    let mut documents: serde_json::Value = serde_json::from_str(include_str!(
+        "../../db-sync-alt/schema/status.examples.json"
+    ))
+    .unwrap();
+    documents["following"]["capabilities"] =
+        serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned()).unwrap();
+    documents["following"]["real_data_evidence"] =
+        serde_json::to_value(observations::status(&client).await.unwrap()).unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../db-sync-alt/schema/status.schema.json")).unwrap();
+    jsonschema::validator_for(&schema)
+        .unwrap()
+        .validate(&documents["following"])
+        .unwrap();
+
     let reference = &first[&Shape::StoredLargeDatum]
         .first_stored_observation
         .as_ref()
@@ -497,8 +505,8 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
     assert_eq!(extracted, fixture.page.as_bytes());
     assert!(!String::from_utf8(extracted).unwrap().contains(common::KEY));
     let mut duplicate_held = BTreeMap::new();
-    let mut duplicate = capture(&fixture, &pending)
-        .await
+    let mut captured_block = capture(&fixture, &pending).await;
+    let mut duplicate = captured_block
         .prepare(
             &fixture.profile,
             &previous(),
@@ -540,6 +548,30 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
         raw.is_none(),
         "already witnessed shapes must not open spools or retain raw bodies"
     );
+
+    let mut no_facts_held = BTreeMap::new();
+    let mut no_fact_capture = capture(&fixture, &BTreeSet::new()).await;
+    let mut no_facts = no_fact_capture
+        .prepare(
+            &fixture.profile,
+            &previous(),
+            9,
+            &mut no_facts_held,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+    let transaction = client.transaction().await.unwrap();
+    assert!(transaction.batch_execute("SELECT 1/0").await.is_err());
+    assert_eq!(
+        no_facts
+            .stage_witnesses(&transaction, &InsertedRows::default())
+            .await
+            .unwrap(),
+        0,
+        "no candidate means zero SQL even on an aborted transaction"
+    );
+    drop(transaction);
+    drop(no_facts);
     client.execute("UPDATE dsa_follower.raw_chunk SET body=decode('00','hex') WHERE sha256=$1 AND ordinal=0",&[&reference.response_sha256]).await.unwrap();
     assert!(
         observations::extract_raw(&client, &reference.response_sha256, &mut Vec::new())
@@ -590,8 +622,8 @@ async fn old_inline_missing_origin_is_explicit_without_false_spending_capture() 
         .unwrap()
         .apply_held();
     let spend = spend_fixture(&fixture);
-    let prepared = capture(&spend, &pending)
-        .await
+    let mut captured_block = capture(&spend, &pending).await;
+    let prepared = captured_block
         .prepare(&spend.profile, &fixture.header, 10, &mut held, &pending)
         .unwrap();
     assert_eq!(
@@ -640,8 +672,8 @@ async fn already_stored_datum_does_not_claim_new_real_evidence() {
     let fixture = fixture_options(vec![0; 10001], true, true, true, "recipient", "fallback");
     let pending = Shape::ALL.into_iter().collect();
     let mut held = BTreeMap::new();
-    let mut publication = capture(&fixture, &pending)
-        .await
+    let mut captured_block = capture(&fixture, &pending).await;
+    let mut publication = captured_block
         .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
         .unwrap();
     let datum = &publication.rows().datum[0];
@@ -715,8 +747,8 @@ async fn positive_zero_null_placeholders_hash_only_and_distinct_sources() {
     for kind in ["recipient", "zero", "null", "nul"] {
         let fixture = fixture_options(vec![0; 10001], true, true, true, kind, "inline");
         let mut held = BTreeMap::new();
-        let publication = capture(&fixture, &pending)
-            .await
+        let mut captured_block = capture(&fixture, &pending).await;
+        let publication = captured_block
             .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
             .unwrap();
         let positive = matches!(kind, "recipient" | "zero");
@@ -735,8 +767,8 @@ async fn positive_zero_null_placeholders_hash_only_and_distinct_sources() {
     for source in ["inline", "witness", "endpoint", "fallback", "hash_only"] {
         let fixture = fixture_options(vec![0; 10001], true, true, true, "recipient", source);
         let mut held = BTreeMap::new();
-        let publication = capture(&fixture, &pending)
-            .await
+        let mut captured_block = capture(&fixture, &pending).await;
+        let publication = captured_block
             .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
             .unwrap();
         let large = publication
@@ -763,8 +795,8 @@ async fn positive_zero_null_placeholders_hash_only_and_distinct_sources() {
     raw.push(0);
     let fixture = fixture_options(raw, true, true, true, "recipient", "inline");
     let mut held = BTreeMap::new();
-    let publication = capture(&fixture, &pending)
-        .await
+    let mut captured_block = capture(&fixture, &pending).await;
+    let publication = captured_block
         .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
         .unwrap();
     assert!(publication.rows().datum[0].value.is_none());
@@ -773,4 +805,113 @@ async fn positive_zero_null_placeholders_hash_only_and_distinct_sources() {
             .observation_shapes()
             .contains(&Shape::StoredLargeDatum)
     );
+}
+
+#[tokio::test]
+async fn causal_supplement_retries_preserve_the_one_original_page_capture() {
+    let fixture = fixture_options(vec![0; 10001], true, true, true, "recipient", "endpoint");
+    let pending = Shape::ALL.into_iter().collect();
+    let page = fixture.page.clone();
+    let metadata = fixture.metadata.clone();
+    let datum = fixture
+        .datum_response
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let server = Server::start(move |path, _| {
+        Behavior::raw(if path.ends_with("/metadata") {
+            metadata.clone()
+        } else if path.contains("/scripts/datum/") {
+            datum.clone()
+        } else {
+            page.clone()
+        })
+    })
+    .await;
+    let (provider, _, recorder) = common::client(&server.url, |_| {});
+    let directory = tempfile::tempdir().unwrap();
+    let mut block = ObservedBlock::new(fixture.header.clone()).unwrap();
+    let mut held = BTreeMap::new();
+    block
+        .push(
+            provider
+                .fetch_with_evidence(
+                    Endpoint::BlockCbor {
+                        block: fixture.header.hash.parse().unwrap(),
+                        page: Page::new(1).unwrap(),
+                    },
+                    &pending,
+                    directory.path(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        block.prepare(&fixture.profile, &previous(), 9, &mut held, &pending),
+        Err(observations::Error::Check(
+            dsa_chain::checks::CheckError::Supplement(dsa_chain::rows::BuildError::Required(
+                dsa_chain::rows::SupplementRequest::Datum(_)
+            ))
+        ))
+    ));
+    assert!(held.is_empty());
+    block
+        .push(
+            provider
+                .fetch_with_evidence(
+                    Endpoint::Datum(transaction::hash(&fixture.raw_datum).parse().unwrap()),
+                    &pending,
+                    directory.path(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        block.prepare(&fixture.profile, &previous(), 9, &mut held, &pending),
+        Err(observations::Error::Build(
+            dsa_chain::rows::BuildError::Required(dsa_chain::rows::SupplementRequest::Metadata(_))
+        ))
+    ));
+    assert!(held.is_empty());
+    block
+        .push(
+            provider
+                .fetch_with_evidence(
+                    Endpoint::Metadata(fixture.hash.parse().unwrap()),
+                    &pending,
+                    directory.path(),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+    let first = block
+        .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
+        .unwrap();
+    assert_eq!(first.observation_count(), 3);
+    let original = first.rows().clone();
+    drop(first);
+    let retry = block
+        .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
+        .unwrap();
+    assert_eq!(retry.rows(), &original);
+    assert_eq!(retry.observation_count(), 3);
+    drop(retry);
+    assert_eq!(recorder.counts.lock().unwrap().len(), 3);
+    assert_eq!(
+        server
+            .state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path.contains("/txs/cbor"))
+            .count(),
+        1
+    );
+    assert!(held.is_empty());
 }

@@ -29,7 +29,8 @@ The preparatory `dsa-service::observations` adapter stores raw bodies in private
 store's `first_witness` table is authoritative. The adapter must run under the
 normal writer lock. Collect actual selected INSERT ... RETURNING outcomes in an `InsertedRows`
 receipt (ON CONFLICT DO NOTHING returns no old datum). Call `stage_witnesses`
-with that receipt in the same transaction, commit SQL, then call `apply_held`.
+with that receipt in the same transaction. The terminal `Publication::commit` commits SQL and applies
+the held overlay only after success.
 Discard receipts if their savepoint rolls back. A source or staging error
 requires rolling back the entire publication. Dropping an unsuccessful
 publication discards its held overlay. Load `status` again after commit and at
@@ -71,3 +72,9 @@ whose deeply nested JSON rendering is NULL still meets that raw-byte criterion;
 the raw provider response remains the regression input. In contrast, a bridge
 placeholder with NULL/rejected JSON does not consume the positive bridge slot.
 A non-NULL JSON value of 0 does qualify; it is not treated as absence.
+
+`ObservedBlock::prepare` retains the one original captured inventory across
+causal supplement requests and failed publication retries. A caller supplies
+one pending-shape snapshot for that block attempt. It can add the specifically
+requested ordinary supplement and prepare again; neither witness capture nor
+row/check preparation requires requesting the block page again.

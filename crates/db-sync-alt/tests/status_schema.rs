@@ -189,3 +189,25 @@ fn capability_scope_and_historical_gaps_cannot_be_silently_promoted() {
         assert!(document["real_data_evidence"][shape]["first_stored_observation"].is_null());
     }
 }
+
+#[test]
+fn committed_shape_requires_its_actual_dimension_and_excludes_credentials() {
+    let (validator, examples) = contract();
+    let observation = json!({"block_height":10,"block_hash":"01".repeat(32),"transaction_hash":"02".repeat(32),"transaction_index":0,"observed_at":1,"output_index":0,"datum_hash":"03".repeat(32),"raw_datum_bytes":10001,"metadata_key":6500973,"sources":[{"source":"block_cbor","endpoint":format!("/blocks/{}/txs/cbor?count=100&page=1&order=asc","01".repeat(32)),"response_sha256":"04".repeat(32)}]});
+    for (shape, dimension) in [
+        ("stored_pointer_address", "output_index"),
+        ("stored_large_datum", "raw_datum_bytes"),
+        ("stored_bridge_metadata", "metadata_key"),
+    ] {
+        let mut document = examples["following"].clone();
+        document["real_data_evidence"][shape]["first_stored_observation"] = observation.clone();
+        assert!(validator.is_valid(&document));
+        document["real_data_evidence"][shape]["first_stored_observation"][dimension] = Value::Null;
+        assert!(!validator.is_valid(&document));
+    }
+    let mut document = examples["following"].clone();
+    let mut observation = observation;
+    observation["project_id"] = json!("synthetic-key");
+    document["real_data_evidence"]["stored_large_datum"]["first_stored_observation"] = observation;
+    assert!(!validator.is_valid(&document));
+}

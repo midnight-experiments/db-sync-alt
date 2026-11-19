@@ -164,7 +164,7 @@
         "node_release": "2.1.101",
         "enabled_in_block_production_and_import": false,
         "operator_rpc_cli": "unsupported",
-        "includes_ariadne_parameter_registrations": true,
+        "unsupported_scope_includes_ariadne_registrations": true,
         "future_support_requires_full_address_coverage": true,
         "future_support_requires_new_keep_rule_version": true
       }
@@ -305,7 +305,7 @@
         "node_release": "2.1.101",
         "enabled_in_block_production_and_import": false,
         "operator_rpc_cli": "unsupported",
-        "includes_ariadne_parameter_registrations": true,
+        "unsupported_scope_includes_ariadne_registrations": true,
         "future_support_requires_full_address_coverage": true,
         "future_support_requires_new_keep_rule_version": true
       }
@@ -493,7 +493,7 @@
         "node_release": "2.1.101",
         "enabled_in_block_production_and_import": false,
         "operator_rpc_cli": "unsupported",
-        "includes_ariadne_parameter_registrations": true,
+        "unsupported_scope_includes_ariadne_registrations": true,
         "future_support_requires_full_address_coverage": true,
         "future_support_requires_new_keep_rule_version": true
       }
@@ -690,7 +690,7 @@
         "node_release": "2.1.101",
         "enabled_in_block_production_and_import": false,
         "operator_rpc_cli": "unsupported",
-        "includes_ariadne_parameter_registrations": true,
+        "unsupported_scope_includes_ariadne_registrations": true,
         "future_support_requires_full_address_coverage": true,
         "future_support_requires_new_keep_rule_version": true
       }
@@ -883,7 +883,7 @@
         "node_release": "2.1.101",
         "enabled_in_block_production_and_import": false,
         "operator_rpc_cli": "unsupported",
-        "includes_ariadne_parameter_registrations": true,
+        "unsupported_scope_includes_ariadne_registrations": true,
         "future_support_requires_full_address_coverage": true,
         "future_support_requires_new_keep_rule_version": true
       }

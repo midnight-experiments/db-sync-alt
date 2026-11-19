@@ -12,7 +12,7 @@ pub struct RegisteredCandidates {
     pub node_release: &'static str,
     pub enabled_in_block_production_and_import: bool,
     pub operator_rpc_cli: &'static str,
-    pub includes_ariadne_parameter_registrations: bool,
+    pub unsupported_scope_includes_ariadne_registrations: bool,
     pub future_support_requires_full_address_coverage: bool,
     pub future_support_requires_new_keep_rule_version: bool,
 }
@@ -24,7 +24,7 @@ impl NodeCapabilities {
                 node_release: crate::profiles::NODE_RELEASE,
                 enabled_in_block_production_and_import: false,
                 operator_rpc_cli: "unsupported",
-                includes_ariadne_parameter_registrations: true,
+                unsupported_scope_includes_ariadne_registrations: true,
                 future_support_requires_full_address_coverage: true,
                 future_support_requires_new_keep_rule_version: true,
             },

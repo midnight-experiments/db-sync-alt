@@ -668,6 +668,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "jsonschema",
  "rcgen",
  "rustls",
  "serde",
