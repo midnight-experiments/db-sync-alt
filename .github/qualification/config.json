@@ -1,0 +1,6 @@
+{
+  "source": "36b842a561e28c56a4d66cce67d949b5250551f1",
+  "mode": "qualify",
+  "divisor": 100,
+  "scope": "smoke only before full generated preflight"
+}

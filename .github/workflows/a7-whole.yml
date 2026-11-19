@@ -1,0 +1,35 @@
+name: a7-whole-generated
+on:
+  push:
+    branches: ['validation/a7-whole-conversion']
+    paths: ['.github/qualification/**','.github/workflows/a7-whole.yml']
+permissions:
+  contents: read
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: pin
+        run: |
+          python3 - <<'PY'
+          import json,os,re
+          config=json.load(open('.github/qualification/config.json'));assert re.fullmatch('[0-9a-f]{40}',config['source'])
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('source='+config['source']+'\n')
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{steps.pin.outputs.source}}
+          path: product
+          persist-credentials: false
+      - name: Generated whole conversion and verified physical backpressure
+        run: python3 .github/qualification/run_whole.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a7-whole-generated-${{github.run_id}}
+          path: ${{runner.temp}}/whole-evidence
+          retention-days: 5
