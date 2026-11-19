@@ -67,6 +67,36 @@ use dsa_store::{
     convert::{ConvertOptions, LegacySource},
 };
 
+// Header-only evidence helpers: the complete native rows still compare exactly.
+fn observed_header_hash(row: &str) -> Result<String> {
+    let value: Value = serde_json::from_str(row)?;
+    let encoded = value["hash"].as_str().ok_or("missing native header hash")?;
+    let hash = encoded
+        .trim_start_matches('\\')
+        .strip_prefix('x')
+        .ok_or("invalid native bytea header hash")?;
+    assert_eq!(hash.len(), 64);
+    Ok(hash.to_owned())
+}
+fn assert_fixture_anchors(f: &common::fixtures::Fixture, state: &Value) {
+    let rows = f.rows();
+    for (role, height) in [
+        ("horizon", 6),
+        ("target", f.bounds.target),
+        ("tip", f.bounds.tip),
+    ] {
+        let header = rows["block"]
+            .iter()
+            .find(|row| row["id"] == height)
+            .unwrap();
+        assert_eq!(state[role]["height"], height);
+        assert_eq!(
+            state[role]["hash"].as_str().unwrap(),
+            header["hash"].as_str().unwrap().trim_start_matches("\\x")
+        );
+    }
+}
+
 async fn setup(seed: u64) -> Result<(Database, Database, common::fixtures::Fixture)> {
     let mut f = fixture(seed);
     f.reindex_ordinals();
@@ -331,6 +361,8 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
             },
         )
         .await?;
+    let anchors = serde_json::to_value(&staged.source().state)?;
+    assert_fixture_anchors(&f, &anchors);
     source.write(&format!("INSERT INTO chain.generations VALUES(2,1,'ready','generated',0,0,{}, {},'{{}}');INSERT INTO serve.block VALUES({},decode('{}','hex'),1084,999999,{},timestamp '2026-01-02',0);UPDATE chain.integrity_state SET projection_generation=2,serve_generation=2;UPDATE chain.service_state SET canonical_ready=2,publication_serial=publication_serial+1",f.bounds.target+1,f.bounds.tip+1,f.bounds.tip+1,"cd".repeat(32),f.bounds.tip+1)).await?;
     let options = Options {
         missing_policy: Some(compare::choose_missing_policy(&[&tx]).await?),
@@ -357,7 +389,24 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
     )
     .await?;
     tx.commit().await?;
-    assert!(compare::compare(&left, &right)?.matched);
+    let compared = compare::compare(&left, &right)?;
+    assert!(compared.matched);
+    let old_latest = left
+        .cases
+        .values()
+        .find(|case| case.query.starts_with("get_latest_block_info:"))
+        .unwrap();
+    let kept_latest = right
+        .cases
+        .values()
+        .find(|case| case.query.starts_with("get_latest_block_info:"))
+        .unwrap();
+    assert_eq!(old_latest.rows, kept_latest.rows);
+    assert_eq!(
+        observed_header_hash(&old_latest.rows[0])?,
+        anchors["tip"]["hash"].as_str().unwrap()
+    );
+
     // A fresh source snapshot must expose the unbounded #4 difference; no hidden
     // cursor/target rewrite is allowed to make the later CLI invocation match.
     let dir = tempfile::tempdir()?;
@@ -386,6 +435,29 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
             .starts_with("get_latest_block_info")
             && d["informational"] == false
     }));
+    let latest_difference = report["differences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|difference| {
+            difference["query"]
+                .as_str()
+                .unwrap()
+                .starts_with("get_latest_block_info:")
+        })
+        .unwrap();
+    assert_eq!(
+        observed_header_hash(latest_difference["a"].as_str().unwrap())?,
+        "cd".repeat(32)
+    );
+    assert_eq!(
+        observed_header_hash(latest_difference["b"].as_str().unwrap())?,
+        anchors["tip"]["hash"].as_str().unwrap()
+    );
+    println!(
+        "{}",
+        json!({"event":"advancing_source_same_snapshot_receipt","mode":"coordinator_library_actual_writer_during_RR","anchors":anchors,"literal_latest_sql_sha256":old_latest.sql_sha256,"source_snapshot_latest_rows":old_latest.rows,"converted_latest_rows":kept_latest.rows,"anchored_matched":compared.matched,"fresh_cli_exit":out.status.code(),"fresh_literal_latest_difference":latest_difference})
+    );
     drop(source_session);
     drop(reader);
     source.cleanup().await?;
@@ -1064,6 +1136,7 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
         .await?;
     assert!(file.is_file());
     assert!(converted.get("source_capture").is_some());
+    assert_fixture_anchors(&f, &converted["source"]["state"]);
     target
         .cli("grant-reader", "mainnet", &["--role", &target.reader])
         .await?;
@@ -1114,6 +1187,49 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
         .output()
         .await?;
     assert_eq!(fresh.status.code(), Some(2));
+    let fresh_report: Value = serde_json::from_slice(&fresh.stdout)?;
+    let latest_difference = fresh_report["differences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|difference| {
+            difference["query"]
+                .as_str()
+                .unwrap()
+                .starts_with("get_latest_block_info:")
+        })
+        .unwrap();
+    assert_eq!(latest_difference["informational"], false);
+    assert_eq!(
+        observed_header_hash(latest_difference["a"].as_str().unwrap())?,
+        "cd".repeat(32)
+    );
+    assert_eq!(
+        observed_header_hash(latest_difference["b"].as_str().unwrap())?,
+        converted["source"]["state"]["tip"]["hash"].as_str().unwrap()
+    );
+    let old_latest = capture["capture"]["cases"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|case| {
+            case["query"]
+                .as_str()
+                .unwrap()
+                .starts_with("get_latest_block_info:")
+        })
+        .unwrap();
+    assert_eq!(
+        observed_header_hash(old_latest["rows"][0].as_str().unwrap())?,
+        converted["source"]["state"]["tip"]["hash"].as_str().unwrap()
+    );
+    assert_eq!(report["newest_a"], f.bounds.tip);
+    assert_eq!(report["positions"]["horizon"], 6);
+    assert_eq!(report["positions"]["target"], f.bounds.target);
+    println!(
+        "{}",
+        json!({"event":"advancing_source_same_snapshot_receipt","mode":"normal_CLI_convert_capture_then_writer_then_compare","anchors":converted["source"]["state"],"literal_latest_sql_sha256":old_latest["sql_sha256"],"source_capture_latest_rows":old_latest["rows"],"anchored_matched":report["matched"],"anchored_newest_a":report["newest_a"],"anchored_newest_b":report["newest_b"],"fresh_cli_exit":fresh.status.code(),"fresh_literal_latest_difference":latest_difference})
+    );
     let old_file = dir.path().join("old-observation.capture.json");
     let mut old = capture.clone();
     old["format"] = json!(1);
