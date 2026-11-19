@@ -1,77 +1,161 @@
-name: rust
+name: a7-rehearsal-tool
 on:
   push:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'profiles/**'
-      - 'reference/**'
-      - '.github/workflows/rust.yml'
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - 'profiles/**'
-      - 'reference/**'
-      - '.github/workflows/rust.yml'
+    branches: [validation/a7-tool-16ba29e]
 permissions:
   contents: read
+  actions: read
 jobs:
-  check:
+  build-and-qualify:
     runs-on: ubuntu-24.04
-    container: rust:1.100.0-bookworm
-    timeout-minutes: 15
+    timeout-minutes: 25
+    env:
+      PRODUCT_PIN: 16ba29e2df097cf642df9b440d4fb38669620626
+      RUST_IMAGE: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+      PG_IMAGE: postgres:17.11@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: 16ba29e2df097cf642df9b440d4fb38669620626
           persist-credentials: false
-      - name: Install the pinned toolchain
+      - name: Build exact clean source in pinned Docker
+        shell: bash
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          rustup show active-toolchain
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
-      - run: python3 .github/scripts/check_public_source.py
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
-      - name: Check generated profiles against the node sources
-        run: |
-          git clone --filter=blob:none --no-checkout https://github.com/midnightntwrk/midnight-node.git "$RUNNER_TEMP/midnight-node"
-          git -C "$RUNNER_TEMP/midnight-node" checkout 86774edf8cc76345a5c3a4221f3fe80c094b1c33
-          cargo run --locked -p dsa-chain --example generate_profiles -- --node-source "$RUNNER_TEMP/midnight-node" --check
-          python3 .github/scripts/check_reference_source.py --node-source "$RUNNER_TEMP/midnight-node"
-  integration:
-    runs-on: ubuntu-24.04
-    container: rust:1.100.0-bookworm
-    timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_DB: dsa_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP"/{bundle,cargo,target}
+          mkdir -p "$RUNNER_TEMP/bundle"/{bin,image,evidence,rootfs}
+          {
+            git rev-parse HEAD
+            test "$(git rev-parse HEAD)" = "$PRODUCT_PIN"
+            test -z "$(git status --porcelain)"
+            git ls-files -z | xargs -0 sha256sum
+            uname -a
+            free -b
+            docker version
+          } > "$RUNNER_TEMP/bundle/evidence/source-provenance.txt"
+          docker pull "$RUST_IMAGE"
+          docker pull "$PG_IMAGE"
+          docker image inspect "$RUST_IMAGE" "$PG_IMAGE" > "$RUNNER_TEMP/bundle/evidence/build-images.json"
+          docker run --rm --name dsa-a7-build --cpus 2 --memory 4g --memory-swap 4g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/cargo:/cargo-cache" -v "$RUNNER_TEMP/target:/target" -v "$RUNNER_TEMP/bundle:/bundle" \
+            -w /workspace -e CARGO_HOME=/cargo-cache -e CARGO_TARGET_DIR=/target -e CARGO_BUILD_JOBS=2 -e PRODUCT_PIN "$RUST_IMAGE" \
+            sh -ec '
+              rustc -Vv > /bundle/evidence/rustc.txt
+              cargo -V > /bundle/evidence/cargo.txt
+              getconf GNU_LIBC_VERSION > /bundle/evidence/build-glibc.txt
+              cargo test --locked --release -p db-sync-alt --test comparison --test conversion --test snapshots --no-run
+              strip --strip-unneeded /target/release/db-sync-alt
+              cp /target/release/db-sync-alt /bundle/bin/db-sync-alt
+              sha256sum /target/release/db-sync-alt > /bundle/evidence/tested-binary.sha256
+              ldd /bundle/bin/db-sync-alt > /bundle/evidence/ldd.txt
+              readelf -h /bundle/bin/db-sync-alt > /bundle/evidence/elf.txt
+              /bundle/bin/db-sync-alt --version > /bundle/evidence/version.txt
+              /bundle/bin/db-sync-alt --help > /bundle/evidence/help.txt
+              for sub in profile create status verify snapshot restore convert compare grant-reader; do /bundle/bin/db-sync-alt "$sub" --help > "/bundle/evidence/help-$sub.txt"; done
+              /bundle/bin/db-sync-alt profile --network mainnet > /bundle/evidence/profile-mainnet.json
+              /bundle/bin/db-sync-alt profile --network preprod > /bundle/evidence/profile-preprod.json
+              python3 - <<'"'"'PY'"'"'
+          from pathlib import Path
+          import hashlib,json,re,shutil,os
+          b=Path("/bundle");binary=b/"bin/db-sync-alt";root=b/"rootfs"
+          libs=sorted(set(re.findall(r"(/[^\s()]+)", (b/"evidence/ldd.txt").read_text())))
+          assert libs and "not found"not in (b/"evidence/ldd.txt").read_text()
+          dependencies=[]
+          for name in libs:
+              src=Path(name);dst=root/name.lstrip("/");dst.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(src,dst)
+              dependencies.append({"path":name,"sha256":hashlib.sha256(dst.read_bytes()).hexdigest(),"bytes":dst.stat().st_size})
+          target=root/"usr/local/bin/db-sync-alt";target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(binary,target)
+          (root/"etc").mkdir();(root/"etc/nsswitch.conf").write_text("hosts: files dns\n")
+          (root/"tmp").mkdir(mode=0o1777);(root/"work").mkdir()
+          (b/"Dockerfile").write_text("FROM scratch\nCOPY rootfs/ /\nENV TMPDIR=/tmp\nWORKDIR /work\nUSER 65532:65532\nENTRYPOINT [\"/usr/local/bin/db-sync-alt\"]\n")
+          manifest={"purpose":"A7 historical rehearsal CLI only; not a release/follower","release":False,"follower":False,"product_pin":os.environ["PRODUCT_PIN"],"architecture":"x86_64","build_mode":"cargo test --locked --release -p db-sync-alt --test comparison --test conversion --test snapshots --no-run; strip --strip-unneeded","binary":"bin/db-sync-alt","binary_sha256":hashlib.sha256(binary.read_bytes()).hexdigest(),"binary_bytes":binary.stat().st_size,"build_glibc":(b/"evidence/build-glibc.txt").read_text().strip(),"binary_version":(b/"evidence/version.txt").read_text().strip(),"runtime_dependencies":dependencies,"image_has_shell_python_time":False}
+          (b/"manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
+          PY
+            ' 2>&1 | tee "$RUNNER_TEMP/bundle/evidence/build.log"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bundle"
+      - name: Download the immutable strict predecessor for capture compatibility
+        uses: actions/download-artifact@v4
         with:
-          persist-credentials: false
-      - name: Install the pinned toolchain
+          name: a7-rehearsal-tool-b683466
+          path: ${{ runner.temp }}/old
+          run-id: 44545002275
+          github-token: ${{ github.token }}
+      - name: Verify the predecessor binary
+        shell: bash
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          rustup show active-toolchain
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
-      - name: PostgreSQL integration tests
-        env:
-          DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
-          # Deterministic CI sample; the full proof defaults to 10,000 cases
-          # when DSA_KEEP_CASES is unset in the on-demand test invocation.
-          DSA_KEEP_CASES: 64
-        run: cargo test --locked --workspace -- --ignored --nocapture --skip keep_rule_realistic_plans --skip convert_scaled_source_cost --skip compare_cli_tls_reader_files_and_certificate_identity
+          set -euo pipefail
+          printf '%s  %s\n' '5958ba539298df88b0e42af60e1e4b629853bdf30e8bb6dbfaebd0caf1ca5bbf' "$RUNNER_TEMP/old/bin/db-sync-alt" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/old/bin/db-sync-alt"
+          python3 - <<'PYOLD'
+          from pathlib import Path
+          import json,os
+          old=Path(os.environ['RUNNER_TEMP'])/'old';m=json.loads((old/'manifest.json').read_text());assert m['product_pin']=='b6834660ef730d8c1fb490c0d4ffd5f5ce7ec53a'
+          (Path(os.environ['RUNNER_TEMP'])/'bundle/evidence/old-tool-manifest.json').write_text(json.dumps(m,indent=2)+'\n')
+          PYOLD
+      - name: Qualify the final stripped release executable on generated stores
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create --internal dsa-a7-internal
+          docker run -d --name dsa-a7-postgres --network dsa-a7-internal --network-alias postgres \
+            --cpus 2 --memory 1g --memory-swap 1g --shm-size 128m \
+            --tmpfs /var/lib/postgresql/data:rw,size=1073741824,mode=0700 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=dsa_test "$PG_IMAGE" \
+            -c jit=off -c max_wal_size=128MB -c min_wal_size=32MB -c checkpoint_timeout=30s
+          for i in $(seq 1 60); do if docker exec dsa-a7-postgres pg_isready -U postgres -d dsa_test; then break; fi; sleep 1; done
+          docker run --rm --name dsa-a7-smoke --network dsa-a7-internal --cpus 2 --memory 2g --memory-swap 2g \
+            -v "$PWD:/workspace:ro" -v "$RUNNER_TEMP/target:/target:ro" -v "$RUNNER_TEMP/old/bin:/old:ro" -w /workspace \
+            -e 'DSA_TEST_DATABASE=host=postgres user=postgres dbname=dsa_test sslmode=disable' -e DSA_TEST_OLD_CLI=/old/db-sync-alt "$RUST_IMAGE" \
+            sh -ec '
+              for spec in "conversion convert_true_legacy_public_reader_model_and_snapshot" "comparison compare_cli_capture_from_conversion_survives_source_advancement_and_integrity" "snapshots snapshot_generated_roundtrips_and_reader" "comparison compare_q19_incidental_candidate_literal_counterexamples" "comparison compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal" "comparison compare_q19_compatible_b683_observation_without_reconversion"; do
+                set -- $spec
+                test_binary=$(find /target/release -type f -executable -name "$1-*")
+                test -n "$test_binary"
+                "$test_binary" "$2" --ignored --exact --nocapture --test-threads=1
+              done
+            ' 2>&1 | tee "$RUNNER_TEMP/bundle/evidence/functional-smoke.log"
+      - name: Assemble and test minimal runtime image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --network=none -t dsa-00072-a7-cli:16ba29e \
+            --label org.opencontainers.image.revision="$PRODUCT_PIN" \
+            --label org.opencontainers.image.description='A7 historical rehearsal CLI only; not a release or follower' \
+            "$RUNNER_TEMP/bundle" 2>&1 | tee "$RUNNER_TEMP/bundle/evidence/image-build.log"
+          image_id=$(docker image inspect dsa-00072-a7-cli:16ba29e --format '{{.Id}}')
+          printf '%s\n' "$image_id" > "$RUNNER_TEMP/bundle/image/image-id.txt"
+          docker image inspect "$image_id" > "$RUNNER_TEMP/bundle/evidence/runtime-image.json"
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,mode=1777 "$image_id" --version > "$RUNNER_TEMP/bundle/evidence/image-version.txt"
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,mode=1777 "$image_id" profile --network preprod > "$RUNNER_TEMP/bundle/evidence/image-profile-preprod.json"
+          docker exec dsa-a7-postgres psql -U postgres -d dsa_test -Xv ON_ERROR_STOP=1 -c 'CREATE ROLE a7_image_owner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS' -c 'CREATE ROLE a7_image_reader LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS' -c 'CREATE DATABASE a7_image_smoke OWNER a7_image_owner'
+          for command in create status; do
+            docker run --rm --network dsa-a7-internal --read-only --tmpfs /tmp:rw,mode=1777 "$image_id" "$command" --database 'host=postgres user=a7_image_owner dbname=a7_image_smoke sslmode=disable' --network mainnet > "$RUNNER_TEMP/bundle/evidence/image-$command.json"
+          done
+          docker run --rm --network dsa-a7-internal --read-only --tmpfs /tmp:rw,mode=1777 "$image_id" grant-reader --database 'host=postgres user=a7_image_owner dbname=a7_image_smoke sslmode=disable' --network mainnet --role a7_image_reader > "$RUNNER_TEMP/bundle/evidence/image-grant-reader.json"
+          docker save "$image_id" | gzip -n > "$RUNNER_TEMP/bundle/image/dsa-00072-a7-cli-16ba29e.tar.gz"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,os,subprocess,shutil
+          b=Path(os.environ['RUNNER_TEMP'])/'bundle';m=json.loads((b/'manifest.json').read_text());m['ci_run_id']=int(os.environ['GITHUB_RUN_ID']);m['runtime_image_id']=(b/'image/image-id.txt').read_text().strip();m['image_archive']='image/dsa-00072-a7-cli-16ba29e.tar.gz';m['image_archive_sha256']=hashlib.sha256((b/m['image_archive']).read_bytes()).hexdigest()
+          assert (b/'evidence/functional-smoke.log').read_text().count('test result: ok. 1 passed;')==6
+          assert json.loads((b/'evidence/profile-mainnet.json').read_text())['network']=='mainnet'
+          assert json.loads((b/'evidence/profile-preprod.json').read_text())==json.loads((b/'evidence/image-profile-preprod.json').read_text())
+          assert hashlib.sha256((b/'bin/db-sync-alt').read_bytes()).hexdigest()==m['binary_sha256']
+          m['functional_smoke']='6 generated legacy/conversion/capture/restore/snapshot/reader workflows (four Q19 nonfatal examples, five fatal controls, actual b683 unchanged-capture reuse included) passed with final stripped executable; image create/status/grant-reader passed'
+          (b/'manifest.json').write_text(json.dumps(m,indent=2)+'\n');shutil.rmtree(b/'rootfs')
+          with (b/'SHA256SUMS').open('w')as out:
+              for f in sorted(b.rglob('*')):
+                  if f.is_file()and f.name!='SHA256SUMS':out.write(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+str(f.relative_to(b))+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a7-rehearsal-tool-16ba29e
+          path: ${{ runner.temp }}/bundle
+          compression-level: 0
+          retention-days: 30
+      - name: Remove generated-only test resources
+        if: always()
+        run: |
+          docker rm -f dsa-a7-build dsa-a7-smoke dsa-a7-postgres || true
+          docker network rm dsa-a7-internal || true
