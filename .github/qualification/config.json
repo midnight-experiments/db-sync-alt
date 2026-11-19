@@ -1,7 +1,7 @@
 {
-  "source": "daf596312ccdcbc8abc7aec98bee19c3d55d3cfa",
+  "source": "63f3090be732ea590f22091b38ba4a11e6d1554c",
   "mode": "qualify",
   "divisor": 1,
-  "scope": "complete eleven-family local TEMP diagnostic, original20privateindexes, finite600, no source/capture/whole qualification",
-  "target": "selection"
+  "scope": "full generated CLI at production63: source60/idle60, owner600/idle7200, overall7200; original20privateindexes; no historical acceptance",
+  "target": "whole"
 }

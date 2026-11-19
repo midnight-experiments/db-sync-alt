@@ -37,7 +37,7 @@ def probe(name,read,write):
  for kind in ['write']+(['read'] if read else []):
   before=io_stat(cg(name));begin=time.monotonic()
   cmd='dd if=/dev/zero of=/var/lib/postgresql/data/whole-qualification-probe bs=1048576 count=16 oflag=direct conv=fsync status=none' if kind=='write' else 'dd if=/var/lib/postgresql/data/whole-qualification-probe of=/dev/null bs=1048576 count=16 iflag=direct status=none'
-  call(['docker','exec','-u','postgres',name,'sh','-c',cmd],timeout=(600 if FOCUS else 90));elapsed=time.monotonic()-begin;after=io_stat(cg(name));limit=write if kind=='write' else read;minimum=16*1048576/limit*0.85
+  call(['docker','exec','-u','postgres',name,'sh','-c',cmd],timeout=600);elapsed=time.monotonic()-begin;after=io_stat(cg(name));limit=write if kind=='write' else read;minimum=16*1048576/limit*0.85
   assert elapsed>=minimum,(name,kind,'throttle not observed',elapsed,minimum,admitted)
   results.append({'kind':kind,'bytes':16*1048576,'seconds':elapsed,'observed_bytes_per_second':16*1048576/elapsed,'before':before,'after':after})
  call(['docker','exec','-u','postgres',name,'rm','--','/var/lib/postgresql/data/whole-qualification-probe'])

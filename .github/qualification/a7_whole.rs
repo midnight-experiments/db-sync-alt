@@ -324,7 +324,7 @@ async fn whole_conversion_qualification() -> Result {
     )?;
     let wait = Instant::now();
     while !directory().join("io-ready.json").is_file() {
-        if wait.elapsed() > Duration::from_secs(300) {
+        if wait.elapsed() > Duration::from_secs(1200) {
             return Err("hosted IO admission did not complete".into());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -348,7 +348,7 @@ async fn whole_conversion_qualification() -> Result {
         "--source-idle-transaction-timeout-seconds",
         "60",
         "--statement-timeout-seconds",
-        "120",
+        "600",
         "--idle-transaction-timeout-seconds",
         "7200",
         "--overall-timeout-seconds",
@@ -444,7 +444,7 @@ async fn whole_conversion_qualification() -> Result {
             "verify",
             &[
                 "--statement-timeout-seconds",
-                "120",
+                "600",
                 "--idle-transaction-timeout-seconds",
                 "7200",
             ],
@@ -463,7 +463,7 @@ async fn whole_conversion_qualification() -> Result {
                 "--file",
                 directory().join("explicit.snapshot").to_str().unwrap(),
                 "--statement-timeout-seconds",
-                "120",
+                "600",
                 "--idle-transaction-timeout-seconds",
                 "7200",
             ],
@@ -479,7 +479,7 @@ async fn whole_conversion_qualification() -> Result {
                 "--file",
                 snapshot.to_str().unwrap(),
                 "--statement-timeout-seconds",
-                "120",
+                "600",
                 "--idle-transaction-timeout-seconds",
                 "7200",
             ],
