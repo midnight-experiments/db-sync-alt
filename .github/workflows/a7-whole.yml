@@ -19,12 +19,18 @@ jobs:
           python3 - <<'PY'
           import json,os,re
           config=json.load(open('.github/qualification/config.json'));assert re.fullmatch('[0-9a-f]{40}',config['source'])
-          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('source='+config['source']+'\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('source='+config['source']+'\npredecessor='+config.get('predecessor','')+'\n')
           PY
       - uses: actions/checkout@v4
         with:
           ref: ${{steps.pin.outputs.source}}
           path: product
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        if: steps.pin.outputs.predecessor != ''
+        with:
+          ref: ${{steps.pin.outputs.predecessor}}
+          path: predecessor
           persist-credentials: false
       - name: Generated whole conversion and verified physical backpressure
         run: python3 .github/qualification/run_whole.py

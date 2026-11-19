@@ -11,10 +11,10 @@ import threading
 from pathlib import Path
 ROOT=Path(os.environ['GITHUB_WORKSPACE']);OUT=Path(os.environ['RUNNER_TEMP'])/'whole-evidence';OUT.mkdir(exist_ok=True)
 CONFIG=json.loads((ROOT/'.github/qualification/config.json').read_text());PIN=CONFIG['source'];MODE=CONFIG['mode'];DIVISOR=CONFIG['divisor'];assert re.fullmatch('[0-9a-f]{40}',PIN)
-TARGET=CONFIG.get('target','whole');FOCUS=TARGET in ['index','selection'];TEST={'index':'a7_index_generated','selection':'a7_select_generated'}.get(TARGET,'a7_whole_generated');HARNESS={'index':'a7_index.rs','selection':'a7_select.rs'}.get(TARGET,'a7_whole.rs')
+TARGET=CONFIG.get('target','whole');FOCUS=TARGET in ['index','selection'];TEST={'index':'a7_index_generated','selection':'a7_select_generated','restore':'a7_restore_generated'}.get(TARGET,'a7_whole_generated');HARNESS={'index':'a7_index.rs','selection':'a7_select.rs','restore':'a7_restore.rs'}.get(TARGET,'a7_whole.rs')
 RUST='rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea'
 PG='postgres:17.11-bookworm@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675'
-PREFIX='dsa-whole-'+os.environ['GITHUB_RUN_ID'];NETWORK=PREFIX+'-net';NAMES={k:PREFIX+'-'+k for k in ['source','destination','restored','worker']};VOLUMES={k:PREFIX+'-'+k+'-data' for k in ['source','destination','restored']};IDS={};STOP=threading.Event()
+PREFIX='dsa-whole-'+os.environ['GITHUB_RUN_ID'];NETWORK=PREFIX+'-net';NAMES={k:PREFIX+'-'+k for k in ['source','destination','restored','worker']};VOLUMES={k:PREFIX+'-'+k+'-data' for k in ['source','destination','restored']};IDS={};RESETTING=set();TRACE={};STOP=threading.Event()
 def call(args,**kw):return subprocess.run(args,check=True,text=True,**kw)
 def output(args):return subprocess.check_output(args,text=True,stderr=subprocess.STDOUT)
 def docker(*args):return output(['docker',*args])
@@ -88,12 +88,16 @@ def monitor():
    for role in ['source','destination','restored','worker']:
     name=NAMES[role]
     if name not in IDS:continue
+    if role in RESETTING:record['containers'][role]={'stage':'intentional_fresh_target_reset'};continue
     data={}
     try:
      d=inspect(name);data['state']=d['State'];data['memory_bytes']=d['HostConfig']['Memory'];data['cpu_nanos']=d['HostConfig']['NanoCpus']
      if d['State']['Running']:
       path=cg(name);data['memory_current']=stat_file(path/'memory.current');data['memory_peak']=stat_file(path/'memory.peak');data['io_stat']=io_stat(path);data['io_max']=stat_file(path/'io.max');data['cpu_stat']=stat_file(path/'cpu.stat');data['memory_stat']=stat_file(path/'memory.stat');data['memory_events']=stat_file(path/'memory.events');data['io_pressure']=stat_file(path/'io.pressure')
-      if role=='worker':data['process_memory']=process_memory(d['State']['Pid'],d['Id'])
+      if role=='worker':
+       data['process_memory']=process_memory(d['State']['Pid'],d['Id'])
+       if TARGET=='restore':
+        result=subprocess.run(['sudo','nsenter','-t',str(d['State']['Pid']),'-n','ss','-tin'],text=True,capture_output=True,timeout=2);data['socket_kernel_info']={'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr}
       if role!='worker':
        data['volume_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data').split()[0]);data['volume_allocated_bytes']=int(docker('exec',name,'du','-sB1','/var/lib/postgresql/data').split()[0]);data['wal_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data/pg_wal').split()[0]);database=databases.get(role)
        if database:
@@ -108,6 +112,56 @@ def wait_postgres(name):
   if subprocess.run(['docker','exec',name,'pg_isready','-U','postgres'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0:return
   time.sleep(.5)
  raise RuntimeError('PostgreSQL did not become ready')
+
+def fresh_restore_target(label):
+ role='restored';name=NAMES[role];assert re.fullmatch('[a-z0-9-]+',label);RESETTING.add(role)
+ try:
+  assert inspect(name)['Id']==IDS[name]
+  (OUT/(label+'-previous-pg.log')).write_text(docker('logs',name));docker('stop','-t','120',name);save(label+'-previous-final.json',inspect(name));docker('rm',name);docker('volume','rm',VOLUMES[role]);docker('volume','create',VOLUMES[role])
+  IDS[name]=docker('run','-d','--name',name,'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={VOLUMES[role]},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0').strip();wait_postgres(name)
+  admission=probe(name,4*1048576,2*1048576);value={'ready':True,'label':label,'target_inspect':inspect(name),'admission':admission,'scope':'fresh owned PG container/data per variant; source/converted unchanged'};save(label+'-fresh-target.json',value);return value
+ finally:RESETTING.discard(role)
+
+def tcp_counters():
+ try:
+  worker=inspect(NAMES['worker']);assert worker['Id']==IDS[NAMES['worker']]
+  raw=output(['sudo','nsenter','-t',str(worker['State']['Pid']),'-n','cat','/proc/net/netstat']);lines=raw.splitlines();counters={}
+  for a,b in zip(lines[::2],lines[1::2]):
+   keys=a.split();values=b.split()
+   if keys[0]=='TcpExt:':counters={k:int(v) for k,v in zip(keys[1:],values[1:])}
+  return {k:v for k,v in counters.items() if k in ['TCPAbortOnTimeout','TCPTimeouts','TCPWinProbe','TCPToZeroWindowAdv','TCPFromZeroWindowAdv','TCPZeroWindowDrop']}
+ except Exception as error:return {'observation_error':str(error)}
+
+def stop_socket_trace():
+ if not TRACE:return {'trace_active':False}
+ state=TRACE.copy();TRACE.clear();process=state.get('process')
+ if process and process.poll() is None:
+  subprocess.run(['sudo','kill','-INT','--',str(-process.pid)],text=True,capture_output=True)
+  try:process.wait(timeout=5)
+  except subprocess.TimeoutExpired:subprocess.run(['sudo','kill','-KILL','--',str(-process.pid)],text=True,capture_output=True);process.wait(timeout=5)
+ if state.get('thread'):state['thread'].join(timeout=5)
+ after=tcp_counters();before=state['before'];result={k:v for k,v in state.items() if k not in ['process','thread','counts']};result['packet_counts']=state['counts'];result['after']=after;result['tcp_abort_on_timeout_delta']=max(0,after.get('TCPAbortOnTimeout',0)-before.get('TCPAbortOnTimeout',0));result['stopped_unix']=time.time();save('socket-'+state['label']+'-summary.json',result);return result
+
+def start_socket_trace(label):
+ stop_socket_trace();assert re.fullmatch('[a-z0-9-]+',label)
+ w=inspect(NAMES['worker']);d=inspect(NAMES['restored']);assert w['Id']==IDS[NAMES['worker']] and d['Id']==IDS[NAMES['restored']]
+ worker_ip=w['NetworkSettings']['Networks'][NETWORK]['IPAddress'];target_ip=d['NetworkSettings']['Networks'][NETWORK]['IPAddress'];net=json.loads(docker('network','inspect',NETWORK))[0];bridge=net.get('Options',{}).get('com.docker.network.bridge.name','br-'+net['Id'][:12]);assert re.fullmatch('[a-zA-Z0-9_-]+',bridge)
+ counts={'zero_window_from_target':0,'lines_written':0,'dropped_after_byte_cap':0};state={'label':label,'started_unix':time.time(),'worker_ip':worker_ip,'target_ip':target_ip,'bridge':bridge,'before':tcp_counters(),'counts':counts,'packet_format':'text TCPheaders/window/sequence only; no payload/pcap','per_trace_text_cap_bytes':32*1048576}
+ command=shutil.which('tcpdump')
+ if command:
+  errors=(OUT/('socket-'+label+'-stderr.log')).open('w');process=subprocess.Popen(['sudo',command,'-i',bridge,'-n','-tttt','-l','-S','-s','128',f'tcp port 5432 and host {worker_ip} and host {target_ip}'],stdout=subprocess.PIPE,stderr=errors,text=True,start_new_session=True);errors.close();state['process']=process
+  def packets():
+   total=0
+   with (OUT/('socket-'+label+'-headers.log')).open('w') as log:
+    for line in process.stdout:
+     zero=f'{target_ip}.5432 > {worker_ip}.' in line and 'win 0,' in line
+     if zero:counts['zero_window_from_target']+=1
+     if total<32*1048576 or zero:
+      log.write(line);total+=len(line.encode());counts['lines_written']+=1
+     else:counts['dropped_after_byte_cap']+=1
+  state['thread']=threading.Thread(target=packets,daemon=True);state['thread'].start();time.sleep(.25);state['tcpdump_running']=process.poll() is None
+ else:state['tcpdump_running']=False;state['unavailable']='tcpdump not installed; kernel ss/counters still sampled'
+ TRACE.update(state);return {k:v for k,v in state.items() if k not in ['process','thread','counts']}
 
 thread=None
 try:
@@ -124,6 +178,12 @@ try:
  with (OUT/'build.stdout').open('w') as stdout,(OUT/'build.stderr').open('w') as stderr:call(build,stdout=stdout,stderr=stderr)
  binaries=[json.loads(line) for line in (OUT/'build.stdout').read_text().splitlines() if line.startswith('{')];binary=[r['executable'] for r in binaries if r.get('reason')=='compiler-artifact' and r['target']['name']==TEST and r.get('executable')][0]
  save('binaries.json',{'test_binary':binary,'cli_sha256':hashlib.sha256((target/'release/db-sync-alt').read_bytes()).hexdigest(),'test_sha256':hashlib.sha256((target/Path(binary).relative_to('/work/target')).read_bytes()).hexdigest()})
+ if TARGET=='restore':
+  assert output(['git','-C',str(ROOT/'predecessor'),'rev-parse','HEAD']).strip()==CONFIG['predecessor']
+  old_target=Path(os.environ['RUNNER_TEMP'])/'restore-predecessor-target';old_target.mkdir(exist_ok=True)
+  old_build=['docker','run','--rm','--name',PREFIX+'-predecessor-build','-e','CARGO_TARGET_DIR=/work/target-old','-e','CARGO_PROFILE_RELEASE_DEBUG=0','--mount',f'type=bind,src={ROOT}/predecessor,dst=/work/predecessor,readonly','--mount',f'type=bind,src={old_target},dst=/work/target-old','-w','/work/predecessor',RUST,'cargo','build','--locked','--release','-p','db-sync-alt','--bin','db-sync-alt']
+  with (OUT/'predecessor-build.stdout').open('w') as stdout,(OUT/'predecessor-build.stderr').open('w') as stderr:call(old_build,stdout=stdout,stderr=stderr)
+  save('predecessor.json',{'source_head':CONFIG['predecessor'],'tracked_diff':output(['git','-C',str(ROOT/'predecessor'),'diff','--name-only']),'cli_sha256':hashlib.sha256((old_target/'release/db-sync-alt').read_bytes()).hexdigest()})
  docker('network','create',NETWORK)
  for role in ['source','destination','restored']:
   volume=VOLUMES[role];docker('volume','create',volume)
@@ -132,15 +192,28 @@ try:
  # Destination is slowed from its first write. Population itself is source-only;
  # source write cap is positively installed after generated setup/checkpoint.
  admission={} if FOCUS else {role:probe(NAMES[role],4*1048576,2*1048576) for role in ['destination','restored']};save('destination-io-admission.json',admission)
- worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,binary,'--ignored','--exact',({'index':'private_index_focus','selection':'selection_focus'}.get(TARGET,'whole_conversion_qualification')),'--nocapture']
- IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False;reclaimed_nonce=None
+ worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,binary,'--ignored','--exact',({'index':'private_index_focus','selection':'selection_focus','restore':'restore_focus'}.get(TARGET,'whole_conversion_qualification')),'--nocapture']
+ if TARGET=='restore':worker[worker.index(RUST):worker.index(RUST)]=['--mount',f'type=bind,src={old_target},dst=/work/target-old,readonly','-e','DSA_PREDECESSOR_CLI=/work/target-old/release/db-sync-alt']
+ IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False;reset_nonce=None;trace_nonce=None
  while inspect(NAMES['worker'])['State']['Running']:
   if not admitted and (OUT/'fixture-ready.json').exists():
    admission.update({'destination':probe(NAMES['destination'],4*1048576,2*1048576)}) if FOCUS else admission.update({'source':probe(NAMES['source'],None,2*1048576)});save('io-admission.json',admission);save('baseline-volumes.json',{role:{'allocated_bytes':int(docker('exec',NAMES[role],'du','-sB1','/var/lib/postgresql/data').split()[0]),'apparent_bytes':int(docker('exec',NAMES[role],'du','-sb','/var/lib/postgresql/data').split()[0])} for role in ['source','destination','restored']});save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
+  if TARGET=='restore':
+   if (OUT/'target-reset-request.json').exists():
+    request=json.loads((OUT/'target-reset-request.json').read_text())
+    if request['nonce']!=reset_nonce:
+     value=fresh_restore_target(request['label']);save('target-reset-ready.json',{'nonce':request['nonce'],**value});reset_nonce=request['nonce']
+   if (OUT/'socket-trace-request.json').exists():
+    request=json.loads((OUT/'socket-trace-request.json').read_text())
+    if request['nonce']!=trace_nonce:
+     value=start_socket_trace(request['label']) if request['action']=='start' else stop_socket_trace();save('socket-trace-ready.json',{'nonce':request['nonce'],'ready':True,**value});trace_nonce=request['nonce']
   time.sleep(1)
  save('worker-exit.json',inspect(NAMES['worker'])['State']);print(docker('logs',NAMES['worker']),flush=True);assert inspect(NAMES['worker'])['State']['ExitCode']==0,'qualification binary failed'
  save(('index-experiment-success.json' if FOCUS else 'qualification-success.json'),{'source':PIN,'config':CONFIG,'admitted':admitted,'generated_only':True,'historical_acceptance':False})
 finally:
+ if TARGET=='restore':
+  try:stop_socket_trace()
+  except Exception as error:save('socket-stop-error.json',{'error':repr(error)})
  STOP.set()
  if thread:thread.join(timeout=30)
  for role,name in NAMES.items():
@@ -157,12 +230,17 @@ finally:
   except Exception:pass
  try:docker('network','rm',NETWORK)
  except Exception:pass
- # Do not upload full generated DBs, test executables or bulk snapshots.
- for name in ['source.capture.json','converted.snapshot','explicit.snapshot']:
+ # Never upload PGDATA or executable trees. These named inputs are wholly generated.
+ retained=0;portable_cap=CONFIG.get('portable_bytes',256*1048576)
+ for name in ['source.capture.json','converted.snapshot','explicit.snapshot','representative.snapshot']:
   path=OUT/name
   if path.exists():
-   try:save(name+'.manifest.json',{'bytes':path.stat().st_size,'sha256':hashlib.sha256(path.read_bytes()).hexdigest()});path.unlink()
-   except OSError as error:save(name+'.retention-error.json',{'error':str(error)});call(['sudo','chmod','u+r,g+r,o+r',str(path)]);path.unlink()
+   try:
+    size=path.stat().st_size;keep=retained+size<=portable_cap
+    save(name+'.manifest.json',{'bytes':size,'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'retained':keep,'scope':'generated portable fixture only','aggregate_cap_bytes':portable_cap})
+    if keep:retained+=size
+    else:path.unlink()
+   except OSError as error:save(name+'.retention-error.json',{'error':str(error)})
  try:
   points=[json.loads(line) for line in (OUT/'telemetry.jsonl').read_text().splitlines()]
   maxima={};source_released=[];source_held=[];actual_copy_queries={};simultaneous=[];idle_maxima={};baseline=json.loads((OUT/'baseline-volumes.json').read_text())
