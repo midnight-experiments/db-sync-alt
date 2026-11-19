@@ -71,6 +71,7 @@ jobs:
           (b/"manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
           PY
             ' 2>&1 | tee "$RUNNER_TEMP/bundle/evidence/build.log"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bundle"
       - name: Qualify the final stripped release executable on generated stores
         shell: bash
         run: |
