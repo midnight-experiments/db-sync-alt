@@ -75,6 +75,16 @@ pub async fn status(client: &Client) -> Result<BTreeMap<Shape, FieldEvidence>, E
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let exists: bool = client
+        .query_one(
+            "SELECT to_regclass('dsa_follower.first_witness') IS NOT NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    if !exists {
+        return Ok(result);
+    }
     for row in client
         .query(
             "SELECT shape,observation FROM dsa_follower.first_witness ORDER BY shape",

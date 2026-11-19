@@ -89,6 +89,8 @@ pub struct Limits {
     pub transaction_outputs: usize,
     pub transaction_output_values: usize,
     pub json_depth: u16,
+    pub evidence_memory: usize,
+    pub evidence_spool: usize,
 }
 
 impl Default for Limits {
@@ -104,6 +106,8 @@ impl Default for Limits {
             transaction_outputs: 128 * 1024 * 1024,
             transaction_output_values: 8 * 1024 * 1024,
             json_depth: 2048,
+            evidence_memory: 4 * 1024 * 1024,
+            evidence_spool: 256 * 1024 * 1024,
         }
     }
 }
@@ -123,6 +127,8 @@ impl Limits {
     }
     fn validate(&self) -> Result<(), Error> {
         for (field, value) in [
+            ("provider.limits.evidence_memory", self.evidence_memory),
+            ("provider.limits.evidence_spool", self.evidence_spool),
             ("provider.limits.headers", self.headers),
             ("provider.limits.block_cbor", self.block_cbor),
             ("provider.limits.genesis", self.genesis),
@@ -260,6 +266,7 @@ struct Inner {
     counts: Mutex<Counts>,
     recorder: Arc<dyn AttemptRecorder>,
     clock: Arc<dyn Clock>,
+    evidence_budget: Arc<evidence::Budget>,
 }
 
 #[derive(Clone)]
@@ -352,6 +359,10 @@ impl Provider {
             .build()
             .map_err(|_| Error::configuration("provider.base_url"))?;
         Ok(Self(Arc::new(Inner {
+            evidence_budget: evidence::Budget::new(
+                config.limits.evidence_memory,
+                config.limits.evidence_spool,
+            ),
             http,
             base_url,
             key,
@@ -642,7 +653,9 @@ impl Provider {
         }
         if matches!(endpoint, Endpoint::TransactionOutputs(_)) {
             let spool = evidence_directory
-                .map(|directory| evidence::Spool::new(directory, &self.0.key))
+                .map(|directory| {
+                    evidence::Spool::new(directory, &self.0.key, &self.0.evidence_budget)
+                })
                 .transpose()
                 .map_err(|_| self.failure("evidence_storage_unavailable", None, None))?;
             let reply = self
@@ -679,9 +692,19 @@ impl Provider {
             .map_err(|code| self.failure(code, None, None))?;
         // A successful in-flight response cannot erase a concurrent refusal.
         self.0.control.lock().unwrap().failures = 0;
-        let evidence = evidence_directory.map(|_| {
-            evidence::RawResponse::buffered(endpoint.clone(), body, self.0.clock.unix_seconds())
-        });
+        let evidence = evidence_directory
+            .map(|directory| {
+                evidence::RawResponse::buffered(
+                    endpoint.clone(),
+                    body,
+                    self.0.clock.unix_seconds(),
+                    directory,
+                    &self.0.key,
+                    &self.0.evidence_budget,
+                )
+            })
+            .transpose()
+            .map_err(|_| self.failure("evidence_storage_or_capacity", None, None))?;
         Ok(evidence::CapturedReply {
             endpoint,
             reply,

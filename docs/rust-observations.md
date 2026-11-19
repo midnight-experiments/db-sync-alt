@@ -36,7 +36,12 @@ requires rolling back the entire publication. Dropping an unsuccessful
 publication discards its held overlay. Load `status` again after commit and at
 restart; derive the pending set from it before requesting ordinary responses
 with `fetch_with_evidence`. A-built snapshots have no follower-local witnesses.
-The full follower loop, migration invocation and HTTP status wiring remain
+The existing `db-sync-alt status` command now adds `capabilities` and
+`real_data_evidence` to its identity/position output using this same durable
+projection. On an A-created store without the follower table it reports
+unobserved defaults without creating a schema or writing anything. It preserves
+permission errors for weak roles. The full follower loop, migration invocation
+and HTTP status wiring remain
 pending the A merge and B4/B5 integration gates.
 
 To recover a local future regression input, take a `response_sha256` under the
@@ -78,3 +83,14 @@ causal supplement requests and failed publication retries. A caller supplies
 one pending-shape snapshot for that block attempt. It can add the specifically
 requested ordinary supplement and prepare again; neither witness capture nor
 row/check preparation requires requesting the block page again.
+
+Evidence retention shares configurable aggregate budgets across all responses
+and cloned provider clients: 4 MiB of retained raw buffers and 256 MiB of
+unlinked temporary spool files by default. Once retained raw buffers reach the
+memory budget, further evidence bodies spill to the explicitly configured
+spool directory. Per-endpoint wire/retained-value ceilings still apply. Dropping
+a rejected, rolled-back or completed input releases its reservation. A budget
+or storage error is reported and the publication must roll back; it cannot
+publish a false witness. After all shapes are seen, the normal no-evidence path
+opens no spool, retains no raw buffer and the zero-candidate staging path issues
+no SQL. B5's full-process memory/throughput measurement is still required.

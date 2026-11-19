@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+dsa-service = { path = "../dsa-service" }
 clap.workspace = true
 dsa-chain.workspace = true
 dsa-store.workspace = true

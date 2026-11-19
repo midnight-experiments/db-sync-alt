@@ -849,14 +849,13 @@ async fn causal_supplement_retries_preserve_the_one_original_page_capture() {
                 .unwrap(),
         )
         .unwrap();
-    assert!(matches!(
-        block.prepare(&fixture.profile, &previous(), 9, &mut held, &pending),
-        Err(observations::Error::Check(
-            dsa_chain::checks::CheckError::Supplement(dsa_chain::rows::BuildError::Required(
-                dsa_chain::rows::SupplementRequest::Datum(_)
-            ))
-        ))
-    ));
+    match block.prepare(&fixture.profile, &previous(), 9, &mut held, &pending) {
+        Err(observations::Error::Build(dsa_chain::rows::BuildError::Required(
+            dsa_chain::rows::SupplementRequest::Datum(_),
+        ))) => {}
+        Err(error) => panic!("expected causal required datum, got {error:?}"),
+        Ok(_) => panic!("missing datum accepted"),
+    }
     assert!(held.is_empty());
     block
         .push(

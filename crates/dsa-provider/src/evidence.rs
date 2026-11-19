@@ -7,6 +7,10 @@ use std::{
     collections::BTreeSet,
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 pub struct CapturedReply {
@@ -30,6 +34,62 @@ impl CapturedReply {
         (self.endpoint, self.reply, self.evidence)
     }
 }
+/// Shared across every retained response and cloned client. Released on drop,
+/// including rejected responses, rollback, retries and publication completion.
+pub(crate) struct Budget {
+    memory: AtomicUsize,
+    disk: AtomicUsize,
+    memory_limit: usize,
+    disk_limit: usize,
+}
+impl Budget {
+    pub(crate) fn new(memory_limit: usize, disk_limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            memory: AtomicUsize::new(0),
+            disk: AtomicUsize::new(0),
+            memory_limit,
+            disk_limit,
+        })
+    }
+    fn lease(self: &Arc<Self>, disk: bool) -> Lease {
+        Lease {
+            budget: self.clone(),
+            disk,
+            bytes: 0,
+        }
+    }
+}
+struct Lease {
+    budget: Arc<Budget>,
+    disk: bool,
+    bytes: usize,
+}
+impl Lease {
+    fn grow(&mut self, length: usize) -> io::Result<()> {
+        let (counter, limit) = if self.disk {
+            (&self.budget.disk, self.budget.disk_limit)
+        } else {
+            (&self.budget.memory, self.budget.memory_limit)
+        };
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                old.checked_add(length).filter(|next| *next <= limit)
+            })
+            .map_err(|_| io::Error::other("evidence_capture_budget"))?;
+        self.bytes += length;
+        Ok(())
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let counter = if self.disk {
+            &self.budget.disk
+        } else {
+            &self.budget.memory
+        };
+        counter.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
 enum Body {
     Buffered(Vec<u8>),
     Spooled(std::fs::File),
@@ -40,6 +100,7 @@ pub struct RawResponse {
     sha256: String,
     length: u64,
     received_at: u64,
+    _lease: Lease,
 }
 impl RawResponse {
     pub fn endpoint(&self) -> &Endpoint {
@@ -66,13 +127,28 @@ impl RawResponse {
             }
         }
     }
-    pub(crate) fn buffered(endpoint: Endpoint, body: Vec<u8>, received_at: u64) -> Self {
-        Self {
-            sha256: format!("{:x}", Sha256::digest(&body)),
-            length: body.len() as u64,
-            body: Body::Buffered(body),
-            endpoint,
-            received_at,
+    pub(crate) fn buffered(
+        endpoint: Endpoint,
+        body: Vec<u8>,
+        received_at: u64,
+        directory: &Path,
+        key: &str,
+        budget: &Arc<Budget>,
+    ) -> io::Result<Self> {
+        let mut lease = budget.lease(false);
+        if lease.grow(body.len()).is_ok() {
+            Ok(Self {
+                sha256: format!("{:x}", Sha256::digest(&body)),
+                length: body.len() as u64,
+                body: Body::Buffered(body),
+                endpoint,
+                received_at,
+                _lease: lease,
+            })
+        } else {
+            let mut spool = Spool::new(directory, key, budget)?;
+            spool.write(&body)?;
+            Ok(spool.finish(endpoint, received_at))
         }
     }
 }
@@ -93,20 +169,23 @@ pub(crate) struct Spool {
     hash: Sha256,
     length: u64,
     scanner: SecretScanner,
+    lease: Lease,
 }
 impl Spool {
-    pub(crate) fn new(directory: &Path, key: &str) -> io::Result<Self> {
+    pub(crate) fn new(directory: &Path, key: &str, budget: &Arc<Budget>) -> io::Result<Self> {
         Ok(Self {
             file: tempfile::tempfile_in(directory)?,
             hash: Sha256::new(),
             length: 0,
             scanner: SecretScanner::new(key),
+            lease: budget.lease(true),
         })
     }
     pub(crate) fn write(&mut self, chunk: &[u8]) -> io::Result<()> {
         for &byte in chunk {
             self.scanner.byte(byte)?;
         }
+        self.lease.grow(chunk.len())?;
         self.file.write_all(chunk)?;
         self.hash.update(chunk);
         self.length += chunk.len() as u64;
@@ -119,6 +198,7 @@ impl Spool {
             sha256: format!("{:x}", self.hash.finalize()),
             length: self.length,
             received_at,
+            _lease: self.lease,
         }
     }
 }
@@ -241,13 +321,61 @@ impl SecretScanner {
 mod tests {
     use super::*;
     #[test]
+    fn aggregate_evidence_budget_spills_memory_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = Budget::new(4, 8);
+        let endpoint = Endpoint::Metadata("01".repeat(32).parse().unwrap());
+        let first = RawResponse::buffered(
+            endpoint.clone(),
+            b"[0]\n".to_vec(),
+            1,
+            directory.path(),
+            "synthetic-key",
+            &budget,
+        )
+        .unwrap();
+        let second = RawResponse::buffered(
+            endpoint.clone(),
+            b"[1]\n".to_vec(),
+            1,
+            directory.path(),
+            "synthetic-key",
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(budget.memory.load(Ordering::SeqCst), 4);
+        assert_eq!(budget.disk.load(Ordering::SeqCst), 4);
+        assert!(
+            RawResponse::buffered(
+                endpoint,
+                b"[12345678]".to_vec(),
+                1,
+                directory.path(),
+                "synthetic-key",
+                &budget
+            )
+            .is_err()
+        );
+        assert_eq!(budget.disk.load(Ordering::SeqCst), 4);
+        drop(first);
+        drop(second);
+        assert_eq!(budget.memory.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.disk.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+    #[test]
     fn escaped_credentials_in_discarded_fields_never_enter_evidence() {
         for raw in [
             br#"{"inputs":["synthetic-key"]}"#.as_slice(),
             br#"{"inputs":["synthetic-\u006bey"]}"#.as_slice(),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let mut spool = Spool::new(dir.path(), "synthetic-key").unwrap();
+            let mut spool = Spool::new(
+                dir.path(),
+                "synthetic-key",
+                &Budget::new(4 * 1024 * 1024, 256 * 1024 * 1024),
+            )
+            .unwrap();
             let mut rejected = false;
             for chunk in raw.chunks(1) {
                 if spool.write(chunk).is_err() {
@@ -262,7 +390,12 @@ mod tests {
     fn raw_spool_preserves_whitespace_and_unknown_fields_exactly() {
         let raw = b" {\n\"unknown\": [1,2], \"outputs\": [] }\n";
         let dir = tempfile::tempdir().unwrap();
-        let mut spool = Spool::new(dir.path(), "synthetic-key").unwrap();
+        let mut spool = Spool::new(
+            dir.path(),
+            "synthetic-key",
+            &Budget::new(4 * 1024 * 1024, 256 * 1024 * 1024),
+        )
+        .unwrap();
         for chunk in raw.chunks(3) {
             spool.write(chunk).unwrap();
         }
