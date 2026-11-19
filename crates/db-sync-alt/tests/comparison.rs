@@ -1206,7 +1206,9 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
     );
     assert_eq!(
         observed_header_hash(latest_difference["b"].as_str().unwrap())?,
-        converted["source"]["state"]["tip"]["hash"].as_str().unwrap()
+        converted["source"]["state"]["tip"]["hash"]
+            .as_str()
+            .unwrap()
     );
     let old_latest = capture["capture"]["cases"]
         .as_object()
@@ -1221,7 +1223,9 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
         .unwrap();
     assert_eq!(
         observed_header_hash(old_latest["rows"][0].as_str().unwrap())?,
-        converted["source"]["state"]["tip"]["hash"].as_str().unwrap()
+        converted["source"]["state"]["tip"]["hash"]
+            .as_str()
+            .unwrap()
     );
     assert_eq!(report["newest_a"], f.bounds.tip);
     assert_eq!(report["positions"]["horizon"], 6);
