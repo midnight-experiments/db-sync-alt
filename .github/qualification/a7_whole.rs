@@ -231,6 +231,7 @@ async fn whole_conversion_qualification() -> Result {
         .collect();
     for row in initial.query("SELECT encode(m.policy,'hex')||encode(m.name,'hex'),coalesce(sum(a.quantity),0)::text FROM serve.multi_asset m LEFT JOIN serve.ma_tx_out a ON a.ident=m.id LEFT JOIN serve.tx_out o ON o.id=a.tx_out_id WHERE NOT EXISTS(SELECT 1 FROM serve.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index) GROUP BY m.id,m.policy,m.name",&[]).await?{let unit:String=row.get(0);if expected_supply.contains_key(&unit){expected_supply.insert(unit,row.get(1));}}
     let original = fingerprint(&source).await?;
+    let datum_id_base:i64=initial.query_one("SELECT coalesce(max(id),0)+10000 FROM serve.datum",&[]).await?.get(0);
     let n_outputs = wanted_outputs - original["counts"]["tx_out"].as_i64().unwrap();
     let n_assets = wanted_assets - original["counts"]["ma_tx_out"].as_i64().unwrap();
     let n_spends = wanted_spends - original["counts"]["tx_in"].as_i64().unwrap();
@@ -253,7 +254,7 @@ async fn whole_conversion_qualification() -> Result {
     }
     for low in (0..n_datums).step_by(10_000) {
         let high = (low + 9999).min(n_datums - 1);
-        source.write(&format!("INSERT INTO serve.datum SELECT 10000+n,decode(md5('whole-datum/'||n::text)||md5('whole-datum2/'||n::text),'hex'),CASE WHEN n%1000=0 THEN NULL WHEN n%1000=10 THEN 'null'::jsonb ELSE jsonb_build_object('constructor',0,'fields',jsonb_build_array(jsonb_build_object('int',n),jsonb_build_object('bytes',(SELECT string_agg(md5(n::text||'/'||j::text),'') FROM generate_series(0,CASE WHEN n%1000=2 THEN 1023 WHEN n%100=3 THEN 255 WHEN n%25=4 THEN 63 ELSE 15 END)j)))) END FROM generate_series({low}::bigint,{high}::bigint)n")).await?;
+        source.write(&format!("INSERT INTO serve.datum SELECT {datum_id_base}+n,decode(md5('whole-datum/'||n::text)||md5('whole-datum2/'||n::text),'hex'),CASE WHEN n%1000=0 THEN NULL WHEN n%1000=10 THEN 'null'::jsonb ELSE jsonb_build_object('constructor',0,'fields',jsonb_build_array(jsonb_build_object('int',n),jsonb_build_object('bytes',(SELECT string_agg(md5(n::text||'/'||j::text),'') FROM generate_series(0,CASE WHEN n%1000=2 THEN 1023 WHEN n%100=3 THEN 255 WHEN n%25=4 THEN 63 ELSE 15 END)j)))) END FROM generate_series({low}::bigint,{high}::bigint)n")).await?;
         if low % 100000 == 0 {
             event(
                 json!({"event":"datum_population","rows":high+1,"seconds":began.elapsed().as_secs_f64()}),
@@ -307,7 +308,7 @@ async fn whole_conversion_qualification() -> Result {
     expected_raw["tx_metadata"] = json!(0);
     save(
         "expected-raw-families.json",
-        &json!({"rows":expected_raw,"scope":"same-snapshot transport bounds; all rows except metadata restricted to H..T","independent_formula_counts":{"block":headers,"tx_out":wanted_outputs,"ma_tx_out":wanted_assets,"tx_in":wanted_spends,"datum":wanted_datums,"tx":original["counts"]["tx"].as_i64().unwrap()+2*span}}),
+        &json!({"rows":expected_raw,"scope":"same-snapshot transport bounds: block through P, tx/output/asset/spend through T, metadata H..T; catalogue/datum/epoch families complete","independent_formula_counts":{"block":headers,"tx_out":wanted_outputs,"ma_tx_out":wanted_assets,"tx_in":wanted_spends,"datum":wanted_datums,"tx":original["counts"]["tx"].as_i64().unwrap()+2*span}}),
     )?;
     let datum_sizes:Value=owner.query_one("SELECT jsonb_build_object('rows',count(*),'sql_null',count(*) FILTER(WHERE value IS NULL),'json_null',count(*) FILTER(WHERE value='null'::jsonb),'json_utf8_bytes',sum(octet_length(value::text)),'column_bytes',sum(pg_column_size(value)),'maximum_json_utf8_bytes',max(octet_length(value::text))) FROM serve.datum",&[]).await?.get(0);
     let window:Value=owner.query_one(&format!("SELECT jsonb_build_object('outputs',(SELECT count(*) FROM serve.tx_out WHERE id>={horizon}::bigint*16777216),'spends',(SELECT count(*) FROM serve.tx_in WHERE id>={horizon}::bigint*16777216),'old_unspent',(SELECT count(*) FROM serve.tx_out o WHERE id<{horizon}::bigint*16777216 AND NOT EXISTS(SELECT 1 FROM serve.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index)))"),&[]).await?.get(0);
@@ -315,7 +316,7 @@ async fn whole_conversion_qualification() -> Result {
     assert!(window["spends"].as_i64().unwrap() > 1000);
     save(
         "fixture.json",
-        &json!({"kind":"generated_not_field_evidence","divisor":divisor,"fingerprint":ready,"datum_sizes":datum_sizes,"expected_supply":expected_supply,"window":window,"H":horizon,"T":target,"P":tip,"setup_seconds":began.elapsed().as_secs_f64(),"generated_spends_exact":n_spends,"generated_unspent_asset_formula":n_assets-(n_assets*n_spends/n_outputs),"source_chain_tables":"legacy DDL present but no full chain-copy population; served view cardinalities only","datum_distribution":"deterministic high-entropy 512/2048/8192/32768hex-character bands; controlled SQL/JSON nulls; synthetic not empirical"}),
+        &json!({"kind":"generated_not_field_evidence","divisor":divisor,"fingerprint":ready,"datum_sizes":datum_sizes,"expected_supply":expected_supply,"window":window,"H":horizon,"T":target,"P":tip,"setup_seconds":began.elapsed().as_secs_f64(),"generated_datum_id_base":datum_id_base,"generated_spends_exact":n_spends,"generated_unspent_asset_formula":n_assets-(n_assets*n_spends/n_outputs),"source_chain_tables":"legacy DDL present but no full chain-copy population; served view cardinalities only","datum_distribution":"deterministic high-entropy 512/2048/8192/32768hex-character bands; controlled SQL/JSON nulls; synthetic not empirical"}),
     )?;
     save(
         "fixture-ready.json",
