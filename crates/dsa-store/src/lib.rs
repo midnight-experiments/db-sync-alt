@@ -542,7 +542,7 @@ mod diagnostic_tests {
     struct SecretContext(std::io::Error);
     impl std::fmt::Display for SecretContext {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("postgres://operator:generated-secret@private-host/private-db")
+            f.write_str("generated-secret context private-host private-db")
         }
     }
     impl std::error::Error for SecretContext {
@@ -566,7 +566,7 @@ mod diagnostic_tests {
         ] {
             assert!(!serialized.contains(secret));
         }
-        let other = std::io::Error::other("postgres://operator:another-secret@private-host");
+        let other = std::io::Error::other("another-secret context private-host");
         assert_eq!(
             io_causes(Some(&other)),
             vec![json!({"kind":"Other","os_error":null})]
