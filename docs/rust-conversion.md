@@ -40,14 +40,38 @@ and data_hash remain; original selected payloads, IDs and pre-filter asset
 ordinals are preserved. The six fixed lookup descriptors retain their source
 IDs even without output references. Rule1 pruned sources cannot be relabelled.
 
-The source sends one natural-key stream per family. Destination batches use
-`--batch-rows` (default4096) and `--batch-bytes` (default4MiB); one larger
-supported row travels alone. Source work includes prefix unspent/carry
-selection and sorting. Reports include actual source limits, work_mem,
-preflight, network, supply and header/horizon read times, each family's
-row/byte/batch counts and wall cost, plus destination preparation,
-index/analyze/sequence, verification, commit and total finish times. Network
-time is included in the reported bounds read time. The transaction can hold back source vacuum while active.
+The source sends bounded unique-key binary COPY pages into destination-owned
+TEMP tables. Each source page is fully read before any destination write, so
+slow destination writes do not keep a source statement active. Both
+`--batch-rows` (default 4096, source cap 4096) and `--batch-bytes` (default 4 MiB)
+bound pages. A single larger supported row travels alone and remains subject
+to the caller's finite timeouts. A conservative SQL byte counter uses one
+indexed successor at a time; it may inspect one extra row at a page boundary.
+Only binary COPY transports data: numeric values, timestamps, bytea, datum JSON
+and SQL NULL versus JSON null are preserved without a Rust value decoder.
+
+All eleven visible families are read in the same source snapshot, with safe
+positional target/tip and bridge-window bounds. This is a full-reader operation;
+`raw_families` reports its rows, wire bytes, page costs, destination write time
+and temporary relation bytes. It creates no source TEMP objects or grants.
+Source observations are captured and committed before the expensive local
+finish. The private copy is checked by an independent binary row digest, then
+the unchanged A3 predicate is evaluated once and its keys reused for all
+families. Natural-key fingerprints, old-spent state, supply and closure are
+checked before publication. TEMP data disappears on commit, rollback or a
+lost connection; the served layout and snapshot format do not change.
+
+Temporary staging, its indexes, local selection spill, the selected database,
+WAL, snapshot and restore all need disk headroom. The separately guarded runbook
+must verify the actual PostgreSQL storage mounts and free-space floor against
+the qualified peak footprint before starting. The tool reports its TEMP relation
+sizes; it never creates local root-disk scratch. Hosted data/costs do not by
+themselves qualify the actual archive or authorize live reads.
+
+Reports retain selected-family row/byte costs and add raw copy/staging and
+local-selection costs, alongside actual source limits, work_mem and destination
+index/analyze/sequence, verification, commit and finish times. The source
+transaction can hold back vacuum until its capture and commit finish.
 
 Positive PostgreSQL statement and idle-transaction limits are preserved. A
 source reader whose inherited value is0 receives a scoped60s default. The
@@ -58,9 +82,10 @@ Explicit positive overrides are connection-local:
 `--source-statement-timeout-seconds`,
 `--source-idle-transaction-timeout-seconds`,
 `--statement-timeout-seconds`, and `--idle-transaction-timeout-seconds`.
-Source statement time includes destination backpressure. A destination can be
-idle while a source sort runs; a caller's short idle limit can therefore end a
-conversion. Limits are never silently disabled. Live-source limits still
+A source page is complete before its destination COPY starts. A destination can
+still be idle while a source page or source-answer capture runs, and a source
+can be idle while a bounded destination page writes. A caller's short idle
+limit can therefore still end a conversion. Limits are never silently disabled. Live-source limits still
 require the operator's authorization; synthetic timing does not change them.
 
 Source, horizon, destination and optional snapshot path preflights precede

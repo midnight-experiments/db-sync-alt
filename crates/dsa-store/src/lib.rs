@@ -3,6 +3,7 @@
 mod canonical;
 pub mod catalogue;
 pub mod compare;
+mod conversion_stage;
 pub mod convert;
 pub mod keep;
 pub mod snapshot;

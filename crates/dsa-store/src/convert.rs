@@ -20,13 +20,14 @@
 //! every retained window header gets first_served=publication time, preserving
 //! the full configured period after conversion, as after restore.
 //!
-//! One source stream per family returns original-row JSONB text, natural-key
-//! canonical text and the old-spent marker in natural-key order. Rust never
-//! parses arbitrary datum/metadata JSON. Destination batches are bounded by rows
-//! and bytes; one supported row larger than the byte target travels alone.
-//! Rule v2 filters asset rows at every address before loading, preserving the
-//! original IDs/ordinals and every retained payload. Output shells remain.
-//! Source and destination family/state digests and inserted counts must agree.
+//! Bounded, byte-limited unique-key binary COPY pages first populate private
+//! destination TEMP facts. Each source query is fully drained before any
+//! destination write; a single oversized row travels alone within caller limits.
+//! Source raw binary digests are independently rechecked on the local copy.
+//! The unchanged A3 predicate is then materialized once locally for all families,
+//! after source capture/commit. Server-side selected INSERTs preserve types,
+//! JSON null versus SQL NULL, original IDs and all payloads. Natural-key digest,
+//! sparse old-spent state, closure and supply checks gate publication.
 //!
 //! stage_conversion accepts the caller's already-open readonly transaction. An
 //! A6/A7 coordinator can capture original node statements, including the newest
@@ -44,13 +45,7 @@ use crate::{
     snapshot::Description,
     verify::{self, MARKERS, Position, ServingState, Verification},
 };
-use dsa_chain::{
-    VERSION,
-    digest::{FamilyDigest, FamilyHasher, root},
-    keep::Bounds,
-    profiles::Profile,
-};
-use futures_util::{StreamExt, pin_mut};
+use dsa_chain::{VERSION, digest::root, keep::Bounds, profiles::Profile};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -204,6 +199,9 @@ pub struct SourceReport {
     /// Raw asset rows paged before filtering; includes foreign units.
     pub supply_rows: u64,
     pub longest_supply_page_seconds: f64,
+    /// Source transport costs, before local retention; all reads use one RR snapshot.
+    pub raw_families: BTreeMap<String, crate::conversion_stage::RawFamilyCost>,
+    pub staging_peak_bytes: i64,
     pub bounds_read_seconds: f64,
     pub horizon_read_seconds: f64,
     pub horizon_point_queries: u32,
@@ -223,6 +221,7 @@ pub struct DestinationCost {
     pub verify_seconds: f64,
     pub commit_seconds: f64,
     pub finish_seconds: f64,
+    pub local_selection_seconds: f64,
 }
 #[derive(Debug, Serialize)]
 pub struct Conversion {
@@ -236,8 +235,9 @@ pub struct StagedConversion<'a> {
     transaction: Transaction<'a>,
     profile_hash: String,
     source: SourceReport,
-    families: BTreeMap<String, FamilyDigest>,
-    protected_state: FamilyDigest,
+    raw: crate::conversion_stage::RawState,
+    selection: Selection,
+    options: ConvertOptions,
     supply: BTreeMap<String, String>,
     destination: DestinationCost,
 }
@@ -251,6 +251,26 @@ impl StagedConversion<'_> {
         }
         let finished = Instant::now();
         let tx = &self.transaction;
+        let selected = crate::conversion_stage::select(
+            tx,
+            &self.source.state,
+            &self.options,
+            &self.raw,
+            &self.selection,
+        )
+        .await?;
+        self.destination.local_selection_seconds = finished.elapsed().as_secs_f64();
+        self.source.staging_peak_bytes =
+            self.source.staging_peak_bytes.max(selected.temporary_bytes);
+        self.source.families = selected.costs;
+        self.source.longest_family_seconds = self
+            .source
+            .families
+            .values()
+            .map(|c| c.elapsed_seconds)
+            .fold(0.0, f64::max);
+        let families = selected.families;
+        let protected_state = selected.markers;
         let state = &self.source.state;
         write_state(tx, state).await?;
         for (unit, quantity) in &self.supply {
@@ -274,13 +294,13 @@ impl StagedConversion<'_> {
         let verify_started = Instant::now();
         let verified = verify::verify(tx, profile, false).await?;
         self.destination.verify_seconds = verify_started.elapsed().as_secs_f64();
-        if verified.families != self.families
-            || verified.content_digest != root(&self.families)
-            || verified.protected_state != self.protected_state
+        if verified.families != families
+            || verified.content_digest != root(&families)
+            || verified.protected_state != protected_state
             || verified.state_digest
                 != root(&BTreeMap::from([(
                     MARKERS.to_owned(),
-                    self.protected_state.clone(),
+                    protected_state.clone(),
                 )]))
             || verified.supply != self.supply
         {
@@ -368,7 +388,7 @@ async fn validate_reader(source: &Transaction<'_>) -> Result<u32, Error> {
     Ok(oid)
 }
 
-fn columns(table: &str) -> Vec<(&'static str, &'static str, &'static str)> {
+pub(crate) fn columns(table: &str) -> Vec<(&'static str, &'static str, &'static str)> {
     let values = match table {
         "block" => {
             "id:int8,hash:hash32type,epoch_no:word31type,slot_no:word63type,block_no:word31type,time:timestamp,tx_count:word63type"
@@ -684,6 +704,8 @@ async fn source_report(
         supply_batches: 0,
         supply_rows: 0,
         longest_supply_page_seconds: 0.0,
+        raw_families: BTreeMap::new(),
+        staging_peak_bytes: 0,
         bounds_read_seconds,
         horizon_read_seconds: horizon_started.elapsed().as_secs_f64(),
         horizon_point_queries: point_queries,
@@ -808,46 +830,6 @@ async fn supply(
     Ok((amounts, cost))
 }
 
-struct Batch {
-    json: String,
-    rows: usize,
-    markers: Vec<i64>,
-    batches: u64,
-}
-impl Batch {
-    fn new() -> Self {
-        Self {
-            json: "[".to_owned(),
-            rows: 0,
-            markers: Vec::new(),
-            batches: 0,
-        }
-    }
-    async fn flush(&mut self, tx: &Transaction<'_>, table: &str) -> Result<(), Error> {
-        if self.rows == 0 {
-            return Ok(());
-        }
-        self.json.push(']');
-        let count=tx.execute(&format!("INSERT INTO serve.{table} SELECT * FROM jsonb_populate_recordset(NULL::serve.{table},$1::text::jsonb)"),&[&self.json]).await?;
-        if count != self.rows as u64 {
-            return Err(Error::Refusal("conversion_batch_row_mismatch"));
-        }
-        if !self.markers.is_empty() {
-            tx.execute(
-                "INSERT INTO dsa.consumed_before_horizon SELECT unnest($1::bigint[])",
-                &[&self.markers],
-            )
-            .await?;
-        }
-        self.json.clear();
-        self.json.push('[');
-        self.rows = 0;
-        self.markers.clear();
-        self.batches += 1;
-        Ok(())
-    }
-}
-
 impl Store {
     /// Read-only refusal check. prepare_destination repeats its authoritative
     /// checks under the writer lock after source preflight, closing the race.
@@ -902,7 +884,8 @@ impl Store {
     }
 
     /// The caller retains the source transaction for reference-answer capture.
-    /// Finish/commit source reads before `StagedConversion::finish` if possible.
+    /// Capture and commit source reads before `StagedConversion::finish`, whose
+    /// local keep/digest/index work uses only the verified private TEMP copy.
     pub async fn stage_conversion<'a>(
         &'a mut self,
         profile: &Profile,
@@ -945,85 +928,16 @@ impl Store {
             tx.batch_execute(&format!("DROP INDEX IF EXISTS serve.{name}"))
                 .await?;
         }
-        let mut families = BTreeMap::new();
-        let mut markers = FamilyHasher::new(MARKERS);
-        for table in NODE_RELATIONS {
-            let sql = selection.conversion_rows_sql(table)?;
-            let started = Instant::now();
-            let sql_sha256 = format!("{:x}", Sha256::digest(sql.as_bytes()));
-            eprintln!(
-                "{}",
-                json!({"operation":"convert","event":"source_family_started","family":table,"sql_sha256":sql_sha256})
-            );
-            let rows = source
-                .query_raw(&sql, selection.parameters())
-                .await
-                .map_err(|error| Error::SourceRead {
-                    family: table,
-                    elapsed_seconds: started.elapsed().as_secs_f64(),
-                    error,
-                })?;
-            pin_mut!(rows);
-            let mut digest = FamilyHasher::new(table);
-            let mut batch = Batch::new();
-            let (mut count, mut bytes) = (0, 0);
-            while let Some(row) = rows.next().await {
-                let row = row.map_err(|error| Error::SourceRead {
-                    family: table,
-                    elapsed_seconds: started.elapsed().as_secs_f64(),
-                    error,
-                })?;
-                let original: &str = row.try_get(0)?;
-                let canonical: &str = row.try_get(1)?;
-                let key: i64 = row.try_get(2)?;
-                let marker: Option<&str> = row.try_get(3)?;
-                if batch.rows > 0
-                    && (batch.rows >= options.batch_rows
-                        || batch.json.len() + original.len() + 2 > options.batch_bytes)
-                {
-                    batch.flush(&tx, table).await?;
-                }
-                digest.row(canonical.as_bytes());
-                count += 1;
-                bytes += original.len() as u64;
-                if batch.rows > 0 {
-                    batch.json.push(',');
-                }
-                batch.json.push_str(original);
-                batch.rows += 1;
-                if let Some(marker) = marker {
-                    markers.row(marker.as_bytes());
-                    batch.markers.push(key);
-                }
-                if batch.rows >= options.batch_rows || batch.json.len() + 1 >= options.batch_bytes {
-                    batch.flush(&tx, table).await?;
-                }
-            }
-            batch.flush(&tx, table).await?;
-            let elapsed = started.elapsed().as_secs_f64();
-            report.longest_family_seconds = report.longest_family_seconds.max(elapsed);
-            eprintln!(
-                "{}",
-                json!({"operation":"convert","event":"source_family_finished","family":table,"rows":count,"jsonb_utf8_bytes":bytes,"batches":batch.batches,"elapsed_seconds":elapsed,"sql_sha256":sql_sha256})
-            );
-            report.families.insert(
-                table.to_owned(),
-                FamilyCost {
-                    rows: count,
-                    jsonb_utf8_bytes: bytes,
-                    batches: batch.batches,
-                    elapsed_seconds: elapsed,
-                    sql_sha256,
-                },
-            );
-            families.insert(table.to_owned(), digest.finish());
-        }
+        let raw = crate::conversion_stage::stage(source, &tx, &report.state, options).await?;
+        report.raw_families = raw.costs.clone();
+        report.staging_peak_bytes = raw.temporary_bytes;
         Ok(StagedConversion {
             transaction: tx,
             profile_hash: profile.hash()?,
             source: report,
-            families,
-            protected_state: markers.finish(),
+            raw,
+            selection,
+            options: options.clone(),
             supply: amounts,
             destination,
         })

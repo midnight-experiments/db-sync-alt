@@ -15,12 +15,15 @@ use crate::Error;
 pub enum SourceSchema {
     Public,
     Serve,
+    /// Private conversion facts, never a source-reader schema.
+    Temporary,
 }
 impl SourceSchema {
     pub fn name(self) -> &'static str {
         match self {
             Self::Public => "public",
             Self::Serve => "serve",
+            Self::Temporary => "pg_temp",
         }
     }
 }

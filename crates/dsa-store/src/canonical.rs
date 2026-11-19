@@ -72,6 +72,30 @@ pub(crate) fn query(table: &str) -> Result<String, Error> {
 }
 
 pub(crate) fn selected_source(table: &str) -> Result<String, Error> {
+    selected(
+        table,
+        crate::keep::SourceSchema::Public,
+        crate::keep::Selection::ctes_sql(crate::keep::SourceSchema::Public),
+    )
+}
+
+/// Exact same payload/closure/marker projection, over the private full source
+/// copy and the once-materialized, unchanged A3 retained keys.
+pub(crate) fn selected_staging(table: &str) -> Result<String, Error> {
+    selected(
+        table,
+        crate::keep::SourceSchema::Temporary,
+        format!(
+            "WITH keep_{table} AS (SELECT id FROM pg_temp.conversion_keep_keys WHERE family='{table}')"
+        ),
+    )
+}
+
+fn selected(
+    table: &str,
+    schema: crate::keep::SourceSchema,
+    prefix: String,
+) -> Result<String, Error> {
     if !crate::NODE_RELATIONS.contains(&table) {
         return Err(Error::Refusal("invalid_keep_table"));
     }
@@ -85,13 +109,14 @@ pub(crate) fn selected_source(table: &str) -> Result<String, Error> {
     } else {
         "id"
     };
-    let target = format!("public.{table} {alias}");
+    let schema_name = schema.name();
+    let target = format!("{schema_name}.{table} {alias}");
     // Preserve the raw selected row even if a source reference is missing.
     // Destination closure validation must refuse it, rather than fingerprint
     // and publish the same silently shortened stream on both sides.
     let mut from = from
-        .replace(" JOIN serve.", " LEFT JOIN public.")
-        .replace("serve.", "public.")
+        .replace(" JOIN serve.", &format!(" LEFT JOIN {schema_name}."))
+        .replace("serve.", &format!("{schema_name}."))
         .replacen(
             &target,
             &format!("{target} JOIN keep_{table} selected ON selected.id={alias}.{key}"),
@@ -110,20 +135,22 @@ pub(crate) fn selected_source(table: &str) -> Result<String, Error> {
         );
     }
     let marker = if table == "tx_out" {
-        "CASE WHEN o.id<h.height*16777216 AND EXISTS(SELECT 1 FROM public.tx_in spent WHERE spent.tx_out_id=o.tx_id AND spent.tx_out_index=o.index AND spent.id BETWEEN 0 AND h.height*16777216-1) THEN jsonb_build_array(encode(t.hash,'hex'),o.index)::text ELSE NULL::text END"
+        format!(
+            "CASE WHEN o.id<h.height*16777216 AND EXISTS(SELECT 1 FROM {schema_name}.tx_in spent WHERE spent.tx_out_id=o.tx_id AND spent.tx_out_index=o.index AND spent.id BETWEEN 0 AND h.height*16777216-1) THEN jsonb_build_array(encode(t.hash,'hex'),o.index)::text ELSE NULL::text END"
+        )
     } else {
-        "NULL::text"
+        "NULL::text".to_owned()
     };
     let extra = if table == "ma_tx_out" {
         format!(
-            ", conversion_assets AS (SELECT id FROM keep_ma_tx_out UNION SELECT a.id FROM public.ma_tx_out a WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND ({}))",
-            crate::keep::Selection::asset_predicate(crate::keep::SourceSchema::Public, "a")
+            ", conversion_assets AS (SELECT id FROM keep_ma_tx_out UNION SELECT a.id FROM {schema_name}.ma_tx_out a WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND ({}))",
+            crate::keep::Selection::asset_predicate(schema, "a")
         )
     } else {
         String::new()
     };
     Ok(format!(
         "{}{extra}, h AS (SELECT $1::bigint AS height) SELECT to_jsonb({alias})::text,jsonb_build_array({payload})::text,{alias}.{key}::bigint,{marker} FROM {from} ORDER BY {order}",
-        crate::keep::Selection::ctes_sql(crate::keep::SourceSchema::Public)
+        prefix
     ))
 }
