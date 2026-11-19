@@ -928,6 +928,9 @@ async fn convert_destination_termination_stream_finish_and_post_source_commit_ki
 #[tokio::test]
 #[ignore = "on-demand generated multi-million-header source cost"]
 async fn convert_scaled_source_cost() -> Result {
+    if std::env::var("DSA_CONVERSION_SUPPLY_ONLY").as_deref() == Ok("1") {
+        return supply_source_realistic_cost().await;
+    }
     let headers: u32 = std::env::var("DSA_CONVERSION_HEADERS")
         .unwrap_or_else(|_| "2432170".to_owned())
         .parse()?;
@@ -1418,5 +1421,214 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
     );
     source.cleanup().await?;
     target.cleanup().await?;
+    Ok(())
+}
+
+// On-demand hosted cost branch of the existing skipped scale harness. Generated
+// data only, genuine legacy DDL/gate/grants, no operator database or provider.
+async fn supply_source_realistic_cost() -> Result {
+    let wanted: i64 = std::env::var("DSA_SUPPLY_ROWS")
+        .unwrap_or_else(|_| "2630984".to_owned())
+        .parse()?;
+    assert!(wanted >= 10000);
+    let offset = 9_000_000_u32;
+    let headers = 1_202_855_u32;
+    let mut f = fixture(401);
+    f.translate_heights(offset);
+    let p = offset + headers - 1;
+    let t = p - f.profile.cardano.security_parameter;
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let units = dsa_chain::assets::fixed_units(&f.profile);
+    let policies = units
+        .iter()
+        .map(|u| hex::decode(&u[..56]))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let names = units
+        .iter()
+        .map(|u| hex::decode(&u[56..]))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let old = include_str!("common/source_supply_unpaged.sql");
+    let sql = include_str!("../../dsa-store/src/conversion_supply.sql");
+    let mut session = LegacySource::connect(source.reader_config(), None).await?;
+    let tx = session.snapshot().await?;
+    let mut expected = tx
+        .query(old, &[&policies, &names, &i64::from(t)])
+        .await?
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect::<BTreeMap<_, _>>();
+    tx.commit().await?;
+    drop(session);
+    let owner = connect(&source.config).await?;
+    let original_assets: i64 = owner
+        .query_one("SELECT count(*) FROM serve.ma_tx_out", &[])
+        .await?
+        .get(0);
+    let original_inputs: i64 = owner
+        .query_one("SELECT count(*) FROM serve.tx_in", &[])
+        .await?
+        .get(0);
+    let generated = wanted - original_assets;
+    let spent = (2_386_344 - original_inputs).min(generated * 95 / 100);
+    let asset = f.asset_id("cnight");
+    let began = Instant::now();
+    for low in (i64::from(offset)..=i64::from(p)).step_by(10000) {
+        let high = (low + 9999).min(i64::from(p));
+        source.write(&format!("INSERT INTO serve.block SELECT n,decode(md5('supplyblock/'||n::text)||md5('supplyblock2/'||n::text),'hex'),(n-{offset})/20000,n*20,n,timestamp '2026-01-01'+(n-{offset})*interval '20 seconds',0 FROM generate_series({low},{high})n ON CONFLICT DO NOTHING")).await?;
+    }
+    for low in (0..generated).step_by(10000) {
+        let high = (low + 9999).min(generated - 1);
+        source.write(&format!("WITH coordinates AS(SELECT DISTINCT {offset}+13+n/3 h FROM generate_series({low},{high})n) INSERT INTO serve.tx SELECT h*4096+100,decode(md5('supplytx/'||h::text)||md5('supplytx2/'||h::text),'hex'),h,100,true FROM coordinates ON CONFLICT DO NOTHING;
+        INSERT INTO serve.tx_out SELECT ({offset}+13+n/3)*16777216+100*4096+n%3,({offset}+13+n/3)*4096+100,(n%3)::smallint,'holder-'||(n%10007)::text,1,NULL,NULL FROM generate_series({low},{high})n;
+        INSERT INTO serve.ma_tx_out SELECT (({offset}+13+n/3)*16777216+100*4096+n%3)*4096,1,({offset}+13+n/3)*16777216+100*4096+n%3,{asset} FROM generate_series({low},{high})n;
+        WITH coordinates AS(SELECT DISTINCT {offset}+14+n/3 h FROM generate_series({low},least({high},{spent}-1))n) INSERT INTO serve.tx SELECT h*4096+101,decode(md5('supplyspend/'||h::text)||md5('supplyspend2/'||h::text),'hex'),h,101,true FROM coordinates ON CONFLICT DO NOTHING;
+        INSERT INTO serve.tx_in SELECT ({offset}+14+n/3)*16777216+101*4096+n%3,({offset}+14+n/3)*4096+101,({offset}+13+n/3)*4096+100,(n%3)::smallint FROM generate_series({low},least({high},{spent}-1))n")).await?;
+        if low % 100000 == 0 {
+            println!(
+                "{}",
+                json!({"event":"supply_cost_setup","rows":high+1,"elapsed_seconds":began.elapsed().as_secs_f64()})
+            );
+        }
+    }
+    let mut counts = BTreeMap::new();
+    let mut sizes = BTreeMap::new();
+    for table in TABLES {
+        owner
+            .batch_execute(&format!("ANALYZE serve.{table}"))
+            .await?;
+        counts.insert(
+            table,
+            owner
+                .query_one(&format!("SELECT count(*) FROM serve.{table}"), &[])
+                .await?
+                .get::<_, i64>(0),
+        );
+        sizes.insert(
+            table,
+            owner
+                .query_one(
+                    "SELECT pg_total_relation_size($1::text::regclass)",
+                    &[&format!("serve.{table}")],
+                )
+                .await?
+                .get::<_, i64>(0),
+        );
+    }
+    assert_eq!(counts["ma_tx_out"], wanted);
+    assert_eq!(counts["block"], i64::from(headers));
+    let u = f.profile.assets["cnight"].unit();
+    expected.insert(
+        u.clone(),
+        (expected[&u].parse::<i128>()? + i128::from(generated - spent)).to_string(),
+    );
+    println!(
+        "{}",
+        json!({"event":"supply_cost_fixture","counts":counts,"bytes":sizes,"T":t,"P":p,"generated_rows":generated,"generated_spends":spent,"setup_seconds":began.elapsed().as_secs_f64(),"expected_supply":expected})
+    );
+    // Preserve the previous whole-history plan and actual outcome at the SAME
+    // 60s role limit. A hosted machine may finish it; no timeout is required.
+    let mut session = LegacySource::connect(source.reader_config(), None).await?;
+    let tx = session.snapshot().await?;
+    let settings:Value=tx.query_one("SELECT jsonb_build_object('statement_timeout',current_setting('statement_timeout'),'idle_timeout',current_setting('idle_in_transaction_session_timeout'),'work_mem',current_setting('work_mem'),'jit',current_setting('jit'),'read_only',current_setting('transaction_read_only'),'isolation',current_setting('transaction_isolation'),'server_version',current_setting('server_version'))",&[]).await?.get(0);
+    assert_eq!(settings["statement_timeout"], "1min");
+    let plan: Value = tx
+        .query_one(
+            &format!("EXPLAIN(SETTINGS,FORMAT JSON) {old}"),
+            &[&policies, &names, &i64::from(t)],
+        )
+        .await?
+        .get(0);
+    println!(
+        "{}",
+        json!({"event":"supply_cost_old_plan","settings":settings,"plan":plan})
+    );
+    let began = Instant::now();
+    match tx.query(old, &[&policies, &names, &i64::from(t)]).await {
+        Ok(rows) => {
+            let actual = rows
+                .into_iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(actual, expected);
+            println!(
+                "{}",
+                json!({"event":"supply_cost_old","outcome":"complete","elapsed_seconds":began.elapsed().as_secs_f64()})
+            );
+        }
+        Err(error) => {
+            assert_eq!(error.code().map(|c| c.code()), Some("57014"));
+            println!(
+                "{}",
+                json!({"event":"supply_cost_old","outcome":"57014","elapsed_seconds":began.elapsed().as_secs_f64()})
+            );
+        }
+    }
+    tx.rollback().await?;
+    drop(session);
+    let mut session = LegacySource::connect(source.reader_config(), None).await?;
+    let tx = session.snapshot().await?;
+    let mut previous = vec!["0".to_owned(); units.len()];
+    let mut after = -1_i64;
+    let mut seen = 0_i64;
+    let mut pages = 0;
+    let mut longest = 0.0_f64;
+    let began = Instant::now();
+    let mut actual: BTreeMap<String, String>;
+    loop {
+        if pages == 0 || seen >= wanted / 2 && seen - 4096 < wanted / 2 || seen + 4096 >= wanted {
+            let plan: Value = tx
+                .query_one(
+                    &format!("EXPLAIN(ANALYZE,BUFFERS,SETTINGS,FORMAT JSON) {sql}"),
+                    &[&policies, &names, &i64::from(t), &after, &previous],
+                )
+                .await?
+                .get(0);
+            println!(
+                "{}",
+                json!({"event":"supply_cost_page_plan","page":pages,"after_id":after,"seen":seen,"plan":plan})
+            );
+        }
+        let started = Instant::now();
+        let rows = tx
+            .query(sql, &[&policies, &names, &i64::from(t), &after, &previous])
+            .await?;
+        let elapsed = started.elapsed().as_secs_f64();
+        longest = longest.max(elapsed);
+        let count: i64 = rows[0].get(3);
+        let last: Option<i64> = rows[0].get(2);
+        assert!((0..=4096).contains(&count));
+        assert!(elapsed < 60.0);
+        actual = rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect();
+        previous = units.iter().map(|u| actual[u].clone()).collect();
+        pages += 1;
+        seen += count;
+        println!(
+            "{}",
+            json!({"event":"supply_cost_page","page":pages,"rows":count,"after_id":after,"last_id":last,"elapsed_seconds":elapsed})
+        );
+        if let Some(id) = last {
+            assert!(id > after);
+            after = id;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(seen, wanted);
+    assert!(pages > 1);
+    let final_settings: String = tx.query_one("SHOW statement_timeout", &[]).await?.get(0);
+    assert_eq!(final_settings, "1min");
+    println!(
+        "{}",
+        json!({"event":"supply_cost_result","rows":seen,"pages":pages,"elapsed_seconds":began.elapsed().as_secs_f64(),"longest_page_seconds":longest,"settings":settings,"final_statement_timeout":final_settings,"supply":actual,"status":"PASS"})
+    );
+    tx.commit().await?;
+    drop(session);
+    drop(owner);
+    source.cleanup().await?;
     Ok(())
 }
