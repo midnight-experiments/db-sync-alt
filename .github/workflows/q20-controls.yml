@@ -1,0 +1,79 @@
+name: q20-controls
+on:
+  push:
+    branches: ['validation/q20-witness-7c5b804']
+    paths: ['.github/workflows/q20-controls.yml']
+permissions:
+  contents: read
+jobs:
+  witnesses:
+    runs-on: ubuntu-24.04
+    container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: dsa_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RUSTUP_TOOLCHAIN: 1.100.0
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TARGET_DIR: /tmp/q20-target
+      DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7c5b804fc39995d15296fa6cdf339aca42542306
+          persist-credentials: false
+      - name: Baseline and runtime negative controls
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          out=Path('/tmp/q20-artifacts');out.mkdir()
+          subprocess.run(['git','config','--global','--add','safe.directory',os.environ['GITHUB_WORKSPACE']],check=True)
+          source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip();assert source=='7c5b804fc39995d15296fa6cdf339aca42542306'
+          def run(name,args):
+              result=subprocess.run(['cargo','test','--locked',*args],capture_output=True,text=True)
+              log=result.stdout+result.stderr;(out/(name+'.log')).write_text(log)
+              return result,log
+          service=['-p','dsa-service','--test','observations']
+          baselines=[('positive-service',service+['--','--include-ignored','--nocapture']),('positive-evidence',['-p','dsa-provider','--lib','evidence::tests','--','--nocapture']),('positive-fallback',['-p','dsa-provider','--test','provider','raw_fallback','--','--nocapture']),('positive-cli',['-p','db-sync-alt','--test','database','status_capabilities_and_evidence_are_read_only_additions','--','--ignored','--exact','--nocapture'])]
+          for name,args in baselines:
+              result,log=run(name,args);assert result.returncode==0,name+' baseline failed'
+          controls=[]
+          def control(name,path,mutate,args,needle):
+              path=Path(path);original=path.read_text()
+              try:
+                  changed=mutate(original);assert changed!=original
+                  path.write_text(changed)
+                  result,log=run(name,args)
+                  assert result.returncode!=0 and 'test result: FAILED' in log and needle in log and 'could not compile' not in log,name+' wrong control failure'
+                  controls.append({'name':name,'exit':result.returncode,'assertion':needle,'result':'detected','source_sha256':hashlib.sha256(original.encode()).hexdigest(),'mutation_sha256':hashlib.sha256(changed.encode()).hexdigest()})
+              finally:path.write_text(original)
+          def replace_once(old,new):
+              def apply(text):assert text.count(old)==1,(old,text.count(old));return text.replace(old,new,1)
+              return apply
+          control('threshold-at10000','crates/dsa-chain/src/rows.rs',replace_once('raw.len() > 10_000','raw.len() >= 10_000'),service+['actual_decoder_and_projection_enforce_boundaries_and_excluded_facts','--','--exact','--nocapture'],'size10000/storedtrue/validtrue/bridgetrue')
+          control('ignore-insertion-receipt','crates/dsa-service/src/observations.rs',replace_once('if !inserted.contains(*shape, observation)? {','if inserted.contains(*shape, observation)? && false {'),service+['publication_raw_witness_status_rollback_retry_restart_are_atomic','--','--ignored','--exact','--nocapture'],'left: 3')
+          def no_extract_digest(text):
+              prefix,marker,suffix=text.partition('pub async fn extract_raw');assert marker
+              return prefix+marker+replace_once('|| format!("{:x}", digest.finalize()) != hash','|| { let _ = digest.finalize(); false }')(suffix)
+          control('ignore-extraction-digest','crates/dsa-service/src/observations.rs',no_extract_digest,service+['publication_raw_witness_status_rollback_retry_restart_are_atomic','--','--ignored','--exact','--nocapture'],'same-length corrupt raw bytes must not pass SHA verification')
+          control('no-candidate-network-query','crates/dsa-service/src/observations.rs',replace_once('if self.observations.is_empty() {','if false && self.observations.is_empty() {'),service+['publication_raw_witness_status_rollback_retry_restart_are_atomic','--','--ignored','--exact','--nocapture'],'25P02')
+          clean=subprocess.check_output(['git','status','--porcelain'],text=True);assert clean==''
+          metadata={'source_head':source,'source_status':clean,'workflow_head':os.environ['GITHUB_SHA'],'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'container_image':'rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea','positive_commands':baselines,'controls':controls}
+          (out/'verification.json').write_text(json.dumps(metadata,indent=2)+'\n')
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: q20-controls-7c5b804
+          path: /tmp/q20-artifacts
+          retention-days: 7
