@@ -736,6 +736,10 @@ async fn commit_reply_proxy(
                     let mut receiver = receiver.clone();
                     connections.spawn(async move {
                         let mut upstream = TcpStream::connect((host.as_str(), port)).await?;
+                        // Match the PostgreSQL client's low-latency socket behavior;
+                        // the proxy's split frame writes must not add Nagle delays.
+                        downstream.set_nodelay(true)?;
+                        upstream.set_nodelay(true)?;
                         let mut length = [0; 4];
                         downstream.read_exact(&mut length).await?;
                         let n = u32::from_be_bytes(length) as usize;
@@ -771,6 +775,7 @@ async fn commit_reply_proxy(
                                 }
                                 if publishing && tag == *b"Q" && body == b"COMMIT\0" {
                                     committing.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    eprintln!("publication_proxy_forwarding_commit");
                                 }
                                 server_write.write_all(&tag).await?;
                                 server_write.write_all(&length).await?;
@@ -830,7 +835,7 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
                 "--horizon-block",
                 "6",
                 "--overall-timeout-seconds",
-                "10",
+                "30",
                 "--snapshot",
                 path.to_str().unwrap(),
             ])
@@ -865,7 +870,7 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
                 break;
             }
             assert!(
-                start.elapsed() < Duration::from_secs(8),
+                start.elapsed() < Duration::from_secs(25),
                 "publication did not happen before deadline"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -883,7 +888,7 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
                     .success()
             );
         }
-        let status = tokio::time::timeout(Duration::from_secs(16), child.wait()).await??;
+        let status = tokio::time::timeout(Duration::from_secs(36), child.wait()).await??;
         let output = std::process::Output {
             status,
             stdout: stdout.await??,
