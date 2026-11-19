@@ -34,10 +34,10 @@ through `Options::missing_policy`; differing probes are refused. The original26
 gated statements/52 executions are accompanied by three
 read-only catalogue probes.
 
-Every event and state answer is exact, including NULL, wide integers and JSON,
+Every supported event and state answer is exact, including NULL, wide integers and JSON,
 with the SQL's outer ordering preserved. Unordered results use multisets,
 including duplicate multiplicities. Only the two internal bounds helpers may
-report valid differing IDs as information. Their before/after anchors and
+report valid differing IDs as information; unsupported registered-candidate observations use a separate coverage label. Their before/after anchors and
 related output/asset/input bounds are verified independently at each database.
 The actual `resolve_ident` lookup IDs are exact. `--verify-unbounded` additionally
 checks event answers with bounds0..i64::MAX; use this on generated scratch data
@@ -50,8 +50,7 @@ Acceptance requires destination B's chain-order check. Source A remains
 unscanned globally. A pruned asset table may have leading/interior ordinal gaps;
 order verification does not infer dense rank from filtered facts. First-row
 previews are capped at4096characters, with full-row SHA256 and an explicit
-truncation flag. Whole rows are still compared exactly. Exit0 means a
-match,2 means a real answer mismatch and1 means a refusal or query failure.
+truncation flag. Whole rows are still compared exactly. Exit0 means supported-query parity,2 means a supported answer mismatch and1 means a refusal or query failure.
 Rule1 pruned stores and mismatched rule declarations/identity are refused.
 Genuine legacy schema5 readers remain supported. Preprod's empty-name cNIGHT
 and named NIGHT bridge unit are reported separately.
@@ -99,3 +98,16 @@ compares one page at a time against the native rows. Shared immutable row
 storage avoids result-vector clones. Defaults bound retained row text to512MiB
 and1million rows per endpoint; these limits are not a measured RSS guarantee.
 A7 records actual peak RSS/time for its500+ pairs and whole-window range.
+
+Node2.1.101 supplies an empty registered-candidate list during authority selection.
+Registered-candidate results in operator RPCs and CLI are unsupported. Both literal
+registered-address query variants still execute, and the report retains their full
+raw observations and differences with `unsupported_registered_candidates` coverage.
+Only that configured-address scope is nonfatal. Other addresses, RPC queries,
+permissioned candidates, identifiers and every event/state query keep their exact
+checks. Q14 helper ID information remains separate. A node release enabling
+registered candidates requires full address coverage under a new keep-rule version.
+
+Observation-format2 files from the stricter rehearsal tool remain readable: omitted
+candidate input metadata is recovered only for its known initial/epoch call sites.
+Their raw rows/checksums are unchanged; the report states the current coverage.

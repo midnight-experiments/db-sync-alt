@@ -845,7 +845,7 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
         let actual = cli(&source, &target, &f.profile, &[]).await?;
         assert_eq!(
             actual.status.code(),
-            Some(2),
+            Some(0),
             "{scenario}: {}",
             String::from_utf8_lossy(&actual.stderr)
         );
@@ -856,7 +856,18 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
                 .unwrap()
                 .starts_with("get_utxos_for_address_")
                 && d["informational"] == false
+                && d["unsupported"] == true
+                && d["fatal"] == false
         }));
+        assert_eq!(report["matched"], true);
+        assert_eq!(report["registered_candidates"]["supported"], false);
+        assert!(
+            report["unsupported_observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["a_rows"] != o["b_rows"] && o["a_input"]["address"] == address)
+        );
         println!(
             "{}",
             json!({"event":"q19_cli_counterexample","scenario":scenario,"exit":actual.status.code()})
@@ -1676,5 +1687,204 @@ async fn compare_cli_refuses_duplicate_units_on_window_and_old_spent_outputs() -
         source.cleanup().await?;
         target.cleanup().await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result {
+    for mutation in ["epoch_header", "stake", "other_address"] {
+        let mut f = fixture(373);
+        f.reindex_ordinals();
+        let extra = f.output(7, 12, 20, "mapping", "cnight", Some(99073));
+        f.reindex_ordinals();
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let target = Database::new().await?;
+        target
+            .cli(
+                "convert",
+                "mainnet",
+                &["--source", &source.dsn(true), "--horizon-block", "6"],
+            )
+            .await?;
+        target
+            .cli("grant-reader", "mainnet", &["--role", &target.reader])
+            .await?;
+        match mutation {
+            "epoch_header" => {
+                target
+                    .write("UPDATE serve.block SET hash=decode(repeat('aa',32),'hex') WHERE id=3")
+                    .await?
+            }
+            "stake" => {
+                target
+                    .write("UPDATE serve.epoch_stake SET amount=amount+1")
+                    .await?
+            }
+            _ => {
+                let hash = f.chain.outputs[&extra].datum_hash.as_ref().unwrap();
+                target.write(&format!("UPDATE serve.datum SET value='{{\"int\":99074}}'::jsonb WHERE hash=decode('{hash}','hex')")).await?;
+            }
+        }
+        let args = if mutation == "other_address" {
+            vec![
+                "--candidate-address",
+                f.profile.addresses["mapping"].as_str(),
+            ]
+        } else {
+            vec![]
+        };
+        let output = cli(&source, &target, &f.profile, &args).await?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{mutation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        let query = match mutation {
+            "epoch_header" => "get_latest_block_for_epoch:",
+            "stake" => "get_stake_distribution:",
+            _ => "get_utxos_for_address_",
+        };
+        assert!(report["differences"].as_array().unwrap().iter().any(|d| {
+            d["query"].as_str().unwrap().starts_with(query)
+                && d["fatal"] == true
+                && d["unsupported"] == false
+        }));
+        assert!(
+            report["unsupported_observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o["a_input"]["address"]
+                    == dsa_store::catalogue::catalogue().candidate_addresses["mainnet"])
+        );
+        println!(
+            "{}",
+            json!({"event":"q19_supported_control","mutation":mutation,"exit":output.status.code()})
+        );
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17; optional DSA_TEST_OLD_CLI proves actual b683 file reuse"]
+async fn compare_q19_compatible_b683_observation_without_reconversion() -> Result {
+    let mut f = fixture(375);
+    let output = f.output(7, 12, 20, "other", "cnight", Some(99075));
+    f.chain.outputs.get_mut(&output).unwrap().address =
+        dsa_store::catalogue::catalogue().candidate_addresses["mainnet"].clone();
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("source-format2.json");
+    let actual_old = std::env::var("DSA_TEST_OLD_CLI").ok();
+    if let Some(old) = &actual_old {
+        let converted = Command::new(old)
+            .args([
+                "convert",
+                "--network",
+                "mainnet",
+                "--source",
+                &source.dsn(true),
+                "--database",
+                &target.dsn(false),
+                "--horizon-block",
+                "6",
+                "--capture-source",
+                file.to_str().unwrap(),
+            ])
+            .output()
+            .await?;
+        assert!(
+            converted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&converted.stderr)
+        );
+    } else {
+        target
+            .cli(
+                "convert",
+                "mainnet",
+                &[
+                    "--source",
+                    &source.dsn(true),
+                    "--horizon-block",
+                    "6",
+                    "--capture-source",
+                    file.to_str().unwrap(),
+                ],
+            )
+            .await?;
+        let mut legacy = dsa_store::source_capture::read(&file, &f.profile)?;
+        for case in legacy.cases.values_mut() {
+            case.candidate_input = None;
+        }
+        std::fs::remove_file(&file)?;
+        dsa_store::source_capture::write(&file, &legacy)?;
+    }
+    let before = std::fs::read(&file)?;
+    let legacy = dsa_store::source_capture::read(&file, &f.profile)?;
+    assert!(legacy.cases.values().all(|c| c.candidate_input.is_none()));
+    target
+        .cli("grant-reader", "mainnet", &["--role", &target.reader])
+        .await?;
+    let run = |binary: String| {
+        let mut c = Command::new(binary);
+        c.args([
+            "compare",
+            "--network",
+            "mainnet",
+            "--a-capture",
+            file.to_str().unwrap(),
+            "--b",
+            &target.dsn(true),
+            "--verify-unbounded",
+        ]);
+        c
+    };
+    if let Some(old) = actual_old.clone() {
+        assert_eq!(run(old).output().await?.status.code(), Some(2));
+    }
+    let compared = run(env!("CARGO_BIN_EXE_db-sync-alt").to_owned())
+        .output()
+        .await?;
+    assert!(
+        compared.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&compared.stderr),
+        String::from_utf8_lossy(&compared.stdout)
+    );
+    let report: Value = serde_json::from_slice(&compared.stdout)?;
+    assert_eq!(report["matched"], true);
+    assert!(report["unsupported_difference_count"].as_u64().unwrap() > 0);
+    assert!(
+        report["unsupported_observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["a_rows"] != o["b_rows"])
+    );
+    assert_eq!(before, std::fs::read(&file)?);
+    let mut future = legacy.clone();
+    future.node_commit = "00".repeat(20);
+    assert!(matches!(
+        compare::compare(&future, &future),
+        Err(dsa_store::Error::Refusal(
+            "comparison_node_coverage_contract"
+        ))
+    ));
+    println!(
+        "{}",
+        json!({"event":"q19_capture_compatibility","actual_b683_binary":actual_old.is_some(),"format":2,"file_unchanged":true,"new_exit":compared.status.code()})
+    );
+    source.cleanup().await?;
+    target.cleanup().await?;
     Ok(())
 }

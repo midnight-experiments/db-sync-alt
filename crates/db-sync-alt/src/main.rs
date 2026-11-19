@@ -647,7 +647,7 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
     let report = compare(&left, &right)?;
     eprintln!(
         "{}",
-        json!({"operation":"compare","event":"finished","matched":report.matched,"differing_cases":report.differences.iter().filter(|d|!d.informational).count(),"helper_id_differences":report.helper_id_differences})
+        json!({"operation":"compare","event":"finished","matched":report.matched,"differing_cases":report.supported_difference_count,"unsupported_differences":report.unsupported_difference_count,"helper_id_differences":report.helper_id_differences})
     );
     Ok(serde_json::to_value(report)?)
 }

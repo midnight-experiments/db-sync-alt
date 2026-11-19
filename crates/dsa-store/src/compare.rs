@@ -35,6 +35,7 @@ use tokio_postgres::{
 
 /// Canonical observation encoding; independent of retained-data rule version.
 pub const OBSERVATION_FORMAT: u32 = 2;
+const REGISTERED_CANDIDATE_NODE: &str = "86774edf8cc76345a5c3a4221f3fe80c094b1c33";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
@@ -408,6 +409,11 @@ pub fn parameter_types(s: &Statement) -> Vec<Type> {
         })
         .collect()
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateInput {
+    pub address: String,
+    pub reference_block: i32,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Case {
     pub query: String,
@@ -417,6 +423,9 @@ pub struct Case {
     pub ordered: bool,
     pub rows: Arc<Vec<String>>,
     pub elapsed_seconds: f64,
+    // Omitted None preserves the checksum serialization of existing format2 files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_input: Option<CandidateInput>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capture {
@@ -446,6 +455,9 @@ pub struct Difference {
     pub group: String,
     pub label: String,
     pub informational: bool,
+    pub unsupported: bool,
+    pub fatal: bool,
+    pub coverage: String,
     pub a_rows: usize,
     pub b_rows: usize,
     pub first_index: usize,
@@ -472,6 +484,26 @@ pub struct BridgeProbe {
     pub asset_source: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnsupportedObservation {
+    pub coverage: String,
+    pub query: String,
+    pub sql_sha256: String,
+    pub label: String,
+    pub a_input: CandidateInput,
+    pub b_input: CandidateInput,
+    pub matched: bool,
+    pub a_rows: Arc<Vec<String>>,
+    pub b_rows: Arc<Vec<String>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredCandidateCoverage {
+    pub supported: bool,
+    pub configured_address: Option<String>,
+    pub scope: String,
+    pub node_source: String,
+    pub later_node_requirement: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub observation_format: u32,
     pub keep_rule_version: i32,
@@ -481,6 +513,10 @@ pub struct Report {
     pub transaction_hit_available_a: bool,
     pub transaction_hit_available_b: bool,
     pub matched: bool,
+    pub registered_candidates: RegisteredCandidateCoverage,
+    pub unsupported_observations: Vec<UnsupportedObservation>,
+    pub unsupported_difference_count: usize,
+    pub supported_difference_count: usize,
     /// Actual row counts for each catalogue hit/miss label at both endpoints.
     pub probe_rows: BTreeMap<String, [usize; 2]>,
     pub chain_order_checked_a: bool,
@@ -1309,7 +1345,21 @@ impl Collector {
             self.options.max_bytes.saturating_sub(self.bytes),
         )
         .await?;
-        self.record(s, label, data, started.elapsed().as_secs_f64())
+        let rows = self.record(s, label, data, started.elapsed().as_secs_f64())?;
+        if is_registered_query(s) {
+            let [Bind::Text(address), Bind::I32(reference_block)] = values else {
+                return Err(Error::Refusal("comparison_invalid_candidate_input"));
+            };
+            self.capture
+                .cases
+                .get_mut(&format!("{}/{label}", s.id))
+                .unwrap()
+                .candidate_input = Some(CandidateInput {
+                address: address.clone(),
+                reference_block: *reference_block,
+            });
+        }
+        Ok(rows)
     }
     fn record(
         &mut self,
@@ -1338,6 +1388,7 @@ impl Collector {
                     ordered: ordered(&s.sql),
                     rows: Arc::clone(&data),
                     elapsed_seconds: elapsed,
+                    candidate_input: None,
                 },
             )
             .is_some()
@@ -1603,6 +1654,24 @@ pub async fn capture(
             }
         }
     }
+    // Diagnostic address overrides remain supported/fatal, but cannot suppress
+    // the configured registered-candidate observations required by the contract.
+    let configured_candidates = &cat.candidate_addresses[&profile.network];
+    if &context.options.candidate_address != configured_candidates {
+        for s in entries.iter().filter(|s| is_registered_query(s)) {
+            result
+                .add(
+                    tx,
+                    s,
+                    "configured/hit",
+                    &[
+                        Bind::Text(configured_candidates.clone()),
+                        Bind::I32(first.reference.block as i32),
+                    ],
+                )
+                .await?;
+        }
+    }
     // All11 actual index names, every epoch the window touches plus2 old epochs.
     let index = entries
         .iter()
@@ -1681,6 +1750,16 @@ pub async fn capture(
                             ],
                         )
                         .await?;
+                    if &context.options.candidate_address != configured_candidates {
+                        result
+                            .add(
+                                tx,
+                                candidates,
+                                &format!("epoch/{epoch}/{}/configured_candidates", s.id),
+                                &[Bind::Text(configured_candidates.clone()), Bind::I32(block)],
+                            )
+                            .await?;
+                    }
                 }
             }
         }
@@ -1936,9 +2015,76 @@ fn coverage(capture: &Capture) -> BTreeMap<String, QueryCoverage> {
     }
     result
 }
-/// Only verified helper ID differences are informational. Case provenance,
-/// profile/positions and every other answer (including resolve_ident) are exact.
+fn is_registered_query(s: &Statement) -> bool {
+    s.kind == "read"
+        && [
+            "get_utxos_for_address_tx_in_enabled",
+            "get_utxos_for_address_tx_in_consumed",
+        ]
+        .contains(&s.name.as_str())
+}
+/// Format2 observations from b683466 omit input metadata. Their two original
+/// call sites are fixed: initial hit/miss and an epoch-end header witness.
+/// Recover only those known inputs; an unknown case is never exempted.
+fn candidate_input(capture: &Capture, case: &Case) -> Option<CandidateInput> {
+    if !case.query.starts_with("get_utxos_for_address_tx_in_") {
+        return None;
+    }
+    let cat = catalogue::catalogue();
+    if capture.node_commit != cat.node_commit
+        || capture.catalogue_sha256 != hash(catalogue::GENERATED)
+    {
+        return None;
+    }
+    if !cat
+        .entries
+        .iter()
+        .any(|s| s.id == case.query && is_registered_query(s) && s.sha256 == case.sql_sha256)
+    {
+        return None;
+    }
+    if let Some(input) = &case.candidate_input {
+        return Some(input.clone());
+    }
+    if case.label == "hit" {
+        return Some(CandidateInput {
+            address: capture.candidate_address.clone(),
+            reference_block: i32::try_from(capture.positions.pairs.first()?.reference.block)
+                .ok()?,
+        });
+    }
+    if case.label == "miss" {
+        return Some(CandidateInput {
+            address: String::new(),
+            reference_block: i32::MAX,
+        });
+    }
+    let parts = case.label.split('/').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "epoch" || parts[3] != "candidates" {
+        return None;
+    }
+    let epoch = parts[1].parse::<i32>().ok()?;
+    let header = cat
+        .entries
+        .iter()
+        .find(|s| s.id == parts[2] && s.name == "get_latest_block_for_epoch" && s.kind == "read")?;
+    let witness = capture.cases.get(&format!("{}/epoch/{epoch}", header.id))?;
+    if witness.sql_sha256 != header.sha256 {
+        return None;
+    }
+    let row: serde_json::Value = serde_json::from_str(witness.rows.first()?).ok()?;
+    Some(CandidateInput {
+        address: capture.candidate_address.clone(),
+        reference_block: i32::try_from(row["block_no"].as_i64()?).ok()?,
+    })
+}
+/// Q14 helper IDs are informational. Q19 excludes only the configured-address
+/// registered-candidate observations; raw rows and differences remain present.
+/// Every other query/input and every identifier retains exact comparison.
 pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
+    if a.node_commit != REGISTERED_CANDIDATE_NODE || b.node_commit != REGISTERED_CANDIDATE_NODE {
+        return Err(Error::Refusal("comparison_node_coverage_contract"));
+    }
     if a.observation_format != OBSERVATION_FORMAT || b.observation_format != OBSERVATION_FORMAT {
         return Err(Error::Refusal("comparison_observation_format_mismatch"));
     }
@@ -1947,7 +2093,8 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     {
         return Err(Error::Refusal("comparison_keep_rule_mismatch"));
     }
-    if a.missing_tx_hash != b.missing_tx_hash
+    if a.network != b.network
+        || a.missing_tx_hash != b.missing_tx_hash
         || a.candidate_address != b.candidate_address
         || a.missing_policy != b.missing_policy
         || a.node_commit != b.node_commit
@@ -1968,6 +2115,11 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
         .map(|e| e.id)
         .collect::<BTreeSet<_>>();
     let mut differences = Vec::new();
+    let mut unsupported_observations = Vec::new();
+    let configured_address = catalogue::catalogue()
+        .candidate_addresses
+        .get(&a.network)
+        .cloned();
     let keys = a
         .cases
         .keys()
@@ -1977,9 +2129,30 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     for key in keys {
         let left = a.cases.get(&key);
         let right = b.cases.get(&key);
+        let mut unsupported = false;
         if let (Some(x), Some(y)) = (left, right) {
             if x.sql_sha256 != y.sql_sha256 || x.ordered != y.ordered {
                 return Err(Error::Refusal("comparison_query_context_mismatch"));
+            }
+            if let (Some(a_input), Some(b_input), Some(address)) = (
+                candidate_input(a, x),
+                candidate_input(b, y),
+                configured_address.as_ref(),
+            ) && &a_input.address == address
+                && &b_input.address == address
+            {
+                unsupported = true;
+                unsupported_observations.push(UnsupportedObservation {
+                    coverage: "unsupported_registered_candidates".to_owned(),
+                    query: x.query.clone(),
+                    sql_sha256: x.sql_sha256.clone(),
+                    label: x.label.clone(),
+                    a_input,
+                    b_input,
+                    matched: x.rows == y.rows,
+                    a_rows: Arc::clone(&x.rows),
+                    b_rows: Arc::clone(&y.rows),
+                });
             }
             if x.rows == y.rows {
                 continue;
@@ -1991,11 +2164,20 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
         let first = (0..x.len().max(y.len()))
             .find(|i| x.get(*i) != y.get(*i))
             .unwrap_or(0);
+        let informational = helpers.contains(&source.query) && left.is_some() && right.is_some();
         differences.push(Difference {
             query: source.query.clone(),
             group: source.group.clone(),
             label: source.label.clone(),
-            informational: helpers.contains(&source.query) && left.is_some() && right.is_some(),
+            informational,
+            unsupported,
+            fatal: !informational && !unsupported,
+            coverage: if unsupported {
+                "unsupported_registered_candidates"
+            } else {
+                "supported"
+            }
+            .to_owned(),
             a_rows: x.len(),
             b_rows: y.len(),
             first_index: first,
@@ -2025,7 +2207,11 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
         coverage_b: coverage(b),
         bridge_probe:BridgeProbe {metadata_key:6500973,metadata_key_source:"node 86774edf: partner-chains/toolkit/smart-contracts/plutus-data/src/bridge.rs:6 TOKEN_TRANSFER_METADATUM_KEY; db_model.rs:889 binding".to_owned(),checkpoint_mode:"synthetic Block(cursor.block-1), unlimited raw SQL range".to_owned(),asset_source:"pinned profile shipped bridge genesis plus separate ICS/reserve inputs; current runtime checkpoint/asset not measured".to_owned()},
         keep_rule_version: crate::KEEP_RULE_VERSION,
-        matched: differences.iter().all(|d| d.informational),
+        matched: differences.iter().all(|d| !d.fatal),
+        registered_candidates:RegisteredCandidateCoverage {supported:false,configured_address,scope:"Only literal #22 variants at the configured registered-candidates address; raw observations retained. Operator RPC/CLI registered-candidate results are unsupported.".to_owned(),node_source:"node 2.1.101 authority_selection_inputs.rs:142-153: registered_candidates = Vec::new()".to_owned(),later_node_requirement:"Full registered-address coverage and a new keep-rule version before enabling registered candidates.".to_owned()},
+        unsupported_difference_count:differences.iter().filter(|d|d.unsupported).count(),
+        supported_difference_count:differences.iter().filter(|d|d.fatal).count(),
+        unsupported_observations,
         node_commit: a.node_commit.clone(),
         catalogue_sha256: a.catalogue_sha256.clone(),
         network: a.network.clone(),
