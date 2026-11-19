@@ -81,10 +81,19 @@ fn fixture_options(
         output.extend([4, 0]);
     } // benign own unsupported-output control only
 
-    let mut body = vec![0xa4, 0, 0x80, 1, 0x81];
-    body.extend(output);
-    body.extend([2, 1, 7]);
+    let mut body = if datum_source == "collateral" {
+        vec![0xa5, 0, 0x80, 1, 0x80, 2, 1, 7]
+    } else {
+        let mut body = vec![0xa4, 0, 0x80, 1, 0x81];
+        body.extend(output.clone());
+        body.extend([2, 1, 7]);
+        body
+    };
     body.extend(bytes(&hex::decode(transaction::hash(&auxiliary)).unwrap()));
+    if datum_source == "collateral" {
+        body.push(16);
+        body.extend(output);
+    }
     let hash = transaction::hash(&body);
     let mut envelope = vec![0x84];
     envelope.extend(body);
@@ -357,7 +366,7 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
     transaction.commit().await.unwrap();
     client.batch_execute("CREATE TABLE dsa_follower.commit_failure(id integer PRIMARY KEY,parent integer REFERENCES dsa_follower.commit_failure(id) DEFERRABLE INITIALLY DEFERRED)").await.unwrap();
     let observer = connect(&config).await;
-    let mut fixture = fixture_options(vec![0; 10001], true, true, true, "recipient", "endpoint");
+    let mut fixture = fixture_options(vec![0; 10001], true, true, true, "zero", "endpoint");
     let mut page: serde_json::Value = serde_json::from_str(&fixture.page).unwrap();
     page[0]["extra_unknown"] = json!("z".repeat(150_000));
     fixture.page = format!(" \n{}\n", page);
@@ -438,6 +447,14 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
     assert_eq!(retry.observation_count(), 3);
     retry.commit(transaction, inserted).await.unwrap();
     assert_eq!(held.len(), 1);
+    assert_eq!(
+        client
+            .query_one("SELECT json::text FROM serve.tx_metadata", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "0"
+    );
     let first = observations::status(&client).await.unwrap();
     assert!(observations::pending(&first).is_empty());
     drop(client);
@@ -913,4 +930,23 @@ async fn causal_supplement_retries_preserve_the_one_original_page_capture() {
         1
     );
     assert!(held.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_collateral_return_stores_pointer_and_raw_datum_only() {
+    let fixture = fixture_options(vec![0; 10001], true, false, true, "recipient", "collateral");
+    let pending = Shape::ALL.into_iter().collect();
+    let mut input = capture(&fixture, &pending).await;
+    let mut held = BTreeMap::new();
+    let publication = input
+        .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
+        .unwrap();
+    assert_eq!(publication.rows().tx_out.len(), 1);
+    assert_eq!(publication.rows().tx_out[0].index, 0);
+    assert!(!publication.rows().tx[0].valid_contract);
+    assert!(publication.rows().tx_metadata.is_empty());
+    assert_eq!(
+        publication.observation_shapes(),
+        [Shape::StoredPointerAddress, Shape::StoredLargeDatum]
+    );
 }

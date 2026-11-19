@@ -72,7 +72,7 @@ impl Lease {
             (&self.budget.memory, self.budget.memory_limit)
         };
         counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
                 old.checked_add(length).filter(|next| *next <= limit)
             })
             .map_err(|_| io::Error::other("evidence_capture_budget"))?;
