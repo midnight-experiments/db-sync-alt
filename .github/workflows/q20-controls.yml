@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 7c5b804fc39995d15296fa6cdf339aca42542306
+          ref: 98da2822a1fb9709aaccc381c89e678dc1642e81
           persist-credentials: false
       - name: Baseline and runtime negative controls
         run: |
@@ -38,13 +38,13 @@ jobs:
           from pathlib import Path
           out=Path('/tmp/q20-artifacts');out.mkdir()
           subprocess.run(['git','config','--global','--add','safe.directory',os.environ['GITHUB_WORKSPACE']],check=True)
-          source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip();assert source=='7c5b804fc39995d15296fa6cdf339aca42542306'
+          source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip();assert source=='98da2822a1fb9709aaccc381c89e678dc1642e81'
           def run(name,args):
               result=subprocess.run(['cargo','test','--locked',*args],capture_output=True,text=True)
               log=result.stdout+result.stderr;(out/(name+'.log')).write_text(log)
               return result,log
           service=['-p','dsa-service','--test','observations']
-          baselines=[('positive-service',service+['--','--include-ignored','--nocapture']),('positive-evidence',['-p','dsa-provider','--lib','evidence::tests','--','--nocapture']),('positive-fallback',['-p','dsa-provider','--test','provider','raw_fallback','--','--nocapture']),('positive-cli',['-p','db-sync-alt','--test','database','status_capabilities_and_evidence_are_read_only_additions','--','--ignored','--exact','--nocapture'])]
+          baselines=[('positive-service',service+['--','--include-ignored','--nocapture']),('positive-evidence',['-p','dsa-provider','--lib','evidence::tests','--','--nocapture']),('positive-fallback',['-p','dsa-provider','--test','provider','raw_fallback','--','--nocapture']),('positive-local-errors',['-p','dsa-provider','--test','provider','local_evidence_capacity_does_not_backoff_ordinary_provider_requests','--','--exact','--nocapture']),('positive-cli',['-p','db-sync-alt','--test','database','status_capabilities_and_evidence_are_read_only_additions','--','--ignored','--exact','--nocapture'])]
           for name,args in baselines:
               result,log=run(name,args);assert result.returncode==0,name+' baseline failed'
           controls=[]
@@ -61,7 +61,8 @@ jobs:
               def apply(text):assert text.count(old)==1,(old,text.count(old));return text.replace(old,new,1)
               return apply
           control('threshold-at10000','crates/dsa-chain/src/rows.rs',replace_once('raw.len() > 10_000','raw.len() >= 10_000'),service+['actual_decoder_and_projection_enforce_boundaries_and_excluded_facts','--','--exact','--nocapture'],'size10000/storedtrue/validtrue/bridgetrue')
-          control('ignore-insertion-receipt','crates/dsa-service/src/observations.rs',replace_once('if !inserted.contains(*shape, observation)? {','if inserted.contains(*shape, observation)? && false {'),service+['publication_raw_witness_status_rollback_retry_restart_are_atomic','--','--ignored','--exact','--nocapture'],'left: 3')
+          control('ignore-insertion-receipt','crates/dsa-service/src/observations.rs',replace_once('if !inserted.contains(*shape, observation)? {','if inserted.contains(*shape, observation)? && false {'),service+['already_stored_datum_does_not_claim_new_real_evidence','--','--ignored','--exact','--nocapture'],'left: 3')
+          control('ignore-row-existence','crates/dsa-service/src/observations.rs',replace_once('if !stored_row_exists(transaction, *shape, observation).await? {','if false && !stored_row_exists(transaction, *shape, observation).await? {'),service+['publication_raw_witness_status_rollback_retry_restart_are_atomic','--','--ignored','--exact','--nocapture'],'rolled-back savepoint must not record witness')
           def no_extract_digest(text):
               prefix,marker,suffix=text.partition('pub async fn extract_raw');assert marker
               return prefix+marker+replace_once('|| format!("{:x}", digest.finalize()) != hash','|| { let _ = digest.finalize(); false }')(suffix)
@@ -74,6 +75,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: q20-controls-7c5b804
+          name: q20-controls-98da282
           path: /tmp/q20-artifacts
           retention-days: 7
