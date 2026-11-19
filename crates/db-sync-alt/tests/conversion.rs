@@ -800,7 +800,9 @@ async fn commit_reply_proxy(
                         tokio::select! { r=outgoing=>r, r=incoming=>r }
                     });
                 }
-                Some(_) = connections.join_next() => {}
+                Some(result) = connections.join_next() => {
+                    eprintln!("publication_proxy_connection_finished: {result:?}");
+                }
             }
         }
     });
@@ -857,6 +859,17 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
         let observer = connect(&target.config).await?;
         let start = Instant::now();
         loop {
+            if let Some(status) = child.try_wait()? {
+                let stdout = stdout.await??;
+                let stderr = stderr.await??;
+                proxy.abort();
+                return Err(format!(
+                    "CLI exited before publication: {status}; stdout={}; stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                )
+                .into());
+            }
             let exists: bool = observer
                 .query_one("SELECT to_regclass('dsa.position') IS NOT NULL", &[])
                 .await?
@@ -869,10 +882,18 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
             {
                 break;
             }
-            assert!(
-                start.elapsed() < Duration::from_secs(25),
-                "publication did not happen before deadline"
-            );
+            if start.elapsed() >= Duration::from_secs(25) {
+                child.kill().await?;
+                let stderr = stderr.await??;
+                let stdout = stdout.await??;
+                proxy.abort();
+                return Err(format!(
+                    "publication did not happen before deadline; stdout={}; stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                )
+                .into());
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
