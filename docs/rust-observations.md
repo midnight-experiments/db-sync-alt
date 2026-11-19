@@ -31,7 +31,9 @@ normal writer lock. Collect actual selected INSERT ... RETURNING outcomes in an 
 receipt (ON CONFLICT DO NOTHING returns no old datum). Call `stage_witnesses`
 with that receipt in the same transaction. The terminal `Publication::commit` commits SQL and applies
 the held overlay only after success.
-Discard receipts if their savepoint rolls back. A source or staging error
+Discard receipts if their savepoint rolls back. Before a first witness can win,
+the adapter also verifies its referenced row by indexed key, so stale receipts
+from an abandoned savepoint cannot create a witness. A source or staging error
 requires rolling back the entire publication. Dropping an unsuccessful
 publication discards its held overlay. Load `status` again after commit and at
 restart; derive the pending set from it before requesting ordinary responses
@@ -45,8 +47,8 @@ and HTTP status wiring remain
 pending the A merge and B4/B5 integration gates.
 
 To recover a local future regression input, take a `response_sha256` under the
-status observation's `sources`. With an operator reader granted SELECT on the
-three private follower tables, run the read-only extractor:
+status observation's `sources`. With an operator reader granted USAGE on schema `dsa_follower` and SELECT on
+the three private follower tables, run the read-only extractor:
 
 ```sh
 cargo run --locked -p dsa-service --example extract_observation -- RESPONSE_SHA256 local-response.json
@@ -94,3 +96,11 @@ or storage error is reported and the publication must roll back; it cannot
 publish a false witness. After all shapes are seen, the normal no-evidence path
 opens no spool, retains no raw buffer and the zero-candidate staging path issues
 no SQL. B5's full-process memory/throughput measurement is still required.
+
+Every retained individual response is capped at the SQL format's 128 MiB
+ceiling, even if the ordinary endpoint wire limit is configured higher. The
+ordinary `fetch` path keeps its existing limits. Local spool/storage/capacity
+failures return an evidence error without incrementing the provider's refusal
+backoff or closing its shared gate; the actual already-sent request is still
+counted. Reflected credentials and malformed provider JSON remain provider
+errors. Publication never commits a witness for a failed capture.

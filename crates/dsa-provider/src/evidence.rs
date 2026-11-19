@@ -13,6 +13,16 @@ use std::{
     },
 };
 
+/// Raw response rows use this fixed byte ceiling in the follower migration.
+/// This caps capture only; ordinary request limits keep their existing meaning.
+pub const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) fn response_limit(ordinary: usize, capturing: bool) -> usize {
+    if capturing {
+        ordinary.min(MAX_RESPONSE_BYTES)
+    } else {
+        ordinary
+    }
+}
 pub struct CapturedReply {
     pub(crate) endpoint: Endpoint,
     pub(crate) reply: Reply,
@@ -320,6 +330,21 @@ impl SecretScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_ceiling_matches_sql_without_restricting_ordinary_fetch_limits() {
+        assert!(
+            include_str!("../../dsa-service/src/observations.sql")
+                .contains(&format!("length<={MAX_RESPONSE_BYTES}"))
+        );
+        assert_eq!(
+            response_limit(MAX_RESPONSE_BYTES + 1, true),
+            MAX_RESPONSE_BYTES
+        );
+        assert_eq!(
+            response_limit(MAX_RESPONSE_BYTES + 1, false),
+            MAX_RESPONSE_BYTES + 1
+        );
+    }
     #[test]
     fn aggregate_evidence_budget_spills_memory_and_releases_on_drop() {
         let directory = tempfile::tempdir().unwrap();

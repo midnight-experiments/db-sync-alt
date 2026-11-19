@@ -475,6 +475,9 @@ impl Publication<'_> {
             if !inserted.contains(*shape, observation)? {
                 continue;
             }
+            if !stored_row_exists(transaction, *shape, observation).await? {
+                continue;
+            }
             let value = serde_json::to_value(observation)?;
             let won=transaction.execute("INSERT INTO dsa_follower.first_witness(shape,network,observation) VALUES($1,$2,$3) ON CONFLICT(shape) DO NOTHING",&[&shape.as_str(),&network,&value]).await?;
             if won == 0 {
@@ -508,6 +511,22 @@ impl Publication<'_> {
     pub fn apply_held(self) -> Rows {
         self.prepared.commit()
     }
+}
+/// Check only a hypothetical first-witness winner. INSERT receipts can outlive
+/// an abandoned savepoint; a keyed read prevents its absent rows becoming proof.
+async fn stored_row_exists(
+    transaction: &Transaction<'_>,
+    shape: Shape,
+    observation: &Observation,
+) -> Result<bool, Error> {
+    let txid = ids::transaction_id(observation.block_height, observation.transaction_index)
+        .map_err(|_| Error::Invalid("invalid_observation_position"))?;
+    let row=match shape {
+        Shape::StoredPointerAddress=>{let index=observation.output_index.ok_or(Error::Invalid("missing_output_index"))?;let id=ids::output_id(observation.block_height,observation.transaction_index,index).map_err(|_|Error::Invalid("invalid_observation_position"))?;transaction.query_opt("SELECT 1 FROM serve.tx_out WHERE id=$1",&[&id]).await?},
+        Shape::StoredLargeDatum=>{let hash=observation.datum_hash.as_ref().ok_or(Error::Invalid("missing_datum_hash"))?;transaction.query_opt("SELECT 1 FROM serve.datum WHERE hash=decode($1,'hex')",&[hash]).await?},
+        Shape::StoredBridgeMetadata=>transaction.query_opt("SELECT 1 FROM serve.tx_metadata WHERE id=$1 AND tx_id=$1 AND key=6500973 AND json IS NOT NULL",&[&txid]).await?,
+    };
+    Ok(row.is_some())
 }
 async fn store_raw(transaction: &Transaction<'_>, raw: &mut RawResponse) -> Result<(), Error> {
     let hash = raw.sha256().to_owned();

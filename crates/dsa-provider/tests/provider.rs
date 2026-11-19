@@ -646,8 +646,56 @@ async fn raw_fallback_rejects_escaped_reflected_key_in_discarded_input() {
         Err(error) => error,
         Ok(_) => panic!("reflected key accepted"),
     };
-    assert_eq!(error.code, "unsafe_or_unwritable_evidence");
+    assert_eq!(error.code, "unsafe_provider_response");
     assert!(!format!("{error:?}").contains(KEY));
     assert_eq!(recorder.counts.lock().unwrap().len(), 1);
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn local_evidence_capacity_does_not_backoff_ordinary_provider_requests() {
+    use dsa_chain::observations::Shape;
+    use std::collections::BTreeSet;
+    let server = Server::start(|_, _| Behavior::raw("[]".into())).await;
+    let (provider, _, recorder) = client(&server.url, |config| {
+        config.limits.evidence_memory = 1;
+        config.limits.evidence_spool = 1;
+        config.limits.transaction_outputs = dsa_provider::evidence::MAX_RESPONSE_BYTES + 1;
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let result = provider
+        .fetch_with_evidence(
+            Endpoint::Metadata(point()),
+            &BTreeSet::from([Shape::StoredBridgeMetadata]),
+            directory.path(),
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("capacity limit ignored"),
+    };
+    assert_eq!(error.code, "evidence_capture_budget");
+    assert!(provider.status().unwrap().retry_at.is_none());
+    assert!(
+        matches!(provider.fetch(Endpoint::Metadata(point())).await.unwrap(),Reply::Metadata(rows) if rows.is_empty())
+    );
+    assert_eq!(recorder.counts.lock().unwrap().len(), 2);
+    let missing = directory.path().join("missing");
+    let result = provider
+        .fetch_with_evidence(
+            Endpoint::TransactionOutputs(point()),
+            &BTreeSet::from([Shape::StoredPointerAddress]),
+            &missing,
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("missing spool directory accepted"),
+    };
+    assert_eq!(error.code, "evidence_storage_unavailable");
+    assert!(provider.status().unwrap().retry_at.is_none());
+    assert!(
+        matches!(provider.fetch(Endpoint::Metadata(point())).await.unwrap(),Reply::Metadata(rows) if rows.is_empty())
+    );
+    assert_eq!(recorder.counts.lock().unwrap().len(), 4);
 }

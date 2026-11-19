@@ -360,6 +360,10 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
         .batch_execute(include_str!("../../dsa-store/src/layout.sql"))
         .await
         .unwrap();
+    client
+        .batch_execute(include_str!("../../dsa-store/src/indexes.sql"))
+        .await
+        .unwrap();
     client.batch_execute("CREATE TABLE dsa.identity(id integer PRIMARY KEY,network text NOT NULL); INSERT INTO dsa.identity VALUES(1,'preprod')").await.unwrap();
     let transaction = client.transaction().await.unwrap();
     observations::migrate(&transaction).await.unwrap();
@@ -385,6 +389,19 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
             .await
             .unwrap(),
         0
+    );
+    transaction.commit().await.unwrap();
+    let mut transaction = client.transaction().await.unwrap();
+    let savepoint = transaction.transaction().await.unwrap();
+    let stale = insert_selected(&savepoint, never_stored.rows()).await;
+    savepoint.rollback().await.unwrap();
+    assert_eq!(
+        never_stored
+            .stage_witnesses(&transaction, &stale)
+            .await
+            .unwrap(),
+        0,
+        "rolled-back savepoint must not record witness"
     );
     transaction.commit().await.unwrap();
     drop(never_stored);
@@ -414,8 +431,7 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
         .batch_execute("INSERT INTO dsa_follower.commit_failure VALUES(1,2)")
         .await
         .unwrap();
-    assert!(transaction.commit().await.is_err());
-    drop(failed);
+    assert!(failed.commit(transaction, inserted).await.is_err());
     assert!(held.is_empty());
     let empty = observations::status(&client).await.unwrap();
     assert_eq!(observations::pending(&empty).len(), 3);
@@ -682,6 +698,10 @@ async fn already_stored_datum_does_not_claim_new_real_evidence() {
         .batch_execute(include_str!("../../dsa-store/src/layout.sql"))
         .await
         .unwrap();
+    client
+        .batch_execute(include_str!("../../dsa-store/src/indexes.sql"))
+        .await
+        .unwrap();
     client.batch_execute("CREATE TABLE dsa.identity(id integer PRIMARY KEY,network text NOT NULL); INSERT INTO dsa.identity VALUES(1,'preprod')").await.unwrap();
     let transaction = client.transaction().await.unwrap();
     observations::migrate(&transaction).await.unwrap();
@@ -697,7 +717,7 @@ async fn already_stored_datum_does_not_claim_new_real_evidence() {
     let value: serde_json::Value = serde_json::from_str(datum.value.as_ref().unwrap()).unwrap();
     client
         .execute(
-            "INSERT INTO serve.datum(id,hash,value) VALUES(1,decode($1,'hex'),$2)",
+            "INSERT INTO serve.datum(id,hash,value) VALUES(9000001,decode($1,'hex'),$2)",
             &[&datum.hash, &value],
         )
         .await
@@ -714,6 +734,15 @@ async fn already_stored_datum_does_not_claim_new_real_evidence() {
     transaction.commit().await.unwrap();
     publication.apply_held();
     let state = observations::status(&client).await.unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT id FROM serve.datum", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        9000001,
+        "conflict must be on the actual unique datum hash, not candidate ID1"
+    );
     assert!(
         state[&Shape::StoredLargeDatum]
             .first_stored_observation

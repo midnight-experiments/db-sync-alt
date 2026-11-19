@@ -464,11 +464,31 @@ impl Provider {
         error
     }
 
+    fn local_evidence_error(&self, code: &'static str) -> Error {
+        Error::retry(code, self.0.clock.unix_seconds().saturating_add(1))
+    }
+    fn evidence_io_error(&self, error: std::io::Error) -> Error {
+        match error.to_string().as_str() {
+            "unsafe_provider_response" => self.failure("unsafe_provider_response", None, None),
+            "provider_invalid_response" => self.failure("provider_invalid_response", None, None),
+            "evidence_capture_budget" => self.local_evidence_error("evidence_capture_budget"),
+            _ => self.local_evidence_error("evidence_storage_unavailable"),
+        }
+    }
+    fn size_error(&self, evidence_limited: bool) -> Error {
+        if evidence_limited {
+            self.local_evidence_error("evidence_response_size_limit")
+        } else {
+            self.failure("provider_response_size_limit", None, None)
+        }
+    }
+
     async fn output_response(
         &self,
         mut response: reqwest::Response,
         endpoint: &Endpoint,
         limit: usize,
+        evidence_limited: bool,
         mut spool: Option<evidence::Spool>,
     ) -> Result<evidence::CapturedReply, Error> {
         let (sender, decoder) = outputs::start(
@@ -484,14 +504,18 @@ impl Provider {
                         .checked_add(chunk.len())
                         .is_none_or(|length| length > limit)
                     {
-                        transport_error = Some("provider_response_size_limit");
+                        transport_error = Some(if evidence_limited {
+                            "evidence_response_size_limit"
+                        } else {
+                            "provider_response_size_limit"
+                        });
                         break;
                     }
                     received += chunk.len();
                     if let Some(spool) = spool.as_mut() {
-                        spool.write(&chunk).map_err(|_| {
-                            self.failure("unsafe_or_unwritable_evidence", None, None)
-                        })?;
+                        spool
+                            .write(&chunk)
+                            .map_err(|error| self.evidence_io_error(error))?;
                     }
                     if sender.send(chunk).await.is_err() {
                         break;
@@ -513,7 +537,11 @@ impl Provider {
             .await
             .map_err(|_| self.failure("provider_unavailable", None, None))?;
         if let Some(code) = transport_error {
-            return Err(self.failure(code, None, None));
+            return Err(if code == "evidence_response_size_limit" {
+                self.local_evidence_error(code)
+            } else {
+                self.failure(code, None, None)
+            });
         }
         let row = decoded.map_err(|code| self.failure(code, None, None))?;
         endpoint
@@ -644,12 +672,14 @@ impl Provider {
             };
             return Err(self.failure(code, Some(status), after));
         }
-        let limit = self.0.config.limits.maximum(endpoint.family());
+        let ordinary_limit = self.0.config.limits.maximum(endpoint.family());
+        let limit = evidence::response_limit(ordinary_limit, evidence_directory.is_some());
+        let evidence_limited = limit < ordinary_limit;
         if response
             .content_length()
             .is_some_and(|length| length > limit as u64)
         {
-            return Err(self.failure("provider_response_size_limit", None, None));
+            return Err(self.size_error(evidence_limited));
         }
         if matches!(endpoint, Endpoint::TransactionOutputs(_)) {
             let spool = evidence_directory
@@ -657,9 +687,9 @@ impl Provider {
                     evidence::Spool::new(directory, &self.0.key, &self.0.evidence_budget)
                 })
                 .transpose()
-                .map_err(|_| self.failure("evidence_storage_unavailable", None, None))?;
+                .map_err(|error| self.evidence_io_error(error))?;
             let reply = self
-                .output_response(response, &endpoint, limit, spool)
+                .output_response(response, &endpoint, limit, evidence_limited, spool)
                 .await?;
             self.0.control.lock().unwrap().failures = 0;
             return Ok(reply);
@@ -681,7 +711,7 @@ impl Provider {
                 .checked_add(chunk.len())
                 .is_none_or(|length| length > limit)
             {
-                return Err(self.failure("provider_response_size_limit", None, None));
+                return Err(self.size_error(evidence_limited));
             }
             body.extend_from_slice(&chunk);
         }
@@ -704,7 +734,7 @@ impl Provider {
                 )
             })
             .transpose()
-            .map_err(|_| self.failure("evidence_storage_or_capacity", None, None))?;
+            .map_err(|error| self.evidence_io_error(error))?;
         Ok(evidence::CapturedReply {
             endpoint,
             reply,
