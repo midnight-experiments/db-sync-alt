@@ -263,7 +263,9 @@ impl ObservedBlock {
 }
 fn hex_bytes(text: &str) -> Result<Vec<u8>, Error> {
     text.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |b: u8| {
                 (b as char)
@@ -328,6 +330,59 @@ fn bind(fact: &Fact, header: &Header, sources: &[RawResponse]) -> Result<Observa
     })
 }
 
+/// Outcomes of the selected-row publisher's actual INSERT ... RETURNING,
+/// using ON CONFLICT DO NOTHING for existing datum hashes. No xmin inference:
+/// nested transactions/savepoints and old rows are distinguished explicitly.
+#[derive(Default)]
+pub struct InsertedRows {
+    outputs: BTreeSet<i64>,
+    datums: BTreeSet<String>,
+    metadata: BTreeSet<i64>,
+}
+impl InsertedRows {
+    pub fn output_returned(&mut self, row: &tokio_postgres::Row) -> Result<(), Error> {
+        self.outputs.insert(row.try_get("id")?);
+        Ok(())
+    }
+    pub fn datum_returned(&mut self, row: &tokio_postgres::Row) -> Result<(), Error> {
+        let bytes: Vec<u8> = row.try_get("hash")?;
+        let hash = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.datums.insert(hash);
+        Ok(())
+    }
+    pub fn metadata_returned(&mut self, row: &tokio_postgres::Row) -> Result<(), Error> {
+        self.metadata.insert(row.try_get("id")?);
+        Ok(())
+    }
+    fn contains(&self, shape: Shape, observation: &Observation) -> Result<bool, Error> {
+        Ok(match shape {
+            Shape::StoredPointerAddress => {
+                let index = observation
+                    .output_index
+                    .ok_or(Error::Invalid("missing_output_index"))?;
+                self.outputs.contains(
+                    &ids::output_id(
+                        observation.block_height,
+                        observation.transaction_index,
+                        index,
+                    )
+                    .map_err(|_| Error::Invalid("invalid_observation_position"))?,
+                )
+            }
+            Shape::StoredLargeDatum => self.datums.contains(
+                observation
+                    .datum_hash
+                    .as_ref()
+                    .ok_or(Error::Invalid("missing_datum_hash"))?,
+            ),
+            Shape::StoredBridgeMetadata => self.metadata.contains(
+                &ids::transaction_id(observation.block_height, observation.transaction_index)
+                    .map_err(|_| Error::Invalid("invalid_observation_position"))?,
+            ),
+        })
+    }
+}
+
 pub struct Publication<'a> {
     network: String,
     prepared: PreparedBlock<'a>,
@@ -336,6 +391,11 @@ pub struct Publication<'a> {
     limitations: Vec<&'static str>,
 }
 impl Publication<'_> {
+    pub fn observation_candidates(&self) -> impl Iterator<Item = (Shape, &Observation)> {
+        self.observations
+            .iter()
+            .map(|(shape, observation)| (*shape, observation))
+    }
     pub fn observation_count(&self) -> usize {
         self.observations.len()
     }
@@ -352,7 +412,14 @@ impl Publication<'_> {
     /// Call AFTER inserting the selected rows in this SAME transaction. Each
     /// candidate must name a freshly inserted row, not an older idempotent row.
     /// Commit SQL first; only then apply_held. A failed SQL update drops this.
-    pub async fn stage_witnesses(&mut self, transaction: &Transaction<'_>) -> Result<usize, Error> {
+    pub async fn stage_witnesses(
+        &mut self,
+        transaction: &Transaction<'_>,
+        inserted: &InsertedRows,
+    ) -> Result<usize, Error> {
+        if self.observations.is_empty() {
+            return Ok(0);
+        }
         let network: String = transaction
             .query_one("SELECT network FROM dsa.identity WHERE id=1", &[])
             .await?
@@ -372,11 +439,16 @@ impl Publication<'_> {
             {
                 continue;
             }
-            if !fresh_row(transaction, *shape, observation).await? {
+            if !inserted.contains(*shape, observation)? {
                 continue;
             }
-            // Raw rows have no side effects outside this transaction. Exactly
-            // one metadata row is authoritative, including after a restart.
+            let value = serde_json::to_value(observation)?;
+            let won=transaction.execute("INSERT INTO dsa_follower.first_witness(shape,network,observation) VALUES($1,$2,$3) ON CONFLICT(shape) DO NOTHING",&[&shape.as_str(),&network,&value]).await?;
+            if won == 0 {
+                continue;
+            }
+            // Reserve the unique witness first. A racing loser writes no raw
+            // bytes. Any source error must roll back this entire transaction.
             for reference in &observation.sources {
                 let raw = self
                     .sources
@@ -385,28 +457,13 @@ impl Publication<'_> {
                     .ok_or(Error::Invalid("observation_response_missing"))?;
                 store_raw(transaction, raw).await?;
             }
-            let value = serde_json::to_value(observation)?;
-            count+=transaction.execute("INSERT INTO dsa_follower.first_witness(shape,network,observation) VALUES($1,$2,$3) ON CONFLICT(shape) DO NOTHING",&[&shape.as_str(),&network,&value]).await? as usize;
+            count += 1;
         }
         Ok(count)
     }
     pub fn apply_held(self) -> Rows {
         self.prepared.commit()
     }
-}
-async fn fresh_row(
-    transaction: &Transaction<'_>,
-    shape: Shape,
-    observation: &Observation,
-) -> Result<bool, Error> {
-    let txid = ids::transaction_id(observation.block_height, observation.transaction_index)
-        .map_err(|_| Error::Invalid("invalid_observation_position"))?;
-    let row=match shape {
-        Shape::StoredPointerAddress=>{let index=observation.output_index.ok_or(Error::Invalid("missing_output_index"))?;let id=ids::output_id(observation.block_height,observation.transaction_index,index).map_err(|_|Error::Invalid("invalid_observation_position"))?;transaction.query_opt("SELECT 1 FROM serve.tx_out WHERE id=$1 AND xmin::text::bigint=(pg_current_xact_id()::text::numeric % 4294967296)::bigint",&[&id]).await?},
-        Shape::StoredLargeDatum=>{let hash=observation.datum_hash.as_ref().ok_or(Error::Invalid("missing_datum_hash"))?;transaction.query_opt("SELECT 1 FROM serve.datum WHERE hash=decode($1,'hex') AND xmin::text::bigint=(pg_current_xact_id()::text::numeric % 4294967296)::bigint",&[hash]).await?},
-        Shape::StoredBridgeMetadata=>transaction.query_opt("SELECT 1 FROM serve.tx_metadata WHERE id=$1 AND tx_id=$1 AND key=6500973 AND xmin::text::bigint=(pg_current_xact_id()::text::numeric % 4294967296)::bigint",&[&txid]).await?,
-    };
-    Ok(row.is_some())
 }
 async fn store_raw(transaction: &Transaction<'_>, raw: &mut RawResponse) -> Result<(), Error> {
     let hash = raw.sha256().to_owned();

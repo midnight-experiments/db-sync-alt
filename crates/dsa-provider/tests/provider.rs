@@ -566,3 +566,88 @@ async fn utxo_fallback_discards_large_inputs_and_limits_retained_outputs() {
         "provider_response_size_limit"
     );
 }
+
+#[tokio::test]
+async fn raw_fallback_evidence_tees_once_with_bounded_retained_values() {
+    use dsa_chain::observations::Shape;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
+    use std::io::Read;
+    let raw = format!(
+        " \n{}\n",
+        json!({"hash":hash('1'),"inputs":[{"ignored":"x".repeat(2*1024*1024)}],"outputs":[{"address":"addr1synthetic","output_index":0,"amount":[{"unit":"lovelace","quantity":"2"}],"data_hash":null,"inline_datum":null,"collateral":false,"consumed_by_tx":null}]})
+    );
+    let body = raw.clone();
+    let server = Server::start(move |_, _| Behavior::raw(body.clone())).await;
+    let (provider, _, recorder) = client(&server.url, |config| {
+        config.limits.transaction_outputs = 4 * 1024 * 1024;
+        config.limits.transaction_output_values = 1024;
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let captured = provider
+        .fetch_with_evidence(
+            Endpoint::TransactionOutputs(point()),
+            &BTreeSet::from([Shape::StoredPointerAddress]),
+            directory.path(),
+        )
+        .await
+        .unwrap();
+    let (_, reply, raw_response) = captured.into_parts();
+    assert!(matches!(reply,Reply::TransactionOutputs(row) if row.outputs.len()==1));
+    let mut evidence = raw_response.unwrap();
+    assert_eq!(
+        evidence.sha256(),
+        format!("{:x}", Sha256::digest(raw.as_bytes()))
+    );
+    assert_eq!(evidence.length(), raw.len() as u64);
+    let mut recovered = Vec::new();
+    evidence
+        .reader()
+        .unwrap()
+        .read_to_end(&mut recovered)
+        .unwrap();
+    assert_eq!(recovered, raw.as_bytes());
+    assert_eq!(recorder.counts.lock().unwrap().len(), 1);
+    assert_eq!(server.state.requests.lock().unwrap().len(), 1);
+    drop(evidence);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    let missing = directory.path().join("not-created");
+    let (_, _, raw) = provider
+        .fetch_with_evidence(
+            Endpoint::TransactionOutputs(point()),
+            &BTreeSet::new(),
+            &missing,
+        )
+        .await
+        .unwrap()
+        .into_parts();
+    assert!(raw.is_none());
+}
+#[tokio::test]
+async fn raw_fallback_rejects_escaped_reflected_key_in_discarded_input() {
+    use dsa_chain::observations::Shape;
+    use std::collections::BTreeSet;
+    let key = "synthetic-blockfrost-project-\\u0069d";
+    let body = format!(
+        "{{\"hash\":\"{}\",\"inputs\":[{{\"ignored\":\"{key}\"}}],\"outputs\":[]}}",
+        hash('1')
+    );
+    let server = Server::start(move |_, _| Behavior::raw(body.clone())).await;
+    let (provider, _, recorder) = client(&server.url, |_| {});
+    let directory = tempfile::tempdir().unwrap();
+    let result = provider
+        .fetch_with_evidence(
+            Endpoint::TransactionOutputs(point()),
+            &BTreeSet::from([Shape::StoredLargeDatum]),
+            directory.path(),
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("reflected key accepted"),
+    };
+    assert_eq!(error.code, "unsafe_or_unwritable_evidence");
+    assert!(!format!("{error:?}").contains(KEY));
+    assert_eq!(recorder.counts.lock().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}

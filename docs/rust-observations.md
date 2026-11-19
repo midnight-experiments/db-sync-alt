@@ -27,8 +27,11 @@ alone does not provide a running service.
 The preparatory `dsa-service::observations` adapter stores raw bodies in private
 `dsa_follower.raw_chunk` rows of at most 64 KiB. A unique shape key in that
 store's `first_witness` table is authoritative. The adapter must run under the
-normal writer lock. Insert actual selected rows, call `stage_witnesses` in the
-same transaction, commit SQL, then call `apply_held`. Dropping an unsuccessful
+normal writer lock. Collect actual selected INSERT ... RETURNING outcomes in an `InsertedRows`
+receipt (ON CONFLICT DO NOTHING returns no old datum). Call `stage_witnesses`
+with that receipt in the same transaction, commit SQL, then call `apply_held`.
+Discard receipts if their savepoint rolls back. A source or staging error
+requires rolling back the entire publication. Dropping an unsuccessful
 publication discards its held overlay. Load `status` again after commit and at
 restart; derive the pending set from it before requesting ordinary responses
 with `fetch_with_evidence`. A-built snapshots have no follower-local witnesses.
@@ -61,3 +64,10 @@ caller marks verified existing datum rows with `known_stored_datum`. An abnormal
 missing-origin case reports `held_inline_origin_unavailable`; the adapter can
 publish the ordinary selected rows without attributing the old preimage to the
 spending block or fetching it again. This limitation must be surfaced by B5.
+
+The large-datum criterion measures the hash-verified original CBOR preimage,
+strictly above 10,000 bytes. A hash alone is not a preimage. A valid preimage
+whose deeply nested JSON rendering is NULL still meets that raw-byte criterion;
+the raw provider response remains the regression input. In contrast, a bridge
+placeholder with NULL/rejected JSON does not consume the positive bridge slot.
+A non-NULL JSON value of 0 does qualify; it is not treated as absence.

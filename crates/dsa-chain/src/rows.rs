@@ -620,7 +620,8 @@ fn build_rows(
                 BuildError::Required(SupplementRequest::Metadata(tx.hash.clone()))
             })?;
             if let Some(json) = metadata {
-                if pending.contains(&Shape::StoredBridgeMetadata) {
+                let normalized = crate::metadata::checked(tx, Some(json))?;
+                if normalized.is_some() && pending.contains(&Shape::StoredBridgeMetadata) {
                     facts.push(Fact {
                         shape: Shape::StoredBridgeMetadata,
                         transaction_hash: tx.hash.clone(),
@@ -636,7 +637,7 @@ fn build_rows(
                     id: tx_id,
                     tx_id,
                     key: 6500973,
-                    json: crate::metadata::checked(tx, Some(json))?,
+                    json: normalized,
                 });
             } else {
                 crate::metadata::checked(tx, None)?;
