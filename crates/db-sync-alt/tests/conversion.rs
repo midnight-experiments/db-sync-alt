@@ -1680,3 +1680,101 @@ async fn supply_source_realistic_cost() -> Result {
     source.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_binary_staging_preserves_nulls_numeric_and_oversized_row() -> Result {
+    let mut f = fixture(403);
+    for (tx, datum) in [(25, 90301), (26, 90302), (27, 90303)] {
+        f.output(7, tx, 0, "mapping", "auth", Some(datum));
+    }
+    for tx in [20, 21] {
+        let output = f.output(7, tx, 0, "ics", "bridge", None);
+        let transaction = f.chain.outputs[&output].transaction;
+        f.chain.metadata.insert(transaction, transaction);
+    }
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let hash = |id| f.chain.datums[&id].hash.clone();
+    let tx0 = 7_i64 * 4096 + 20;
+    let tx1 = 7_i64 * 4096 + 21;
+    source.write(&format!("UPDATE serve.datum SET value=NULL WHERE hash=decode('{}','hex');UPDATE serve.datum SET value='null'::jsonb WHERE hash=decode('{}','hex');UPDATE serve.datum SET value=jsonb_build_object('bytes',repeat('x',10000),'wide',340282366920938463463374607431768211456::numeric) WHERE hash=decode('{}','hex');UPDATE serve.tx_metadata SET json=NULL WHERE id={tx0};UPDATE serve.tx_metadata SET json='null'::jsonb WHERE id={tx1}",hash(90301),hash(90302),hash(90303))).await?;
+    let target = Database::new().await?;
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("typed.dsa");
+    let converted = target
+        .cli(
+            "convert",
+            "mainnet",
+            &[
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                "6",
+                "--batch-bytes",
+                "1024",
+                "--batch-rows",
+                "64",
+                "--snapshot",
+                file.to_str().unwrap(),
+            ],
+        )
+        .await?;
+    assert!(
+        converted["source"]["raw_families"]["datum"]["largest_row_bytes"]
+            .as_u64()
+            .unwrap()
+            > 10000
+    );
+    let restored = Database::new().await?;
+    restored
+        .cli("restore", "mainnet", &file_args(&file))
+        .await?;
+    for table in ["datum", "tx_metadata"] {
+        let (field, filter) = if table == "datum" {
+            (
+                "value",
+                format!(
+                    "hash IN(decode('{}','hex'),decode('{}','hex'),decode('{}','hex'))",
+                    hash(90301),
+                    hash(90302),
+                    hash(90303)
+                ),
+            )
+        } else {
+            ("json", format!("id IN({tx0},{tx1})"))
+        };
+        let query = format!(
+            "SELECT jsonb_build_array(id,{field} IS NULL,{field}::text) FROM serve.{table} WHERE {filter} ORDER BY id"
+        );
+        let original = connect(&source.config)
+            .await?
+            .query(&query, &[])
+            .await?
+            .into_iter()
+            .map(|r| r.get::<_, Value>(0))
+            .collect::<Vec<_>>();
+        assert!(!original.is_empty());
+        assert!(original.iter().any(|v| v[1] == true));
+        assert!(original.iter().any(|v| v[1] == false && v[2] == "null"));
+        for database in [&target, &restored] {
+            let rows = connect(&database.config)
+                .await?
+                .query(&query, &[])
+                .await?
+                .into_iter()
+                .map(|r| r.get::<_, Value>(0))
+                .collect::<Vec<_>>();
+            assert_eq!(rows, original);
+        }
+    }
+    println!(
+        "{}",
+        json!({"event":"binary_staging_typed_roundtrip","oversized_datum_wire_bytes":converted["source"]["raw_families"]["datum"]["largest_row_bytes"],"sql_null_and_json_null":"distinct","snapshot_restore":"PASS","source":converted["source"]})
+    );
+    source.cleanup().await?;
+    target.cleanup().await?;
+    restored.cleanup().await?;
+    Ok(())
+}
