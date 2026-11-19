@@ -13,3 +13,5 @@ pub mod transaction;
 
 /// The version shared by the binary and its database metadata.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod capabilities;

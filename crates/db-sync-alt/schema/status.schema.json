@@ -42,7 +42,9 @@
     "policy",
     "warnings",
     "healthy",
-    "reason_codes"
+    "reason_codes",
+    "capabilities",
+    "real_data_evidence"
   ],
   "properties": {
     "status_schema_version": {
@@ -811,6 +813,69 @@
       "items": {
         "$ref": "#/$defs/code"
       }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registered_candidates"
+      ],
+      "properties": {
+        "registered_candidates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "node_release",
+            "enabled_in_block_production_and_import",
+            "operator_rpc_cli",
+            "includes_ariadne_parameter_registrations",
+            "future_support_requires_full_address_coverage",
+            "future_support_requires_new_keep_rule_version"
+          ],
+          "properties": {
+            "node_release": {
+              "const": "2.1.101"
+            },
+            "enabled_in_block_production_and_import": {
+              "const": false
+            },
+            "operator_rpc_cli": {
+              "const": "unsupported"
+            },
+            "includes_ariadne_parameter_registrations": {
+              "const": true
+            },
+            "future_support_requires_full_address_coverage": {
+              "const": true
+            },
+            "future_support_requires_new_keep_rule_version": {
+              "const": true
+            }
+          },
+          "description": "Node 2.1.101 sets registered_candidates = Vec::new() for production/import. Registered-candidate results in operator RPCs/CLI, including Ariadne registrations, are unsupported. A future node enabling them requires full address coverage and a new keep-rule version."
+        }
+      }
+    },
+    "real_data_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stored_pointer_address",
+        "stored_large_datum",
+        "stored_bridge_metadata"
+      ],
+      "properties": {
+        "stored_pointer_address": {
+          "$ref": "#/$defs/field_evidence"
+        },
+        "stored_large_datum": {
+          "$ref": "#/$defs/field_evidence"
+        },
+        "stored_bridge_metadata": {
+          "$ref": "#/$defs/field_evidence"
+        }
+      },
+      "description": "Historical validation of these three shapes is not proven on real data. A first committed stored observation is retained locally for regression review; capture alone does not establish independent real-data proof."
     }
   },
   "$defs": {
@@ -968,6 +1033,147 @@
           }
         }
       }
+    },
+    "field_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "historical_validation",
+        "first_stored_observation"
+      ],
+      "properties": {
+        "historical_validation": {
+          "const": "not_proven_on_real_data"
+        },
+        "first_stored_observation": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/stored_observation"
+            }
+          ]
+        }
+      }
+    },
+    "stored_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_height",
+        "block_hash",
+        "transaction_hash",
+        "transaction_index",
+        "observed_at",
+        "output_index",
+        "datum_hash",
+        "raw_datum_bytes",
+        "metadata_key",
+        "sources"
+      ],
+      "properties": {
+        "block_height": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 134217727
+        },
+        "block_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "transaction_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "transaction_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4095
+        },
+        "observed_at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_index": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4095
+            }
+          ]
+        },
+        "datum_hash": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          ]
+        },
+        "raw_datum_bytes": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "exclusiveMinimum": 10000
+            }
+          ]
+        },
+        "metadata_key": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "const": 6500973
+            }
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source",
+              "endpoint",
+              "response_sha256"
+            ],
+            "properties": {
+              "source": {
+                "enum": [
+                  "block_cbor",
+                  "datum",
+                  "metadata",
+                  "output_fallback"
+                ]
+              },
+              "endpoint": {
+                "type": "string",
+                "maxLength": 256,
+                "pattern": "^/(blocks/[0-9a-f]{64}/txs/cbor\\?count=100&page=[1-9][0-9]*&order=asc|scripts/datum/[0-9a-f]{64}/cbor|txs/[0-9a-f]{64}/(metadata|utxos))$"
+              },
+              "response_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      },
+      "description": "Committed once per network/store/shape. References original response bodies by SHA256, without credentials, headers or operator paths."
     }
   },
   "allOf": [

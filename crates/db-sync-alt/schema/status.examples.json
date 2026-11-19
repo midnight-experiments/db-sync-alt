@@ -158,7 +158,31 @@
     },
     "warnings": [],
     "healthy": true,
-    "reason_codes": []
+    "reason_codes": [],
+    "capabilities": {
+      "registered_candidates": {
+        "node_release": "2.1.101",
+        "enabled_in_block_production_and_import": false,
+        "operator_rpc_cli": "unsupported",
+        "includes_ariadne_parameter_registrations": true,
+        "future_support_requires_full_address_coverage": true,
+        "future_support_requires_new_keep_rule_version": true
+      }
+    },
+    "real_data_evidence": {
+      "stored_pointer_address": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_large_datum": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_bridge_metadata": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      }
+    }
   },
   "restoring": {
     "status_schema_version": 1,
@@ -275,7 +299,31 @@
       "lifecycle_restoring",
       "serving_unready",
       "coverage_unknown"
-    ]
+    ],
+    "capabilities": {
+      "registered_candidates": {
+        "node_release": "2.1.101",
+        "enabled_in_block_production_and_import": false,
+        "operator_rpc_cli": "unsupported",
+        "includes_ariadne_parameter_registrations": true,
+        "future_support_requires_full_address_coverage": true,
+        "future_support_requires_new_keep_rule_version": true
+      }
+    },
+    "real_data_evidence": {
+      "stored_pointer_address": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_large_datum": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_bridge_metadata": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      }
+    }
   },
   "catching_up": {
     "status_schema_version": 1,
@@ -439,7 +487,31 @@
     "reason_codes": [
       "serving_block_lag_exceeded",
       "serving_lag_exceeded"
-    ]
+    ],
+    "capabilities": {
+      "registered_candidates": {
+        "node_release": "2.1.101",
+        "enabled_in_block_production_and_import": false,
+        "operator_rpc_cli": "unsupported",
+        "includes_ariadne_parameter_registrations": true,
+        "future_support_requires_full_address_coverage": true,
+        "future_support_requires_new_keep_rule_version": true
+      }
+    },
+    "real_data_evidence": {
+      "stored_pointer_address": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_large_datum": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_bridge_metadata": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      }
+    }
   },
   "waiting": {
     "status_schema_version": 1,
@@ -612,7 +684,31 @@
     "healthy": false,
     "reason_codes": [
       "provider_poll_quota_exhausted"
-    ]
+    ],
+    "capabilities": {
+      "registered_candidates": {
+        "node_release": "2.1.101",
+        "enabled_in_block_production_and_import": false,
+        "operator_rpc_cli": "unsupported",
+        "includes_ariadne_parameter_registrations": true,
+        "future_support_requires_full_address_coverage": true,
+        "future_support_requires_new_keep_rule_version": true
+      }
+    },
+    "real_data_evidence": {
+      "stored_pointer_address": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_large_datum": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_bridge_metadata": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      }
+    }
   },
   "stopped_by_check": {
     "status_schema_version": 1,
@@ -781,6 +877,30 @@
     "reason_codes": [
       "serving_revoked",
       "sync_halted"
-    ]
+    ],
+    "capabilities": {
+      "registered_candidates": {
+        "node_release": "2.1.101",
+        "enabled_in_block_production_and_import": false,
+        "operator_rpc_cli": "unsupported",
+        "includes_ariadne_parameter_registrations": true,
+        "future_support_requires_full_address_coverage": true,
+        "future_support_requires_new_keep_rule_version": true
+      }
+    },
+    "real_data_evidence": {
+      "stored_pointer_address": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_large_datum": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      },
+      "stored_bridge_metadata": {
+        "historical_validation": "not_proven_on_real_data",
+        "first_stored_observation": null
+      }
+    }
   }
 }

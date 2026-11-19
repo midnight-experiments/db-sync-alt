@@ -72,6 +72,8 @@ fn required_sync_information_is_enforced() {
         "/database/reader_check",
         "/database/tls_available",
         "/warnings",
+        "/capabilities",
+        "/real_data_evidence",
     ] {
         let mut document = examples["following"].clone();
         let (parent, key) = path.rsplit_once('/').unwrap();
@@ -146,5 +148,44 @@ fn consumed_monitoring_fields_keep_their_shapes_and_readiness_meaning() {
         }
         assert!(document["healthy"].is_boolean());
         assert!(document["reason_codes"].is_array());
+    }
+}
+
+#[test]
+fn capability_scope_and_historical_gaps_cannot_be_silently_promoted() {
+    let (validator, examples) = contract();
+    let document = &examples["following"];
+    assert_eq!(
+        document["capabilities"],
+        serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned()).unwrap()
+    );
+    for (path, value) in [
+        (
+            "/capabilities/registered_candidates/enabled_in_block_production_and_import",
+            json!(true),
+        ),
+        (
+            "/capabilities/registered_candidates/operator_rpc_cli",
+            json!("supported"),
+        ),
+        (
+            "/real_data_evidence/stored_large_datum/historical_validation",
+            json!("proven"),
+        ),
+    ] {
+        let mut changed = document.clone();
+        *changed.pointer_mut(path).unwrap() = value;
+        assert!(!validator.is_valid(&changed), "accepted {path}");
+    }
+    for shape in [
+        "stored_pointer_address",
+        "stored_large_datum",
+        "stored_bridge_metadata",
+    ] {
+        assert_eq!(
+            document["real_data_evidence"][shape]["historical_validation"],
+            "not_proven_on_real_data"
+        );
+        assert!(document["real_data_evidence"][shape]["first_stored_observation"].is_null());
     }
 }
