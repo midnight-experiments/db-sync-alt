@@ -842,8 +842,6 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
                 json!({"event":"q19_literal_counterexample","scenario":scenario,"query":name,"sql_sha256":sql.sha256,"address":address,"reference_block":reference,"horizon":6,"source_rows":left,"converted_rows":right})
             );
         }
-        ta.commit().await?;
-        tb.commit().await?;
         let actual = cli(&source, &target, &f.profile, &[]).await?;
         assert_eq!(
             actual.status.code(),
@@ -894,9 +892,7 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
             assert!(
                 variant
                     .iter()
-                    .any(|o| o["a_input"]["reference_block"] == reference
-                        && o["a_rows"] == json!(left)
-                        && o["b_rows"] == json!(right)),
+                    .any(|o| o["a_rows"] == json!(left) && o["b_rows"] == json!(right)),
                 "{scenario}/{name}: raw literal rows absent"
             );
             assert!(
@@ -905,6 +901,26 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
                     .all(|o| o["matched"] == json!(o["a_rows"] == o["b_rows"])
                         && o["a_input"] == o["b_input"])
             );
+            let sql = catalogue
+                .entries
+                .iter()
+                .find(|s| s.kind == "read" && s.name == name)
+                .unwrap();
+            for observation in &variant {
+                let actual_reference =
+                    i32::try_from(observation["a_input"]["reference_block"].as_i64().unwrap())?;
+                let values = [Bind::Text(address.clone()), Bind::I32(actual_reference)];
+                assert_eq!(
+                    observation["a_rows"],
+                    json!(compare::rows(&ta, sql, &values).await?),
+                    "{scenario}/{name}: source raw rows at actual binding"
+                );
+                assert_eq!(
+                    observation["b_rows"],
+                    json!(compare::rows(&tb, sql, &values).await?),
+                    "{scenario}/{name}: converted raw rows at actual binding"
+                );
+            }
             if scenario == "funding_inputs" && name == "get_utxos_for_address_tx_in_consumed" {
                 assert!(
                     variant.iter().any(
@@ -921,6 +937,8 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
             "{}",
             json!({"event":"q19_cli_counterexample","scenario":scenario,"exit":actual.status.code()})
         );
+        ta.commit().await?;
+        tb.commit().await?;
         source.cleanup().await?;
         target.cleanup().await?;
     }
