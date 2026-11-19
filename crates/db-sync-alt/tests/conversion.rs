@@ -1306,7 +1306,7 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
         .iter()
         .map(|u| hex::decode(&u[56..]))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let expected = tx
+    let mut expected = tx
         .query(
             include_str!("common/source_supply_unpaged.sql"),
             &[&policies, &names, &8_i64],
@@ -1320,6 +1320,7 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
         "0"
     );
     assert!(expected[&f.profile.assets["cnight"].unit()].parse::<i128>()? > i128::from(u64::MAX));
+    tx.batch_execute("SET LOCAL enable_seqscan=off;SET LOCAL enable_bitmapscan=off;SET LOCAL enable_indexscan=on;SET LOCAL enable_indexonlyscan=on").await?;
     let sql = include_str!("../../dsa-store/src/conversion_supply.sql");
     let mut previous = vec!["0".to_owned(); units.len()];
     let mut after = -1_i64;
@@ -1337,8 +1338,23 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
         fn page_limit(v: &Value) -> bool {
             if let Some(o) = v.as_object() {
                 if o.get("Subplan Name").and_then(Value::as_str) == Some("CTE page") {
+                    fn ordered_index(v: &Value) -> bool {
+                        if let Some(o) = v.as_object() {
+                            if o.get("Relation Name").and_then(Value::as_str) == Some("ma_tx_out") {
+                                return matches!(
+                                    o.get("Node Type").and_then(Value::as_str),
+                                    Some("Index Scan" | "Index Only Scan")
+                                ) && o.get("Scan Direction").and_then(Value::as_str)
+                                    == Some("Forward")
+                                    && o["Actual Rows"].as_u64().unwrap() <= 4096;
+                            }
+                            return o.values().any(ordered_index);
+                        }
+                        v.as_array().is_some_and(|a| a.iter().any(ordered_index))
+                    }
                     return o.get("Node Type").and_then(Value::as_str) == Some("Limit")
-                        && o["Actual Rows"].as_u64().unwrap() <= 4096;
+                        && o["Actual Rows"].as_u64().unwrap() <= 4096
+                        && ordered_index(v);
                 }
                 return o.values().any(page_limit);
             }
@@ -1382,12 +1398,34 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
     assert!(result.iter().all(|r| r.get::<_, String>(1) == wide));
     tx.commit().await?;
     drop(reader);
+    // Direct page arithmetic accepts wider numeric accumulators; a served
+    // store's existing supply domain is uint64, so keep this CLI case valid
+    // while still exceeding signed bigint.
+    source.write(&format!("UPDATE serve.ma_tx_out SET quantity=5000000000000000000 WHERE id IN ({boundary},{after_boundary})")).await?;
+    let mut session = LegacySource::connect(source.reader_config(), None).await?;
+    let snapshot = session.snapshot().await?;
+    expected = snapshot
+        .query(
+            include_str!("common/source_supply_unpaged.sql"),
+            &[&policies, &names, &8_i64],
+        )
+        .await?
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect();
+    assert!(expected[&f.profile.assets["cnight"].unit()].parse::<i128>()? > i128::from(i64::MAX));
+    snapshot.commit().await?;
+    drop(session);
     let target = Database::new().await?;
+    let source_dsn = format!(
+        "{} options='-c enable_seqscan=on -c enable_bitmapscan=on -c enable_indexscan=off -c enable_indexonlyscan=off'",
+        source.dsn(true)
+    );
     let output = target
         .start_cli(
             "convert",
             "mainnet",
-            &["--source", &source.dsn(true), "--horizon-block", "6"],
+            &["--source", &source_dsn, "--horizon-block", "6"],
         )?
         .wait_with_output()
         .await?;
@@ -1408,10 +1446,19 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
             < 60.0
     );
     for line in String::from_utf8_lossy(&output.stderr).lines() {
-        if let Ok(event) = serde_json::from_str::<Value>(line)
-            && event["event"] == "source_supply_page_finished"
-        {
-            assert!(event["rows"].as_i64().unwrap() <= 4096);
+        if let Ok(event) = serde_json::from_str::<Value>(line) {
+            match event["event"].as_str() {
+                Some("source_supply_page_finished") => {
+                    assert!(event["rows"].as_i64().unwrap() <= 4096)
+                }
+                Some("source_supply_started") => {
+                    assert_eq!(event["planner_before"], json!(["on", "on", "off", "off"]))
+                }
+                Some("source_supply_finished") => {
+                    assert_eq!(event["planner_restored"], json!(["on", "on", "off", "off"]))
+                }
+                _ => {}
+            }
         }
     }
     assert_eq!(source.catalog().await?, before);
@@ -1568,6 +1615,7 @@ async fn supply_source_realistic_cost() -> Result {
     drop(session);
     let mut session = LegacySource::connect(source.reader_config(), None).await?;
     let tx = session.snapshot().await?;
+    tx.batch_execute("SET LOCAL enable_seqscan=off;SET LOCAL enable_bitmapscan=off;SET LOCAL enable_indexscan=on;SET LOCAL enable_indexonlyscan=on").await?;
     let mut previous = vec!["0".to_owned(); units.len()];
     let mut after = -1_i64;
     let mut seen = 0_i64;

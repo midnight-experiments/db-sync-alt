@@ -726,11 +726,22 @@ async fn supply(
     let sql = include_str!("conversion_supply.sql");
     let sql_sha256 = format!("{:x}", Sha256::digest(sql.as_bytes()));
     let started = Instant::now();
+    // A LIMIT can otherwise sort an unbounded bitmap/heap scan under stale
+    // statistics. Scope ordered-index paths to this project-owned operation;
+    // restore the caller's flags before family or native node statements.
+    let planner=source.query_one("SELECT current_setting('enable_seqscan'),current_setting('enable_bitmapscan'),current_setting('enable_indexscan'),current_setting('enable_indexonlyscan')",&[]).await?;
+    let planner_before = (0..4)
+        .map(|n| planner.get::<_, String>(n))
+        .collect::<Vec<_>>();
+    let set_planner = "SELECT set_config('enable_seqscan',$1,true),set_config('enable_bitmapscan',$2,true),set_config('enable_indexscan',$3,true),set_config('enable_indexonlyscan',$4,true)";
+    source
+        .query_one(set_planner, &[&"off", &"off", &"on", &"on"])
+        .await?;
     let mut after_id = -1_i64;
     let mut cost = SupplyCost::default();
     eprintln!(
         "{}",
-        json!({"event":"source_supply_started","operation":"convert","target":target,"page_rows":4096,"sql_sha256":sql_sha256})
+        json!({"event":"source_supply_started","operation":"convert","target":target,"page_rows":4096,"sql_sha256":sql_sha256,"planner_before":planner_before,"supply_planner":["off","off","on","on"]})
     );
     loop {
         let previous = units.iter().map(|u| amounts[u].clone()).collect::<Vec<_>>();
@@ -776,9 +787,23 @@ async fn supply(
             None => break,
         }
     }
+    let restored = source
+        .query_one(
+            set_planner,
+            &[
+                &planner_before[0],
+                &planner_before[1],
+                &planner_before[2],
+                &planner_before[3],
+            ],
+        )
+        .await?;
+    if (0..4).any(|n| restored.get::<_, String>(n) != planner_before[n]) {
+        return Err(Error::Refusal("source_supply_planner_restore_failed"));
+    }
     eprintln!(
         "{}",
-        json!({"event":"source_supply_finished","operation":"convert","batches":cost.batches,"rows":cost.rows,"elapsed_seconds":started.elapsed().as_secs_f64(),"longest_page_seconds":cost.longest_seconds,"sql_sha256":sql_sha256})
+        json!({"event":"source_supply_finished","operation":"convert","batches":cost.batches,"rows":cost.rows,"elapsed_seconds":started.elapsed().as_secs_f64(),"longest_page_seconds":cost.longest_seconds,"sql_sha256":sql_sha256,"planner_restored":planner_before})
     );
     Ok((amounts, cost))
 }
