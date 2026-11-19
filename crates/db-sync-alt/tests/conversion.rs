@@ -49,6 +49,15 @@ async fn convert_true_legacy_public_reader_model_and_snapshot() -> Result {
             ],
         )
         .await?;
+    for table in TABLES {
+        let raw = &converted["source"]["raw_families"][table];
+        assert_eq!(raw["raw_digest"]["rows"], raw["rows"]);
+        assert_eq!(raw["raw_digest"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(
+            raw["longest_destination_page_seconds"].as_f64().unwrap()
+                <= raw["destination_seconds"].as_f64().unwrap()
+        );
+    }
     let expected = selected(&f.rows(), &keep(&f.chain, &f.profile, f.bounds)?);
     assert_eq!(target.rows().await?, expected);
     assert_eq!(
@@ -692,6 +701,222 @@ async fn convert_late_snapshot_failure_reports_published_digest_and_recovery() -
     drop(barrier);
     source.cleanup().await?;
     target.cleanup().await?;
+    Ok(())
+}
+
+// An own-test TCP proxy withholds the COMMIT reply after forwarding COMMIT.
+// PostgreSQL has already published; the CLI cannot yet know its outcome. No
+// product hook, altered SQL, guessed sleeps or historical source is involved.
+async fn commit_reply_proxy(
+    target: &Database,
+) -> Result<(
+    u16,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_postgres::config::Host;
+    let host = match &target.config.get_hosts()[0] {
+        Host::Tcp(host) => host.clone(),
+        Host::Unix(_) => return Err("TCP test database required".into()),
+    };
+    let port = target.config.get_ports().first().copied().unwrap_or(5432);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let proxy_port = listener.local_addr()?.port();
+    assert!(proxy_port > 10000);
+    let (release, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((mut downstream, _)) = accepted else { break };
+                    let host = host.clone();
+                    let mut receiver = receiver.clone();
+                    connections.spawn(async move {
+                        let mut upstream = TcpStream::connect((host.as_str(), port)).await?;
+                        let mut length = [0; 4];
+                        downstream.read_exact(&mut length).await?;
+                        let n = u32::from_be_bytes(length) as usize;
+                        if !(8..=10000).contains(&n) {
+                            return Err(std::io::Error::other("invalid startup frame"));
+                        }
+                        let mut startup = vec![0; n - 4];
+                        downstream.read_exact(&mut startup).await?;
+                        upstream.write_all(&length).await?;
+                        upstream.write_all(&startup).await?;
+                        if n == 16 && startup[..4] == [4, 210, 22, 46] {
+                            // Forward actual PostgreSQL cancellation on its own socket.
+                            tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await?;
+                            return Ok::<(), std::io::Error>(());
+                        }
+                        let (mut client_read, mut client_write) = downstream.into_split();
+                        let (mut server_read, mut server_write) = upstream.into_split();
+                        let committing = std::sync::atomic::AtomicBool::new(false);
+                        let outgoing = async {
+                            let mut publishing = false;
+                            loop {
+                                let mut tag = [0];
+                                if client_read.read(&mut tag).await? == 0 { break; }
+                                client_read.read_exact(&mut length).await?;
+                                let n = u32::from_be_bytes(length) as usize;
+                                if !(4..=1024 * 1024).contains(&n) {
+                                    return Err(std::io::Error::other("invalid frontend frame"));
+                                }
+                                let mut body = vec![0; n - 4];
+                                client_read.read_exact(&mut body).await?;
+                                if tag == [b'Q'] && body.starts_with(b"UPDATE dsa.position SET serving=true") {
+                                    publishing = true;
+                                }
+                                if publishing && tag == [b'Q'] && body == b"COMMIT\0" {
+                                    committing.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                server_write.write_all(&tag).await?;
+                                server_write.write_all(&length).await?;
+                                server_write.write_all(&body).await?;
+                            }
+                            Ok::<(), std::io::Error>(())
+                        };
+                        let incoming = async {
+                            let mut bytes = [0; 8192];
+                            loop {
+                                let n = server_read.read(&mut bytes).await?;
+                                if n == 0 { break; }
+                                if committing.load(std::sync::atomic::Ordering::SeqCst) {
+                                    while !*receiver.borrow() {
+                                        receiver.changed().await.map_err(std::io::Error::other)?;
+                                    }
+                                }
+                                client_write.write_all(&bytes[..n]).await?;
+                            }
+                            Ok::<(), std::io::Error>(())
+                        };
+                        tokio::select! { r=outgoing=>r, r=incoming=>r }
+                    });
+                }
+                Some(_) = connections.join_next() => {}
+            }
+        }
+    });
+    Ok((proxy_port, release, task))
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_deadline_and_term_after_publication_report_unknown_then_verify() -> Result {
+    for signal in [false, true] {
+        let f = fixture(220);
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let target = Database::new().await?;
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("optional.dsa");
+        let (port, release, proxy) = commit_reply_proxy(&target).await?;
+        let proxy_dsn = format!(
+            "host=127.0.0.1 port={port} user={} dbname={} sslmode=disable",
+            target.owner, target.name
+        );
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+            .args([
+                "convert",
+                "--network",
+                "mainnet",
+                "--database",
+                &proxy_dsn,
+                "--source",
+                &source.dsn(true),
+                "--horizon-block",
+                "6",
+                "--overall-timeout-seconds",
+                "10",
+                "--snapshot",
+                path.to_str().unwrap(),
+            ])
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let observer = connect(&target.config).await?;
+        let start = Instant::now();
+        loop {
+            let exists: bool = observer
+                .query_one("SELECT to_regclass('dsa.position') IS NOT NULL", &[])
+                .await?
+                .get(0);
+            if exists
+                && observer
+                    .query_one("SELECT serving FROM dsa.position", &[])
+                    .await?
+                    .get::<_, bool>(0)
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(8),
+                "publication did not happen before deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            child.try_wait()?.is_none(),
+            "COMMIT acknowledgement was not held"
+        );
+        if signal {
+            assert!(
+                tokio::process::Command::new("kill")
+                    .args(["-TERM", &child.id().unwrap().to_string()])
+                    .status()
+                    .await?
+                    .success()
+            );
+        }
+        let output =
+            tokio::time::timeout(Duration::from_secs(16), child.wait_with_output()).await??;
+        let report = failure(&output)?;
+        assert_eq!(
+            report["error"],
+            if signal {
+                "operation_interrupted"
+            } else {
+                "operation_deadline_exceeded"
+            }
+        );
+        assert_eq!(report["operation"], "convert");
+        assert_eq!(report["phase"], "conversion_or_optional_snapshot");
+        assert_eq!(report["outcome"], "unknown");
+        assert_eq!(report["rollback_confirmed"], false);
+        assert!(
+            report["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("status and verify")
+        );
+        let _ = release.send(true);
+        proxy.abort();
+        let _ = proxy.await;
+        drop(observer);
+        let status = target.cli("status", "mainnet", &[]).await?;
+        assert_eq!(status["position"]["serving"], true);
+        let verified = target.cli("verify", "mainnet", &[]).await?;
+        assert!(verified["content_digest"].is_string());
+        assert!(
+            !path.exists(),
+            "snapshot cannot start before COMMIT acknowledgement"
+        );
+        target.cli("snapshot", "mainnet", &file_args(&path)).await?;
+        assert!(path.is_file());
+        target
+            .refusal(
+                "mainnet",
+                &source.dsn(true),
+                &["--horizon-block", "6"],
+                "destination_not_empty",
+            )
+            .await?;
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
     Ok(())
 }
 

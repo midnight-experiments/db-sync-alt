@@ -52,8 +52,12 @@ and SQL NULL versus JSON null are preserved without a Rust value decoder.
 
 All eleven visible families are read in the same source snapshot, with safe
 positional target/tip and bridge-window bounds. This is a full-reader operation;
-`raw_families` reports its rows, wire bytes, page costs, destination write time
-and temporary relation bytes. It creates no source TEMP objects or grants.
+`raw_families` reports its rows, wire bytes, page costs, total and maximum
+destination page-write times, temporary relation bytes, and each raw row-framed
+binary digest `{rows, sha256}`. These transport hashes verify exported bytes
+against the private copy; they do not independently prove source coverage.
+Record independently available source counts/anchors and use anchored capture
+plus compare for source-answer evidence. It creates no source TEMP objects or grants.
 Source observations are captured and committed before the expensive local
 finish. The private copy is checked by an independent binary row digest, then
 the unchanged A3 predicate is evaluated once and its keys reused for all
@@ -71,13 +75,19 @@ themselves qualify the actual archive or authorize live reads.
 Reports retain selected-family row/byte costs and add raw copy/staging and
 local-selection costs, alongside actual source limits, work_mem and destination
 index/analyze/sequence, verification, commit and finish times. The source
-transaction can hold back vacuum until its capture and commit finish.
+transaction stays open through all raw staging and source-answer capture,
+holding back vacuum until its source commit finishes. It is idle between source
+pages while the destination writes, sizes and logs each page; maximum page
+write time helps assess the explicit idle-limit margin. No heartbeat extends
+the caller's limits.
 
 Positive PostgreSQL statement and idle-transaction limits are preserved. A
 source reader whose inherited value is0 receives a scoped60s default. The
 command's default overall deadline is3600s, controlled by
 `--overall-timeout-seconds`; interrupts and deadline expiry cancel this
-operation's own queries before closing its connections.
+operation's own queries before closing its connections. The overall deadline
+covers preflight, supply, raw staging, capture, local selection, publication and
+the optional post-publication snapshot; it is not a per-source-statement limit.
 Explicit positive overrides are connection-local:
 `--source-statement-timeout-seconds`,
 `--source-idle-transaction-timeout-seconds`,
@@ -90,9 +100,15 @@ require the operator's authorization; synthetic timing does not change them.
 
 Source, horizon, destination and optional snapshot path preflights precede
 layout or ACL mutations. A serving or occupied destination is preserved.
-Loading and publication use one destination transaction; cancellation rolls
-back rows and leaves a closed, explicitly owned `convert_failed` layout that
-may be retried. A failed restore belongs to restore and is refused by convert.
+Loading and publication use one destination transaction. A failure before
+publication rolls back its rows and leaves a closed, explicitly owned
+`convert_failed` layout that may be retried. Deadline or signal cancellation can
+race the publication COMMIT acknowledgement or the optional snapshot, so the
+CLI retains its error cause but reports `outcome:unknown` and
+`rollback_confirmed:false`. Run `status` and `verify` on that exact destination
+before cleanup or retry. If it is serving and verifies, preserve it and write a
+fresh snapshot if needed. Never assume rollback or repeat convert/restore into
+a serving or nonempty destination. A failed restore belongs to restore and is refused by convert.
 
 `--snapshot new-file.dsa` writes a verified snapshot after conversion publishes.
 A missing/unwritable parent is refused during preflight. If the path becomes

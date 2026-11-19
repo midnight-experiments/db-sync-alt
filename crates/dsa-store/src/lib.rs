@@ -73,6 +73,8 @@ pub enum Error {
         content_digest: String,
         state_digest: String,
     },
+    #[error("{reason}")]
+    ConversionOutcomeUnknown { reason: &'static str },
     #[error("source_read_failed")]
     SourceRead {
         family: &'static str,
@@ -117,6 +119,9 @@ impl Error {
                 state_digest,
             } => {
                 json!({"error":"conversion_completed_snapshot_failed","converted":true,"content_digest":content_digest,"state_digest":state_digest,"recovery":"The database is serving. Run snapshot with this destination and a new writable --file path; do not repeat convert.","snapshot_error":error.report()})
+            }
+            Self::ConversionOutcomeUnknown { reason } => {
+                json!({"error":reason,"operation":"convert","phase":"conversion_or_optional_snapshot","outcome":"unknown","rollback_confirmed":false,"recovery":"Run status and verify on this exact destination before cleanup or retry. If it is serving and verifies, preserve it and run snapshot with a new writable --file path if needed. Do not repeat convert or restore into a serving or nonempty destination."})
             }
             _ => json!({"error": self.to_string()}),
         }

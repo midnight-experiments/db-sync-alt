@@ -209,6 +209,14 @@ async fn stopped() -> Result<(), Error> {
     }
 }
 async fn execute(command: Command) -> Result<Value, Error> {
+    let converting = matches!(&command, Command::Convert { .. });
+    let interrupted = |reason| {
+        if converting {
+            Error::ConversionOutcomeUnknown { reason }
+        } else {
+            Error::Refusal(reason)
+        }
+    };
     let seconds = match &command {
         Command::Compare(args) => Some(args.overall_timeout_seconds),
         Command::Convert {
@@ -223,8 +231,8 @@ async fn execute(command: Command) -> Result<Value, Error> {
         tokio::pin!(work);
         let result = tokio::select! {
             result=&mut work=>result,
-            signal=stopped()=>match signal {Ok(())=>Err(Error::Refusal("operation_interrupted")),Err(error)=>Err(error)},
-            _=tokio::time::sleep(Duration::from_secs(u64::from(seconds)))=>Err(Error::Refusal("operation_deadline_exceeded"))
+            signal=stopped()=>match signal {Ok(())=>Err(interrupted("operation_interrupted")),Err(error)=>Err(error)},
+            _=tokio::time::sleep(Duration::from_secs(u64::from(seconds)))=>Err(interrupted("operation_deadline_exceeded"))
         };
         if result.is_err() {
             group.cancel().await;
@@ -388,6 +396,10 @@ async fn database_command(
                     dsa_store::compare::capture(&tx, profile, &positions, &Default::default())
                         .await?;
                 tx.commit().await?;
+                eprintln!(
+                    "{}",
+                    json!({"event":"conversion_source_snapshot_committed"})
+                );
                 // Observation publication precedes destination publication. File
                 // failure drops the staged conversion with its gate closed.
                 let path = path.clone();

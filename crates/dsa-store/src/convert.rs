@@ -952,6 +952,10 @@ impl Store {
         let snapshot = source.snapshot().await?;
         let stage = self.stage_conversion(profile, &snapshot, options).await?;
         snapshot.commit().await?;
+        eprintln!(
+            "{}",
+            json!({"event":"conversion_source_snapshot_committed"})
+        );
         let mut converted = stage.finish(profile).await?;
         if let Some(path) = &options.snapshot {
             converted.snapshot = Some(self.snapshot(profile, path).await.map_err(|error| {

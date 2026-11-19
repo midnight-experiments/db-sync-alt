@@ -25,6 +25,10 @@ pub struct RawFamilyCost {
     pub source_seconds: f64,
     pub destination_seconds: f64,
     pub longest_source_page_seconds: f64,
+    #[serde(default)]
+    pub longest_destination_page_seconds: f64,
+    #[serde(default)]
+    pub raw_digest: Option<FamilyDigest>,
     pub largest_row_bytes: u64,
     pub temporary_relation_bytes: i64,
 }
@@ -298,6 +302,9 @@ pub(crate) async fn stage(
             }
             let destination_seconds = write.elapsed().as_secs_f64();
             cost.destination_seconds += destination_seconds;
+            cost.longest_destination_page_seconds = cost
+                .longest_destination_page_seconds
+                .max(destination_seconds);
             cost.rows += page.rows;
             cost.wire_bytes += page.wire.len() as u64;
             eprintln!(
@@ -318,11 +325,13 @@ pub(crate) async fn stage(
             .await?
             .get(0);
         result.temporary_bytes += cost.temporary_relation_bytes;
+        let digest = hash.finish();
+        cost.raw_digest = Some(digest.clone());
         eprintln!(
             "{}",
             json!({"event":"source_family_finished","family":table,"mode":"raw_staging","elapsed_seconds":began.elapsed().as_secs_f64(),"cost":cost})
         );
-        result.digests.insert(table.to_owned(), hash.finish());
+        result.digests.insert(table.to_owned(), digest);
         result.costs.insert(table.to_owned(), cost);
     }
     restore(source, &before).await?;
