@@ -9,6 +9,7 @@ use crate::{
     assets::AssetRule,
     cbor::{Error, error},
     datum, ids,
+    observations::{Fact, Shape, Source},
     profiles::Profile,
     transaction::{Asset, Outpoint, Output, Transaction, hash},
 };
@@ -251,6 +252,7 @@ fn datum_for(
     tx: &Transaction<'_>,
     supplements: &Supplements,
     datums: &mut BTreeMap<String, DatumRow>,
+    observation: Option<(&mut Vec<Fact>, u16, Option<u16>, Source)>,
 ) -> Result<(), BuildError> {
     let Some(expected) = &output.data_hash else {
         return Ok(());
@@ -273,6 +275,27 @@ fn datum_for(
     };
     if hash(raw) != *expected {
         return Err(error("provider_datum_hash_mismatch", 0).into());
+    }
+    if raw.len() > 10_000
+        && let Some((facts, transaction_index, output_index, inline_source)) = observation
+    {
+        let source = if output.inline_datum.is_some() {
+            inline_source
+        } else if tx.datums.contains_key(expected) {
+            Source::BlockCbor
+        } else {
+            Source::Datum(expected.clone())
+        };
+        facts.push(Fact {
+            shape: Shape::StoredLargeDatum,
+            transaction_hash: tx.hash.clone(),
+            transaction_index,
+            output_index,
+            datum_hash: Some(expected.clone()),
+            raw_datum_bytes: Some(raw.len()),
+            metadata_key: None,
+            source,
+        });
     }
     datums.insert(
         expected.clone(),
@@ -336,14 +359,72 @@ pub fn build_block(
     held: &mut BTreeMap<Outpoint, HeldOutput>,
     supplements: &Supplements,
 ) -> Result<Rows, BuildError> {
-    transactions.validate()?;
-    build_facts(
+    Ok(prepare_block(
         profile,
         height,
-        transactions.transactions(),
+        transactions,
         held,
         supplements,
-    )
+        &BTreeSet::new(),
+    )?
+    .commit())
+}
+
+/// The held overlay and immutable rows stay staged until the caller has bound
+/// required observation sources. SQL publication remains the follower's job.
+pub struct PreparedBlock<'a> {
+    held: &'a mut BTreeMap<Outpoint, HeldOutput>,
+    changes: BTreeMap<Outpoint, Option<HeldOutput>>,
+    rows: Rows,
+    facts: Vec<Fact>,
+}
+impl PreparedBlock<'_> {
+    pub fn rows(&self) -> &Rows {
+        &self.rows
+    }
+    pub fn facts(&self) -> &[Fact] {
+        &self.facts
+    }
+    pub fn commit(self) -> Rows {
+        for (point, output) in self.changes {
+            if let Some(output) = output {
+                self.held.insert(point, output);
+            } else {
+                self.held.remove(&point);
+            }
+        }
+        self.rows
+    }
+}
+pub fn prepare_block<'a>(
+    profile: &Profile,
+    height: u32,
+    transactions: &crate::inventory::DecodedTransactions<'_>,
+    held: &'a mut BTreeMap<Outpoint, HeldOutput>,
+    supplements: &Supplements,
+    pending: &BTreeSet<Shape>,
+) -> Result<PreparedBlock<'a>, BuildError> {
+    transactions.validate()?;
+    let mut facts = Vec::new();
+    let (rows, changes) = {
+        let mut staged = HeldChanges::new(held);
+        let rows = build_rows(
+            profile,
+            height,
+            transactions.transactions(),
+            &mut staged,
+            supplements,
+            pending,
+            &mut facts,
+        )?;
+        (rows, staged.changes)
+    };
+    Ok(PreparedBlock {
+        held,
+        changes,
+        rows,
+        facts,
+    })
 }
 
 pub(crate) fn build_facts(
@@ -355,7 +436,15 @@ pub(crate) fn build_facts(
 ) -> Result<Rows, BuildError> {
     let (rows, changes) = {
         let mut staged = HeldChanges::new(held);
-        let rows = build_rows(profile, height, transactions, &mut staged, supplements)?;
+        let rows = build_rows(
+            profile,
+            height,
+            transactions,
+            &mut staged,
+            supplements,
+            &BTreeSet::new(),
+            &mut Vec::new(),
+        )?;
         (rows, staged.changes)
     };
     for (point, output) in changes {
@@ -374,6 +463,8 @@ fn build_rows(
     transactions: &[Transaction<'_>],
     held: &mut HeldChanges<'_>,
     supplements: &Supplements,
+    pending: &BTreeSet<Shape>,
+    facts: &mut Vec<Fact>,
 ) -> Result<Rows, BuildError> {
     let selection = Selection::new(profile);
     let mut rows = Rows::default();
@@ -421,7 +512,18 @@ fn build_rows(
                 tx_out_index: point.index,
             });
             if selection.needs_datum(&origin.output) {
-                datum_for(&origin.output, tx, supplements, &mut datums)?;
+                datum_for(
+                    &origin.output,
+                    tx,
+                    supplements,
+                    &mut datums,
+                    pending.contains(&Shape::StoredLargeDatum).then_some((
+                        &mut *facts,
+                        tx_index,
+                        None,
+                        Source::HeldInline,
+                    )),
+                )?;
             }
         }
         let mut ics = false;
@@ -434,6 +536,41 @@ fn build_rows(
                 })
             })?;
             ics |= profile.addresses.get("ics") == Some(&address);
+            let inline_source = if tx
+                .outputs
+                .get(usize::from(index))
+                .and_then(Option::as_ref)
+                .is_some_and(|o| o.classification_safe)
+                || !tx.valid
+                    && tx
+                        .collateral_output
+                        .as_ref()
+                        .is_some_and(|o| o.classification_safe)
+            {
+                Source::BlockCbor
+            } else {
+                Source::OutputFallback(tx.hash.clone())
+            };
+            if pending.contains(&Shape::StoredPointerAddress)
+                && output
+                    .address
+                    .as_deref()
+                    .and_then(crate::transaction::address_bytes)
+                    .as_deref()
+                    .and_then(|bytes| bytes.first())
+                    .is_some_and(|b| matches!(b >> 4, 4 | 5))
+            {
+                facts.push(Fact {
+                    shape: Shape::StoredPointerAddress,
+                    transaction_hash: tx.hash.clone(),
+                    transaction_index: tx_index,
+                    output_index: Some(index),
+                    datum_hash: None,
+                    raw_datum_bytes: None,
+                    metadata_key: None,
+                    source: inline_source.clone(),
+                });
+            }
             rows.tx_out.push(OutputRow {
                 id: output_id,
                 tx_id,
@@ -455,7 +592,18 @@ fn build_rows(
                 }
             }
             if selection.needs_datum(output) {
-                datum_for(output, tx, supplements, &mut datums)?;
+                datum_for(
+                    output,
+                    tx,
+                    supplements,
+                    &mut datums,
+                    pending.contains(&Shape::StoredLargeDatum).then_some((
+                        &mut *facts,
+                        tx_index,
+                        Some(index),
+                        inline_source,
+                    )),
+                )?;
             }
         }
         for asset in mints {
@@ -471,6 +619,18 @@ fn build_rows(
                 BuildError::Required(SupplementRequest::Metadata(tx.hash.clone()))
             })?;
             if let Some(json) = metadata {
+                if pending.contains(&Shape::StoredBridgeMetadata) {
+                    facts.push(Fact {
+                        shape: Shape::StoredBridgeMetadata,
+                        transaction_hash: tx.hash.clone(),
+                        transaction_index: tx_index,
+                        output_index: None,
+                        datum_hash: None,
+                        raw_datum_bytes: None,
+                        metadata_key: Some(6500973),
+                        source: Source::BlockCbor,
+                    });
+                }
                 rows.tx_metadata.push(MetadataRow {
                     id: tx_id,
                     tx_id,
