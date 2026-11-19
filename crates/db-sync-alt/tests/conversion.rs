@@ -814,7 +814,10 @@ async fn commit_reply_proxy(
 async fn convert_deadline_and_term_after_publication_report_unknown_then_verify() -> Result {
     use tokio::io::AsyncReadExt;
     for signal in [false, true] {
-        let f = fixture(220);
+        // This seed is the independently exercised genuine mainnet source in
+        // convert_true_legacy_public_reader_model_and_snapshot; seed220 lacks
+        // positive network-specific evidence and correctly refuses preflight.
+        let f = fixture(201);
         let source = Database::new().await?;
         source.legacy(&f).await?;
         let target = Database::new().await?;
