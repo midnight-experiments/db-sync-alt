@@ -62,6 +62,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -542,15 +543,31 @@ impl Store {
         }
         for section in &description.sections {
             {
+                let table = qualified(&section.table)?;
+                let began = Instant::now();
+                let database_error = |stage, error: tokio_postgres::Error| Error::AtStage {
+                    stage,
+                    family: section.table.clone(),
+                    elapsed_seconds: began.elapsed().as_secs_f64(),
+                    error: Box::new(Error::Postgres(error)),
+                };
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"restore_section_started","family":section.table,"plain_bytes":section.plain_bytes,"compressed_bytes":section.compressed_bytes,"expected_rows":section.rows})
+                );
                 let mut decoder = zstd::stream::read::Decoder::new(CheckedReader::new(
                     Read::by_ref(&mut file).take(section.compressed_bytes),
                 ))?;
                 decoder.window_log_max(27)?;
-                let query = format!(
-                    "COPY {} FROM STDIN (FORMAT binary)",
-                    qualified(&section.table)?
+                let query = format!("COPY {table} FROM STDIN (FORMAT binary)");
+                let sink = tx
+                    .copy_in::<_, Bytes>(&query)
+                    .await
+                    .map_err(|error| database_error("restore_copy_open", error))?;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"restore_copy_opened","family":section.table,"elapsed_seconds":began.elapsed().as_secs_f64()})
                 );
-                let sink = tx.copy_in::<_, Bytes>(&query).await?;
                 pin_mut!(sink);
                 let mut bytes = 0;
                 let mut buf = [0; 65536];
@@ -563,18 +580,34 @@ impl Store {
                     if bytes > section.plain_bytes {
                         return Err(Error::Refusal("snapshot_plain_size_mismatch"));
                     }
+                    let send = Instant::now();
                     sink.as_mut()
                         .send(Bytes::copy_from_slice(&buf[..n]))
-                        .await?;
+                        .await
+                        .map_err(|error| database_error("restore_copy_send", error))?;
+                    if send.elapsed().as_secs() >= 1 {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"event":"restore_copy_backpressure","family":section.table,"queued_plain_bytes":bytes,"send_seconds":send.elapsed().as_secs_f64(),"elapsed_seconds":began.elapsed().as_secs_f64(),"note":"queued bytes are not server row acknowledgements"})
+                        );
+                    }
                 }
                 let (size, hash) = decoder.finish().into_inner().finish();
                 if size != section.compressed_bytes || hash != section.sha256 {
                     return Err(Error::Refusal("snapshot_section_hash_mismatch"));
                 }
-                let rows = sink.as_mut().finish().await?;
+                let rows = sink
+                    .as_mut()
+                    .finish()
+                    .await
+                    .map_err(|error| database_error("restore_copy_finish", error))?;
                 if bytes != section.plain_bytes || rows != section.rows {
                     return Err(Error::Refusal("snapshot_row_count_mismatch"));
                 }
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"restore_section_finished","family":section.table,"plain_bytes":bytes,"acknowledged_rows":rows,"elapsed_seconds":began.elapsed().as_secs_f64()})
+                );
             }
         }
         let mut extra = [0];

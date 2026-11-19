@@ -75,6 +75,14 @@ pub enum Error {
     },
     #[error("{reason}")]
     ConversionOutcomeUnknown { reason: &'static str },
+    #[error("{error}")]
+    AtStage {
+        stage: &'static str,
+        family: String,
+        elapsed_seconds: f64,
+        #[source]
+        error: Box<Error>,
+    },
     #[error("source_read_failed")]
     SourceRead {
         family: &'static str,
@@ -91,7 +99,9 @@ impl Error {
                 json!({"error": self.to_string(), "details": details})
             }
             Self::Postgres(error) => {
-                json!({"error": "database_error", "sqlstate": error.code().map(|code| code.code())})
+                let mut report = postgres_diagnostic(error);
+                report["error"] = json!("database_error");
+                report
             }
             Self::SourceRead {
                 family,
@@ -123,9 +133,38 @@ impl Error {
             Self::ConversionOutcomeUnknown { reason } => {
                 json!({"error":reason,"operation":"convert","phase":"conversion_or_optional_snapshot","outcome":"unknown","rollback_confirmed":false,"recovery":"Run status and verify on this exact destination before cleanup or retry. If it is serving and verifies, preserve it and run snapshot with a new writable --file path if needed. Do not repeat convert or restore into a serving or nonempty destination."})
             }
+            Self::AtStage {
+                stage,
+                family,
+                elapsed_seconds,
+                error,
+            } => {
+                let mut report = error.report();
+                report["stage"] = json!(stage);
+                report["family"] = json!(family);
+                report["elapsed_seconds"] = json!(elapsed_seconds);
+                report
+            }
             _ => json!({"error": self.to_string()}),
         }
     }
+}
+
+// Error strings, Debug output, SQL text and connection configuration can contain
+// values or secrets. Only standard IO kinds/errno and PostgreSQL codes are public.
+fn io_causes(mut error: Option<&(dyn std::error::Error + 'static)>) -> Vec<Value> {
+    let mut causes = Vec::new();
+    for _ in 0..16 {
+        let Some(current) = error else { break };
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            causes.push(json!({"kind":format!("{:?}",io.kind()),"os_error":io.raw_os_error()}));
+        }
+        error = current.source();
+    }
+    causes
+}
+fn postgres_diagnostic(error: &tokio_postgres::Error) -> Value {
+    json!({"sqlstate":error.code().map(|code|code.code()),"connection_closed":error.is_closed(),"io_causes":io_causes(Some(error))})
 }
 
 pub struct Store {
@@ -168,6 +207,15 @@ impl Store {
             config.tcp_user_timeout(Duration::from_secs(30));
         }
         config.keepalives_idle(config.get_keepalives_idle().min(Duration::from_secs(30)));
+        let connection_role = match config.get_application_name() {
+            Some("db-sync-alt-convert-source") => "legacy_source",
+            Some(value) if value.starts_with("db-sync-alt-compare") => "comparison_reader",
+            _ => "store",
+        };
+        eprintln!(
+            "{}",
+            json!({"event":"postgres_socket_limits","role":connection_role,"connect_timeout_ms":config.get_connect_timeout().map(|v|v.as_millis()),"tcp_user_timeout_ms":config.get_tcp_user_timeout().map(|v|v.as_millis()),"keepalives_idle_ms":config.get_keepalives_idle().as_millis()})
+        );
         let mut roots = rustls::RootCertStore::empty();
         if let Some(path) = root_certificate {
             if config.get_ssl_mode() == SslMode::Disable {
@@ -206,7 +254,12 @@ impl Store {
             tls,
         };
         let connection = tokio::spawn(async move {
-            let _ = connection.await;
+            if let Err(error) = connection.await {
+                eprintln!(
+                    "{}",
+                    json!({"event":"postgres_connection_failed","role":connection_role,"diagnostic":postgres_diagnostic(&error)})
+                );
+            }
         });
         let store = Self {
             client,
@@ -480,4 +533,43 @@ async fn verify_reader<C: GenericClient>(client: &C, role: &str) -> Result<Value
     Ok(
         json!({"role":role,"privileges":"node_relations_only","settings":settings,"warnings":warnings}),
     )
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[derive(Debug)]
+    struct SecretContext(std::io::Error);
+    impl std::fmt::Display for SecretContext {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("postgres://operator:generated-secret@private-host/private-db")
+        }
+    }
+    impl std::error::Error for SecretContext {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    #[test]
+    fn io_diagnostics_keep_kind_errno_without_context_or_message() {
+        let error = SecretContext(std::io::Error::from_raw_os_error(110));
+        let value = serde_json::to_value(io_causes(Some(&error))).unwrap();
+        assert_eq!(value[0]["os_error"], 110);
+        #[cfg(target_os = "linux")]
+        assert_eq!(value[0]["kind"], "TimedOut");
+        let serialized = value.to_string();
+        for secret in [
+            "generated-secret",
+            "private-host",
+            "private-db",
+            "postgres://",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        let other = std::io::Error::other("postgres://operator:another-secret@private-host");
+        assert_eq!(
+            io_causes(Some(&other)),
+            vec![json!({"kind":"Other","os_error":null})]
+        );
+    }
 }
