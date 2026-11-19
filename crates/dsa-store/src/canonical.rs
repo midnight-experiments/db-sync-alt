@@ -91,6 +91,27 @@ pub(crate) fn selected_staging(table: &str) -> Result<String, Error> {
     )
 }
 
+/// The once-materialized retained keys, including the existing bounded orphan
+/// window witness. Keep this statement shared with focused staging diagnostics.
+pub(crate) fn staging_keys_sql() -> String {
+    use crate::keep::{Selection, SourceSchema};
+    let unions = crate::NODE_RELATIONS
+        .iter()
+        .map(|table| {
+            if *table == "ma_tx_out" {
+                format!("SELECT 'ma_tx_out'::text AS family,id FROM (SELECT id FROM keep_ma_tx_out UNION SELECT a.id FROM pg_temp.ma_tx_out a WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND ({})) selected", Selection::asset_predicate(SourceSchema::Temporary, "a"))
+            } else {
+                format!("SELECT '{table}'::text AS family,id FROM keep_{table}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    format!(
+        "CREATE TEMP TABLE conversion_keep_keys ON COMMIT DROP AS {} {unions}",
+        Selection::ctes_sql(SourceSchema::Temporary)
+    )
+}
+
 fn selected(
     table: &str,
     schema: crate::keep::SourceSchema,

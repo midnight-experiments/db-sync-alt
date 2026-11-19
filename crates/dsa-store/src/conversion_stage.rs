@@ -6,7 +6,7 @@
 use crate::{
     Error, NODE_RELATIONS, canonical,
     convert::{ConvertOptions, FamilyCost, columns},
-    keep::{Selection, SourceSchema},
+    keep::Selection,
     verify::{MARKERS, ServingState},
 };
 use bytes::{Bytes, BytesMut};
@@ -399,22 +399,12 @@ pub(crate) async fn select(
             .await?
             .get::<_, i64>(0);
     }
-    let unions=NODE_RELATIONS.iter().map(|table|{
-        if *table=="ma_tx_out" {format!("SELECT 'ma_tx_out'::text AS family,id FROM (SELECT id FROM keep_ma_tx_out UNION SELECT a.id FROM pg_temp.ma_tx_out a WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND ({})) selected",Selection::asset_predicate(SourceSchema::Temporary,"a"))}
-        else {format!("SELECT '{table}'::text AS family,id FROM keep_{table}")}
-    }).collect::<Vec<_>>().join(" UNION ALL ");
     eprintln!(
         "{}",
         json!({"event":"conversion_local_selection_started","source_reads_required":false,"temporary_relation_bytes":raw.temporary_bytes})
     );
     destination
-        .execute(
-            &format!(
-                "CREATE TEMP TABLE conversion_keep_keys ON COMMIT DROP AS {} {unions}",
-                Selection::ctes_sql(SourceSchema::Temporary)
-            ),
-            &selection.parameters(),
-        )
+        .execute(&canonical::staging_keys_sql(), &selection.parameters())
         .await?;
     destination.batch_execute("ALTER TABLE pg_temp.conversion_keep_keys ADD PRIMARY KEY(family,id);ANALYZE pg_temp.conversion_keep_keys").await?;
     let temporary_bytes: i64 = destination
