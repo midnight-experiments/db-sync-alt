@@ -812,6 +812,7 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
             8
         };
         let catalogue = dsa_store::catalogue::catalogue();
+        let mut literal_rows = std::collections::BTreeMap::new();
         for name in [
             "get_utxos_for_address_tx_in_enabled",
             "get_utxos_for_address_tx_in_consumed",
@@ -835,6 +836,7 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
                     "Q19 counterexample {scenario}/{name} disappeared"
                 );
             }
+            literal_rows.insert(name, (left.clone(), right.clone()));
             println!(
                 "{}",
                 json!({"event":"q19_literal_counterexample","scenario":scenario,"query":name,"sql_sha256":sql.sha256,"address":address,"reference_block":reference,"horizon":6,"source_rows":left,"converted_rows":right})
@@ -868,6 +870,53 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
                 .iter()
                 .any(|o| o["a_rows"] != o["b_rows"] && o["a_input"]["address"] == address)
         );
+        let observations = report["unsupported_observations"].as_array().unwrap();
+        for (name, (left, right)) in literal_rows {
+            let variant = observations
+                .iter()
+                .filter(|o| {
+                    o["query"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("{name}:"))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                variant.iter().any(|o| o["label"] == "hit"),
+                "{scenario}/{name}: missing hit"
+            );
+            assert!(
+                variant
+                    .iter()
+                    .any(|o| o["label"].as_str().unwrap().starts_with("epoch/")),
+                "{scenario}/{name}: missing epoch"
+            );
+            assert!(
+                variant
+                    .iter()
+                    .any(|o| o["a_input"]["reference_block"] == reference
+                        && o["a_rows"] == json!(left)
+                        && o["b_rows"] == json!(right)),
+                "{scenario}/{name}: raw literal rows absent"
+            );
+            assert!(
+                variant
+                    .iter()
+                    .all(|o| o["matched"] == json!(o["a_rows"] == o["b_rows"])
+                        && o["a_input"] == o["b_input"])
+            );
+            if scenario == "funding_inputs" && name == "get_utxos_for_address_tx_in_consumed" {
+                assert!(
+                    variant.iter().any(
+                        |o| o["matched"] == true && !o["a_rows"].as_array().unwrap().is_empty()
+                    )
+                );
+            }
+            println!(
+                "{}",
+                json!({"event":"q19_cli_raw_variant","scenario":scenario,"query":name,"observations":variant})
+            );
+        }
         println!(
             "{}",
             json!({"event":"q19_cli_counterexample","scenario":scenario,"exit":actual.status.code()})
@@ -1693,10 +1742,21 @@ async fn compare_cli_refuses_duplicate_units_on_window_and_old_spent_outputs() -
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
 async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result {
-    for mutation in ["epoch_header", "stake", "other_address"] {
+    for mutation in [
+        "epoch_header",
+        "stake",
+        "other_address",
+        "mixed_stake",
+        "permissioned",
+    ] {
         let mut f = fixture(373);
         f.reindex_ordinals();
         let extra = f.output(7, 12, 20, "mapping", "cnight", Some(99073));
+        if mutation == "mixed_stake" {
+            let registered = f.output(7, 12, 21, "other", "cnight", Some(99076));
+            f.chain.outputs.get_mut(&registered).unwrap().address =
+                dsa_store::catalogue::catalogue().candidate_addresses["mainnet"].clone();
+        }
         f.reindex_ordinals();
         let source = Database::new().await?;
         source.legacy(&f).await?;
@@ -1717,10 +1777,15 @@ async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result
                     .write("UPDATE serve.block SET hash=decode(repeat('aa',32),'hex') WHERE id=3")
                     .await?
             }
-            "stake" => {
+            "stake" | "mixed_stake" => {
                 target
                     .write("UPDATE serve.epoch_stake SET amount=amount+1")
                     .await?
+            }
+            "permissioned" => {
+                let out = f.tags["permissioned_8"];
+                let hash = f.chain.outputs[&out].datum_hash.as_ref().unwrap();
+                target.write(&format!("UPDATE serve.datum SET value='{{\"int\":99077}}'::jsonb WHERE hash=decode('{hash}','hex')")).await?;
             }
             _ => {
                 let hash = f.chain.outputs[&extra].datum_hash.as_ref().unwrap();
@@ -1745,7 +1810,8 @@ async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result
         let report: Value = serde_json::from_slice(&output.stdout)?;
         let query = match mutation {
             "epoch_header" => "get_latest_block_for_epoch:",
-            "stake" => "get_stake_distribution:",
+            "stake" | "mixed_stake" => "get_stake_distribution:",
+            "permissioned" => "get_token_utxo_for_epoch:",
             _ => "get_utxos_for_address_",
         };
         assert!(report["differences"].as_array().unwrap().iter().any(|d| {
@@ -1761,9 +1827,13 @@ async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result
                 .all(|o| o["a_input"]["address"]
                     == dsa_store::catalogue::catalogue().candidate_addresses["mainnet"])
         );
+        if mutation == "mixed_stake" {
+            assert!(report["supported_difference_count"].as_u64().unwrap() > 0);
+            assert!(report["unsupported_difference_count"].as_u64().unwrap() > 0);
+        }
         println!(
             "{}",
-            json!({"event":"q19_supported_control","mutation":mutation,"exit":output.status.code()})
+            json!({"event":"q19_supported_control","mutation":mutation,"exit":output.status.code(),"supported_differences":report["supported_difference_count"],"unsupported_differences":report["unsupported_difference_count"]})
         );
         source.cleanup().await?;
         target.cleanup().await?;

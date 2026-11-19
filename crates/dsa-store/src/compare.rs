@@ -2138,8 +2138,8 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
                 candidate_input(a, x),
                 candidate_input(b, y),
                 configured_address.as_ref(),
-            ) && &a_input.address == address
-                && &b_input.address == address
+            ) && a_input == b_input
+                && &a_input.address == address
             {
                 unsupported = true;
                 unsupported_observations.push(UnsupportedObservation {
@@ -2249,6 +2249,171 @@ mod tests {
             canonical_row(&deep).unwrap(),
             format!("{}1{}", "[".repeat(2000), "]".repeat(2000))
         );
+    }
+    fn registered_capture() -> Capture {
+        let cat = catalogue::catalogue();
+        let statement = cat.entries.iter().find(|s| is_registered_query(s)).unwrap();
+        let input = CandidateInput {
+            address: cat.candidate_addresses["mainnet"].clone(),
+            reference_block: 8,
+        };
+        Capture {
+            observation_format: OBSERVATION_FORMAT,
+            keep_rule_version: crate::KEEP_RULE_VERSION,
+            missing_policy: "00".repeat(28),
+            missing_tx_hash: "00".repeat(32),
+            candidate_address: input.address.clone(),
+            transaction_hit_available: false,
+            node_commit: cat.node_commit.clone(),
+            catalogue_sha256: hash(catalogue::GENERATED),
+            profile_hash: "fixture".to_owned(),
+            network: "mainnet".to_owned(),
+            positions: Positions {
+                horizon: 6,
+                target: 8,
+                event_anchors: vec![],
+                event_hint_queries: 0,
+                witness_tx_hash: None,
+                pairs: vec![Pair {
+                    cursor: Cursor {
+                        block: 6,
+                        tx_index: 0,
+                    },
+                    reference: Cursor {
+                        block: 8,
+                        tx_index: 0,
+                    },
+                }],
+            },
+            units: BTreeMap::new(),
+            settings: serde_json::json!({}),
+            newest_height: 8,
+            cases: BTreeMap::from([(
+                format!("{}/hit", statement.id),
+                Case {
+                    query: statement.id.clone(),
+                    group: statement.group.clone(),
+                    label: "hit".to_owned(),
+                    sql_sha256: statement.sha256.clone(),
+                    ordered: false,
+                    rows: Arc::new(vec!["source".to_owned()]),
+                    elapsed_seconds: 0.0,
+                    candidate_input: Some(input),
+                },
+            )]),
+            chain_order_checked: true,
+            unbounded_checked: true,
+            executions: 1,
+        }
+    }
+    #[test]
+    fn registered_coverage_requires_equal_bindings_and_known_legacy_calls() {
+        let a = registered_capture();
+        let mut b = a.clone();
+        b.cases.values_mut().next().unwrap().rows = Arc::new(vec!["converted".to_owned()]);
+        let report = compare(&a, &b).unwrap();
+        assert!(report.matched);
+        assert_eq!(report.unsupported_difference_count, 1);
+        b.cases
+            .values_mut()
+            .next()
+            .unwrap()
+            .candidate_input
+            .as_mut()
+            .unwrap()
+            .reference_block = 7;
+        let report = compare(&a, &b).unwrap();
+        assert!(!report.matched);
+        assert_eq!(report.supported_difference_count, 1);
+        assert_eq!(report.unsupported_difference_count, 0);
+        let mut a = a;
+        a.cases.values_mut().next().unwrap().candidate_input = None;
+        b.cases.values_mut().next().unwrap().candidate_input = None;
+        assert!(compare(&a, &b).unwrap().matched); // exact historical hit inference
+        for malformed in [
+            "unknown_label",
+            "wrong_sql",
+            "missing_epoch",
+            "malformed_epoch",
+            "wrong_epoch_sql",
+        ] {
+            let mut a = a.clone();
+            let mut b = b.clone();
+            if malformed == "wrong_sql" {
+                for capture in [&mut a, &mut b] {
+                    capture.cases.values_mut().next().unwrap().sql_sha256 = "bad".to_owned();
+                }
+            } else if malformed == "unknown_label" {
+                for capture in [&mut a, &mut b] {
+                    capture.cases.values_mut().next().unwrap().label = "unknown".to_owned();
+                }
+            } else {
+                let cat = catalogue::catalogue();
+                let header = cat
+                    .entries
+                    .iter()
+                    .find(|s| s.name == "get_latest_block_for_epoch" && s.kind == "read")
+                    .unwrap();
+                for capture in [&mut a, &mut b] {
+                    capture.cases.values_mut().next().unwrap().label =
+                        format!("epoch/4/{}/candidates", header.id);
+                    if malformed != "missing_epoch" {
+                        capture.cases.insert(
+                            format!("{}/epoch/4", header.id),
+                            Case {
+                                query: header.id.clone(),
+                                group: header.group.clone(),
+                                label: "epoch/4".to_owned(),
+                                sql_sha256: if malformed == "wrong_epoch_sql" {
+                                    "bad".to_owned()
+                                } else {
+                                    header.sha256.clone()
+                                },
+                                ordered: false,
+                                rows: Arc::new(vec![if malformed == "malformed_epoch" {
+                                    r#"{"block_no":"eight"}"#.to_owned()
+                                } else {
+                                    r#"{"block_no":8}"#.to_owned()
+                                }]),
+                                elapsed_seconds: 0.0,
+                                candidate_input: None,
+                            },
+                        );
+                    }
+                }
+            }
+            let report = compare(&a, &b).unwrap();
+            assert!(!report.matched, "{malformed}");
+            assert_eq!(report.unsupported_difference_count, 0, "{malformed}");
+        }
+        let cat = catalogue::catalogue();
+        let header = cat
+            .entries
+            .iter()
+            .find(|s| s.name == "get_latest_block_for_epoch" && s.kind == "read")
+            .unwrap();
+        for capture in [&mut a, &mut b] {
+            capture.cases.values_mut().next().unwrap().label =
+                format!("epoch/4/{}/candidates", header.id);
+            capture.cases.insert(
+                format!("{}/epoch/4", header.id),
+                Case {
+                    query: header.id.clone(),
+                    group: header.group.clone(),
+                    label: "epoch/4".to_owned(),
+                    sql_sha256: header.sha256.clone(),
+                    ordered: false,
+                    rows: Arc::new(vec![r#"{"block_no":8}"#.to_owned()]),
+                    elapsed_seconds: 0.0,
+                    candidate_input: None,
+                },
+            );
+        }
+        assert!(compare(&a, &b).unwrap().matched); // exact historical epoch inference
+        let equal = compare(&a, &a).unwrap();
+        assert!(equal.matched);
+        assert_eq!(equal.unsupported_observations.len(), 1);
+        assert!(equal.unsupported_observations[0].matched);
     }
     #[test]
     fn outer_order_only() {
