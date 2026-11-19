@@ -208,6 +208,20 @@ async fn insert_selected(
     for row in &rows.tx_out {
         transaction.execute("INSERT INTO serve.tx_out(id,tx_id,index,address,value,data_hash) VALUES($1,$2,$3,$4,$5::text::numeric,decode($6,'hex'))",&[&row.id,&row.tx_id,&(row.index as i16),&row.address,&row.value,&row.data_hash]).await.unwrap();
     }
+    for row in &rows.tx_in {
+        transaction
+            .execute(
+                "INSERT INTO serve.tx_in(id,tx_in_id,tx_out_id,tx_out_index) VALUES($1,$2,$3,$4)",
+                &[
+                    &row.id,
+                    &row.tx_in_id,
+                    &row.tx_out_id,
+                    &(row.tx_out_index as i16),
+                ],
+            )
+            .await
+            .unwrap();
+    }
     for (index, row) in rows.datum.iter().enumerate() {
         let json = row
             .value
@@ -376,6 +390,128 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
         "already witnessed shapes must not open spools or retain raw bodies"
     );
     drop(observer);
+    drop(client);
+    admin
+        .batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+        .await
+        .unwrap();
+}
+
+fn spend_fixture(original: &Fixture) -> Fixture {
+    let mut body = vec![0xa3, 0, 0x81, 0x82];
+    body.extend(bytes(&hex::decode(&original.hash).unwrap()));
+    body.extend([0, 1, 0x80, 2, 1]);
+    let hash = transaction::hash(&body);
+    let mut envelope = vec![0x84];
+    envelope.extend(body);
+    envelope.extend([0xa0, 0xf5, 0xf6]);
+    Fixture {
+        profile: original.profile.clone(),
+        hash: hash.clone(),
+        page: json!([{"tx_hash":hash,"cbor":hex::encode(envelope)}]).to_string(),
+        metadata: "[]".into(),
+        raw_datum: Vec::new(),
+        header: Header {
+            height: 11,
+            hash: "03".repeat(32),
+            previous_hash: Some(original.header.hash.clone()),
+            transaction_count: 1,
+        },
+    }
+}
+#[tokio::test]
+async fn old_inline_missing_origin_is_explicit_without_false_spending_capture() {
+    let fixture = fixture(10001, true, true, true);
+    let pending = Shape::ALL.into_iter().collect();
+    let mut held = BTreeMap::new();
+    capture(&fixture, &pending)
+        .await
+        .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
+        .unwrap()
+        .apply_held();
+    let spend = spend_fixture(&fixture);
+    let prepared = capture(&spend, &pending)
+        .await
+        .prepare(&spend.profile, &fixture.header, 10, &mut held, &pending)
+        .unwrap();
+    assert_eq!(
+        prepared.evidence_limitations(),
+        ["held_inline_origin_unavailable"]
+    );
+    assert_eq!(prepared.observation_count(), 0);
+    assert_eq!(prepared.rows().datum.len(), 1);
+    drop(prepared);
+    assert_eq!(held.len(), 1, "an uncommitted spend remains staged");
+    // A conversion carries the actual stored output fields/hash, not an
+    // invented provider preimage. Its verified datum lookup avoids a fetch.
+    for output in held.values_mut() {
+        output.output.inline_datum = None;
+    }
+    let mut block = capture(&spend, &pending).await;
+    block.known_stored_datum(transaction::hash(&fixture.raw_datum));
+    let prepared = block
+        .prepare(&spend.profile, &fixture.header, 10, &mut held, &pending)
+        .unwrap();
+    assert!(prepared.rows().datum.is_empty());
+    assert!(prepared.evidence_limitations().is_empty());
+    assert_eq!(prepared.observation_count(), 0);
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn already_stored_datum_does_not_claim_new_real_evidence() {
+    let root: tokio_postgres::Config = std::env::var("DSA_TEST_DATABASE").unwrap().parse().unwrap();
+    let admin = connect(&root).await;
+    let name = format!("observations_old_{}", std::process::id());
+    admin
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .unwrap();
+    let mut config = root.clone();
+    config.dbname(&name);
+    let mut client = connect(&config).await;
+    client
+        .batch_execute(include_str!("../../dsa-store/src/layout.sql"))
+        .await
+        .unwrap();
+    client.batch_execute("CREATE TABLE dsa.identity(id integer PRIMARY KEY,network text NOT NULL); INSERT INTO dsa.identity VALUES(1,'preprod')").await.unwrap();
+    let transaction = client.transaction().await.unwrap();
+    observations::migrate(&transaction).await.unwrap();
+    transaction.commit().await.unwrap();
+    let fixture = fixture(10001, true, true, true);
+    let pending = Shape::ALL.into_iter().collect();
+    let mut held = BTreeMap::new();
+    let mut publication = capture(&fixture, &pending)
+        .await
+        .prepare(&fixture.profile, &previous(), 9, &mut held, &pending)
+        .unwrap();
+    let datum = &publication.rows().datum[0];
+    let value: serde_json::Value = serde_json::from_str(datum.value.as_ref().unwrap()).unwrap();
+    client
+        .execute(
+            "INSERT INTO serve.datum(id,hash,value) VALUES(1,decode($1,'hex'),$2)",
+            &[&datum.hash, &value],
+        )
+        .await
+        .unwrap();
+    let transaction = client.transaction().await.unwrap();
+    insert_selected(&transaction, publication.rows()).await;
+    assert_eq!(publication.stage_witnesses(&transaction).await.unwrap(), 2);
+    transaction.commit().await.unwrap();
+    publication.apply_held();
+    let state = observations::status(&client).await.unwrap();
+    assert!(
+        state[&Shape::StoredLargeDatum]
+            .first_stored_observation
+            .is_none()
+    );
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM serve.datum", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
     drop(client);
     admin
         .batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)"))

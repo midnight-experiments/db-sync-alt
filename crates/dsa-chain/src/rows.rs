@@ -427,6 +427,7 @@ pub fn prepare_block<'a>(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn build_facts(
     profile: &Profile,
     height: u32,

@@ -663,6 +663,7 @@ dependencies = [
  "dsa-chain",
  "dsa-provider",
  "dsa-store",
+ "futures-util",
  "hex",
  "http-body-util",
  "hyper",
