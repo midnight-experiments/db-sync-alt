@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Hosted Docker only. Own generated PG clusters; never operator data."""
-import hashlib,json,os,re,shutil,subprocess,sys,time,threading
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import threading
 from pathlib import Path
 ROOT=Path(os.environ['GITHUB_WORKSPACE']);OUT=Path(os.environ['RUNNER_TEMP'])/'whole-evidence';OUT.mkdir(exist_ok=True)
 CONFIG=json.loads((ROOT/'.github/qualification/config.json').read_text());PIN=CONFIG['source'];MODE=CONFIG['mode'];DIVISOR=CONFIG['divisor'];assert re.fullmatch('[0-9a-f]{40}',PIN)

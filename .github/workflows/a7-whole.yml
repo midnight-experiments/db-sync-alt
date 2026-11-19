@@ -2,7 +2,8 @@ name: a7-whole-generated
 on:
   push:
     branches: ['validation/a7-whole-conversion']
-    paths: ['.github/qualification/**','.github/workflows/a7-whole.yml']
+    paths: ['.github/qualification/config.json']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
