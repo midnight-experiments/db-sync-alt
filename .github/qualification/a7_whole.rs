@@ -92,19 +92,39 @@ async fn command(
     );
     Ok((status.success(), result))
 }
-async fn compare(capture: &Path, database: &Database, name: &str) -> Result<Value> {
+async fn compare(
+    capture: &Path,
+    source: Option<&Database>,
+    database: &Database,
+    name: &str,
+) -> Result<Value> {
     let started = Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
-        .args([
-            "compare",
+    let mut child = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    child.arg("compare");
+    if let Some(source) = source {
+        child.args([
+            "--a",
+            &source.dsn(true),
+            "--positions",
+            directory()
+                .join("captured-positions.json")
+                .to_str()
+                .unwrap(),
+        ]);
+    } else {
+        child.args([
             "--a-capture",
             capture.to_str().unwrap(),
+            "--positions",
+            "auto",
+        ]);
+    }
+    let output = child
+        .args([
             "--b",
             &database.dsn(true),
             "--network",
             "mainnet",
-            "--positions",
-            "auto",
             "--statement-timeout-seconds",
             "60",
             "--idle-transaction-timeout-seconds",
@@ -131,6 +151,8 @@ async fn compare(capture: &Path, database: &Database, name: &str) -> Result<Valu
     let value: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(value["matched"], true);
     assert_eq!(value["chain_order_checked_b"], true);
+    assert_eq!(value["unbounded_checked_b"], true);
+    assert_eq!(value["unbounded_checked_a"], source.is_some());
     assert!(value["positions"]["pairs"].as_array().unwrap().len() >= 500);
     Ok(value)
 }
@@ -187,7 +209,7 @@ async fn whole_conversion_qualification() -> Result {
     let horizon = target - 30_009.min((target - offset) / 2);
     let span = target - offset - 17;
     let mut f = fixture(401);
-    f.reindex_ordinals();
+    // Translation already re-ranks the full legacy ordinal set using translated hashes.
     f.translate_heights(offset as u32);
     f.bounds = Bounds {
         horizon: horizon as u32,
@@ -275,6 +297,18 @@ async fn whole_conversion_qualification() -> Result {
     assert_eq!(ready["counts"]["ma_tx_out"], wanted_assets);
     assert_eq!(ready["counts"]["tx_in"], wanted_spends);
     assert_eq!(ready["counts"]["datum"], wanted_datums);
+    assert_eq!(
+        ready["counts"]["tx"].as_i64().unwrap(),
+        original["counts"]["tx"].as_i64().unwrap() + 2 * span,
+        "independent generated creation/spend transaction formula"
+    );
+    let mut expected_raw = ready["counts"].clone();
+    // All controlled initial metadata belongs to old pre-window transactions.
+    expected_raw["tx_metadata"] = json!(0);
+    save(
+        "expected-raw-families.json",
+        &json!({"rows":expected_raw,"scope":"same-snapshot transport bounds; all rows except metadata restricted to H..T","independent_formula_counts":{"block":headers,"tx_out":wanted_outputs,"ma_tx_out":wanted_assets,"tx_in":wanted_spends,"datum":wanted_datums,"tx":original["counts"]["tx"].as_i64().unwrap()+2*span}}),
+    )?;
     let datum_sizes:Value=owner.query_one("SELECT jsonb_build_object('rows',count(*),'sql_null',count(*) FILTER(WHERE value IS NULL),'json_null',count(*) FILTER(WHERE value='null'::jsonb),'json_utf8_bytes',sum(octet_length(value::text)),'column_bytes',sum(pg_column_size(value)),'maximum_json_utf8_bytes',max(octet_length(value::text))) FROM serve.datum",&[]).await?.get(0);
     let window:Value=owner.query_one(&format!("SELECT jsonb_build_object('outputs',(SELECT count(*) FROM serve.tx_out WHERE id>={horizon}::bigint*16777216),'spends',(SELECT count(*) FROM serve.tx_in WHERE id>={horizon}::bigint*16777216),'old_unspent',(SELECT count(*) FROM serve.tx_out o WHERE id<{horizon}::bigint*16777216 AND NOT EXISTS(SELECT 1 FROM serve.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index)))"),&[]).await?.get(0);
     assert!(window["outputs"].as_i64().unwrap() > 1000);
@@ -387,6 +421,17 @@ async fn whole_conversion_qualification() -> Result {
             "whole conversion failed, exact logs and generated DBs retained until hosted teardown"
         );
         save("conversion.json", &converted)?;
+        for table in TABLES {
+            assert_eq!(
+                converted["source"]["raw_families"][table]["rows"], expected_raw[table],
+                "independent raw source cardinality {table}"
+            );
+        }
+        let capture_value: Value = serde_json::from_slice(&std::fs::read(&capture)?)?;
+        save(
+            "captured-positions.json",
+            &capture_value["capture"]["positions"],
+        )?;
         assert_eq!(
             converted["verified"]["supply"],
             json!(expected_supply),
@@ -448,8 +493,11 @@ async fn whole_conversion_qualification() -> Result {
         ] {
             db.cli("grant-reader", "mainnet", &["--role", &db.reader])
                 .await?;
-            let comparison = compare(&capture, db, name).await?;
+            let comparison = compare(&capture, None, db, name).await?;
             save(&format!("{name}.json"), &comparison)?;
+            let wide_name = format!("{name}-frozen-source-wide");
+            let wide = compare(&capture, Some(&source), db, &wide_name).await?;
+            save(&format!("{wide_name}.json"), &wide)?;
         }
         save(
             "converted-fingerprint.json",

@@ -42,11 +42,25 @@ def probe(name,read,write):
  call(['docker','exec','-u','postgres',name,'rm','--','/var/lib/postgresql/data/whole-qualification-probe'])
  return {'admission':admitted,'probes':results}
 
-PG_QUERY="""SELECT json_build_object('at',clock_timestamp(),'database',current_database(),'database_bytes',pg_database_size(current_database()),'temporary_relations_bytes',coalesce((SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname LIKE 'pg_temp_%' AND c.relkind IN('r','m')),0),'stats',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database()),'sessions',(SELECT json_agg(json_build_object('pid',pid,'application_name',application_name,'state',state,'wait_type',wait_event_type,'wait',wait_event,'xact_start',xact_start,'backend_xmin',backend_xmin,'query_start',query_start,'query',left(query,250))) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()))"""
+PG_QUERY="""SELECT json_build_object('at',clock_timestamp(),'database',current_database(),'database_bytes',pg_database_size(current_database()),'temporary_relations_bytes',coalesce((SELECT sum(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname LIKE 'pg_temp_%' AND c.relkind IN('r','m')),0),'stats',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database()),'sessions',(SELECT json_agg(json_build_object('pid',pid,'application_name',application_name,'state',state,'wait_type',wait_event_type,'wait',wait_event,'xact_start',xact_start,'backend_xmin',backend_xmin,'query_start',query_start,'state_change',state_change,'idle_seconds',CASE WHEN state LIKE 'idle%' THEN extract(epoch FROM clock_timestamp()-state_change) ELSE 0 END,'query',left(query,16384))) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()))"""
 def monitor():
  with (OUT/'telemetry.jsonl').open('w') as log:
+  offset=0;phase=None
   while not STOP.wait(2):
    record={'unix':time.time(),'containers':{}}
+   try:record['active_command']=json.loads((OUT/'active-command.json').read_text())
+   except (OSError,ValueError):pass
+   try:
+    with (OUT/'convert.stderr').open() as events:
+     events.seek(offset);lines=events.readlines();offset=events.tell()
+    parsed=[]
+    for line in lines:
+     try:
+      event=json.loads(line);parsed.append(event)
+      if 'event' in event:phase=event['event']
+     except ValueError:pass
+    record['product_events_observed']=parsed;record['latest_product_event']=phase
+   except OSError:pass
    databases={}
    try:databases=json.loads((OUT/'databases.json').read_text())
    except (OSError,ValueError):pass
@@ -89,7 +103,7 @@ try:
  docker('network','create',NETWORK)
  for role in ['source','destination','restored']:
   volume=VOLUMES[role];docker('volume','create',volume)
-  IDS[NAMES[role]]=docker('run','-d','--name',NAMES[role],'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={volume},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','log_min_duration_statement=1000','-c','log_temp_files=0').strip();wait_postgres(NAMES[role])
+  IDS[NAMES[role]]=docker('run','-d','--name',NAMES[role],'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={volume},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0').strip();wait_postgres(NAMES[role])
  save('startup-inspect.json',[inspect(NAMES[r]) for r in ['source','destination','restored']])
  # Destination is slowed from its first write. Population itself is source-only;
  # source write cap is positively installed after generated setup/checkpoint.
@@ -98,7 +112,7 @@ try:
  IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False
  while inspect(NAMES['worker'])['State']['Running']:
   if not admitted and (OUT/'fixture-ready.json').exists():
-   admission['source']=probe(NAMES['source'],None,2*1048576);save('io-admission.json',admission);save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
+   admission['source']=probe(NAMES['source'],None,2*1048576);save('io-admission.json',admission);save('baseline-volumes.json',{role:{'allocated_bytes':int(docker('exec',NAMES[role],'du','-sB1','/var/lib/postgresql/data').split()[0]),'apparent_bytes':int(docker('exec',NAMES[role],'du','-sb','/var/lib/postgresql/data').split()[0])} for role in ['source','destination','restored']});save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
   time.sleep(1)
  save('worker-exit.json',inspect(NAMES['worker'])['State']);print(docker('logs',NAMES['worker']),flush=True);assert inspect(NAMES['worker'])['State']['ExitCode']==0,'qualification binary failed'
  save('qualification-success.json',{'source':PIN,'config':CONFIG,'admitted':admitted,'generated_only':True,'historical_acceptance':False})
@@ -125,4 +139,36 @@ finally:
   if path.exists():
    try:save(name+'.manifest.json',{'bytes':path.stat().st_size,'sha256':hashlib.sha256(path.read_bytes()).hexdigest()});path.unlink()
    except OSError as error:save(name+'.retention-error.json',{'error':str(error)});call(['sudo','chmod','u+r,g+r,o+r',str(path)]);path.unlink()
+ try:
+  points=[json.loads(line) for line in (OUT/'telemetry.jsonl').read_text().splitlines()]
+  maxima={};source_released=[];source_held=[];actual_copy_queries={};simultaneous=[];idle_maxima={};baseline=json.loads((OUT/'baseline-volumes.json').read_text())
+  for point in points:
+   peak=point.get('evidence_bytes',0);incremental=peak
+   for role,data in point['containers'].items():
+    current=maxima.setdefault(role,{})
+    for key in ['volume_bytes','volume_allocated_bytes','wal_bytes','memory_current','memory_peak']:
+     if data.get(key) is not None:current[key]=max(current.get(key,0),int(data[key]))
+    peak+=data.get('volume_allocated_bytes',0)
+    if role=='source':incremental+=max(0,data.get('volume_allocated_bytes',0)-baseline['source']['allocated_bytes'])
+    elif role in ['destination','restored']:incremental+=data.get('volume_allocated_bytes',0)
+    database=data.get('database') or {}
+    for key in ['database_bytes','temporary_relations_bytes']:
+     if database.get(key) is not None:current[key]=max(current.get(key,0),database[key])
+    for session in database.get('sessions') or []:
+     idle_maxima[role]=max(idle_maxima.get(role,0),float(session.get('idle_seconds') or 0))
+     if role=='source' and session.get('application_name')=='db-sync-alt-convert-source':
+      row={'unix':point['unix'],'phase':point.get('latest_product_event'),'active_command':point.get('active_command'),**session}
+      (source_held if session.get('backend_xmin') is not None else source_released).append(row)
+     query=session.get('query','')
+     if query.startswith('COPY (WITH RECURSIVE page'):
+      actual_copy_queries.setdefault(role,query)
+   simultaneous.append({'unix':point['unix'],'allocated_pgdata_plus_evidence_bytes':peak,'incremental_work_bytes_above_existing_source':incremental})
+  events=[]
+  for line in (OUT/'convert.stderr').read_text().splitlines():
+   try:events.append(json.loads(line))
+   except ValueError:pass
+  pages=[event for event in events if event.get('event')=='source_page_finished']
+  families=[event for event in events if event.get('event')=='source_family_finished']
+  save('resource-summary.json',{'scope':'sampled generated qualification, not real archive','sample_period_seconds':2,'containers_maxima':maxima,'peak_simultaneous_allocated_pgdata_plus_evidence':max(simultaneous,key=lambda p:p['allocated_pgdata_plus_evidence_bytes']) if simultaneous else None,'peak_incremental_work_bytes_above_existing_source':max(simultaneous,key=lambda p:p['incremental_work_bytes_above_existing_source']) if simultaneous else None,'maximum_sampled_idle_seconds_by_role':idle_maxima,'source_snapshot_held_samples':len(source_held),'source_released_samples':len(source_released),'source_released_during_local_selection':[r for r in source_released if str(r['phase'] or '').startswith('conversion_local_selection')],'actual_recursive_copy_queries_observed':actual_copy_queries,'raw_families':families,'page_count':len(pages),'maximum_source_page_seconds':max((r['source_seconds'] for r in pages),default=None),'maximum_destination_write_seconds':max((r['destination_write_seconds'] for r in pages),default=None),'sampled_peak_may_miss_sub2second_spikes':True})
+ except Exception as error:save('resource-summary-error.json',{'error':repr(error)})
  save('SHA256SUMS.json',{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in OUT.iterdir() if p.is_file() and p.name!='SHA256SUMS.json'})
