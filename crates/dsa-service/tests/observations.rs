@@ -589,12 +589,12 @@ async fn publication_raw_witness_status_rollback_retry_restart_are_atomic() {
     );
     drop(transaction);
     drop(no_facts);
-    client.execute("UPDATE dsa_follower.raw_chunk SET body=decode('00','hex') WHERE sha256=$1 AND ordinal=0",&[&reference.response_sha256]).await.unwrap();
+    client.execute("UPDATE dsa_follower.raw_chunk SET body=set_byte(body,0,get_byte(body,0)#1) WHERE sha256=$1 AND ordinal=0",&[&reference.response_sha256]).await.unwrap();
     assert!(
         observations::extract_raw(&client, &reference.response_sha256, &mut Vec::new())
             .await
             .is_err(),
-        "corrupt raw bytes must not pass extraction"
+        "same-length corrupt raw bytes must not pass SHA verification"
     );
     drop(observer);
     drop(client);
