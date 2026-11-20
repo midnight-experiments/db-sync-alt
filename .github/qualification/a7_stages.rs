@@ -161,7 +161,7 @@ async fn stages_focus_inner() -> Result {
         let h = format!("({offset}+13+n*{span}/{n_outputs})");
         let spent = format!("((n+1)*{n_spends}/{n_outputs}>n*{n_spends}/{n_outputs})");
         c.batch_execute(&format!("WITH coordinates AS(SELECT DISTINCT {h} h FROM generate_series({low}::bigint,{high}::bigint)n) INSERT INTO pg_temp.tx SELECT h*4096+100,decode(lpad(to_hex(h),16,'0')||repeat('ab',24),'hex'),h,100,true FROM coordinates ON CONFLICT DO NOTHING;
- INSERT INTO pg_temp.tx_out SELECT {h}*16777216+100*4096+n%4,{h}*4096+100,(n%4)::smallint,CASE WHEN n%100=0 OR n%1000=10 OR n>={n_assets} THEN '{mapping}' ELSE 'holder-'||(n%10007)::text END,1,CASE WHEN n%4=0 THEN decode(md5('whole-datum/'||(n%{n_datums})::text)||md5('whole-datum2/'||(n%{n_datums})::text),'hex') ELSE NULL END,NULL FROM generate_series({low}::bigint,{high}::bigint)n;
+ INSERT INTO pg_temp.tx_out SELECT {h}*16777216+100*4096+n%4,{h}*4096+100,(n%4)::smallint,CASE WHEN n%100=0 OR n%1000=10 OR n>={n_assets} THEN '{mapping}' ELSE rpad('holder-'||(n%10007)::text,100,'x') END,1,CASE WHEN n%4=0 THEN decode(md5('whole-datum/'||(n%{n_datums})::text)||md5('whole-datum2/'||(n%{n_datums})::text),'hex') ELSE NULL END,NULL FROM generate_series({low}::bigint,{high}::bigint)n;
  INSERT INTO pg_temp.ma_tx_out SELECT ({h}*16777216+100*4096+n%4)*4096,1,{h}*16777216+100*4096+n%4,{unit} FROM generate_series({low}::bigint,least({high}::bigint,{n_assets}::bigint-1))n;
  WITH coordinates AS(SELECT DISTINCT {h}+1 h FROM generate_series({low}::bigint,{high}::bigint)n WHERE {spent}) INSERT INTO pg_temp.tx SELECT h*4096+101,decode(lpad(to_hex(h),16,'0')||repeat('cd',24),'hex'),h,101,true FROM coordinates ON CONFLICT DO NOTHING;
  INSERT INTO pg_temp.tx_in SELECT ({h}+1)*16777216+101*4096+n%4,({h}+1)*4096+101,{h}*4096+100,(n%4)::smallint FROM generate_series({low}::bigint,{high}::bigint)n WHERE {spent}")).await?;
@@ -181,7 +181,7 @@ async fn stages_focus_inner() -> Result {
     c.batch_execute(&format!("INSERT INTO pg_temp.multi_asset SELECT {wrong},policy,name||decode('ff','hex') FROM pg_temp.multi_asset WHERE id={pc};
      INSERT INTO pg_temp.tx VALUES({control_tx},decode(md5('stage-control')||md5('stage-control2'),'hex'),{horizon}+10,200,true);
      INSERT INTO pg_temp.datum SELECT {control_datum_base}+n,decode(md5('stage-control-datum/'||n::text)||md5('stage-control-datum2/'||n::text),'hex'),jsonb_build_object('int',n) FROM generate_series(0,7)n;
-     INSERT INTO pg_temp.tx_out SELECT {control_tx}*4096+n,{control_tx},n::smallint,'stage-control-holder',1,decode(md5('stage-control-datum/'||n::text)||md5('stage-control-datum2/'||n::text),'hex'),NULL FROM generate_series(0,7)n;
+     INSERT INTO pg_temp.tx_out SELECT {control_tx}*4096+n,{control_tx},n::smallint,rpad('stage-control-holder',100,'x'),1,decode(md5('stage-control-datum/'||n::text)||md5('stage-control-datum2/'||n::text),'hex'),NULL FROM generate_series(0,7)n;
      INSERT INTO pg_temp.ma_tx_out SELECT ({control_tx}*4096+n)*4096,1,{control_tx}*4096+n,CASE WHEN n<6 THEN {pc} ELSE {wrong} END FROM generate_series(0,7)n")).await?;
     let pools = (2802 / divisor).max(6);
     let stakes = (132350 / divisor).min(pools * ((tip - offset) / 25000 + 1));
@@ -220,7 +220,7 @@ async fn stages_focus_inner() -> Result {
     assert_eq!(counts["tx_metadata"], 0);
     save(
         "stage-fixture.json",
-        &json!({"kind":"generated_destination_TEMP_structural_stages","counts":counts,"raw_sizes":sizes,"H":horizon,"T":target,"P":tip,"setup_seconds":began.elapsed().as_secs_f64(),"settings":settings(&c).await?,"recipe":"seed401/all11 direct TEMP recipe; bulk75percentNULLhash; eight reserved window outputs/six exactPC/two wrongname; original datum payload bands; no binaryCOPY/source/capture", "divisor":divisor}),
+        &json!({"kind":"generated_destination_TEMP_structural_stages","counts":counts,"raw_sizes":sizes,"H":horizon,"T":target,"P":tip,"setup_seconds":began.elapsed().as_secs_f64(),"settings":settings(&c).await?,"recipe":"seed401/all11 direct TEMP recipe; synthetic ordinary holder bodies padded100bytes, profile addresses unchanged; bulk75percentNULLhash; eight reserved window outputs/six exactPC/two wrongname; original datum payload bands; no binaryCOPY/source/capture", "divisor":divisor}),
     )?;
     save(
         "stage-pre-index-layout.json",
@@ -273,7 +273,7 @@ async fn stages_focus_inner() -> Result {
     )?;
     let profile_json = serde_json::to_vec_pretty(&f.profile)?;
     std::fs::write(out().join("stage-profile.json"), &profile_json)?;
-    save("stage-input-distribution.json", &c.query_one("SELECT jsonb_build_object('outputs',count(*),'null_hashes',count(*)FILTER(WHERE data_hash IS NULL),'nonnull_hashes',count(*)FILTER(WHERE data_hash IS NOT NULL),'address_ndv',count(DISTINCT address),'hash_ndv',count(DISTINCT data_hash),'six_added_exact_pc_outputs',6,'two_added_wrong_name_outputs',2,'control_transaction',$1::bigint)FROM pg_temp.tx_out",&[&control_tx]).await?.get(0))?;
+    save("stage-input-distribution.json", &c.query_one("SELECT jsonb_build_object('outputs',count(*),'null_hashes',count(*)FILTER(WHERE data_hash IS NULL),'nonnull_hashes',count(*)FILTER(WHERE data_hash IS NOT NULL),'address_ndv',count(DISTINCT address),'hash_ndv',count(DISTINCT data_hash),'address_min_bytes',min(octet_length(address)),'address_max_bytes',max(octet_length(address)),'address_average_bytes',avg(octet_length(address)),'synthetic_holder_min_bytes',min(octet_length(address))FILTER(WHERE address LIKE 'holder-%'),'synthetic_holder_max_bytes',max(octet_length(address))FILTER(WHERE address LIKE 'holder-%'),'six_added_exact_pc_outputs',6,'two_added_wrong_name_outputs',2,'control_transaction',$1::bigint,'actual_exact_pc_asset_rows',(SELECT count(*)FROM pg_temp.ma_tx_out WHERE ident=$2::bigint),'actual_exact_pc_outputs',(SELECT count(DISTINCT tx_out_id)FROM pg_temp.ma_tx_out WHERE ident=$2::bigint),'actual_wrong_name_asset_rows',(SELECT count(*)FROM pg_temp.ma_tx_out WHERE ident=$3::bigint))FROM pg_temp.tx_out",&[&control_tx,&pc,&wrong]).await?.get(0))?;
     save("stage-settings.json", &settings(&c).await?)?;
     save(
         "stage-post-index-layout.json",

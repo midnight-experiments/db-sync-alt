@@ -1,8 +1,8 @@
 {
   "source": "d038f5e8bf52d90c66e601e2496d4945b9528215",
   "mode": "qualify",
-  "divisor": 100,
+  "divisor": 1,
   "target": "stages",
-  "scope": "Divisor100 smoke before ONE full-width destination-only six-stage qualification; actual public API, original full11reference, no source/convert/provider/archive",
+  "scope": "ONE approved full-width destination-only six-stage cost/equality qualification; actual productAPI/original full11reference,100byte synthetic ordinary addresses/~75percentNULLhash, no source/convert/provider/archive",
   "portable_bytes": 268435456
 }
