@@ -11,8 +11,10 @@ import time
 import threading
 from pathlib import Path
 ROOT=Path(os.environ['GITHUB_WORKSPACE']);OUT=Path(os.environ['RUNNER_TEMP'])/'whole-evidence';OUT.mkdir(exist_ok=True)
-CONFIG=json.loads((ROOT/'.github/qualification/config.json').read_text());PIN=CONFIG['source'];MODE=CONFIG['mode'];DIVISOR=CONFIG['divisor'];assert re.fullmatch('[0-9a-f]{40}',PIN)
-TARGET=CONFIG.get('target','whole');FOCUS=TARGET in ['index','selection'];TEST={'index':'a7_index_generated','selection':'a7_select_generated','restore':'a7_restore_generated'}.get(TARGET,'a7_whole_generated');HARNESS={'index':'a7_index.rs','selection':'a7_select.rs','restore':'a7_restore.rs'}.get(TARGET,'a7_whole.rs')
+CONFIG_PATH=ROOT/os.environ.get('DSA_QUALIFICATION_CONFIG','.github/qualification/config.json');assert CONFIG_PATH.resolve().is_relative_to(ROOT.resolve())
+CONFIG=json.loads(CONFIG_PATH.read_text());PIN=CONFIG['source'];MODE=CONFIG['mode'];DIVISOR=CONFIG['divisor'];assert re.fullmatch('[0-9a-f]{40}',PIN)
+TARGET=CONFIG.get('target','whole');FOCUS=TARGET in ['index','selection','keys'];TEST={'index':'a7_index_generated','selection':'a7_select_generated','restore':'a7_restore_generated','keys':'a7_keys_generated'}.get(TARGET,'a7_whole_generated');HARNESS={'index':'a7_index.rs','selection':'a7_select.rs','restore':'a7_restore.rs','keys':'a7_keys.rs'}.get(TARGET,'a7_whole.rs')
+PG_ROLES=['destination'] if TARGET=='keys' else ['source','destination','restored']
 RESTORE_TCP=CONFIG.get('restore_tcp_user_timeout_seconds',600 if TARGET=='whole' else None)
 assert RESTORE_TCP is None or isinstance(RESTORE_TCP,int) and 1<=RESTORE_TCP<=86400
 RUST='rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea'
@@ -191,6 +193,9 @@ try:
  with (OUT/'build.stdout').open('w') as stdout,(OUT/'build.stderr').open('w') as stderr:call(build,stdout=stdout,stderr=stderr)
  binaries=[json.loads(line) for line in (OUT/'build.stdout').read_text().splitlines() if line.startswith('{')];test_candidates=[r for r in binaries if r.get('reason')=='compiler-artifact' and r['target']['name']==TEST and r['target']['kind']==['test'] and r.get('profile',{}).get('test') is True and r.get('executable')];assert len(test_candidates)==1;test_binary=test_candidates[0]['executable']
  save('binaries.json',{'test_binary':test_binary,'cli_sha256':hashlib.sha256((target/'release/db-sync-alt').read_bytes()).hexdigest(),'test_sha256':hashlib.sha256((target/Path(test_binary).relative_to('/work/target')).read_bytes()).hexdigest()})
+ if TARGET=='keys':
+  mount=['--mount',f'type=bind,src={target},dst=/work/target,readonly'];listing=output(['docker','run','--rm',*mount,RUST,test_binary,'--list']);(OUT/'test-runner-list.txt').write_text(listing);assert 'keys_focus: test' in listing and 'keys_dispatch_smoke: test' in listing
+  smoke=output(['docker','run','--rm',*mount,RUST,test_binary,'--exact','keys_dispatch_smoke','--nocapture']);(OUT/'dispatch-smoke.txt').write_text(smoke);assert 'keys_dispatch_smoke_entered_no_database' in smoke and '1 passed; 0 failed' in smoke
  if TARGET=='whole':
   mount=['--mount',f'type=bind,src={target},dst=/work/target,readonly']
   listing=output(['docker','run','--rm',*mount,RUST,test_binary,'--list']);(OUT/'test-runner-list.txt').write_text(listing);assert 'whole_conversion_qualification: test' in listing and 'qualification_dispatch_smoke: test' in listing
@@ -232,14 +237,14 @@ try:
     data=raw[position:position+section['compressed_bytes']];assert len(data)==section['compressed_bytes'] and hashlib.sha256(data).hexdigest()==section['sha256'];position+=len(data)
    assert position==len(raw);save('reused-snapshot-description.json',description);save('reuse-origin.json',{'run':CONFIG['reuse_run'],'original_wrapper':prior['wrapper_head'],'original_product':prior['product_head'],'verified_manifest_files':len(manifest),'snapshot_sha256':CONFIG['reuse_snapshot_sha256'],'capture_sha256':CONFIG['reuse_capture_sha256'],'compressed_sections_checked':True,'plain_bytes_not_decoded_by_host':True,'no_source_reconversion':True})
  docker('network','create',NETWORK)
- for role in ['source','destination','restored']:
+ for role in PG_ROLES:
   volume=VOLUMES[role];docker('volume','create',volume)
   IDS[NAMES[role]]=docker('run','-d','--name',NAMES[role],'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={volume},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0').strip();wait_postgres(NAMES[role])
- save('startup-inspect.json',[inspect(NAMES[r]) for r in ['source','destination','restored']])
+ save('startup-inspect.json',[inspect(NAMES[r]) for r in PG_ROLES])
  # Destination is slowed from its first write. Population itself is source-only;
  # source write cap is positively installed after generated setup/checkpoint.
  admission={} if FOCUS else {role:probe(NAMES[role],4*1048576,2*1048576) for role in ['destination','restored']};save('destination-io-admission.json',admission)
- worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,test_binary,'--ignored','--exact',({'index':'private_index_focus','selection':'selection_focus','restore':'restore_focus'}.get(TARGET,'whole_conversion_qualification')),'--nocapture']
+ worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,test_binary,'--ignored','--exact',({'index':'private_index_focus','selection':'selection_focus','restore':'restore_focus','keys':'keys_focus'}.get(TARGET,'whole_conversion_qualification')),'--nocapture']
  if TARGET=='restore':
   worker[worker.index(RUST):worker.index(RUST)]=['--mount',f'type=bind,src={old_target},dst=/work/target-old,readonly','-e','DSA_PREDECESSOR_CLI=/work/target-old/release/db-sync-alt']
   if CONFIG.get('reuse_run'):worker[worker.index(RUST):worker.index(RUST)]=['-e','DSA_RESTORE_REUSE=1']
@@ -247,7 +252,7 @@ try:
  IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False;reset_nonce=None;trace_nonce=None
  while inspect(NAMES['worker'])['State']['Running']:
   if not admitted and (OUT/'fixture-ready.json').exists():
-   admission.update({'destination':probe(NAMES['destination'],4*1048576,2*1048576)}) if FOCUS else admission.update({'source':probe(NAMES['source'],None,2*1048576)});save('io-admission.json',admission);save('baseline-volumes.json',{role:{'allocated_bytes':int(docker('exec',NAMES[role],'du','-sB1','/var/lib/postgresql/data').split()[0]),'apparent_bytes':int(docker('exec',NAMES[role],'du','-sb','/var/lib/postgresql/data').split()[0])} for role in ['source','destination','restored']});save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
+   admission.update({'destination':probe(NAMES['destination'],4*1048576,2*1048576)}) if FOCUS else admission.update({'source':probe(NAMES['source'],None,2*1048576)});save('io-admission.json',admission);save('baseline-volumes.json',{role:{'allocated_bytes':int(docker('exec',NAMES[role],'du','-sB1','/var/lib/postgresql/data').split()[0]),'apparent_bytes':int(docker('exec',NAMES[role],'du','-sb','/var/lib/postgresql/data').split()[0])} for role in PG_ROLES});save('io-ready.json',{'ready':True,'at':time.time(),'all_caps_positively_probed':True});admitted=True
   if TARGET=='restore':
    if (OUT/'target-reset-request.json').exists():
     request=json.loads((OUT/'target-reset-request.json').read_text())

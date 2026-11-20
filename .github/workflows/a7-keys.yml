@@ -1,0 +1,31 @@
+name: a7-keys-small-generated
+on:
+  push:
+    branches: ['validation/a7-whole-conversion']
+    paths: ['.github/qualification/keys-config.json']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  comparison:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 89793eba0287b0118cf28e022077038607596d0a
+          path: product
+          persist-credentials: false
+      - name: Bounded generated whole-key comparison
+        env:
+          DSA_QUALIFICATION_CONFIG: .github/qualification/keys-config.json
+        run: python3 .github/qualification/run_whole.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a7-small-keys-${{github.run_id}}
+          path: ${{runner.temp}}/whole-evidence
+          retention-days: 5

@@ -1,0 +1,8 @@
+{
+  "source": "89793eba0287b0118cf28e022077038607596d0a",
+  "mode": "qualify",
+  "divisor": 1,
+  "target": "keys",
+  "scope": "ONE contained generated whole-key predecessor/product comparison; max25koutputs/50kMA,75percentNULLhash,rarePC,old/new/new/old; no cold/source/conversion/archive timing claim",
+  "portable_bytes": 268435456
+}
