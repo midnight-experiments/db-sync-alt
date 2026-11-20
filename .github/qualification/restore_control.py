@@ -23,7 +23,7 @@ def run(g):
     names, ids = g['NAMES'], g['IDS']
     assert output(['git', '-C', str(root/'product'), 'rev-parse', 'HEAD']).strip() == g['PIN']
     assert output(['git', '-C', str(root/'product'), 'diff', '--name-only']) == ''
-    save('source.json', {'product_head':g['PIN'], 'wrapper_head':g['os'].environ['GITHUB_SHA'], 'product_tracked_diff':'', 'config':config, 'synthetic':True, 'scope':'direct paired CLI restore only, no source generation/conversion'})
+    save('source.json', {'product_head':g['PIN'], 'wrapper_head':g['os'].environ['GITHUB_SHA'], 'product_tracked_diff':'', 'config':config, 'synthetic':True, 'scope':'direct CLI restore diagnostic only, no source generation/conversion'})
     reused = root/'reuse'
     seal = json.loads((reused/'SHA256SUMS.json').read_text())
     for name, digest in seal.items():
@@ -52,8 +52,10 @@ def run(g):
     docker('network','create',g['NETWORK'])
     ids[names['worker']] = docker('run','-d','--user',f'{g["os"].getuid()}:{g["os"].getgid()}','--name',names['worker'],'--network',g['NETWORK'],'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={out},dst=/evidence',rust,'sleep','infinity').strip()
     g['thread'] = threading.Thread(target=g['monitor'],daemon=True);g['thread'].start()
+    controlled = config['target'] == 'control'
     results = []
-    for label, tcp in [('controlled-default30',None), ('controlled-owner600',600)]:
+    variants = [('controlled-default30',None), ('controlled-owner600',600)] if controlled else [('stage-owner600',600)]
+    for label, tcp in variants:
         target_info = g['fresh_restore_target'](label)
         save('baseline-volumes.json', {'source':{'allocated_bytes':0}, 'restored':{'allocated_bytes':int(docker('exec',names['restored'],'du','-sB1','/var/lib/postgresql/data').split()[0])}})
         name = 'restore_control';owner = 'restore_control_owner'
@@ -67,7 +69,7 @@ def run(g):
         started = time.time();save('active-command.json',{'name':label,'started_unix':started})
         with (out/(label+'.stdout')).open('w') as stdout, (out/(label+'.stderr')).open('w') as stderr:
             process = subprocess.Popen([*base,'restore',*common,'--file','/evidence/representative.snapshot'],stdout=stdout,stderr=stderr)
-            control = {'label':label,'container_id':ids[names['restored']], 'statement_seconds':600, 'requested_tcp_ms':30000 if tcp is None else 600000, 'scope':'controlled own COPY stall, not original failure cause'}
+            control = {'label':label,'container_id':ids[names['restored']], 'statement_seconds':600, 'requested_tcp_ms':30000 if tcp is None else 600000, 'scope':'controlled own COPY stall, not original failure cause' if controlled else 'natural owner600 restore stage timing, no pause or source generation'}
             released = threading.Event();watchdog = None
             def query(sql):
                 raw = output(['docker','exec','-e','PGOPTIONS=-c statement_timeout=3000',names['restored'],'psql','-XAt','-v','ON_ERROR_STOP=1','-U','postgres','-d','postgres','-c',sql])
@@ -78,58 +80,63 @@ def run(g):
                 assert inspect(names['restored'])['Id'] == control['container_id']
                 pid = control['backend']['pid'];assert identity(pid) == control['os_start_ticks']
                 g['call'](['docker','exec','--user','postgres',names['restored'],'sh','-c','kill -'+signal+' "$1"','signal-backend',str(pid)],timeout=10,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
-            try:
-                deadline = time.monotonic()+120
-                while process.poll() is None and time.monotonic()<deadline:
-                    rows = query(f"SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'client_addr',client_addr,'client_port',client_port,'query',query,'application_name',application_name,'backend_type',backend_type)), '[]'::json) FROM pg_stat_activity WHERE datname='{name}' AND application_name='db-sync-alt' AND backend_type='client backend' AND state='active' AND query ~ '^COPY serve\\.tx FROM STDIN'")
-                    if rows:
-                        assert len(rows)==1;control['backend']=rows[0];break
-                    time.sleep(.1)
-                assert 'backend' in control,'actual COPY serve.tx not observed'
-                assert control['backend']['client_addr']==trace_start['worker_ip']
-                control['os_start_ticks']=identity(control['backend']['pid'])
-                signal_backend('STOP');control['stopped_unix']=time.time();control['release_deadline_monotonic']=time.monotonic()+90
-                def resume():
-                    while not released.wait(.05):
-                        if time.monotonic() >= control['release_deadline_monotonic']:break
-                    try:
-                        signal_backend('CONT');control['continued_unix']=time.time();control['continued']=True
-                    except Exception as error:control['resume_error']=repr(error)
-                    released.set()
-                watchdog=threading.Thread(target=resume,daemon=True);watchdog.start()
-                recheck=query(f"SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'client_addr',client_addr,'client_port',client_port,'query',query,'application_name',application_name,'backend_type',backend_type)), '[]'::json) FROM pg_stat_activity WHERE pid={control['backend']['pid']}")
-                assert recheck==[control['backend']],'COPY backend/family raced before STOP'
-                confirm_deadline=time.monotonic()+15
-                while time.monotonic()<confirm_deadline:
-                    worker=inspect(names['worker']);assert worker['Id']==ids[names['worker']]
-                    sockets=output(['sudo','nsenter','-t',str(worker['State']['Pid']),'-n','ss','-tin'])
-                    pending=socket_queue(sockets,control['backend']['client_port'],trace_start['target_ip'])
-                    zero=g['TRACE']['counts'].get('last_zero_window',{})
-                    if pending and zero.get('client_port')==control['backend']['client_port'] and zero.get('observed_unix',0)>=control['stopped_unix']:
-                        control['zero_window_confirmed_unix']=time.time();control['pending_send_bytes']=pending;control['confirmed_socket_info']=sockets;control['confirmed_zero_window']=zero
-                        control['release_deadline_monotonic']=time.monotonic()+45;break
-                    time.sleep(.1)
-                assert 'zero_window_confirmed_unix' in control,'no verified zero-window plus pending data'
+            if not controlled:
                 code=process.wait(timeout=1200)
-                # Even a default30 failure must leave the independent hold/release intact.
-                watchdog.join(timeout=100);assert not watchdog.is_alive() and control.get('continued')
-            except BaseException as error:
-                control['control_error']=repr(error);released.set()
-                if watchdog:watchdog.join(timeout=15)
-                if process.poll() is None:
-                    assert inspect(names['worker'])['Id']==ids[names['worker']]
-                    docker('kill',names['worker']);process.wait(timeout=15)
-                code=process.returncode
-            finally:
-                released.set()
-                if watchdog:watchdog.join(timeout=15)
                 save(label+'-control.json',control)
+            else:
+                try:
+                    deadline = time.monotonic()+120
+                    while process.poll() is None and time.monotonic()<deadline:
+                        rows = query(f"SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'client_addr',client_addr,'client_port',client_port,'query',query,'application_name',application_name,'backend_type',backend_type)), '[]'::json) FROM pg_stat_activity WHERE datname='{name}' AND application_name='db-sync-alt' AND backend_type='client backend' AND state='active' AND query ~ '^COPY serve\\.tx FROM STDIN'")
+                        if rows:
+                            assert len(rows)==1;control['backend']=rows[0];break
+                        time.sleep(.1)
+                    assert 'backend' in control,'actual COPY serve.tx not observed'
+                    assert control['backend']['client_addr']==trace_start['worker_ip']
+                    control['os_start_ticks']=identity(control['backend']['pid'])
+                    signal_backend('STOP');control['stopped_unix']=time.time();control['release_deadline_monotonic']=time.monotonic()+90
+                    def resume():
+                        while not released.wait(.05):
+                            if time.monotonic() >= control['release_deadline_monotonic']:break
+                        try:
+                            signal_backend('CONT');control['continued_unix']=time.time();control['continued']=True
+                        except Exception as error:control['resume_error']=repr(error)
+                        released.set()
+                    watchdog=threading.Thread(target=resume,daemon=True);watchdog.start()
+                    recheck=query(f"SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'client_addr',client_addr,'client_port',client_port,'query',query,'application_name',application_name,'backend_type',backend_type)), '[]'::json) FROM pg_stat_activity WHERE pid={control['backend']['pid']}")
+                    assert recheck==[control['backend']],'COPY backend/family raced before STOP'
+                    confirm_deadline=time.monotonic()+15
+                    while time.monotonic()<confirm_deadline:
+                        worker=inspect(names['worker']);assert worker['Id']==ids[names['worker']]
+                        sockets=output(['sudo','nsenter','-t',str(worker['State']['Pid']),'-n','ss','-tin'])
+                        pending=socket_queue(sockets,control['backend']['client_port'],trace_start['target_ip'])
+                        zero=g['TRACE']['counts'].get('last_zero_window',{})
+                        if pending and zero.get('client_port')==control['backend']['client_port'] and zero.get('observed_unix',0)>=control['stopped_unix']:
+                            control['zero_window_confirmed_unix']=time.time();control['pending_send_bytes']=pending;control['confirmed_socket_info']=sockets;control['confirmed_zero_window']=zero
+                            control['release_deadline_monotonic']=time.monotonic()+45;break
+                        time.sleep(.1)
+                    assert 'zero_window_confirmed_unix' in control,'no verified zero-window plus pending data'
+                    code=process.wait(timeout=1200)
+                    # Even a default30 failure must leave the independent hold/release intact.
+                    watchdog.join(timeout=100);assert not watchdog.is_alive() and control.get('continued')
+                except BaseException as error:
+                    control['control_error']=repr(error);released.set()
+                    if watchdog:watchdog.join(timeout=15)
+                    if process.poll() is None:
+                        assert inspect(names['worker'])['Id']==ids[names['worker']]
+                        docker('kill',names['worker']);process.wait(timeout=15)
+                    code=process.returncode
+                finally:
+                    released.set()
+                    if watchdog:watchdog.join(timeout=15)
+                    save(label+'-control.json',control)
         finished=time.time()
         # Observe actual backend/transaction and writer advisory lock disappearance before state.
         drain_deadline=time.monotonic()+180;remaining=True
         while time.monotonic()<drain_deadline:
             pid=control.get('backend',{}).get('pid',0)
-            remaining=query(f"SELECT json_build_object('backend',EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid={pid}),'writer_lock',EXISTS(SELECT 1 FROM pg_locks WHERE pid={pid} AND locktype='advisory' AND granted))")
+            predicate=f'pid={pid}' if controlled else f"pid IN (SELECT pid FROM pg_stat_activity WHERE datname='{name}' AND application_name='db-sync-alt')"
+            remaining=query(f"SELECT json_build_object('backend',EXISTS(SELECT 1 FROM pg_stat_activity WHERE {predicate}),'writer_lock',EXISTS(SELECT 1 FROM pg_locks WHERE {predicate} AND locktype='advisory' AND granted))")
             if not remaining['backend'] and not remaining['writer_lock']:break
             time.sleep(.25)
         control['backend_release']=remaining;control['backend_release_observed_unix']=time.time();save(label+'-control.json',control)
@@ -145,7 +152,9 @@ def run(g):
         state=json.loads(state_raw)
         item={'label':label,'exit_code':code,'seconds':finished-started,'control':control,'trace':trace,'connection_failures':safe_errno,'state':state,'fresh_target':target_info,'socket_limits':[e for e in events if e.get('event')=='postgres_socket_limits']}
         if code==0:
+            verify_started=time.time();verify_clock=time.monotonic()
             verified=subprocess.run([*base,'verify',*common],text=True,capture_output=True,timeout=600)
+            save(label+'-verify.measurement.json',{'seconds':time.monotonic()-verify_clock,'started_unix':verify_started,'finished_unix':time.time(),'exit_code':verified.returncode,'tcp_user_timeout_ms':600000 if tcp else 30000,'statement_seconds':600})
             (out/(label+'-verify.stdout')).write_text(verified.stdout);(out/(label+'-verify.stderr')).write_text(verified.stderr)
             value=json.loads(verified.stdout);item['verified']=value
             assert verified.returncode==0 and value['content_digest']==original['content_digest'] and value['state_digest']==original['state_digest']
@@ -160,6 +169,13 @@ def run(g):
         if isinstance(value,dict):return value.get('os_error')==110 or value.get('kind')=='TimedOut' or any(errno110(v) for v in value.values())
         if isinstance(value,list):return any(errno110(v) for v in value)
         return False
+    if not controlled:
+        positive=results[0]
+        assert positive['exit_code']==0 and positive['state']['serving']
+        assert positive['control']['backend_release']=={'backend':False,'writer_lock':False}
+        assert positive['socket_limits'][0]['tcp_user_timeout_ms']==600000
+        save('restore-stage-result.json',{'status':'PASS_FOCUSED_RESTORE_ONLY','variants':results,'original_failure_cause_proven':False,'source_generation':False,'source_conversion':False,'generated_only':True})
+        return
     negative,positive=results
     for item in results:
         c=item['control'];assert 'control_error' not in c and c['continued'] and c['continued_unix']-c['zero_window_confirmed_unix']>=44.5

@@ -13,6 +13,8 @@ from pathlib import Path
 ROOT=Path(os.environ['GITHUB_WORKSPACE']);OUT=Path(os.environ['RUNNER_TEMP'])/'whole-evidence';OUT.mkdir(exist_ok=True)
 CONFIG=json.loads((ROOT/'.github/qualification/config.json').read_text());PIN=CONFIG['source'];MODE=CONFIG['mode'];DIVISOR=CONFIG['divisor'];assert re.fullmatch('[0-9a-f]{40}',PIN)
 TARGET=CONFIG.get('target','whole');FOCUS=TARGET in ['index','selection'];TEST={'index':'a7_index_generated','selection':'a7_select_generated','restore':'a7_restore_generated'}.get(TARGET,'a7_whole_generated');HARNESS={'index':'a7_index.rs','selection':'a7_select.rs','restore':'a7_restore.rs'}.get(TARGET,'a7_whole.rs')
+RESTORE_TCP=CONFIG.get('restore_tcp_user_timeout_seconds',600 if TARGET=='whole' else None)
+assert RESTORE_TCP is None or isinstance(RESTORE_TCP,int) and 1<=RESTORE_TCP<=86400
 RUST='rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea'
 PG='postgres:17.11-bookworm@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675'
 PREFIX='dsa-whole-'+os.environ['GITHUB_RUN_ID'];NETWORK=PREFIX+'-net';NAMES={k:PREFIX+'-'+k for k in ['source','destination','restored','worker']};VOLUMES={k:PREFIX+'-'+k+'-data' for k in ['source','destination','restored']};IDS={};RESETTING=set();TRACE={};STOP=threading.Event()
@@ -97,7 +99,7 @@ def monitor():
       path=cg(name);data['memory_current']=stat_file(path/'memory.current');data['memory_peak']=stat_file(path/'memory.peak');data['io_stat']=io_stat(path);data['io_max']=stat_file(path/'io.max');data['cpu_stat']=stat_file(path/'cpu.stat');data['memory_stat']=stat_file(path/'memory.stat');data['memory_events']=stat_file(path/'memory.events');data['io_pressure']=stat_file(path/'io.pressure')
       if role=='worker':
        data['process_memory']=process_memory(d['State']['Pid'],d['Id'])
-       if TARGET in ['restore','control']:
+       if TARGET in ['restore','control','restore_stage']:
         result=subprocess.run(['sudo','nsenter','-t',str(d['State']['Pid']),'-n','ss','-tin'],text=True,capture_output=True,timeout=2);data['socket_kernel_info']={'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr}
       if role!='worker':
        data['volume_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data').split()[0]);data['volume_allocated_bytes']=int(docker('exec',name,'du','-sB1','/var/lib/postgresql/data').split()[0]);data['wal_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data/pg_wal').split()[0]);database=databases.get(role)
@@ -172,7 +174,7 @@ def start_socket_trace(label):
 thread=None
 class ControlCompleted(Exception):pass
 try:
- if TARGET=='control':
+ if TARGET in ['control','restore_stage']:
   from restore_control import run
   run(globals())
   raise ControlCompleted
@@ -182,13 +184,21 @@ try:
  if TARGET=='selection':
   for name in ['a7_candidate_indexes.sql','a7_closure.sql']:shutil.copy2(ROOT/'.github/qualification'/name,ROOT/'product/crates/db-sync-alt/tests'/name)
  tracked=output(['git','-C',str(ROOT/'product'),'diff','--name-only']);assert tracked==''
- save('source.json',{'product_head':PIN,'wrapper_head':os.environ['GITHUB_SHA'],'product_tracked_diff':tracked,'injected_test_sha256':hashlib.sha256((ROOT/'.github/qualification'/HARNESS).read_bytes()).hexdigest(),'config':CONFIG,'synthetic':True,'injected_sql_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'.github/qualification').glob('a7_*.sql')} })
+ save('source.json',{'product_head':PIN,'wrapper_head':os.environ['GITHUB_SHA'],'product_tracked_diff':tracked,'injected_test_sha256':hashlib.sha256((ROOT/'.github/qualification'/HARNESS).read_bytes()).hexdigest(),'config':CONFIG,'synthetic':True,'harness_connection_settings':{'restore_only_tcp_user_timeout_seconds':RESTORE_TCP,'source_statement_seconds':60,'source_idle_seconds':60,'reader_statement_seconds':60,'private_statement_seconds':600,'overall_seconds':7200},'injected_sql_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'.github/qualification').glob('a7_*.sql')} })
  call(['docker','pull',RUST]);call(['docker','pull',PG]);save('images.json',json.loads(docker('image','inspect',RUST,PG)))
  target=Path(os.environ['RUNNER_TEMP'])/'whole-target';target.mkdir(exist_ok=True)
  build=['docker','run','--rm','--name',PREFIX+'-build','-e','CARGO_TARGET_DIR=/work/target','-e','CARGO_PROFILE_RELEASE_DEBUG=0','--mount',f'type=bind,src={ROOT}/product,dst=/work/product','--mount',f'type=bind,src={target},dst=/work/target','-w','/work/product',RUST,'cargo','test','--locked','--release','-p','db-sync-alt','--test',TEST,'--no-run','--message-format=json']
  with (OUT/'build.stdout').open('w') as stdout,(OUT/'build.stderr').open('w') as stderr:call(build,stdout=stdout,stderr=stderr)
  binaries=[json.loads(line) for line in (OUT/'build.stdout').read_text().splitlines() if line.startswith('{')];test_candidates=[r for r in binaries if r.get('reason')=='compiler-artifact' and r['target']['name']==TEST and r['target']['kind']==['test'] and r.get('profile',{}).get('test') is True and r.get('executable')];assert len(test_candidates)==1;test_binary=test_candidates[0]['executable']
  save('binaries.json',{'test_binary':test_binary,'cli_sha256':hashlib.sha256((target/'release/db-sync-alt').read_bytes()).hexdigest(),'test_sha256':hashlib.sha256((target/Path(test_binary).relative_to('/work/target')).read_bytes()).hexdigest()})
+ if TARGET=='whole':
+  mount=['--mount',f'type=bind,src={target},dst=/work/target,readonly']
+  listing=output(['docker','run','--rm',*mount,RUST,test_binary,'--list']);(OUT/'test-runner-list.txt').write_text(listing);assert 'whole_conversion_qualification: test' in listing and 'qualification_dispatch_smoke: test' in listing
+  smoke=output(['docker','run','--rm',*mount,RUST,test_binary,'--exact','qualification_dispatch_smoke','--nocapture']);(OUT/'dispatch-smoke.txt').write_text(smoke);assert 'qualification_dispatch_smoke_entered_no_database' in smoke and '1 passed; 0 failed' in smoke
+  version=output(['docker','run','--rm',*mount,RUST,'/work/target/release/db-sync-alt','--version']);(OUT/'cli-version.txt').write_text(version);assert version.strip()=='db-sync-alt 0.5.0'
+  for verb in ['convert','verify','restore','snapshot','compare','grant-reader']:
+   helptext=output(['docker','run','--rm',*mount,RUST,'/work/target/release/db-sync-alt',verb,'--help']);(OUT/(verb+'-help.txt')).write_text(helptext);assert '--statement-timeout-seconds' in helptext and '--idle-transaction-timeout-seconds' in helptext
+   if verb in ['convert','compare']:assert '--overall-timeout-seconds' in helptext
  if TARGET=='restore':
   assert output(['git','-C',str(ROOT/'predecessor'),'rev-parse','HEAD']).strip()==CONFIG['predecessor']
   old_target=Path(os.environ['RUNNER_TEMP'])/'restore-predecessor-target';old_target.mkdir(exist_ok=True)
@@ -233,6 +243,7 @@ try:
  if TARGET=='restore':
   worker[worker.index(RUST):worker.index(RUST)]=['--mount',f'type=bind,src={old_target},dst=/work/target-old,readonly','-e','DSA_PREDECESSOR_CLI=/work/target-old/release/db-sync-alt']
   if CONFIG.get('reuse_run'):worker[worker.index(RUST):worker.index(RUST)]=['-e','DSA_RESTORE_REUSE=1']
+ if TARGET=='whole' and RESTORE_TCP is not None:worker[worker.index(RUST):worker.index(RUST)]=['-e',f'DSA_RESTORE_TCP_USER_TIMEOUT_SECONDS={RESTORE_TCP}']
  IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False;reset_nonce=None;trace_nonce=None
  while inspect(NAMES['worker'])['State']['Running']:
   if not admitted and (OUT/'fixture-ready.json').exists():
@@ -251,7 +262,7 @@ try:
  save(('index-experiment-success.json' if FOCUS else 'qualification-success.json'),{'source':PIN,'config':CONFIG,'admitted':admitted,'generated_only':True,'historical_acceptance':False})
 except ControlCompleted:pass
 finally:
- if TARGET in ['restore','control']:
+ if TARGET in ['restore','control','restore_stage']:
   try:stop_socket_trace()
   except Exception as error:save('socket-stop-error.json',{'error':repr(error)})
  STOP.set()

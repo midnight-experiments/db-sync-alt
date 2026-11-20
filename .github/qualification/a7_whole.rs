@@ -20,6 +20,12 @@ use std::{
 use tokio::process::Command;
 use tokio_postgres::{Config, config::SslMode};
 type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+#[test]
+fn qualification_dispatch_smoke() {
+    assert_eq!(env!("CARGO_PKG_NAME"), "db-sync-alt");
+    assert!(env!("CARGO_BIN_EXE_db-sync-alt").ends_with("/db-sync-alt"));
+    println!("qualification_dispatch_smoke_entered_no_database");
+}
 fn directory() -> PathBuf {
     PathBuf::from(std::env::var("DSA_QUALIFICATION_OUT").unwrap())
 }
@@ -58,14 +64,23 @@ async fn command(
 ) -> Result<(bool, Value)> {
     let begin = Instant::now();
     let start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
+    let restore_tcp = if verb == "restore" {
+        std::env::var("DSA_RESTORE_TCP_USER_TIMEOUT_SECONDS")
+            .ok()
+            .map(|value| value.parse::<u32>())
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(seconds) = restore_tcp {
+        assert!((1..=86400).contains(&seconds));
+    }
+    let mut dsn = database.dsn(false);
+    if let Some(seconds) = restore_tcp {
+        dsn.push_str(&format!(" tcp_user_timeout={seconds}"));
+    }
     let mut child = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
-    child.args([
-        verb,
-        "--database",
-        &database.dsn(false),
-        "--network",
-        "mainnet",
-    ]);
+    child.args([verb, "--database", &dsn, "--network", "mainnet"]);
     child
         .args(args)
         .stdout(Stdio::from(std::fs::File::create(
@@ -77,7 +92,7 @@ async fn command(
         .kill_on_drop(true);
     save(
         "active-command.json",
-        &json!({"name":name,"started_unix":start,"database":database.name}),
+        &json!({"name":name,"started_unix":start,"database":database.name,"restore_only_tcp_user_timeout_seconds":restore_tcp}),
     )?;
     let status = child.spawn()?.wait().await?;
     let elapsed = begin.elapsed().as_secs_f64();
@@ -85,7 +100,7 @@ async fn command(
     let result = serde_json::from_slice(&raw).unwrap_or(Value::Null);
     save(
         &format!("{name}.measurement.json"),
-        &json!({"name":name,"exit_code":status.code(),"success":status.success(),"wall_seconds":elapsed,"started_unix":start,"finished_unix":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64()}),
+        &json!({"name":name,"exit_code":status.code(),"success":status.success(),"wall_seconds":elapsed,"started_unix":start,"finished_unix":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64(),"restore_only_tcp_user_timeout_seconds":restore_tcp}),
     )?;
     event(
         json!({"event":"qualification_command","name":name,"success":status.success(),"seconds":elapsed}),
@@ -231,7 +246,10 @@ async fn whole_conversion_qualification() -> Result {
         .collect();
     for row in initial.query("SELECT encode(m.policy,'hex')||encode(m.name,'hex'),coalesce(sum(a.quantity),0)::text FROM serve.multi_asset m LEFT JOIN serve.ma_tx_out a ON a.ident=m.id LEFT JOIN serve.tx_out o ON o.id=a.tx_out_id WHERE NOT EXISTS(SELECT 1 FROM serve.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index) GROUP BY m.id,m.policy,m.name",&[]).await?{let unit:String=row.get(0);if expected_supply.contains_key(&unit){expected_supply.insert(unit,row.get(1));}}
     let original = fingerprint(&source).await?;
-    let datum_id_base:i64=initial.query_one("SELECT coalesce(max(id),0)+10000 FROM serve.datum",&[]).await?.get(0);
+    let datum_id_base: i64 = initial
+        .query_one("SELECT coalesce(max(id),0)+10000 FROM serve.datum", &[])
+        .await?
+        .get(0);
     let n_outputs = wanted_outputs - original["counts"]["tx_out"].as_i64().unwrap();
     let n_assets = wanted_assets - original["counts"]["ma_tx_out"].as_i64().unwrap();
     let n_spends = wanted_spends - original["counts"]["tx_in"].as_i64().unwrap();
@@ -471,6 +489,24 @@ async fn whole_conversion_qualification() -> Result {
         .await?;
         assert!(ok);
         save("snapshot.json", &snapshot_result)?;
+        // Independent converted proof is earned even if a later restore fails.
+        target_db
+            .cli("grant-reader", "mainnet", &["--role", &target_db.reader])
+            .await?;
+        let converted_comparison = compare(&capture, None, &target_db, "compare-converted").await?;
+        save("compare-converted.json", &converted_comparison)?;
+        let converted_wide = compare(
+            &capture,
+            Some(&source),
+            &target_db,
+            "compare-converted-frozen-source-wide",
+        )
+        .await?;
+        save("compare-converted-frozen-source-wide.json", &converted_wide)?;
+        save(
+            "converted-fingerprint.json",
+            &fingerprint(&target_db).await?,
+        )?;
         let (ok, restored) = command(
             &restored_db,
             "restore",
@@ -488,10 +524,7 @@ async fn whole_conversion_qualification() -> Result {
         assert!(ok);
         assert_eq!(restored["content_digest"], verified["content_digest"]);
         assert_eq!(restored["state_digest"], verified["state_digest"]);
-        for (db, name) in [
-            (&target_db, "compare-converted"),
-            (&restored_db, "compare-restored"),
-        ] {
+        for (db, name) in [(&restored_db, "compare-restored")] {
             db.cli("grant-reader", "mainnet", &["--role", &db.reader])
                 .await?;
             let comparison = compare(&capture, None, db, name).await?;
@@ -500,10 +533,6 @@ async fn whole_conversion_qualification() -> Result {
             let wide = compare(&capture, Some(&source), db, &wide_name).await?;
             save(&format!("{wide_name}.json"), &wide)?;
         }
-        save(
-            "converted-fingerprint.json",
-            &fingerprint(&target_db).await?,
-        )?;
         save(
             "restored-fingerprint.json",
             &fingerprint(&restored_db).await?,
