@@ -241,9 +241,12 @@ query reads ([bridge readiness](docs/connect-a-node.md#bridge-readiness)).
 
 - **Networks** (`--network`): **Preprod** is supported and tested end to end.
   **Mainnet**: a database built from a real Mainnet cardano-db-sync is followed
-  through Blockfrost, and a Midnight node reads it; serving that node at the
-  Mainnet chain tip is not tested. **Preview**: the profile is packaged and
-  tested on synthetic data only ([networks](docs/networks.md)).
+  through Blockfrost. An archive Midnight node 2.1.101, started from an official
+  Midnight Mainnet snapshot and reading its Cardano data only from this
+  database, followed the chain to the tip and held it in a 60-minute check: not
+  syncing, with its finalized block at the same height and hash as on Midnight's
+  public Mainnet RPC. **Preview**: the profile is packaged and tested on
+  synthetic data only ([networks](docs/networks.md)).
 - **PostgreSQL 17**, which you provide, as you would for cardano-db-sync. It is
   the major version the Midnight node's reference environment runs its
   cardano-db-sync database on, so db-sync-alt's database can live on the same
@@ -255,7 +258,6 @@ See the [compatibility matrix](docs/compatibility.md) and
 
 Planned next:
 
-- a Midnight node served at the Mainnet chain tip;
 - Cardano Preview built and followed end to end;
 - a bound on how much update history the database keeps.
 
