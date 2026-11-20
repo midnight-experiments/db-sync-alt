@@ -4,10 +4,13 @@
   node 2.1.101 only. Cardano Mainnet, Preprod and Preview have network profiles.
   Preprod has been built, followed, served to a Midnight node and checked
   against cardano-db-sync end to end. A Mainnet database built from a real
-  Mainnet cardano-db-sync is followed through Blockfrost, and a Midnight node
-  reads it; serving that node at the Mainnet chain tip is not tested. Preview is
-  tested on synthetic data only ([networks](networks.md)). Other networks have
-  no profile and are refused.
+  Mainnet cardano-db-sync is followed through Blockfrost. An archive Midnight
+  node 2.1.101, started from an official Midnight Mainnet snapshot and reading
+  its Cardano data only from this database, followed the chain to the tip and
+  held it in a 60-minute check: not syncing, with its finalized block at the
+  same height and hash as on Midnight's public Mainnet RPC. Preview is tested on
+  synthetic data only ([networks](networks.md)). Other networks have no profile
+  and are refused.
 - **Node configuration must match the profile.** The node's
   `CARDANO_SECURITY_PARAMETER` must equal the profile's k, and its Cardano
   addresses and policies must be the profile's. db-sync-alt cannot see the

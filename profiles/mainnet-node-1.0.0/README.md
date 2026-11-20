@@ -13,5 +13,8 @@ profile and its network. `network.json` holds the network's values (see
   asset name `NIGHT` (`4e49474854`); ICS and reserve use the same unit.
 
 The profile is shipped inside the package and is the default of
-`db-sync-alt acquire --network mainnet`. Mainnet has not been built or qualified
-end-to-end with this release; see [compatibility](../../docs/compatibility.md).
+`db-sync-alt acquire --network mainnet`. A Mainnet database built with this
+profile from a real Mainnet cardano-db-sync is followed through Blockfrost, and
+a Midnight node 2.1.101 reading it held the chain tip in a 60-minute check; see
+[networks](../../docs/networks.md#packaged-networks) and
+[compatibility](../../docs/compatibility.md).

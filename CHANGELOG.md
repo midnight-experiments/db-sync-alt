@@ -12,6 +12,12 @@
   date the memory and disk measurement, and say when `provider_concurrency` and
   `provider_max_requests_per_hour` apply. The operations page counts eleven
   reader relations.
+- Documentation only. The README, the compatibility, limitations and networks
+  pages and the Mainnet profile's README give the Mainnet tip check: an archive
+  Midnight node 2.1.101, started from an official Midnight Mainnet snapshot and
+  reading its Cardano data only from a db-sync-alt Mainnet database, followed
+  the chain to the tip and held it in a 60-minute check, its finalized block at
+  the same height and hash as on Midnight's public Mainnet RPC.
 
 ## 0.4.9
 
