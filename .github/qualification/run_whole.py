@@ -97,7 +97,7 @@ def monitor():
       path=cg(name);data['memory_current']=stat_file(path/'memory.current');data['memory_peak']=stat_file(path/'memory.peak');data['io_stat']=io_stat(path);data['io_max']=stat_file(path/'io.max');data['cpu_stat']=stat_file(path/'cpu.stat');data['memory_stat']=stat_file(path/'memory.stat');data['memory_events']=stat_file(path/'memory.events');data['io_pressure']=stat_file(path/'io.pressure')
       if role=='worker':
        data['process_memory']=process_memory(d['State']['Pid'],d['Id'])
-       if TARGET=='restore':
+       if TARGET in ['restore','control']:
         result=subprocess.run(['sudo','nsenter','-t',str(d['State']['Pid']),'-n','ss','-tin'],text=True,capture_output=True,timeout=2);data['socket_kernel_info']={'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr}
       if role!='worker':
        data['volume_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data').split()[0]);data['volume_allocated_bytes']=int(docker('exec',name,'du','-sB1','/var/lib/postgresql/data').split()[0]);data['wal_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data/pg_wal').split()[0]);database=databases.get(role)
@@ -117,8 +117,10 @@ def wait_postgres(name):
 def fresh_restore_target(label):
  role='restored';name=NAMES[role];assert re.fullmatch('[a-z0-9-]+',label);RESETTING.add(role)
  try:
-  assert inspect(name)['Id']==IDS[name]
-  (OUT/(label+'-previous-pg.log')).write_text(docker('logs',name));docker('stop','-t','120',name);save(label+'-previous-final.json',inspect(name));docker('rm',name);docker('volume','rm',VOLUMES[role]);docker('volume','create',VOLUMES[role])
+  if name in IDS:
+   assert inspect(name)['Id']==IDS[name]
+   (OUT/(label+'-previous-pg.log')).write_text(docker('logs',name));docker('stop','-t','120',name);save(label+'-previous-final.json',inspect(name));docker('rm',name);docker('volume','rm',VOLUMES[role])
+  docker('volume','create',VOLUMES[role])
   IDS[name]=docker('run','-d','--name',name,'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={VOLUMES[role]},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0').strip();wait_postgres(name)
   admission=probe(name,4*1048576,2*1048576);value={'ready':True,'label':label,'target_inspect':inspect(name),'admission':admission,'scope':'fresh owned PG container/data per variant; source/converted unchanged'};save(label+'-fresh-target.json',value);return value
  finally:RESETTING.discard(role)
@@ -156,7 +158,10 @@ def start_socket_trace(label):
    with (OUT/('socket-'+label+'-headers.log')).open('w') as log:
     for line in process.stdout:
      zero=f'{target_ip}.5432 > {worker_ip}.' in line and 'win 0,' in line
-     if zero:counts['zero_window_from_target']+=1
+     if zero:
+      counts['zero_window_from_target']+=1
+      flow_match=re.search(r'> '+re.escape(worker_ip)+r'\.(\d+):',line)
+      if flow_match:counts['last_zero_window']={'client_port':int(flow_match.group(1)),'observed_unix':time.time()}
      if total<32*1048576 or zero:
       log.write(line);total+=len(line.encode());counts['lines_written']+=1
      else:counts['dropped_after_byte_cap']+=1
@@ -165,7 +170,12 @@ def start_socket_trace(label):
  TRACE.update(state);return {k:v for k,v in state.items() if k not in ['process','thread','counts']}
 
 thread=None
+class ControlCompleted(Exception):pass
 try:
+ if TARGET=='control':
+  from restore_control import run
+  run(globals())
+  raise ControlCompleted
  # Product files are the explicit untouched pin, with only one opt-in test copy.
  assert output(['git','-C',str(ROOT/'product'),'rev-parse','HEAD']).strip()==PIN
  shutil.copy2(ROOT/'.github/qualification'/HARNESS,ROOT/'product/crates/db-sync-alt/tests'/(TEST+'.rs'))
@@ -239,8 +249,9 @@ try:
   time.sleep(1)
  save('worker-exit.json',inspect(NAMES['worker'])['State']);print(docker('logs',NAMES['worker']),flush=True);assert inspect(NAMES['worker'])['State']['ExitCode']==0,'qualification binary failed'
  save(('index-experiment-success.json' if FOCUS else 'qualification-success.json'),{'source':PIN,'config':CONFIG,'admitted':admitted,'generated_only':True,'historical_acceptance':False})
+except ControlCompleted:pass
 finally:
- if TARGET=='restore':
+ if TARGET in ['restore','control']:
   try:stop_socket_trace()
   except Exception as error:save('socket-stop-error.json',{'error':repr(error)})
  STOP.set()
