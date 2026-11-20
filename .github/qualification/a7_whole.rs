@@ -524,6 +524,25 @@ async fn whole_conversion_qualification() -> Result {
         assert!(ok);
         assert_eq!(restored["content_digest"], verified["content_digest"]);
         assert_eq!(restored["state_digest"], verified["state_digest"]);
+        let (ok, restored_verified) = command(
+            &restored_db,
+            "verify-restored",
+            "verify",
+            &[
+                "--statement-timeout-seconds",
+                "600",
+                "--idle-transaction-timeout-seconds",
+                "7200",
+            ],
+        )
+        .await?;
+        assert!(ok);
+        assert_eq!(
+            restored_verified["content_digest"],
+            restored["content_digest"]
+        );
+        assert_eq!(restored_verified["state_digest"], restored["state_digest"]);
+        save("restored-verification.json", &restored_verified)?;
         for (db, name) in [(&restored_db, "compare-restored")] {
             db.cli("grant-reader", "mainnet", &["--role", &db.reader])
                 .await?;
