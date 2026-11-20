@@ -80,6 +80,8 @@ pub enum Error {
         stage: &'static str,
         family: String,
         elapsed_seconds: f64,
+        wait_seconds: Option<f64>,
+        queued_plain_bytes: Option<u64>,
         #[source]
         error: Box<Error>,
     },
@@ -118,7 +120,7 @@ impl Error {
                 json!({"error":"comparison_source_failed","side":side,"cause":error.report()})
             }
             Self::Io(error) => {
-                json!({"error":"snapshot_io_error","kind":format!("{:?}",error.kind())})
+                json!({"error":"snapshot_io_error","kind":format!("{:?}",error.kind()),"os_error":error.raw_os_error()})
             }
             Self::PublishedDurabilityUncertain => {
                 json!({"error":"snapshot_published_durability_uncertain","published":true,"durability":"uncertain"})
@@ -137,12 +139,20 @@ impl Error {
                 stage,
                 family,
                 elapsed_seconds,
+                wait_seconds,
+                queued_plain_bytes,
                 error,
             } => {
                 let mut report = error.report();
                 report["stage"] = json!(stage);
                 report["family"] = json!(family);
                 report["elapsed_seconds"] = json!(elapsed_seconds);
+                if let Some(seconds) = wait_seconds {
+                    report["wait_seconds"] = json!(seconds);
+                }
+                if let Some(bytes) = queued_plain_bytes {
+                    report["queued_plain_bytes"] = json!(bytes);
+                }
                 report
             }
             _ => json!({"error": self.to_string()}),
@@ -571,5 +581,21 @@ mod diagnostic_tests {
             io_causes(Some(&other)),
             vec![json!({"kind":"Other","os_error":null})]
         );
+        assert_eq!(
+            Error::Io(std::io::Error::from_raw_os_error(110)).report()["os_error"],
+            110
+        );
+        let staged = Error::AtStage {
+            stage: "restore_copy_send",
+            family: "block".to_owned(),
+            elapsed_seconds: 3.0,
+            wait_seconds: Some(2.0),
+            queued_plain_bytes: Some(65536),
+            error: Box::new(Error::Io(other)),
+        }
+        .report();
+        assert_eq!(staged["wait_seconds"], 2.0);
+        assert_eq!(staged["queued_plain_bytes"], 65536);
+        assert!(!staged.to_string().contains("another-secret"));
     }
 }

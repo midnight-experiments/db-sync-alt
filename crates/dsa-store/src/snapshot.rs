@@ -42,6 +42,9 @@
 //! transaction. Compressed bytes actually decoded are hashed again during COPY.
 //! Caller statement/idle transaction timeouts remain in force; no timeout is
 //! silently disabled. Long operations need explicit operator-chosen limits.
+//! Restore reports separate COPY/index/analyze/verification/publication times.
+//! On a send failure, queued bytes count only earlier successful send awaits,
+//! not the attempted chunk or any server row acknowledgement.
 //! A writer-locked transaction streams bounded decompression into binary COPY,
 //! checks exact sizes/hashes/trailing EOF, creates indexes, analyzes, initializes
 //! private allocation sequences above imported identity IDs, verifies closure,
@@ -81,6 +84,43 @@ const MAGIC: &[u8; 8] = b"DSASNAP\0";
 const FORMAT: u32 = 1;
 const MAX_DESCRIPTION: u64 = 1024 * 1024;
 const MAX_SECTION: u64 = 1 << 40;
+
+// Restore-local stage timings contain only fixed operation and table labels.
+// They neither change the SQL grouping nor adjust any operational timeout.
+struct RestoreStage<'a> {
+    stage: &'static str,
+    family: &'a str,
+    began: Instant,
+}
+impl<'a> RestoreStage<'a> {
+    fn start(stage: &'static str, family: &'a str) -> Self {
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"restore_stage_started","stage":stage,"family":family})
+        );
+        Self {
+            stage,
+            family,
+            began: Instant::now(),
+        }
+    }
+    fn error(&self, error: impl Into<Error>) -> Error {
+        Error::AtStage {
+            stage: self.stage,
+            family: self.family.to_owned(),
+            elapsed_seconds: self.began.elapsed().as_secs_f64(),
+            wait_seconds: None,
+            queued_plain_bytes: None,
+            error: Box::new(error.into()),
+        }
+    }
+    fn finish(&self) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"restore_stage_finished","stage":self.stage,"family":self.family,"elapsed_seconds":self.began.elapsed().as_secs_f64()})
+        );
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -522,12 +562,23 @@ impl Store {
     }
 
     pub async fn restore(&mut self, profile: &Profile, path: &Path) -> Result<Verification, Error> {
-        self.prepare_destination(profile, "restore_failed").await?;
+        let stage = RestoreStage::start("restore_prepare", "database");
+        self.prepare_destination(profile, "restore_failed")
+            .await
+            .map_err(|error| stage.error(error))?;
+        stage.finish();
         // Opening/parsing happens after a closed, identifiable retry state exists.
-        let mut file = File::open(path)?;
-        let description = read_description(&mut file, profile)?;
-        preflight(&mut file, &description)?;
-        let tx = self.writer_transaction().await?;
+        let stage = RestoreStage::start("restore_preflight", "database");
+        let mut file = File::open(path).map_err(|error| stage.error(error))?;
+        let description =
+            read_description(&mut file, profile).map_err(|error| stage.error(error))?;
+        preflight(&mut file, &description).map_err(|error| stage.error(error))?;
+        stage.finish();
+        let stage = RestoreStage::start("restore_drop_indexes", "database");
+        let tx = self
+            .writer_transaction()
+            .await
+            .map_err(|error| stage.error(error))?;
         // A manually initialized empty layout may already have secondary indexes.
         for line in include_str!("indexes.sql")
             .lines()
@@ -539,18 +590,25 @@ impl Store {
                 .and_then(|s| s.split_whitespace().next())
                 .ok_or(Error::Refusal("invalid_index_catalogue"))?;
             tx.batch_execute(&format!("DROP INDEX IF EXISTS serve.{name}"))
-                .await?;
+                .await
+                .map_err(|error| stage.error(error))?;
         }
+        stage.finish();
         for section in &description.sections {
             {
                 let table = qualified(&section.table)?;
                 let began = Instant::now();
-                let database_error = |stage, error: tokio_postgres::Error| Error::AtStage {
-                    stage,
-                    family: section.table.clone(),
-                    elapsed_seconds: began.elapsed().as_secs_f64(),
-                    error: Box::new(Error::Postgres(error)),
-                };
+                let database_error =
+                    |stage, error: tokio_postgres::Error, wait_seconds, queued_plain_bytes| {
+                        Error::AtStage {
+                            stage,
+                            family: section.table.clone(),
+                            elapsed_seconds: began.elapsed().as_secs_f64(),
+                            wait_seconds,
+                            queued_plain_bytes,
+                            error: Box::new(Error::Postgres(error)),
+                        }
+                    };
                 eprintln!(
                     "{}",
                     serde_json::json!({"event":"restore_section_started","family":section.table,"plain_bytes":section.plain_bytes,"compressed_bytes":section.compressed_bytes,"expected_rows":section.rows})
@@ -563,7 +621,7 @@ impl Store {
                 let sink = tx
                     .copy_in::<_, Bytes>(&query)
                     .await
-                    .map_err(|error| database_error("restore_copy_open", error))?;
+                    .map_err(|error| database_error("restore_copy_open", error, None, None))?;
                 eprintln!(
                     "{}",
                     serde_json::json!({"event":"restore_copy_opened","family":section.table,"elapsed_seconds":began.elapsed().as_secs_f64()})
@@ -584,7 +642,14 @@ impl Store {
                     sink.as_mut()
                         .send(Bytes::copy_from_slice(&buf[..n]))
                         .await
-                        .map_err(|error| database_error("restore_copy_send", error))?;
+                        .map_err(|error| {
+                            database_error(
+                                "restore_copy_send",
+                                error,
+                                Some(send.elapsed().as_secs_f64()),
+                                Some(bytes - n as u64),
+                            )
+                        })?;
                     if send.elapsed().as_secs() >= 1 {
                         eprintln!(
                             "{}",
@@ -596,11 +661,15 @@ impl Store {
                 if size != section.compressed_bytes || hash != section.sha256 {
                     return Err(Error::Refusal("snapshot_section_hash_mismatch"));
                 }
-                let rows = sink
-                    .as_mut()
-                    .finish()
-                    .await
-                    .map_err(|error| database_error("restore_copy_finish", error))?;
+                let finish = Instant::now();
+                let rows = sink.as_mut().finish().await.map_err(|error| {
+                    database_error(
+                        "restore_copy_finish",
+                        error,
+                        Some(finish.elapsed().as_secs_f64()),
+                        Some(bytes),
+                    )
+                })?;
                 if bytes != section.plain_bytes || rows != section.rows {
                     return Err(Error::Refusal("snapshot_row_count_mismatch"));
                 }
@@ -610,45 +679,68 @@ impl Store {
                 );
             }
         }
+        let stage = RestoreStage::start("restore_load_state", "database");
         let mut extra = [0];
-        if file.read(&mut extra)? != 0 {
-            return Err(Error::Refusal("snapshot_trailing_bytes"));
+        if file.read(&mut extra).map_err(|error| stage.error(error))? != 0 {
+            return Err(stage.error(Error::Refusal("snapshot_trailing_bytes")));
         }
         for (unit, quantity) in &description.verified.supply {
             tx.execute(
                 "INSERT INTO dsa.supply(unit,quantity) VALUES($1,$2::text::numeric)",
                 &[unit, quantity],
             )
-            .await?;
+            .await
+            .map_err(|error| stage.error(error))?;
         }
         let s = &description.verified.state;
-        tx.execute("UPDATE dsa.position SET horizon_height=$1::integer,horizon_hash=decode($2,'hex'),horizon_time=$3::text::timestamptz,target_height=$4::integer,target_hash=decode($5,'hex'),target_time=$6::text::timestamptz,tip_height=$7::integer,tip_hash=decode($8,'hex'),tip_time=$9::text::timestamptz,retention_seconds=$10,updated_at=now() WHERE id=1",&[&(s.horizon.height as i32),&s.horizon.hash,&s.horizon.time,&(s.target.height as i32),&s.target.hash,&s.target.time,&(s.tip.height as i32),&s.tip.hash,&s.tip.time,&s.retention_seconds]).await?;
-        tx.batch_execute(include_str!("indexes.sql")).await?;
+        tx.execute("UPDATE dsa.position SET horizon_height=$1::integer,horizon_hash=decode($2,'hex'),horizon_time=$3::text::timestamptz,target_height=$4::integer,target_hash=decode($5,'hex'),target_time=$6::text::timestamptz,tip_height=$7::integer,tip_hash=decode($8,'hex'),tip_time=$9::text::timestamptz,retention_seconds=$10,updated_at=now() WHERE id=1",&[&(s.horizon.height as i32),&s.horizon.hash,&s.horizon.time,&(s.target.height as i32),&s.target.hash,&s.target.time,&(s.tip.height as i32),&s.tip.hash,&s.tip.time,&s.retention_seconds]).await.map_err(|error| stage.error(error))?;
+        stage.finish();
+        let stage = RestoreStage::start("restore_indexes", "database");
+        tx.batch_execute(include_str!("indexes.sql"))
+            .await
+            .map_err(|error| stage.error(error))?;
+        stage.finish();
         for table in tables() {
+            let stage = RestoreStage::start("restore_analyze", table);
             tx.batch_execute(&format!("ANALYZE {}", qualified(table)?))
-                .await?;
+                .await
+                .map_err(|error| stage.error(error))?;
+            stage.finish();
         }
         for table in ["multi_asset", "datum", "pool_hash", "epoch_stake"] {
-            tx.query_one(&format!("SELECT setval('dsa.{table}_id_seq',greatest(coalesce(max(id),0)+1,1),false) FROM serve.{table}"),&[]).await?;
+            let stage = RestoreStage::start("restore_sequences", table);
+            tx.query_one(&format!("SELECT setval('dsa.{table}_id_seq',greatest(coalesce(max(id),0)+1,1),false) FROM serve.{table}"),&[]).await.map_err(|error| stage.error(error))?;
+            stage.finish();
         }
-        let verified = verify::verify(&tx, profile, false).await?;
+        let stage = RestoreStage::start("restore_verify", "database");
+        let verified = verify::verify(&tx, profile, false)
+            .await
+            .map_err(|error| stage.error(error))?;
         if !verify::logical_equal(&description.verified, &verified) {
-            return Err(Error::Refusal("snapshot_content_digest_mismatch"));
+            return Err(stage.error(Error::Refusal("snapshot_content_digest_mismatch")));
         }
-        tx.execute("INSERT INTO dsa.first_served SELECT id,transaction_timestamp() FROM serve.block WHERE id BETWEEN $1 AND $2",&[&i64::from(s.horizon.height),&i64::from(s.target.height)]).await?;
+        stage.finish();
+        let stage = RestoreStage::start("restore_publish", "database");
+        tx.execute("INSERT INTO dsa.first_served SELECT id,transaction_timestamp() FROM serve.block WHERE id BETWEEN $1 AND $2",&[&i64::from(s.horizon.height),&i64::from(s.target.height)]).await.map_err(|error| stage.error(error))?;
         tx.execute(
             "UPDATE dsa.identity SET origin=$1,tool_version=$2 WHERE id=1",
             &[
-                &serde_json::to_value(description.origin.restored(&verified))?,
+                &serde_json::to_value(description.origin.restored(&verified))
+                    .map_err(|error| stage.error(error))?,
                 &VERSION,
             ],
         )
-        .await?;
+        .await
+        .map_err(|error| stage.error(error))?;
         tx.batch_execute(
             "UPDATE dsa.position SET serving=true,reason='serving',updated_at=now() WHERE id=1",
         )
-        .await?;
-        tx.commit().await?;
+        .await
+        .map_err(|error| stage.error(error))?;
+        stage.finish();
+        let stage = RestoreStage::start("restore_commit", "database");
+        tx.commit().await.map_err(|error| stage.error(error))?;
+        stage.finish();
         Ok(verified)
     }
 }

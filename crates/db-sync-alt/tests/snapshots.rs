@@ -977,3 +977,134 @@ async fn snapshot_input_change_after_preflight_is_refused() -> Result {
     dest.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn restore_copy_sqlstate_privacy_and_pipeline_timings() -> Result {
+    let f = fixture(39);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("copy-error.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    let client = connect(&dest.config).await?;
+    client.batch_execute("CREATE FUNCTION serve.copy_error_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION USING ERRCODE='P0001',MESSAGE='generated-private-message-marker',DETAIL='generated-private-detail-marker',HINT='generated-private-hint-marker';END$$;CREATE TRIGGER copy_error_guard BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.copy_error_guard()").await?;
+    let failed = dest
+        .cli_raw("restore", &f.profile.network, &file_args(&path))
+        .await?;
+    assert_eq!(failed.status.code(), Some(1));
+    let stderr = String::from_utf8(failed.stderr)?;
+    let report = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["error"] == "database_error")
+        .ok_or("missing database error report")?;
+    assert_eq!(report["sqlstate"], "P0001");
+    assert_eq!(report["family"], "block");
+    assert!(matches!(
+        report["stage"].as_str(),
+        Some("restore_copy_send" | "restore_copy_finish")
+    ));
+    assert!(
+        report["elapsed_seconds"]
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && n >= 0.0)
+    );
+    assert!(
+        report["wait_seconds"]
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && n >= 0.0)
+    );
+    assert!(report["queued_plain_bytes"].is_u64());
+    for private in [
+        "generated-private-message-marker",
+        "generated-private-detail-marker",
+        "generated-private-hint-marker",
+        "copy_error_guard",
+        "RAISE EXCEPTION",
+    ] {
+        assert!(
+            !stderr.contains(private),
+            "server context leaked: {private}"
+        );
+    }
+    let closed = dest.cli("status", &f.profile.network, &[]).await?;
+    assert_eq!(closed["position"]["serving"], false);
+    assert_eq!(closed["position"]["reason"], "restore_failed");
+    assert_eq!(
+        client
+            .query_one("SELECT count(*) FROM serve.block", &[])
+            .await?
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        client
+            .query("SELECT * FROM public.block", &[])
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "55000"
+    );
+    client
+        .batch_execute(
+            "DROP TRIGGER copy_error_guard ON serve.block;DROP FUNCTION serve.copy_error_guard()",
+        )
+        .await?;
+    let retry = dest
+        .cli_raw("restore", &f.profile.network, &file_args(&path))
+        .await?;
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let restored: Value = serde_json::from_slice(&retry.stdout)?;
+    assert_eq!(
+        restored["content_digest"],
+        description["verified"]["content_digest"]
+    );
+    assert_eq!(
+        restored["state_digest"],
+        description["verified"]["state_digest"]
+    );
+    let events = String::from_utf8(retry.stderr)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    for name in [
+        "restore_prepare",
+        "restore_preflight",
+        "restore_drop_indexes",
+        "restore_load_state",
+        "restore_indexes",
+        "restore_analyze",
+        "restore_sequences",
+        "restore_verify",
+        "restore_publish",
+        "restore_commit",
+    ] {
+        assert!(
+            events.iter().any(|v| v["event"] == "restore_stage_finished"
+                && v["stage"] == name
+                && v["elapsed_seconds"]
+                    .as_f64()
+                    .is_some_and(|n| n.is_finite() && n >= 0.0)),
+            "missing completed stage: {name}"
+        );
+    }
+    println!(
+        "{}",
+        json!({"restore_copy_server_failure":report,"server_message_detail_hint_and_context_omitted":true,"failed_gate_closed":true,"clean_retry_verified":true,"pipeline_stages_observed":10})
+    );
+    drop(client);
+    source.cleanup().await?;
+    dest.cleanup().await?;
+    Ok(())
+}
