@@ -2,7 +2,7 @@
   "source": "c447b8ef439f3dd7d502989c20ac91eb7a1f02fa",
   "mode": "qualify",
   "divisor": 1,
-  "scope": "REUSE retained generated snapshot/capture44640985891; no source reconversion; immutable63 and safe-diagnostics default30; owner600 only after measuredtimeout; source60/private600; not fullqualification",
+  "scope": "REUSE retained generated snapshot/capture44640985891; exacttestkind/profile+entrysmoke+CLIidentity beforePG; no source reconversion; immutable63 and safe-diagnostics default30; owner600 only after measuredtimeout; source60/private600; not fullqualification",
   "target": "restore",
   "predecessor": "63f3090be732ea590f22091b38ba4a11e6d1554c",
   "portable_bytes": 268435456,

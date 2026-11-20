@@ -14,6 +14,12 @@ use std::{
 use tokio::process::Command;
 use tokio_postgres::{Config, config::SslMode};
 type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+#[test]
+fn restore_dispatch_smoke() {
+    assert_eq!(env!("CARGO_PKG_NAME"), "db-sync-alt");
+    assert!(env!("CARGO_BIN_EXE_db-sync-alt").ends_with("/db-sync-alt"));
+    println!("restore_dispatch_smoke_entered_no_database");
+}
 fn directory() -> PathBuf {
     PathBuf::from(std::env::var("DSA_QUALIFICATION_OUT").unwrap())
 }
