@@ -1,12 +1,9 @@
 {
-  "source": "814f3e30650a0d09b7254bf6ff7f1672869006bb",
+  "source": "89793eba0287b0118cf28e022077038607596d0a",
   "mode": "qualify",
   "divisor": 1,
-  "scope": "ONE direct natural retained snapshot restore with ownerTCP600/privateSQL600; measured COPY and postCOPY diagnostic stages plus independentverify; no pause/source generation/conversion, not full qualification",
-  "target": "restore_stage",
-  "predecessor": "63f3090be732ea590f22091b38ba4a11e6d1554c",
+  "scope": "ONE archive-scale GENERATED whole CLI convert/same-snapshot capture/verify/snapshot/restore/native+wide qualification on minimal sharedK4nonnull remedy; source60/private600/overall7200; restoreONLYTCP600; no real archive timing/acceptance",
+  "target": "whole",
   "portable_bytes": 268435456,
-  "reuse_run": 44640985891,
-  "reuse_snapshot_sha256": "5b831a292adb8b7fbd5cbc2f3e064a9b0108cd919a2ea397795b688464a5e143",
-  "reuse_capture_sha256": "f6c644c7817a13cabb7adb448eca37cf0225f3e0acb4878cb59c3c2b6d915a2f"
+  "restore_tcp_user_timeout_seconds": 600
 }
