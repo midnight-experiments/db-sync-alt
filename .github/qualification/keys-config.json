@@ -4,5 +4,6 @@
   "divisor": 1,
   "target": "keys",
   "scope": "ONE contained generated whole-key predecessor/product comparison; max25koutputs/50kMA,75percentNULLhash,rarePC,old/new/new/old; no cold/source/conversion/archive timing claim",
-  "portable_bytes": 268435456
+  "portable_bytes": 268435456,
+  "harness_revision": "metadata SQL JSON constructor after preserved compile-only failure"
 }

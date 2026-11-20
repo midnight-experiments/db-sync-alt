@@ -118,7 +118,7 @@ async fn keys_inner() -> Result {
      CREATE TEMP TABLE small_spends AS SELECT *,CASE WHEN n<{old} THEN bh+200 ELSE bh+1 END sh,CASE WHEN n<{old} THEN 500+n/600 ELSE 500+(n-{old})/995 END si FROM small_coordinates WHERE n BETWEEN 5 AND 10004 OR(n>={old} AND n<{old}+{window_spends});
      INSERT INTO pg_temp.tx SELECT sh*4096+si,decode(md5('small-spend/'||(sh*4096+si)::text)||md5('small-spend2/'||(sh*4096+si)::text),'hex'),sh,si::integer,true FROM small_spends;
      INSERT INTO pg_temp.tx_in SELECT (sh*4096+si)*4096,sh*4096+si,txid,0 FROM small_spends;
-     INSERT INTO pg_temp.tx_metadata(id,key,json,tx_id)SELECT txid,6500973,'{{"bytes":"00"}}'::jsonb,txid FROM small_coordinates WHERE n={old}+5;
+     INSERT INTO pg_temp.tx_metadata(id,key,json,tx_id)SELECT txid,6500973,jsonb_build_object('bytes','00'),txid FROM small_coordinates WHERE n={old}+5;
      DELETE FROM pg_temp.epoch_stake;DELETE FROM pg_temp.pool_hash;DELETE FROM pg_temp.epoch_param;
      INSERT INTO pg_temp.epoch_param SELECT 600+i,decode(md5('small-epoch/'||i::text)||md5('small-epoch2/'||i::text),'hex'),16384 FROM generate_series(0,8)i;
      INSERT INTO pg_temp.pool_hash SELECT 1000+i,substring(decode(md5('small-pool/'||i::text)||md5('small-pool2/'||i::text),'hex')FROM 1 FOR 28)FROM generate_series(0,5)i;
