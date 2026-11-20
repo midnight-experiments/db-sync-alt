@@ -726,6 +726,135 @@ async fn verify_observations(
     Ok(counts)
 }
 
+// Experimental Q4 execution shapes; the shipped predicate remains unchanged
+// until private archived-data measurements select a remedy. The independent
+// pure model supplies both retained output IDs and expected datum IDs.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn keep_rule_q4_private_split_equivalence() -> Result {
+    use std::collections::BTreeSet;
+    let initial = Fixture::base(1);
+    let db = Database::new(&initial.profile).await?;
+    db.store
+        .client()
+        .batch_execute("CREATE TEMP TABLE q4_retained_outputs(id bigint PRIMARY KEY)")
+        .await?;
+    let mut cases = named_cases().into_values().collect::<Vec<_>>();
+    cases.extend((0..32).map(Fixture::generated));
+    let mut address_mutation = 0;
+    let mut unit_mutation = 0;
+    for fixture in &cases {
+        db.replace(fixture).await?;
+        let model = keep(&fixture.chain, &fixture.profile, fixture.bounds)?;
+        let outputs = model["tx_out"].iter().copied().collect::<Vec<_>>();
+        db.store
+            .client()
+            .batch_execute("TRUNCATE pg_temp.q4_retained_outputs")
+            .await?;
+        db.store
+            .client()
+            .execute(
+                "INSERT INTO pg_temp.q4_retained_outputs SELECT unnest($1::bigint[])",
+                &[&outputs],
+            )
+            .await?;
+        let selection = Selection::new(&fixture.profile, fixture.bounds)?;
+        let prefix = Selection::ctes_sql(SourceSchema::Serve);
+        let output_start = prefix.find("keep_tx_out AS MATERIALIZED (").unwrap();
+        let output_end = prefix.find("keep_block AS MATERIALIZED (").unwrap();
+        let split = format!(
+            "{}keep_tx_out AS MATERIALIZED (SELECT id FROM pg_temp.q4_retained_outputs),\n{}",
+            &prefix[..output_start],
+            &prefix[output_end..]
+        );
+        let datum_start = prefix.find("keep_datum AS MATERIALIZED (").unwrap();
+        let datum_end = prefix.find("keep_epoch_param AS MATERIALIZED (").unwrap();
+        let original = &prefix[datum_start..datum_end];
+        let nonnull = original.replace(
+            "WHERE o.id BETWEEN",
+            "WHERE o.data_hash IS NOT NULL AND o.id BETWEEN",
+        );
+        assert_ne!(nonnull, original);
+        let forward = r#"datum_output_candidates AS MATERIALIZED (
+ SELECT o.id,o.data_hash FROM (SELECT DISTINCT address FROM unnest($4::text[]) g(address)) g
+ JOIN serve.tx_out o ON o.address=g.address
+ WHERE o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND o.data_hash IS NOT NULL
+ UNION ALL
+ SELECT o.id,o.data_hash FROM serve.multi_asset m
+ JOIN serve.ma_tx_out a ON a.ident=m.id AND a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
+ JOIN serve.tx_out o ON o.id=a.tx_out_id AND o.id BETWEEN 0 AND $2::bigint*16777216+16777215
+ WHERE m.policy=$7::bytea AND m.name=$8::bytea AND o.data_hash IS NOT NULL
+),
+keep_datum AS MATERIALIZED (
+ SELECT DISTINCT d.id FROM datum_output_candidates o
+ JOIN keep_tx_out k ON k.id=o.id JOIN serve.datum d ON d.hash=o.data_hash
+),
+"#;
+        for (name, sql) in [
+            ("original", prefix.clone()),
+            ("split_indexed_outputs", split.clone()),
+            ("split_nonnull", split.replacen(original, &nonnull, 1)),
+            ("forward_eligibility", prefix.replacen(original, forward, 1)),
+        ] {
+            let ids = db
+                .store
+                .client()
+                .query(
+                    &(sql + " SELECT id FROM keep_datum ORDER BY id"),
+                    &selection.parameters(),
+                )
+                .await?
+                .iter()
+                .map(|row| row.get::<_, i64>(0))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(ids, model["datum"], "Q4 {name} seed{}", fixture.seed);
+        }
+        // Real sensitivity controls: removing an address reason or broadening
+        // exact permissioned-unit matching must change a generated datum set.
+        for (kind, mutant) in [
+            (
+                "address",
+                original.replace("o.address=ANY($4::text[])", "FALSE"),
+            ),
+            (
+                "unit",
+                original.replace(
+                    "m.policy=$7::bytea AND m.name=$8::bytea",
+                    "m.policy=$7::bytea",
+                ),
+            ),
+        ] {
+            let sql =
+                prefix.replacen(original, &mutant, 1) + " SELECT id FROM keep_datum ORDER BY id";
+            let ids = db
+                .store
+                .client()
+                .query(&sql, &selection.parameters())
+                .await?
+                .iter()
+                .map(|row| row.get::<_, i64>(0))
+                .collect::<BTreeSet<_>>();
+            if ids != model["datum"] {
+                if kind == "address" {
+                    address_mutation += 1;
+                } else {
+                    unit_mutation += 1;
+                }
+            }
+        }
+    }
+    assert!(address_mutation > 0, "address mutation was not detected");
+    assert!(
+        unit_mutation > 0,
+        "wrong-name permissioned mutation was not detected"
+    );
+    println!(
+        "{}",
+        json!({"q4_execution_shape_cases":cases.len(),"variants":4,"address_negative_cases":address_mutation,"unit_negative_cases":unit_mutation,"semantic_source":"unchanged A3 pure model","product_keep_changed":false})
+    );
+    db.cleanup().await
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_ten_thousand_chains() -> Result {
