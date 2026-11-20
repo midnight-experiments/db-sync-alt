@@ -66,20 +66,22 @@ async fn exec(
         &json!({"name":label,"started_unix":at}),
     )?;
     let dsn = format!("{}{}", db.dsn(false), suffix);
-    let status = Command::new(binary)
-        .args([
-            verb,
-            "--database",
-            &dsn,
-            "--network",
-            "mainnet",
-            "--statement-timeout-seconds",
-            "600",
-            "--idle-transaction-timeout-seconds",
-            "7200",
-            "--overall-timeout-seconds",
-            "7200",
-        ])
+    let mut command = Command::new(binary);
+    command.args([
+        verb,
+        "--database",
+        &dsn,
+        "--network",
+        "mainnet",
+        "--statement-timeout-seconds",
+        "600",
+        "--idle-transaction-timeout-seconds",
+        "7200",
+    ]);
+    if verb == "convert" {
+        command.args(["--overall-timeout-seconds", "7200"]);
+    }
+    let status = command
         .args(args)
         .stdout(Stdio::from(std::fs::File::create(
             directory().join(format!("{label}.stdout")),
@@ -267,63 +269,87 @@ async fn restore_focus_inner() -> Result {
     let capture = directory().join("source.capture.json");
     let h = horizon.to_string();
     let src = source.dsn(true);
-    let (ok, converted_value) = exec(
-        &predecessor,
-        &converted,
-        "mini-convert",
-        "convert",
-        "",
-        &[
-            "--source",
-            &src,
-            "--source-statement-timeout-seconds",
-            "60",
-            "--source-idle-transaction-timeout-seconds",
-            "60",
-            "--horizon-block",
-            &h,
-            "--snapshot",
-            snapshot.to_str().unwrap(),
-            "--capture-source",
-            capture.to_str().unwrap(),
-        ],
-    )
-    .await?;
-    assert!(ok, "normal predecessor fixtureconversion failed");
-    save("mini-conversion.json", &converted_value)?;
-    let (ok, verified) = exec(&predecessor, &converted, "mini-verify", "verify", "", &[]).await?;
-    assert!(ok);
-    assert_eq!(
-        verified["content_digest"],
-        converted_value["verified"]["content_digest"]
-    );
+    let reuse = std::env::var("DSA_RESTORE_REUSE").is_ok();
+    let (a, b, verified) = if reuse {
+        let prior_fixture: Value =
+            serde_json::from_slice(&std::fs::read(directory().join("reused-fixture.json"))?)?;
+        let new_fixture: Value =
+            serde_json::from_slice(&std::fs::read(directory().join("restore-fixture.json"))?)?;
+        assert_eq!(prior_fixture["source_counts"], new_fixture["source_counts"]);
+        for key in ["H", "T", "P"] {
+            assert_eq!(prior_fixture[key], new_fixture[key]);
+        }
+        let value: Value = serde_json::from_slice(&std::fs::read(
+            directory().join("reused-mini-conversion.json"),
+        )?)?;
+        save(
+            "mini-converted-parity.json",
+            &json!({"skipped":"original converted database was not retained; retained normal snapshot reused, no source reconversion"}),
+        )?;
+        (Value::Null, Value::Null, value["verified"].clone())
+    } else {
+        let (ok, converted_value) = exec(
+            &predecessor,
+            &converted,
+            "mini-convert",
+            "convert",
+            "",
+            &[
+                "--source",
+                &src,
+                "--source-statement-timeout-seconds",
+                "60",
+                "--source-idle-transaction-timeout-seconds",
+                "60",
+                "--horizon-block",
+                &h,
+                "--snapshot",
+                snapshot.to_str().unwrap(),
+                "--capture-source",
+                capture.to_str().unwrap(),
+            ],
+        )
+        .await?;
+        assert!(ok, "normal predecessor fixtureconversion failed");
+        save("mini-conversion.json", &converted_value)?;
+        let (ok, verified) =
+            exec(&predecessor, &converted, "mini-verify", "verify", "", &[]).await?;
+        assert!(ok);
+        assert_eq!(
+            verified["content_digest"],
+            converted_value["verified"]["content_digest"]
+        );
+        let file: Value = serde_json::from_slice(&std::fs::read(&capture)?)?;
+        save("mini-positions.json", &file["capture"]["positions"])?;
+        converted
+            .cli("grant-reader", "mainnet", &["--role", &converted.reader])
+            .await?;
+        let a = compare(
+            &predecessor,
+            &source,
+            &converted,
+            &capture,
+            "mini-converted-native",
+            false,
+        )
+        .await?;
+        let b = compare(
+            &predecessor,
+            &source,
+            &converted,
+            &capture,
+            "mini-converted-frozen-wide",
+            true,
+        )
+        .await?;
+        save(
+            "mini-converted-parity.json",
+            &json!({"native":a,"frozen_source_wide":b}),
+        )?;
+        (json!(a), json!(b), verified)
+    };
     let file: Value = serde_json::from_slice(&std::fs::read(&capture)?)?;
     save("mini-positions.json", &file["capture"]["positions"])?;
-    converted
-        .cli("grant-reader", "mainnet", &["--role", &converted.reader])
-        .await?;
-    let a = compare(
-        &predecessor,
-        &source,
-        &converted,
-        &capture,
-        "mini-converted-native",
-        false,
-    )
-    .await?;
-    let b = compare(
-        &predecessor,
-        &source,
-        &converted,
-        &capture,
-        "mini-converted-frozen-wide",
-        true,
-    )
-    .await?;
-    save(
-        "mini-converted-parity.json",
-        &json!({"native":a,"frozen_source_wide":b}),
-    )?;
     let mut variants = Vec::new();
     let mut timeout_supported = false;
     for (label, binary, suffix) in [
@@ -380,6 +406,24 @@ async fn restore_focus_inner() -> Result {
         if ok {
             assert_eq!(value["content_digest"], verified["content_digest"]);
             assert_eq!(value["state_digest"], verified["state_digest"]);
+            let (checked, independently_verified) = exec(
+                binary,
+                &dest,
+                &format!("{label}-verify"),
+                "verify",
+                suffix,
+                &[],
+            )
+            .await?;
+            assert!(checked);
+            assert_eq!(
+                independently_verified["content_digest"],
+                verified["content_digest"]
+            );
+            assert_eq!(
+                independently_verified["state_digest"],
+                verified["state_digest"]
+            );
             dest.cli("grant-reader", "mainnet", &["--role", &dest.reader])
                 .await?;
             let n = compare(
@@ -426,7 +470,7 @@ async fn restore_focus_inner() -> Result {
     }
     save(
         "restore-trial-result.json",
-        &json!({"status":"EXPERIMENT_COMPLETED_NOT_FULL_QUALIFICATION","converted_parity":{"native":a,"wide":b},"variants":variants,"snapshot_bytes":std::fs::metadata(&snapshot)?.len(),"capture_bytes":std::fs::metadata(&capture)?.len(),"snapshot_producer":"immutable63normalCLI","all_data_generated":true,"source_after_counts_not_re_read":true}),
+        &json!({"status":"EXPERIMENT_COMPLETED_NOT_FULL_QUALIFICATION","converted_parity":{"native":a,"wide":b},"reused_portable_snapshot":reuse,"variants":variants,"snapshot_bytes":std::fs::metadata(&snapshot)?.len(),"capture_bytes":std::fs::metadata(&capture)?.len(),"snapshot_producer":"immutable63normalCLI","all_data_generated":true,"source_after_counts_not_re_read":true}),
     )?;
     source.cleanup().await?;
     converted.cleanup().await?;

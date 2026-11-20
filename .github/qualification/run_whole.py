@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import struct
 import time
 import threading
 from pathlib import Path
@@ -184,6 +185,28 @@ try:
   old_build=['docker','run','--rm','--name',PREFIX+'-predecessor-build','-e','CARGO_TARGET_DIR=/work/target-old','-e','CARGO_PROFILE_RELEASE_DEBUG=0','--mount',f'type=bind,src={ROOT}/predecessor,dst=/work/predecessor,readonly','--mount',f'type=bind,src={old_target},dst=/work/target-old','-w','/work/predecessor',RUST,'cargo','build','--locked','--release','-p','db-sync-alt','--bin','db-sync-alt']
   with (OUT/'predecessor-build.stdout').open('w') as stdout,(OUT/'predecessor-build.stderr').open('w') as stderr:call(old_build,stdout=stdout,stderr=stderr)
   save('predecessor.json',{'source_head':CONFIG['predecessor'],'tracked_diff':output(['git','-C',str(ROOT/'predecessor'),'diff','--name-only']),'cli_sha256':hashlib.sha256((old_target/'release/db-sync-alt').read_bytes()).hexdigest()})
+  # Exact per-subcommand executable help is checked before any database work.
+  for variant,tree,binary in [('diagnostic',target,'/work/target/release/db-sync-alt'),('predecessor',old_target,'/work/target/release/db-sync-alt')]:
+   for verb in ['convert','verify','restore','compare','grant-reader']:
+    helptext=output(['docker','run','--rm','--mount',f'type=bind,src={tree},dst=/work/target,readonly',RUST,binary,verb,'--help']);(OUT/(variant+'-'+verb+'-help.txt')).write_text(helptext)
+    required=['--statement-timeout-seconds','--idle-transaction-timeout-seconds']
+    if verb in ['convert','compare']:required+=['--overall-timeout-seconds']
+    if verb=='restore':required+=['--file']
+    if verb=='compare':required+=['--a-capture','--a','--b','--positions','--verify-unbounded']
+    assert all(flag in helptext for flag in required),(variant,verb,required)
+  save('cli-preflight.json',{'exact_executables_checked':True,'all_subcommands':['convert','verify','restore','compare','grant-reader'],'overall_flag_only_convert_compare':True})
+  if CONFIG.get('reuse_run'):
+   reused=ROOT/'reuse';manifest=json.loads((reused/'SHA256SUMS.json').read_text())
+   for name,digest in manifest.items():
+    assert Path(name).name==name and hashlib.sha256((reused/name).read_bytes()).hexdigest()==digest,name
+   prior=json.loads((reused/'source.json').read_text());assert prior['product_head']==PIN and prior['wrapper_head']=='8a86a8e61310e897e6b21f5479af06d3d4312958'
+   for name,key in [('representative.snapshot','reuse_snapshot_sha256'),('source.capture.json','reuse_capture_sha256')]:
+    assert hashlib.sha256((reused/name).read_bytes()).hexdigest()==CONFIG[key];shutil.copyfile(reused/name,OUT/name)
+   for name,new in [('mini-conversion.json','reused-mini-conversion.json'),('restore-fixture.json','reused-fixture.json')]:shutil.copyfile(reused/name,OUT/new)
+   raw=(OUT/'representative.snapshot').read_bytes();assert raw[:8]==b'DSASNAP\0';format_number,description_bytes=struct.unpack('>IQ',raw[8:20]);body=raw[52:52+description_bytes];assert format_number==1 and hashlib.sha256(body).digest()==raw[20:52];description=json.loads(body);position=52+description_bytes
+   for section in description['sections']:
+    data=raw[position:position+section['compressed_bytes']];assert len(data)==section['compressed_bytes'] and hashlib.sha256(data).hexdigest()==section['sha256'];position+=len(data)
+   assert position==len(raw);save('reused-snapshot-description.json',description);save('reuse-origin.json',{'run':CONFIG['reuse_run'],'original_wrapper':prior['wrapper_head'],'original_product':prior['product_head'],'verified_manifest_files':len(manifest),'snapshot_sha256':CONFIG['reuse_snapshot_sha256'],'capture_sha256':CONFIG['reuse_capture_sha256'],'compressed_sections_checked':True,'plain_bytes_not_decoded_by_host':True,'no_source_reconversion':True})
  docker('network','create',NETWORK)
  for role in ['source','destination','restored']:
   volume=VOLUMES[role];docker('volume','create',volume)
@@ -193,7 +216,9 @@ try:
  # source write cap is positively installed after generated setup/checkpoint.
  admission={} if FOCUS else {role:probe(NAMES[role],4*1048576,2*1048576) for role in ['destination','restored']};save('destination-io-admission.json',admission)
  worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,binary,'--ignored','--exact',({'index':'private_index_focus','selection':'selection_focus','restore':'restore_focus'}.get(TARGET,'whole_conversion_qualification')),'--nocapture']
- if TARGET=='restore':worker[worker.index(RUST):worker.index(RUST)]=['--mount',f'type=bind,src={old_target},dst=/work/target-old,readonly','-e','DSA_PREDECESSOR_CLI=/work/target-old/release/db-sync-alt']
+ if TARGET=='restore':
+  worker[worker.index(RUST):worker.index(RUST)]=['--mount',f'type=bind,src={old_target},dst=/work/target-old,readonly','-e','DSA_PREDECESSOR_CLI=/work/target-old/release/db-sync-alt']
+  if CONFIG.get('reuse_run'):worker[worker.index(RUST):worker.index(RUST)]=['-e','DSA_RESTORE_REUSE=1']
  IDS[NAMES['worker']]=output(worker).strip();thread=threading.Thread(target=monitor,daemon=True);thread.start();admitted=False;reset_nonce=None;trace_nonce=None
  while inspect(NAMES['worker'])['State']['Running']:
   if not admitted and (OUT/'fixture-ready.json').exists():

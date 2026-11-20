@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
   qualification:
     runs-on: ubuntu-24.04
@@ -19,7 +20,7 @@ jobs:
           python3 - <<'PY'
           import json,os,re
           config=json.load(open('.github/qualification/config.json'));assert re.fullmatch('[0-9a-f]{40}',config['source'])
-          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('source='+config['source']+'\npredecessor='+config.get('predecessor','')+'\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('source='+config['source']+'\npredecessor='+config.get('predecessor','')+'\nreuse='+str(config.get('reuse_run',''))+'\n')
           PY
       - uses: actions/checkout@v4
         with:
@@ -32,6 +33,13 @@ jobs:
           ref: ${{steps.pin.outputs.predecessor}}
           path: predecessor
           persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: steps.pin.outputs.reuse != ''
+        with:
+          name: a7-whole-generated-${{steps.pin.outputs.reuse}}
+          run-id: ${{steps.pin.outputs.reuse}}
+          github-token: ${{github.token}}
+          path: reuse
       - name: Generated whole conversion and verified physical backpressure
         run: python3 .github/qualification/run_whole.py
       - uses: actions/upload-artifact@v4

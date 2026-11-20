@@ -2,8 +2,11 @@
   "source": "c447b8ef439f3dd7d502989c20ac91eb7a1f02fa",
   "mode": "qualify",
   "divisor": 1,
-  "scope": "representative selected-size normal snapshot; immutable63 and safe-diagnostics default30; owner600 control only after measuredtimeout; source60/private600; not fullqualification",
+  "scope": "REUSE retained generated snapshot/capture44640985891; no source reconversion; immutable63 and safe-diagnostics default30; owner600 only after measuredtimeout; source60/private600; not fullqualification",
   "target": "restore",
   "predecessor": "63f3090be732ea590f22091b38ba4a11e6d1554c",
-  "portable_bytes": 268435456
+  "portable_bytes": 268435456,
+  "reuse_run": 44640985891,
+  "reuse_snapshot_sha256": "5b831a292adb8b7fbd5cbc2f3e064a9b0108cd919a2ea397795b688464a5e143",
+  "reuse_capture_sha256": "f6c644c7817a13cabb7adb448eca37cf0225f3e0acb4878cb59c3c2b6d915a2f"
 }
