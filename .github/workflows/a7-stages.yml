@@ -1,0 +1,31 @@
+name: a7-stages-generated
+on:
+  push:
+    branches: ['validation/a7-whole-conversion']
+    paths: ['.github/qualification/stages-config.json']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  stages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: d038f5e8bf52d90c66e601e2496d4945b9528215
+          path: product
+          persist-credentials: false
+      - name: Focused destination-only product stage qualification
+        env:
+          DSA_QUALIFICATION_CONFIG: .github/qualification/stages-config.json
+        run: python3 .github/qualification/run_whole.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a7-stages-generated-${{github.run_id}}
+          path: ${{runner.temp}}/whole-evidence
+          retention-days: 5
