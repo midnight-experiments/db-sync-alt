@@ -759,7 +759,7 @@ async fn keep_rule_q4_private_split_equivalence() -> Result {
             )
             .await?;
         let selection = Selection::new(&fixture.profile, fixture.bounds)?;
-        let prefix = Selection::ctes_sql(SourceSchema::Serve);
+        let prefix = Selection::ctes_sql(SourceSchema::Serve).replacen("WITH\n", "WITH q4_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,$3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,$6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,$9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names),\n", 1);
         let output_start = prefix.find("keep_tx_out AS MATERIALIZED (").unwrap();
         let output_end = prefix.find("keep_block AS MATERIALIZED (").unwrap();
         let split = format!(
