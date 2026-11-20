@@ -42,11 +42,97 @@ pub struct Selection {
     fixed_names: Vec<Vec<u8>>,
 }
 
+/// Destination-only checkpoint derived from the same retention CTEs. Source
+/// facts are immutable private tables in one writer transaction. Each step is
+/// evaluated once, then indexed/analyzed before its consumers are planned.
+#[derive(Debug)]
+pub struct KeyStage {
+    pub table: &'static str,
+    pub create_sql: String,
+    pub prepare_sql: String,
+}
+
 fn bytes(value: &str) -> Result<Vec<u8>, Error> {
     hex::decode(value).map_err(|_| Error::Refusal("invalid_keep_profile"))
 }
 
 impl Selection {
+    pub fn staging_plan() -> Result<Vec<KeyStage>, Error> {
+        let mut full = crate::canonical::staging_keys_sql();
+        let mut stages = Vec::new();
+        // Preserve multiplicity for permissioned candidates and epoch headers:
+        // empty epochs can select the same historical header twice. The final
+        // original UNION, rather than a new uniqueness constraint, deduplicates.
+        for (cte, next, table, index, unique) in [
+            (
+                "old_unspent",
+                "governance_candidates",
+                "conversion_keys_unspent",
+                "id",
+                true,
+            ),
+            (
+                "permissioned_candidates",
+                "permissioned_last_transaction",
+                "conversion_keys_permissioned",
+                "tx_id",
+                false,
+            ),
+            (
+                "epoch_headers",
+                "fallback_candidates",
+                "conversion_keys_epochs",
+                "id",
+                false,
+            ),
+            (
+                "keep_tx_out",
+                "keep_block",
+                "conversion_keys_outputs",
+                "id",
+                true,
+            ),
+            (
+                "keep_ma_tx_out",
+                "keep_multi_asset",
+                "conversion_keys_assets",
+                "id",
+                true,
+            ),
+        ] {
+            let prefix = full
+                .split_once(" SELECT 'block'::text AS family,id FROM keep_block")
+                .and_then(|(prefix, _)| {
+                    prefix.strip_prefix("CREATE TEMP TABLE conversion_keep_keys ON COMMIT DROP AS ")
+                })
+                .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+            stages.push(KeyStage {
+                table,
+                create_sql: format!("CREATE TEMP TABLE {table} ON COMMIT DROP AS {prefix} SELECT * FROM {cte}"),
+                prepare_sql: format!("CREATE {}INDEX {table}_lookup ON pg_temp.{table}({index});ANALYZE pg_temp.{table}", if unique {"UNIQUE "} else {""}),
+            });
+            let start = full
+                .find(&format!("{cte} AS MATERIALIZED ("))
+                .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+            let end = full
+                .find(&format!("{next} AS MATERIALIZED ("))
+                .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+            if start >= end {
+                return Err(Error::Refusal("invalid_staging_keep_definition"));
+            }
+            full.replace_range(
+                start..end,
+                &format!("{cte} AS MATERIALIZED (SELECT * FROM pg_temp.{table}),\n"),
+            );
+        }
+        stages.push(KeyStage {
+            table: "conversion_keep_keys",
+            create_sql: full,
+            prepare_sql: "ALTER TABLE pg_temp.conversion_keep_keys ADD PRIMARY KEY(family,id);ANALYZE pg_temp.conversion_keep_keys".to_owned(),
+        });
+        Ok(stages)
+    }
+
     pub fn new(profile: &Profile, bounds: Bounds) -> Result<Self, Error> {
         bounds.validate_profile(profile).map_err(|error| {
             Error::Refusal(match error {

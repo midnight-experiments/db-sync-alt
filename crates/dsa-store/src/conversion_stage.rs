@@ -403,17 +403,39 @@ pub(crate) async fn select(
         "{}",
         json!({"event":"conversion_local_selection_started","source_reads_required":false,"temporary_relation_bytes":raw.temporary_bytes})
     );
-    destination
-        .execute(&canonical::staging_keys_sql(), &selection.parameters())
-        .await?;
-    destination.batch_execute("ALTER TABLE pg_temp.conversion_keep_keys ADD PRIMARY KEY(family,id);ANALYZE pg_temp.conversion_keep_keys").await?;
-    let temporary_bytes: i64 = destination
-        .query_one(
-            "SELECT pg_total_relation_size('pg_temp.conversion_keep_keys')",
-            &[],
-        )
-        .await?
-        .get(0);
+    let plan = Selection::staging_plan()?;
+    let mut temporary_bytes = 0_i64;
+    for stage in &plan {
+        let began = Instant::now();
+        eprintln!(
+            "{}",
+            json!({"event":"conversion_key_stage_started","stage":stage.table})
+        );
+        let rows = destination
+            .execute(&stage.create_sql, &selection.parameters())
+            .await?;
+        let selected_seconds = began.elapsed().as_secs_f64();
+        destination.batch_execute(&stage.prepare_sql).await?;
+        let bytes: i64 = destination
+            .query_one(
+                "SELECT pg_total_relation_size($1::text::regclass)",
+                &[&format!("pg_temp.{}", stage.table)],
+            )
+            .await?
+            .get(0);
+        temporary_bytes += bytes;
+        eprintln!(
+            "{}",
+            json!({"event":"conversion_key_stage_finished","stage":stage.table,"rows":rows,"select_seconds":selected_seconds,"elapsed_seconds":began.elapsed().as_secs_f64(),"relation_bytes":bytes,"sql_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(stage.create_sql.as_bytes()))})
+        );
+    }
+    // All consumers now use final keys; release intermediate disk/cache before
+    // canonical payload streams. ON COMMIT DROP also covers rollback/retry.
+    for stage in plan.iter().take(plan.len() - 1) {
+        destination
+            .batch_execute(&format!("DROP TABLE pg_temp.{}", stage.table))
+            .await?;
+    }
     let mut families = BTreeMap::new();
     let mut costs = BTreeMap::new();
     let mut markers = FamilyHasher::new(MARKERS);

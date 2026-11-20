@@ -726,6 +726,79 @@ async fn verify_observations(
     Ok(counts)
 }
 
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn keep_rule_indexed_stages_match_independent_model() -> Result {
+    let initial = Fixture::base(1);
+    let db = Database::new(&initial.profile).await?;
+    let mut cases = named_cases().into_values().collect::<Vec<_>>();
+    cases.extend((0..32).map(Fixture::generated));
+    let mut empty_epochs = Fixture::base(17);
+    for (height, block) in &mut empty_epochs.chain.blocks {
+        if *height < i64::from(empty_epochs.bounds.horizon) {
+            block.epoch = Some(0);
+        }
+    }
+    cases.push(empty_epochs);
+    let mut duplicate_epoch_cases = 0;
+    for fixture in &cases {
+        let (_, full_ids) = db.replace(fixture).await?;
+        let model = keep(&fixture.chain, &fixture.profile, fixture.bounds)?;
+        assert_eq!(full_ids, model);
+        let selection = Selection::new(&fixture.profile, fixture.bounds)?;
+        db.store.client().batch_execute("BEGIN").await?;
+        for table in TABLES {
+            db.store.client().batch_execute(&format!("CREATE TEMP TABLE {table}(LIKE serve.{table} INCLUDING ALL) ON COMMIT DROP;INSERT INTO pg_temp.{table} SELECT * FROM serve.{table}")).await?;
+        }
+        let plan = Selection::staging_plan()?;
+        assert_eq!(plan.len(), 6);
+        for stage in &plan {
+            db.store
+                .client()
+                .execute(&stage.create_sql, &selection.parameters())
+                .await?;
+            db.store.client().batch_execute(&stage.prepare_sql).await?;
+        }
+        let epoch_counts = db
+            .store
+            .client()
+            .query_one(
+                "SELECT count(*),count(DISTINCT id) FROM pg_temp.conversion_keys_epochs",
+                &[],
+            )
+            .await?;
+        duplicate_epoch_cases +=
+            u64::from(epoch_counts.get::<_, i64>(0) > epoch_counts.get::<_, i64>(1));
+        let mut staged = TABLES
+            .iter()
+            .map(|table| (table.to_string(), std::collections::BTreeSet::new()))
+            .collect::<RetainedRows>();
+        for row in db
+            .store
+            .client()
+            .query(
+                "SELECT family,id FROM pg_temp.conversion_keep_keys ORDER BY family,id",
+                &[],
+            )
+            .await?
+        {
+            staged
+                .get_mut(row.get::<_, &str>(0))
+                .unwrap()
+                .insert(row.get(1));
+        }
+        assert_eq!(staged, model, "indexed stages seed{}", fixture.seed);
+        db.store.client().batch_execute("ROLLBACK").await?;
+        assert!(db.store.client().query_one("SELECT to_regclass('pg_temp.conversion_keys_unspent') IS NULL AND to_regclass('pg_temp.conversion_keep_keys') IS NULL", &[]).await?.get::<_,bool>(0));
+    }
+    assert!(duplicate_epoch_cases > 0);
+    println!(
+        "{}",
+        json!({"indexed_stage_cases":cases.len(),"stages":6,"family_comparisons":cases.len()*TABLES.len(),"duplicate_epoch_cases":duplicate_epoch_cases,"oracle":"independent pure model and original all11 CTEs","rollback_cleanup_verified":true})
+    );
+    db.cleanup().await
+}
+
 // Keep the measured non-NULL optimization equivalent to its predecessor and
 // the independent pure model, including all eleven families and real mutants.
 #[tokio::test]
