@@ -1,9 +1,9 @@
 {
-  "source": "c447b8ef439f3dd7d502989c20ac91eb7a1f02fa",
+  "source": "814f3e30650a0d09b7254bf6ff7f1672869006bb",
   "mode": "qualify",
   "divisor": 1,
-  "scope": "DIRECT paired retained-snapshot private COPY backend control: defaultTCP30 vs explicit owner600, confirmed zero-window+pending queue45s, independent finite CONT watchdog; no source population/conversion; mechanism only, not original cause",
-  "target": "control",
+  "scope": "ONE direct natural retained snapshot restore with ownerTCP600/privateSQL600; measured COPY and postCOPY diagnostic stages plus independentverify; no pause/source generation/conversion, not full qualification",
+  "target": "restore_stage",
   "predecessor": "63f3090be732ea590f22091b38ba4a11e6d1554c",
   "portable_bytes": 268435456,
   "reuse_run": 44640985891,
