@@ -726,9 +726,8 @@ async fn verify_observations(
     Ok(counts)
 }
 
-// Experimental Q4 execution shapes; the shipped predicate remains unchanged
-// until private archived-data measurements select a remedy. The independent
-// pure model supplies both retained output IDs and expected datum IDs.
+// Keep the measured non-NULL optimization equivalent to its predecessor and
+// the independent pure model, including all eleven families and real mutants.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_q4_private_split_equivalence() -> Result {
@@ -744,8 +743,10 @@ async fn keep_rule_q4_private_split_equivalence() -> Result {
     let mut address_mutation = 0;
     let mut unit_mutation = 0;
     for fixture in &cases {
-        db.replace(fixture).await?;
+        let (product_rows, product_ids) = db.replace(fixture).await?;
         let model = keep(&fixture.chain, &fixture.profile, fixture.bounds)?;
+        assert_eq!(product_ids, model, "product seed{}", fixture.seed);
+        assert_eq!(product_rows, selected(&fixture.rows(), &model));
         let outputs = model["tx_out"].iter().copied().collect::<Vec<_>>();
         db.store
             .client()
@@ -769,12 +770,37 @@ async fn keep_rule_q4_private_split_equivalence() -> Result {
         );
         let datum_start = prefix.find("keep_datum AS MATERIALIZED (").unwrap();
         let datum_end = prefix.find("keep_epoch_param AS MATERIALIZED (").unwrap();
-        let original = &prefix[datum_start..datum_end];
-        let nonnull = original.replace(
-            "WHERE o.id BETWEEN",
+        let nonnull = &prefix[datum_start..datum_end];
+        let original = nonnull.replace(
             "WHERE o.data_hash IS NOT NULL AND o.id BETWEEN",
+            "WHERE o.id BETWEEN",
         );
         assert_ne!(nonnull, original);
+        let predecessor = prefix.replacen(nonnull, &original, 1);
+        let all_families = TABLES
+            .iter()
+            .map(|table| format!("SELECT '{table}'::text AS family,id FROM keep_{table}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let mut predecessor_ids = TABLES
+            .iter()
+            .map(|table| (table.to_string(), BTreeSet::new()))
+            .collect::<RetainedRows>();
+        for row in db
+            .store
+            .client()
+            .query(
+                &format!("{predecessor} {all_families} ORDER BY family,id"),
+                &selection.parameters(),
+            )
+            .await?
+        {
+            predecessor_ids
+                .get_mut(row.get::<_, &str>(0))
+                .unwrap()
+                .insert(row.get(1));
+        }
+        assert_eq!(predecessor_ids, model, "predecessor seed{}", fixture.seed);
         let forward = r#"datum_output_candidates AS MATERIALIZED (
  SELECT o.id,o.data_hash FROM (SELECT DISTINCT address FROM unnest($4::text[]) g(address)) g
  JOIN serve.tx_out o ON o.address=g.address
@@ -791,10 +817,14 @@ keep_datum AS MATERIALIZED (
 ),
 "#;
         for (name, sql) in [
-            ("original", prefix.clone()),
-            ("split_indexed_outputs", split.clone()),
-            ("split_nonnull", split.replacen(original, &nonnull, 1)),
-            ("forward_eligibility", prefix.replacen(original, forward, 1)),
+            ("predecessor", predecessor),
+            ("normal_product", prefix.clone()),
+            (
+                "split_indexed_outputs",
+                split.replacen(nonnull, &original, 1),
+            ),
+            ("split_nonnull", split.clone()),
+            ("forward_eligibility", prefix.replacen(nonnull, forward, 1)),
         ] {
             let ids = db
                 .store
@@ -814,18 +844,18 @@ keep_datum AS MATERIALIZED (
         for (kind, mutant) in [
             (
                 "address",
-                original.replace("o.address=ANY($4::text[])", "FALSE"),
+                nonnull.replace("o.address=ANY($4::text[])", "FALSE"),
             ),
             (
                 "unit",
-                original.replace(
+                nonnull.replace(
                     "m.policy=$7::bytea AND m.name=$8::bytea",
                     "m.policy=$7::bytea",
                 ),
             ),
         ] {
             let sql =
-                prefix.replacen(original, &mutant, 1) + " SELECT id FROM keep_datum ORDER BY id";
+                prefix.replacen(nonnull, &mutant, 1) + " SELECT id FROM keep_datum ORDER BY id";
             let ids = db
                 .store
                 .client()
@@ -850,7 +880,7 @@ keep_datum AS MATERIALIZED (
     );
     println!(
         "{}",
-        json!({"q4_execution_shape_cases":cases.len(),"variants":4,"address_negative_cases":address_mutation,"unit_negative_cases":unit_mutation,"semantic_source":"unchanged A3 pure model","product_keep_changed":false})
+        json!({"q4_execution_shape_cases":cases.len(),"variants":5,"full_family_comparisons":cases.len()*TABLES.len(),"address_negative_cases":address_mutation,"unit_negative_cases":unit_mutation,"semantic_source":"unchanged A3 pure model","product_optimization":"explicit nonNULL datum hash; predecessor all11 exact","keep_rule_version_changed":false})
     );
     db.cleanup().await
 }

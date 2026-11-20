@@ -104,7 +104,9 @@ keep_multi_asset AS MATERIALIZED (
 keep_datum AS MATERIALIZED (
  SELECT DISTINCT d.id FROM __SOURCE__.tx_out o JOIN keep_tx_out k ON k.id=o.id
  JOIN __SOURCE__.datum d ON d.hash=o.data_hash
- WHERE o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND (o.address=ANY($4::text[]) OR EXISTS(
+ -- The datum equality join already excludes NULL hashes. Make that filter
+ -- explicit before the correlated permissioned-unit eligibility probe.
+ WHERE o.data_hash IS NOT NULL AND o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND (o.address=ANY($4::text[]) OR EXISTS(
   SELECT 1 FROM __SOURCE__.ma_tx_out a JOIN __SOURCE__.multi_asset m ON m.id=a.ident
   WHERE a.tx_out_id=o.id AND a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
   AND (m.policy=$7::bytea AND m.name=$8::bytea)))
