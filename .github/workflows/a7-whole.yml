@@ -9,6 +9,11 @@ on:
         description: 'Reviewed full product SHA for the authorized retained-generated restore-only pair'
         required: true
         type: string
+      restore_pair_mode:
+        description: 'Product comparison or explicitly authorized same-c384 owner work_mem control'
+        type: choice
+        options: [product_pair, owner_work_mem_pair]
+        default: product_pair
 permissions:
   contents: read
   actions: read
@@ -23,6 +28,7 @@ jobs:
       - id: pin
         env:
           RESTORE_PAIR_CANDIDATE: ${{ inputs.restore_pair_candidate }}
+          RESTORE_PAIR_MODE: ${{ inputs.restore_pair_mode }}
         run: |
           python3 - <<'PY'
           import json,os,re,sys
@@ -31,7 +37,7 @@ jobs:
             candidate=os.environ['RESTORE_PAIR_CANDIDATE'];assert re.fullmatch('[0-9a-f]{40}',candidate)
             sys.path.insert(0,'.github/qualification')
             from restore_pair import configuration
-            config=configuration(candidate)
+            config=configuration(candidate,os.environ['RESTORE_PAIR_MODE'] or 'product_pair')
             path='.github/qualification/restore-pair-run.json'
             with open(path,'w') as f:json.dump(config,f,indent=2)
           else:config=json.load(open(path))

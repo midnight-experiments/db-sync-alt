@@ -6,6 +6,14 @@ qualification. The existing push-on-`config.json` full conversion path is unchan
 Wait for the A executor's exact reviewed candidate and green normal CI, and the
 coordinator's dispatch instruction. No candidate has been selected here.
 
+The separately authorized `owner_work_mem_pair` mode keeps both executables at
+the same c384 predecessor (supply that SHA as the candidate input). Fresh targets
+receive an explicit owner-only4MiB versus128MiB work_mem setting. The owner reads
+back exact GUCs before each restore; all other settings, physical limits and input
+bytes stay equal. This is a controlled diagnostic setting variant, not a product
+patch or default/cap change. It is still not dispatched. The actual source-free
+ABBA verification study is a separate operator-owned experiment.
+
 The predecessor is c384207b9bffaffb7995d26a815bdfb333b97555. Both executables
 are built from clean exact public checkouts in the pinned Rust image, identified
 by SHA-256, and their actual version/restore/verify/status help is checked before
@@ -30,6 +38,11 @@ parallel workers0, `wal_level=minimal`, `max_wal_senders=0`, `archive_mode=off`,
 fsync/synchronous_commit/full_page_writes on. Default `wal_skip_threshold`,
 checkpoint and memory GUCs are read back; none is tuned between variants.
 The former hosted128MiB shared buffer/30s checkpoint override is not used.
+In product-pair mode work_mem stays4MiB; only the explicitly selected setting-pair
+mode uses an owner128MiB override. Work_mem is allocated per executor operation,
+and hash_mem_multiplier and multiple operators/clients can multiply it;128MiB
+does not bound total memory. The1GiB cgroup cap remains enforced and OOM failure
+must be reported. No recommendation for a concurrent production setting follows.
 Read-only observation logging matches the archival launcher: duration250ms,
 IO timing, lock waits, and bind-parameter logging disabled. No ports are published.
 

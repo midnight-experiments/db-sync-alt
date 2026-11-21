@@ -27,10 +27,13 @@ EXPECTED_FIELDS = ['content_digest', 'state_digest', 'families', 'protected_stat
 PREDECESSOR = 'c384207b9bffaffb7995d26a815bdfb333b97555'
 
 
-def configuration(candidate):
-    assert re.fullmatch('[0-9a-f]{40}', candidate) and candidate != PREDECESSOR
+def configuration(candidate, mode='product_pair'):
+    assert mode in ['product_pair', 'owner_work_mem_pair']
+    assert re.fullmatch('[0-9a-f]{40}', candidate)
+    assert (candidate != PREDECESSOR) if mode == 'product_pair' else (candidate == PREDECESSOR)
     return {'source': candidate, 'predecessor': PREDECESSOR, 'reuse_run': 44724041124,
             'mode': 'qualify', 'divisor': 1, 'target': 'restore_pair',
+            'restore_pair_mode': mode,
             'portable_bytes': 134217728, 'restore_tcp_user_timeout_seconds': 600,
             'restore_server_settings': SERVER_SETTINGS,
             'scope': 'ONE retained GENERATED snapshot paired restore and independent verify; no source generation/conversion or actual archive timing'}
@@ -82,9 +85,12 @@ def run(g):
     names, ids = g['NAMES'], g['IDS']
     assert config['restore_server_settings'] == SERVER_SETTINGS
     assert config['reuse_run'] == 44724041124
-    pins = [('predecessor', config['predecessor'], root / 'predecessor'),
-            ('candidate', g['PIN'], root / 'product')]
-    assert pins[0][1] != pins[1][1]
+    mode = config['restore_pair_mode']
+    assert mode in ['product_pair', 'owner_work_mem_pair']
+    labels = ['predecessor', 'candidate'] if mode == 'product_pair' else ['owner-work4', 'owner-work128']
+    pins = [(labels[0], config['predecessor'], root / 'predecessor'),
+            (labels[1], g['PIN'], root / 'product')]
+    assert (pins[0][1] != pins[1][1]) if mode == 'product_pair' else (pins[0][1] == pins[1][1] == PREDECESSOR)
     for label, pin, path in pins:
         assert re.fullmatch('[0-9a-f]{40}', pin)
         assert output(['git', '-C', str(path), 'rev-parse', 'HEAD']).strip() == pin
@@ -115,9 +121,17 @@ def run(g):
     g['call'](['docker', 'pull', g['RUST']]); g['call'](['docker', 'pull', g['PG']])
     save('images.json', json.loads(docker('image', 'inspect', g['RUST'], g['PG'])))
     targets = {}
+    built_by_pin = {}
     for label, pin, path in pins:
+        if pin in built_by_pin:
+            target = built_by_pin[pin]; targets[label] = target
+            save(label + '-binary.json', {'source_head': pin, 'clean': True,
+                'sha256': hashlib.sha256((target / 'release/db-sync-alt').read_bytes()).hexdigest(),
+                'rust_image': g['RUST'], 'same_immutable_executable_as': labels[0],
+                'normal_cli_help_checked_before_pg': True})
+            continue
         target = Path(g['os'].environ['RUNNER_TEMP']) / ('restore-pair-build-' + label)
-        target.mkdir(exist_ok=True); targets[label] = target
+        target.mkdir(exist_ok=True); targets[label] = target; built_by_pin[pin] = target
         args = ['docker', 'run', '--rm', '--name', g['PREFIX'] + '-build-' + label,
                 '-e', 'CARGO_TARGET_DIR=/work/target', '-e', 'CARGO_PROFILE_RELEASE_DEBUG=0',
                 '--mount', f'type=bind,src={path},dst=/work/product,readonly',
@@ -154,16 +168,26 @@ def run(g):
         name, owner = 'restore_pair', 'restore_pair_owner'
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
                '-d', 'postgres', '-c', f'CREATE ROLE {owner} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
+        owner_work = 128 if label == 'owner-work128' else 4
+        if mode == 'owner_work_mem_pair':
+            docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
+                   '-d', 'postgres', '-c', f"ALTER ROLE {owner} SET work_mem='{owner_work}MB'")
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
                '-d', 'postgres', '-c', f'CREATE DATABASE {name} OWNER {owner}')
         save('databases.json', {'restored': name})
         save('baseline-volumes.json', {'source': {'allocated_bytes': 0}, 'restored': {
             'allocated_bytes': int(docker('exec', names['restored'], 'du', '-sB1', '/var/lib/postgresql/data').split()[0])}})
-        def query(sql):
+        def query(sql, user='postgres'):
             return json.loads(output(['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=3000',
-                names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', name, '-c', sql]))
-        settings = query("SELECT json_object_agg(name,json_build_object('setting',setting,'unit',unit,'source',source)) FROM pg_settings WHERE name=ANY(ARRAY['wal_level','max_wal_senders','archive_mode','fsync','synchronous_commit','full_page_writes','wal_skip_threshold','shared_buffers','maintenance_work_mem','work_mem','temp_buffers','jit','random_page_cost','max_parallel_workers_per_gather','max_parallel_maintenance_workers','max_wal_size','min_wal_size','checkpoint_timeout','checkpoint_completion_target','log_min_duration_statement','track_io_timing','log_parameter_max_length','log_parameter_max_length_on_error','log_line_prefix','server_version_num'])")
+                names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', user, '-d', name, '-c', sql]))
+        settings = query("SELECT json_object_agg(name,json_build_object('setting',setting,'unit',unit,'source',source)) FROM pg_settings WHERE name=ANY(ARRAY['wal_level','max_wal_senders','archive_mode','fsync','synchronous_commit','full_page_writes','wal_skip_threshold','shared_buffers','maintenance_work_mem','work_mem','hash_mem_multiplier','temp_buffers','jit','random_page_cost','max_parallel_workers_per_gather','max_parallel_maintenance_workers','max_wal_size','min_wal_size','checkpoint_timeout','checkpoint_completion_target','log_min_duration_statement','track_io_timing','log_parameter_max_length','log_parameter_max_length_on_error','log_line_prefix','server_version_num'])", user=owner)
         assert settings['wal_level']['setting'] == 'minimal' and settings['shared_buffers']['setting'] == '8192'
+        assert int(settings['work_mem']['setting']) == owner_work * 1024 and settings['work_mem']['unit'] == 'kB'
+        assert settings['maintenance_work_mem']['setting'] == '65536' and settings['temp_buffers']['setting'] == '1024'
+        assert settings['jit']['setting'] == 'on'
+        assert all(settings[key]['setting'] == '0' for key in ['max_parallel_workers_per_gather', 'max_parallel_maintenance_workers', 'max_wal_senders'])
+        assert all(settings[key]['setting'] == 'on' for key in ['fsync', 'synchronous_commit', 'full_page_writes'])
+        assert settings['archive_mode']['setting'] == 'off'
         save(label + '-settings.json', settings)
         def counters():
             value = query("SELECT json_build_object('at',clock_timestamp(),'insert_lsn',pg_current_wal_insert_lsn(),'flush_lsn',pg_current_wal_flush_lsn(),'wal',row_to_json(w),'checkpointer',(SELECT row_to_json(c) FROM pg_stat_checkpointer c),'io',(SELECT json_agg(i) FROM pg_stat_io i),'database',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database())) FROM pg_stat_wal w")
@@ -233,6 +257,7 @@ def run(g):
         assert socket_limits and all(event['tcp_user_timeout_ms'] == 600000 for event in socket_limits)
         combined = phases['restore']['seconds'] + phases['verify']['seconds']
         item = {'label': label, 'source_head': pin, 'fresh_target': fresh, 'state': state,
+                'owner_work_mem_mb': owner_work, 'owner_work_mem_override': mode == 'owner_work_mem_pair',
                 'restore_seconds': phases['restore']['seconds'], 'independent_verify_seconds': phases['verify']['seconds'],
                 'restore_plus_independent_verify_seconds': combined, 'criterion_seconds': 180,
                 'criterion_met_on_this_generated_fixture': combined <= 180,
@@ -242,9 +267,11 @@ def run(g):
                           'combined_seconds': combined, 'functional_pass': True}), flush=True)
     assert all(results[0]['verified'][k] == results[1]['verified'][k] for k in EXPECTED_FIELDS)
     save('restore-pair-result.json', {'status': 'PASS_GENERATED_FUNCTIONAL_PAIR', 'variants': results,
+        'restore_pair_mode': mode,
         'snapshot_file_bytes': FULL_SNAPSHOT_BYTES, 'plain_section_bytes': FULL_PLAIN_BYTES,
         'source_generation': False, 'source_conversion': False, 'historical_timing_proven': False,
         'limitations': ['one predecessor-first/candidate-second pair, not order-balanced speedup proof',
                         'fresh PGDATA each; no forced cache eviction', 'per-statement logs omit executions below 250 ms',
                         'checkpoint drain is reported separately; per-device IO must not be summed',
+                        'work_mem is per operation, not a total memory bound; multiple operators/clients can multiply memory',
                         'generated addresses/payloads and storage differ from real archived data']})

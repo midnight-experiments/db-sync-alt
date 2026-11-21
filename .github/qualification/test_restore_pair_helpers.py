@@ -20,6 +20,11 @@ class PreparationControls(unittest.TestCase):
         self.assertTrue(math.isclose(items[1]['seconds'], .250001))
         self.assertEqual(items[0]['first_sql_line'], 'SELECT 1')
 
+    def test_setting_pair_keeps_exact_predecessor_code(self):
+        self.assertEqual(configuration(PREDECESSOR, 'owner_work_mem_pair')['source'], PREDECESSOR)
+        with self.assertRaises(AssertionError): configuration('a' * 40, 'owner_work_mem_pair')
+        with self.assertRaises(AssertionError): configuration(PREDECESSOR, 'unbounded')
+
     def test_stacked_devices_are_not_added(self):
         before = {'252:0': {'wbytes': 10}, '259:3': {'wbytes': 10}}
         after = {'252:0': {'wbytes': 30}, '259:3': {'wbytes': 30}}
