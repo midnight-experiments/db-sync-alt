@@ -21,6 +21,478 @@ use std::{
 use tokio_postgres::config::SslMode;
 type Result<T = ()> = std::result::Result<T, Box<dyn StdError + Send + Sync>>;
 
+async fn closed_conversion_reader(
+    reader: &tokio_postgres::Client,
+    original: &str,
+    prepared: &tokio_postgres::Statement,
+) -> Result {
+    let names = [
+        "idx_block_block_no",
+        "idx_tx_block_id",
+        "idx_tx_out_tx_id",
+        "idx_tx_out_data_hash",
+        "idx_tx_out_address",
+        "idx_tx_in_tx_in_id",
+        "idx_tx_in_tx_out_id_tx_out_index",
+        "idx_multi_asset_policy_name",
+        "idx_multi_asset_policy_name_hex",
+        "idx_ma_tx_out_ident",
+        "idx_ma_tx_out_id_ident",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(reader.query_one("SELECT count(*) FROM pg_indexes WHERE schemaname='serve' AND indexname=ANY($1::text[])", &[&names]).await?.get::<_,i64>(0),11,"node startup indexes changed while closed");
+    for sql in TABLES
+        .iter()
+        .map(|table| format!("SELECT * FROM public.{table}"))
+        .chain([
+            original.to_owned(),
+            format!("SELECT * FROM ({original}) q22_original"),
+        ])
+    {
+        assert_eq!(
+            reader
+                .query(&sql, &[])
+                .await
+                .unwrap_err()
+                .code()
+                .map(|c| c.code()),
+            Some("55000"),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        reader
+            .query(prepared, &[])
+            .await
+            .unwrap_err()
+            .code()
+            .map(|c| c.code()),
+        Some("55000")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publication() -> Result
+{
+    use tokio::io::AsyncReadExt;
+    let catalogue: Value = serde_json::from_str(include_str!("../../dsa-store/catalogue.json"))?;
+    let original = catalogue["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "get_latest_block_info" && entry["kind"] == "read")
+        .unwrap()["sql"]
+        .as_str()
+        .unwrap();
+    for cancel in [true, false] {
+        let f = fixture(201);
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let source_before = source.rows().await?;
+        let target = Database::new().await?;
+        target.cli("create", "mainnet", &[]).await?;
+        target
+            .cli("grant-reader", "mainnet", &["--role", &target.reader])
+            .await?;
+        target
+            .cli(
+                "grant-reader",
+                "mainnet",
+                &["--role", &target.reader, "--check"],
+            )
+            .await?;
+        let owner = connect(&target.config).await?;
+        if !cancel {
+            // A missing storage-only index must be built by the carried finish
+            // plan, while every node startup index remains present throughout.
+            owner
+                .batch_execute("DROP INDEX serve.serve_pool_hash_raw")
+                .await?;
+        }
+        let catalogue:Value=owner.query_one("SELECT jsonb_object_agg(n.nspname||'.'||c.relname,jsonb_build_array(c.oid::bigint,pg_relation_filenode(c.oid)::bigint,c.relacl::text)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('serve','public') AND c.relkind IN ('r','v')",&[]).await?.get(0);
+        let retained_indexes:Value=owner.query_one("SELECT jsonb_object_agg(c.relname,jsonb_build_array(c.oid::bigint,pg_relation_filenode(c.oid)::bigint)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='serve' AND c.relkind='i'",&[]).await?.get(0);
+        let mut config = target.reader_config();
+        config.options("-c default_transaction_read_only=on -c statement_timeout=500ms");
+        let reader = connect(&config).await?;
+        let prepared = reader.prepare(original).await?;
+        closed_conversion_reader(&reader, original, &prepared).await?;
+        // Generated latency only, after the source/network/horizon/supply
+        // preflight and destination preparation: the first raw source COPY.
+        let source_holder = connect(&source.config).await?;
+        let gate: String = source_holder
+            .query_one(
+                "SELECT pg_get_functiondef('chain.gate()'::regprocedure)",
+                &[],
+            )
+            .await?
+            .get(0);
+        let delayed=gate.replace(" RETURN true;"," IF current_query() LIKE 'COPY (%' THEN PERFORM pg_advisory_xact_lock(728,1); END IF; RETURN true;");
+        assert_ne!(gate, delayed);
+        source_holder.batch_execute(&delayed).await?;
+        source_holder
+            .batch_execute("SELECT pg_advisory_lock(728,1)")
+            .await?;
+        if !cancel {
+            owner.batch_execute("CREATE FUNCTION serve.q22_convert_copy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,2);RETURN NEW;END$$;REVOKE ALL ON FUNCTION serve.q22_convert_copy() FROM PUBLIC;CREATE TRIGGER q22_convert_copy BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.q22_convert_copy();CREATE FUNCTION dsa.q22_convert_publish() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,3);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.q22_convert_publish() FROM PUBLIC;CREATE TRIGGER q22_convert_publish AFTER UPDATE ON dsa.position FOR EACH ROW WHEN(NEW.serving) EXECUTE FUNCTION dsa.q22_convert_publish();SELECT pg_advisory_lock(728,2);SELECT pg_advisory_lock(728,3)").await?;
+        }
+        let mut child = target.start_cli(
+            "convert",
+            "mainnet",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let out = tokio::spawn(async move {
+            let mut b = Vec::new();
+            stdout.read_to_end(&mut b).await.map(|_| b)
+        });
+        let err = tokio::spawn(async move {
+            let mut b = Vec::new();
+            stderr.read_to_end(&mut b).await.map(|_| b)
+        });
+        source.wait_barrier().await?;
+        let held:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND query LIKE 'COPY (%' AND backend_xmin IS NOT NULL)",&[&source.name]).await?.get(0);
+        assert!(held, "no real source COPY/snapshot");
+        closed_conversion_reader(&reader, original, &prepared).await?;
+        let competing = target
+            .start_cli("grant-reader", "mainnet", &["--role", &target.reader])?
+            .wait_with_output()
+            .await?;
+        assert!(!competing.status.success());
+        assert!(String::from_utf8_lossy(&competing.stderr).contains("writer_busy"));
+        if cancel {
+            // Exercise the CLI's normal interrupt/cancel path, rather than
+            // relying on a disconnected backend to notice an advisory wait.
+            let pid = child
+                .id()
+                .ok_or("converter exited before TERM")?
+                .to_string();
+            assert!(
+                tokio::process::Command::new("sh")
+                    .args(["-c", "kill -TERM \"$1\"", "q22-own-converter", &pid])
+                    .status()
+                    .await?
+                    .success()
+            );
+        } else {
+            source_holder
+                .batch_execute("SELECT pg_advisory_unlock(728,1)")
+                .await?;
+            for prefix in [
+                "INSERT INTO serve.block%",
+                "UPDATE dsa.position SET serving=true%",
+            ] {
+                let began = Instant::now();
+                loop {
+                    let blocked:bool=target.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND query LIKE $2 AND wait_event='advisory')",&[&target.name,&prefix]).await?.get(0);
+                    if blocked {
+                        break;
+                    }
+                    assert!(
+                        began.elapsed() < Duration::from_secs(15),
+                        "no compatible destination barrier {prefix}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let source_open:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+                assert!(
+                    !source_open,
+                    "source snapshot not released before local work"
+                );
+                closed_conversion_reader(&reader, original, &prepared).await?;
+                owner
+                    .batch_execute(if prefix.starts_with("INSERT") {
+                        "SELECT pg_advisory_unlock(728,2)"
+                    } else {
+                        "SELECT pg_advisory_unlock(728,3)"
+                    })
+                    .await?;
+            }
+        }
+        let status = child.wait().await?;
+        let stdout = out.await??;
+        let stderr = err.await??;
+        // TEMP catalogue rows are uncommitted and invisible to our observer.
+        // The actual staging transaction checks its PK shape before emitting
+        // this event; assert that executed invariant rather than a stale or
+        // outside-session catalogue count.
+        let raw_prepared = String::from_utf8_lossy(&stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["event"] == "conversion_raw_table_prepared")
+            .collect::<Vec<_>>();
+        assert!(!raw_prepared.is_empty());
+        assert!(
+            raw_prepared
+                .iter()
+                .all(|event| event["indexes"] == "primary_key_only")
+        );
+        if !cancel {
+            assert_eq!(raw_prepared.len(), 11);
+        }
+        let mode = String::from_utf8_lossy(&stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|v| v["event"] == "conversion_load_mode")
+            .ok_or("missing conversion mode")?;
+        assert_eq!(mode["mode"], "reader_compatible");
+        let converted = if cancel {
+            assert!(!status.success());
+            let began = Instant::now();
+            loop {
+                let active:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+                if !active {
+                    break;
+                }
+                assert!(
+                    began.elapsed() < Duration::from_secs(3),
+                    "canceled source snapshot leaked"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            source_holder
+                .batch_execute("SELECT pg_advisory_unlock(728,1)")
+                .await?;
+            let began = Instant::now();
+            loop {
+                let present:bool=target.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt')",&[&target.name]).await?.get(0);
+                if !present {
+                    break;
+                }
+                assert!(
+                    began.elapsed() < Duration::from_secs(5),
+                    "destination backend not released after TERM"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            target.closed_empty().await?;
+            closed_conversion_reader(&reader, original, &prepared).await?;
+            let temp:i64=target.admin.query_one("SELECT count(*) FROM pg_class c JOIN pg_roles r ON r.oid=c.relowner WHERE c.relpersistence='t' AND r.rolname=$1",&[&target.owner]).await?.get(0);
+            assert_eq!(temp, 0);
+            let after:Value=owner.query_one("SELECT jsonb_object_agg(c.relname,jsonb_build_array(c.oid::bigint,pg_relation_filenode(c.oid)::bigint)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='serve' AND c.relkind='i'",&[]).await?.get(0);
+            assert_eq!(retained_indexes, after, "TERM changed retained indexes");
+            target
+                .cli(
+                    "convert",
+                    "mainnet",
+                    &["--source", &source.dsn(true), "--horizon-block", "6"],
+                )
+                .await?
+        } else {
+            assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+            serde_json::from_slice(&stdout)?
+        };
+        let verified = target.cli("verify", "mainnet", &[]).await?;
+        for key in [
+            "content_digest",
+            "state_digest",
+            "families",
+            "protected_state",
+            "state",
+            "supply",
+        ] {
+            assert_eq!(converted["verified"][key], verified[key]);
+        }
+        assert_eq!(
+            target.rows().await?,
+            selected(&f.rows(), &keep(&f.chain, &f.profile, f.bounds)?)
+        );
+        assert!(!reader.query(original, &[]).await?.is_empty());
+        reader.query(&prepared, &[]).await?;
+        reader
+            .query(&format!("SELECT * FROM ({original}) q22_original"), &[])
+            .await?;
+        target
+            .cli(
+                "grant-reader",
+                "mainnet",
+                &["--role", &target.reader, "--check"],
+            )
+            .await?;
+        let after:Value=owner.query_one("SELECT jsonb_object_agg(n.nspname||'.'||c.relname,jsonb_build_array(c.oid::bigint,pg_relation_filenode(c.oid)::bigint,c.relacl::text)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('serve','public') AND c.relkind IN ('r','v')",&[]).await?.get(0);
+        assert_eq!(
+            catalogue, after,
+            "table/view identity, ACL or storage changed"
+        );
+        for sql in include_str!("../../dsa-store/src/indexes.sql")
+            .lines()
+            .filter(|line| line.starts_with("CREATE"))
+        {
+            let name = sql
+                .split("INDEX ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap();
+            let table = sql
+                .split(" ON ")
+                .nth(1)
+                .unwrap()
+                .split(['(', ' '])
+                .next()
+                .unwrap();
+            let row=owner.query_one("SELECT i.indrelid=to_regclass($2) AND i.indisvalid AND i.indisready AND i.indislive,c.oid::bigint,pg_relation_filenode(c.oid)::bigint FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass($1)",&[&format!("serve.{name}"),&table]).await?;
+            assert!(row.get::<_, bool>(0), "missing/invalid/bad binding: {name}");
+            if let Some(before) = retained_indexes.get(name) {
+                assert_eq!(
+                    before,
+                    &json!([row.get::<_, i64>(1), row.get::<_, i64>(2)]),
+                    "retained index identity changed: {name}"
+                );
+            }
+        }
+        assert_eq!(source_before, source.rows().await?);
+        source_holder.batch_execute(&gate).await?;
+        println!(
+            "{}",
+            json!({"f10_normal_convert_reader_compatible":true,"cancel_then_retry":cancel,"all11_literal4_nested_prepared_55000":true,"source_released":true,"final_model_and_verify_parity":true})
+        );
+        drop(reader);
+        drop(owner);
+        drop(source_holder);
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_reader_recheck_late_row_grant_origin_and_index_conflict() -> Result {
+    for mode in ["late_row", "late_grant", "wrong_origin", "index_conflict"] {
+        let f = fixture(201);
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let target = Database::new().await?;
+        target.cli("create", "mainnet", &[]).await?;
+        if mode != "late_grant" {
+            target
+                .cli("grant-reader", "mainnet", &["--role", &target.reader])
+                .await?;
+        }
+        let owner = connect(&target.config).await?;
+        owner
+            .batch_execute(&format!(
+                "ALTER ROLE {} IN DATABASE {} SET default_transaction_isolation='repeatable read'",
+                target.owner, target.name
+            ))
+            .await?;
+        let index_before = if mode == "index_conflict" {
+            owner.batch_execute("DROP INDEX serve.idx_tx_out_address;CREATE INDEX idx_tx_out_address ON serve.tx_out(tx_id)").await?;
+            Some(owner.query_one("SELECT jsonb_build_array('serve.idx_tx_out_address'::regclass::oid,pg_get_indexdef('serve.idx_tx_out_address'::regclass))",&[]).await?.get::<_,Value>(0))
+        } else {
+            owner
+                .batch_execute("BEGIN;LOCK TABLE serve.block IN SHARE ROW EXCLUSIVE MODE")
+                .await?;
+            None
+        };
+        let child = target.start_cli(
+            "convert",
+            "mainnet",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )?;
+        // Drain progress while controlling a real relation-lock wait.
+        let work = tokio::spawn(async move { child.wait_with_output().await });
+        if mode != "index_conflict" {
+            let began = Instant::now();
+            loop {
+                let waiting:bool=target.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event_type='Lock' AND query LIKE 'LOCK TABLE%')",&[&target.name]).await?.get(0);
+                if waiting {
+                    break;
+                }
+                assert!(
+                    began.elapsed() < Duration::from_secs(15),
+                    "no convert lock recheck barrier: {mode}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let change=match mode {
+                "late_row"=>"INSERT INTO serve.block VALUES(1,decode(repeat('ab',32),'hex'),0,1,1,timestamp '2026-01-01',0);COMMIT".to_owned(),
+                "wrong_origin"=>"UPDATE dsa.identity SET origin=jsonb_build_object('kind','restore_failed');COMMIT".to_owned(),
+                "late_grant"=>format!("GRANT EXECUTE ON FUNCTION dsa.gate() TO {};COMMIT",target.reader),
+                _=>unreachable!(),
+            };
+            owner.batch_execute(&change).await?;
+        }
+        let output = work.await??;
+        let report = failure(&output)?;
+        assert_eq!(
+            report["error"],
+            match mode {
+                "late_grant" => "gate_access_changed",
+                "index_conflict" => "destination_index_mismatch",
+                _ => "destination_not_empty",
+            }
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|event| event["event"] == "source_family_started"),
+            "source export began before authoritative refusal"
+        );
+        assert_eq!(
+            owner
+                .query_one("SELECT count(*) FROM serve.block", &[])
+                .await?
+                .get::<_, i64>(0),
+            if mode == "late_row" { 1 } else { 0 }
+        );
+        assert_eq!(
+            target.cli("status", "mainnet", &[]).await?["position"]["serving"],
+            false
+        );
+        if mode == "wrong_origin" {
+            assert_eq!(
+                owner
+                    .query_one("SELECT origin->>'kind' FROM dsa.identity", &[])
+                    .await?
+                    .get::<_, String>(0),
+                "restore_failed"
+            );
+        }
+        if mode == "late_grant" {
+            assert!(
+                owner
+                    .query_one(
+                        "SELECT has_function_privilege($1,'dsa.gate()','EXECUTE')",
+                        &[&target.reader]
+                    )
+                    .await?
+                    .get::<_, bool>(0)
+            );
+        }
+        if let Some(before) = index_before {
+            let after:Value=owner.query_one("SELECT jsonb_build_array('serve.idx_tx_out_address'::regclass::oid,pg_get_indexdef('serve.idx_tx_out_address'::regclass))",&[]).await?.get(0);
+            assert_eq!(before, after, "conflicting index was changed");
+        }
+        let began = Instant::now();
+        loop {
+            let active:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+            if !active {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "source snapshot retained after refusal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        println!(
+            "{}",
+            json!({"f10_authoritative_convert_recheck":mode,"default_owner_repeatable_read":true,"refused_before_source_export":true,"data_and_conflict_preserved":true,"source_released":true})
+        );
+        drop(owner);
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
 async fn convert_true_legacy_public_reader_model_and_snapshot() -> Result {

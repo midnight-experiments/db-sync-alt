@@ -240,6 +240,7 @@ pub struct StagedConversion<'a> {
     options: ConvertOptions,
     supply: BTreeMap<String, String>,
     destination: DestinationCost,
+    indexes: Vec<&'static str>,
 }
 impl StagedConversion<'_> {
     pub fn source(&self) -> &SourceReport {
@@ -281,7 +282,7 @@ impl StagedConversion<'_> {
             .await?;
         }
         let index_started = Instant::now();
-        tx.batch_execute(include_str!("indexes.sql")).await?;
+        tx.batch_execute(&self.indexes.join("\n")).await?;
         for table in NODE_RELATIONS.into_iter().chain([MARKERS]) {
             let schema = if table == MARKERS { "dsa" } else { "serve" };
             tx.batch_execute(&format!("ANALYZE {schema}.{table}"))
@@ -903,7 +904,7 @@ impl Store {
         report.longest_supply_page_seconds = supply_cost.longest_seconds;
         let prepare_started = Instant::now();
         self.prepare_destination(profile, "convert_failed").await?;
-        let destination = DestinationCost {
+        let mut destination = DestinationCost {
             prepare_seconds: prepare_started.elapsed().as_secs_f64(),
             ..Default::default()
         };
@@ -915,10 +916,30 @@ impl Store {
                 tip: report.state.tip.height,
             },
         )?;
+        // Source/selection preflight precedes all destination changes. Reuse
+        // restore's conservative reader classification and closed-empty checks;
+        // an already granted reader must reach its gate during raw staging and
+        // local selection as well as publication. Retain matching public
+        // indexes in this mode, so node startup prerequisites also stay present.
+        let (isolated_bulk, reason) = crate::snapshot::restore_access(self.client()).await?;
+        eprintln!(
+            "{}",
+            json!({"event":"conversion_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"},"reason":reason})
+        );
+        let (_, locked) = crate::snapshot::restore_tables()?;
         let tx = self.writer_transaction().await?;
+        crate::snapshot::lock_empty_restore(&tx, &locked, isolated_bulk, "convert_failed").await?;
+        let indexes = if isolated_bulk {
+            include_str!("indexes.sql")
+                .lines()
+                .filter(|line| line.starts_with("CREATE"))
+                .collect()
+        } else {
+            crate::snapshot::restore_indexes(&tx).await?.missing
+        };
         for line in include_str!("indexes.sql")
             .lines()
-            .filter(|s| s.starts_with("CREATE"))
+            .filter(|s| isolated_bulk && s.starts_with("CREATE"))
         {
             let name = line
                 .split("INDEX ")
@@ -928,6 +949,7 @@ impl Store {
             tx.batch_execute(&format!("DROP INDEX IF EXISTS serve.{name}"))
                 .await?;
         }
+        destination.prepare_seconds = prepare_started.elapsed().as_secs_f64();
         let raw = crate::conversion_stage::stage(source, &tx, &report.state, options).await?;
         report.raw_families = raw.costs.clone();
         report.staging_peak_bytes = raw.temporary_bytes;
@@ -940,6 +962,7 @@ impl Store {
             options: options.clone(),
             supply: amounts,
             destination,
+            indexes,
         })
     }
 

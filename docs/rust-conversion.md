@@ -65,6 +65,27 @@ families. Natural-key fingerprints, old-spent state, supply and closure are
 checked before publication. TEMP data disappears on commit, rollback or a
 lost connection; the served layout and snapshot format do not change.
 
+An already granted node reader remains supported during conversion. The
+destination uses the same conservative gate-access check and closed-empty
+recheck as restore. The data transaction uses SELECT-compatible locks,
+rechecks empty and validates matching indexes before staging; conflicts and
+invalid indexes are preserved and refused. Matching public indexes remain,
+so startup prerequisites that were present stay present. A missing-index plan is carried
+through local selection and built before verification and atomic publication.
+The raw private TEMP copy retains only each family's primary key, as before;
+public secondary indexes are not cloned into it. Gated reads, including prepared
+and nested node queries, continue to raise55000 until commit. Maintaining public
+indexes during selected-row inserts has a cost; source-free/generated timings
+do not substitute for archive qualification.
+An auto-created failed empty layout can already lack indexes before a reader is
+granted. Those missing prerequisites appear only at successful commit; startup
+helpers can fail or wait during that interval. SELECT-compatible load locks
+still exclude DML and index DDL for the whole conversion, including a startup
+helper attempting to build a missing index. Gated data reads return55000.
+`conversion_load_mode` reports the chosen path. Source permissions, its single
+snapshot and its statement/idle limits are unchanged; no keep predicate,
+positional ID, format, digest or verification rule changes.
+
 Temporary staging, its indexes, local selection spill, the selected database,
 WAL, snapshot and restore all need disk headroom. The separately guarded runbook
 must verify the actual PostgreSQL storage mounts and free-space floor against

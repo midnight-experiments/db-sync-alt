@@ -265,9 +265,23 @@ pub(crate) async fn stage(
     for table in NODE_RELATIONS {
         destination
             .batch_execute(&format!(
-                "CREATE TEMP TABLE {table}(LIKE serve.{table} INCLUDING ALL) ON COMMIT DROP"
+                "CREATE TEMP TABLE {table}(LIKE serve.{table} INCLUDING ALL EXCLUDING INDEXES) ON COMMIT DROP;ALTER TABLE pg_temp.{table} ADD PRIMARY KEY({})",key(table)
             ))
             .await?;
+        // The raw private copy has always needed only its unique page key.
+        // A reader-compatible destination retains public secondary indexes;
+        // do not clone/maintain those while streaming raw source history.
+        let primary_only: bool = destination.query_one(
+            "SELECT count(*)=1 AND coalesce(bool_and(i.indisprimary AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive AND i.indnkeyatts=1 AND i.indnatts=1 AND i.indkey[0]=a.attnum),false) FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attname=$2 WHERE i.indrelid=to_regclass($1)",
+            &[&format!("pg_temp.{table}"), &key(table)],
+        ).await?.get(0);
+        if !primary_only {
+            return Err(Error::Refusal("invalid_conversion_staging_indexes"));
+        }
+        eprintln!(
+            "{}",
+            json!({"event":"conversion_raw_table_prepared","family":table,"indexes":"primary_key_only"})
+        );
         let began = Instant::now();
         let mut cost = RawFamilyCost::default();
         let mut hash = FamilyHasher::new(table);

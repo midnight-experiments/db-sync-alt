@@ -92,7 +92,9 @@ const FORMAT: u32 = 1;
 const MAX_DESCRIPTION: u64 = 1024 * 1024;
 const MAX_SECTION: u64 = 1 << 40;
 
-async fn restore_access<C: GenericClient>(client: &C) -> Result<(bool, &'static str), Error> {
+pub(crate) async fn restore_access<C: GenericClient>(
+    client: &C,
+) -> Result<(bool, &'static str), Error> {
     let row = client.query_one(
         "SELECT p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user),EXISTS(SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner) FROM pg_proc p WHERE p.oid='dsa.gate()'::regprocedure", &[],
     ).await?;
@@ -183,7 +185,11 @@ fn index_shape(sql: &str) -> Vec<String> {
     shape
 }
 
-async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'static str>, Error> {
+pub(crate) struct RestoreIndexes {
+    pub missing: Vec<&'static str>,
+}
+
+pub(crate) async fn restore_indexes<C: GenericClient>(tx: &C) -> Result<RestoreIndexes, Error> {
     let mut missing = Vec::new();
     for sql in include_str!("indexes.sql")
         .lines()
@@ -200,13 +206,14 @@ async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'stati
             .and_then(|s| s.split(['(', ' ']).next())
             .ok_or(Error::Refusal("invalid_index_catalogue"))?;
         let row = tx.query_opt(
-            "SELECT CASE WHEN i.indexrelid IS NOT NULL THEN pg_get_indexdef(c.oid) ELSE '' END,coalesce(i.indisvalid AND i.indisready AND i.indislive AND i.indrelid=to_regclass($2),false) FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass($1)",
+            "SELECT CASE WHEN i.indexrelid IS NOT NULL THEN pg_get_indexdef(c.oid) ELSE '' END,coalesce(i.indrelid=to_regclass($2),false),coalesce(i.indisvalid AND i.indisready AND i.indislive,false) FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass($1)",
             &[&format!("serve.{name}"), &table],
         ).await?;
         match row {
             None => missing.push(sql),
             Some(row)
                 if row.get::<_, bool>(1)
+                    && row.get::<_, bool>(2)
                     && index_shape(&row.get::<_, String>(0)) == index_shape(sql) => {}
             Some(_) => {
                 eprintln!(
@@ -217,7 +224,57 @@ async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'stati
             }
         }
     }
-    Ok(missing)
+    Ok(RestoreIndexes { missing })
+}
+
+pub(crate) fn restore_tables() -> Result<(Vec<String>, Vec<String>), Error> {
+    let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
+    let mut locked = copied.clone();
+    locked.extend([
+        "dsa.supply".into(),
+        "dsa.first_served".into(),
+        "dsa.calls".into(),
+    ]);
+    Ok((copied, locked))
+}
+
+pub(crate) async fn lock_empty_restore<C: GenericClient>(
+    tx: &C,
+    locked: &[String],
+    isolated_bulk: bool,
+    failed_kind: &'static str,
+) -> Result<(), Error> {
+    // Lock before taking a data snapshot, also for a caller using RR isolation.
+    tx.batch_execute(&format!(
+        "LOCK TABLE {} IN {} MODE",
+        locked.join(","),
+        if isolated_bulk {
+            "ACCESS EXCLUSIVE"
+        } else {
+            "SHARE ROW EXCLUSIVE"
+        }
+    ))
+    .await?;
+    if isolated_bulk && !restore_access(tx).await?.0 {
+        return Err(Error::Refusal("gate_access_changed"));
+    }
+    let row = tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1 FOR UPDATE OF p,i", &[]).await?;
+    let occupied = locked
+        .iter()
+        .map(|name| format!("EXISTS(SELECT 1 FROM {name})"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let occupied: bool = tx
+        .query_one(&format!("SELECT {occupied}"), &[])
+        .await?
+        .get(0);
+    if row.get::<_, bool>(0)
+        || row.get::<_, Option<String>>(1).as_deref() != Some(failed_kind)
+        || occupied
+    {
+        return Err(Error::Refusal("destination_not_empty"));
+    }
+    Ok(())
 }
 
 // Restore-local stage timings contain only fixed operation and table labels.
@@ -787,9 +844,10 @@ impl Store {
         } else {
             // DROP INDEX also takes ACCESS EXCLUSIVE on its table. Retain
             // matching indexes and reject conflicting definitions before COPY.
-            missing_restore_indexes(&tx)
+            restore_indexes(&tx)
                 .await
                 .map_err(|error| stage.error(error))?
+                .missing
         };
         stage.finish();
         let stage = RestoreStage::start("restore_drop_indexes", "database");
