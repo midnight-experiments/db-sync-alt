@@ -97,7 +97,9 @@ const FORMAT: u32 = 1;
 const MAX_DESCRIPTION: u64 = 1024 * 1024;
 const MAX_SECTION: u64 = 1 << 40;
 
-async fn restore_access<C: GenericClient>(client: &C) -> Result<(bool, &'static str), Error> {
+pub(crate) async fn restore_access<C: GenericClient>(
+    client: &C,
+) -> Result<(bool, &'static str), Error> {
     let row = client.query_one(
         "SELECT p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user),EXISTS(SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner) FROM pg_proc p WHERE p.oid='dsa.gate()'::regprocedure", &[],
     ).await?;
@@ -188,12 +190,12 @@ fn index_shape(sql: &str) -> Vec<String> {
     shape
 }
 
-struct RestoreIndexes {
-    missing: Vec<&'static str>,
-    present: Vec<String>,
+pub(crate) struct RestoreIndexes {
+    pub missing: Vec<&'static str>,
+    pub present: Vec<String>,
 }
 
-async fn restore_indexes<C: GenericClient>(
+pub(crate) async fn restore_indexes<C: GenericClient>(
     tx: &C,
     retry_concurrent_drop: bool,
 ) -> Result<RestoreIndexes, Error> {
@@ -238,7 +240,7 @@ async fn restore_indexes<C: GenericClient>(
     Ok(RestoreIndexes { missing, present })
 }
 
-fn restore_tables() -> Result<(Vec<String>, Vec<String>), Error> {
+pub(crate) fn restore_tables() -> Result<(Vec<String>, Vec<String>), Error> {
     let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
     let mut locked = copied.clone();
     locked.extend([
@@ -249,10 +251,11 @@ fn restore_tables() -> Result<(Vec<String>, Vec<String>), Error> {
     Ok((copied, locked))
 }
 
-async fn lock_empty_restore<C: GenericClient>(
+pub(crate) async fn lock_empty_restore<C: GenericClient>(
     tx: &C,
     locked: &[String],
     isolated_bulk: bool,
+    failed_kind: &'static str,
 ) -> Result<(), Error> {
     // Lock before taking a data snapshot, also for a caller using RR isolation.
     tx.batch_execute(&format!(
@@ -279,7 +282,7 @@ async fn lock_empty_restore<C: GenericClient>(
         .await?
         .get(0);
     if row.get::<_, bool>(0)
-        || row.get::<_, Option<String>>(1).as_deref() != Some("restore_failed")
+        || row.get::<_, Option<String>>(1).as_deref() != Some(failed_kind)
         || occupied
     {
         return Err(Error::Refusal("destination_not_empty"));
@@ -800,7 +803,7 @@ impl Store {
                 .writer_transaction()
                 .await
                 .map_err(|error| stage.error(error))?;
-            lock_empty_restore(&tx, &locked, false)
+            lock_empty_restore(&tx, &locked, false, "restore_failed")
                 .await
                 .map_err(|error| stage.error(error))?;
             // Validate the complete catalogue before dropping anything. Only a
@@ -829,7 +832,7 @@ impl Store {
             .map_err(|error| stage.error(error))?;
         // Recheck the committed closed layout under locks excluding other DML.
         // Only the isolated path replaces empty storage for minimal-WAL COPY.
-        lock_empty_restore(&tx, &locked, isolated_bulk)
+        lock_empty_restore(&tx, &locked, isolated_bulk, "restore_failed")
             .await
             .map_err(|error| stage.error(error))?;
         let missing_indexes = if isolated_bulk {

@@ -21,6 +21,255 @@ use std::{
 use tokio_postgres::config::SslMode;
 type Result<T = ()> = std::result::Result<T, Box<dyn StdError + Send + Sync>>;
 
+async fn closed_conversion_reader(
+    reader: &tokio_postgres::Client,
+    original: &str,
+    prepared: &tokio_postgres::Statement,
+) -> Result {
+    for sql in TABLES
+        .iter()
+        .map(|table| format!("SELECT * FROM public.{table}"))
+        .chain([
+            original.to_owned(),
+            format!("SELECT * FROM ({original}) q22_original"),
+        ])
+    {
+        assert_eq!(
+            reader
+                .query(&sql, &[])
+                .await
+                .unwrap_err()
+                .code()
+                .map(|c| c.code()),
+            Some("55000"),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        reader
+            .query(prepared, &[])
+            .await
+            .unwrap_err()
+            .code()
+            .map(|c| c.code()),
+        Some("55000")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publication() -> Result
+{
+    use tokio::io::AsyncReadExt;
+    let catalogue: Value = serde_json::from_str(include_str!("../../dsa-store/catalogue.json"))?;
+    let original = catalogue["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "get_latest_block_info" && entry["kind"] == "read")
+        .unwrap()["sql"]
+        .as_str()
+        .unwrap();
+    for cancel in [true, false] {
+        let f = fixture(201);
+        let source = Database::new().await?;
+        source.legacy(&f).await?;
+        let source_before = source.rows().await?;
+        let target = Database::new().await?;
+        target.cli("create", "mainnet", &[]).await?;
+        target
+            .cli("grant-reader", "mainnet", &["--role", &target.reader])
+            .await?;
+        target
+            .cli(
+                "grant-reader",
+                "mainnet",
+                &["--role", &target.reader, "--check"],
+            )
+            .await?;
+        let owner = connect(&target.config).await?;
+        let mut config = target.reader_config();
+        config.options("-c default_transaction_read_only=on -c statement_timeout=500ms");
+        let reader = connect(&config).await?;
+        let prepared = reader.prepare(original).await?;
+        closed_conversion_reader(&reader, original, &prepared).await?;
+        // Generated latency only, after the source/network/horizon/supply
+        // preflight and destination preparation: the first raw source COPY.
+        let source_holder = connect(&source.config).await?;
+        let gate: String = source_holder
+            .query_one(
+                "SELECT pg_get_functiondef('chain.gate()'::regprocedure)",
+                &[],
+            )
+            .await?
+            .get(0);
+        let delayed=gate.replace(" RETURN true;"," IF current_query() LIKE 'COPY (%' THEN PERFORM pg_advisory_xact_lock(728,1); END IF; RETURN true;");
+        assert_ne!(gate, delayed);
+        source_holder.batch_execute(&delayed).await?;
+        source_holder
+            .batch_execute("SELECT pg_advisory_lock(728,1)")
+            .await?;
+        if !cancel {
+            owner.batch_execute("CREATE FUNCTION serve.q22_convert_copy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,2);RETURN NEW;END$$;REVOKE ALL ON FUNCTION serve.q22_convert_copy() FROM PUBLIC;CREATE TRIGGER q22_convert_copy BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.q22_convert_copy();CREATE FUNCTION dsa.q22_convert_publish() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,3);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.q22_convert_publish() FROM PUBLIC;CREATE TRIGGER q22_convert_publish AFTER UPDATE ON dsa.position FOR EACH ROW WHEN(NEW.serving) EXECUTE FUNCTION dsa.q22_convert_publish();SELECT pg_advisory_lock(728,2);SELECT pg_advisory_lock(728,3)").await?;
+        }
+        let mut child = target.start_cli(
+            "convert",
+            "mainnet",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let out = tokio::spawn(async move {
+            let mut b = Vec::new();
+            stdout.read_to_end(&mut b).await.map(|_| b)
+        });
+        let err = tokio::spawn(async move {
+            let mut b = Vec::new();
+            stderr.read_to_end(&mut b).await.map(|_| b)
+        });
+        source.wait_barrier().await?;
+        let held:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND query LIKE 'COPY (%' AND backend_xmin IS NOT NULL)",&[&source.name]).await?.get(0);
+        assert!(held, "no real source COPY/snapshot");
+        closed_conversion_reader(&reader, original, &prepared).await?;
+        let competing = target
+            .start_cli("grant-reader", "mainnet", &["--role", &target.reader])?
+            .wait_with_output()
+            .await?;
+        assert!(!competing.status.success());
+        assert!(String::from_utf8_lossy(&competing.stderr).contains("writer_busy"));
+        if cancel {
+            // Exercise the CLI's normal interrupt/cancel path, rather than
+            // relying on a disconnected backend to notice an advisory wait.
+            let pid = child
+                .id()
+                .ok_or("converter exited before TERM")?
+                .to_string();
+            assert!(
+                tokio::process::Command::new("sh")
+                    .args(["-c", "kill -TERM \"$1\"", "q22-own-converter", &pid])
+                    .status()
+                    .await?
+                    .success()
+            );
+        } else {
+            source_holder
+                .batch_execute("SELECT pg_advisory_unlock(728,1)")
+                .await?;
+            for prefix in [
+                "INSERT INTO serve.block%",
+                "UPDATE dsa.position SET serving=true%",
+            ] {
+                let began = Instant::now();
+                loop {
+                    let blocked:bool=target.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND query LIKE $2 AND wait_event='advisory')",&[&target.name,&prefix]).await?.get(0);
+                    if blocked {
+                        break;
+                    }
+                    assert!(
+                        began.elapsed() < Duration::from_secs(15),
+                        "no compatible destination barrier {prefix}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let source_open:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+                assert!(
+                    !source_open,
+                    "source snapshot not released before local work"
+                );
+                closed_conversion_reader(&reader, original, &prepared).await?;
+                owner
+                    .batch_execute(if prefix.starts_with("INSERT") {
+                        "SELECT pg_advisory_unlock(728,2)"
+                    } else {
+                        "SELECT pg_advisory_unlock(728,3)"
+                    })
+                    .await?;
+            }
+        }
+        let status = child.wait().await?;
+        let stdout = out.await??;
+        let stderr = err.await??;
+        let mode = String::from_utf8_lossy(&stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|v| v["event"] == "conversion_load_mode")
+            .ok_or("missing conversion mode")?;
+        assert_eq!(mode["mode"], "reader_compatible");
+        let converted = if cancel {
+            assert!(!status.success());
+            let began = Instant::now();
+            loop {
+                let active:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+                if !active {
+                    break;
+                }
+                assert!(
+                    began.elapsed() < Duration::from_secs(3),
+                    "canceled source snapshot leaked"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            source_holder
+                .batch_execute("SELECT pg_advisory_unlock(728,1)")
+                .await?;
+            target.closed_empty().await?;
+            closed_conversion_reader(&reader, original, &prepared).await?;
+            let temp:i64=target.admin.query_one("SELECT count(*) FROM pg_class c JOIN pg_roles r ON r.oid=c.relowner WHERE c.relpersistence='t' AND r.rolname=$1",&[&target.owner]).await?.get(0);
+            assert_eq!(temp, 0);
+            target
+                .cli(
+                    "convert",
+                    "mainnet",
+                    &["--source", &source.dsn(true), "--horizon-block", "6"],
+                )
+                .await?
+        } else {
+            assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+            serde_json::from_slice(&stdout)?
+        };
+        let verified = target.cli("verify", "mainnet", &[]).await?;
+        for key in [
+            "content_digest",
+            "state_digest",
+            "families",
+            "protected_state",
+            "state",
+            "supply",
+        ] {
+            assert_eq!(converted["verified"][key], verified[key]);
+        }
+        assert_eq!(
+            target.rows().await?,
+            selected(&f.rows(), &keep(&f.chain, &f.profile, f.bounds)?)
+        );
+        assert!(!reader.query(original, &[]).await?.is_empty());
+        reader.query(&prepared, &[]).await?;
+        reader
+            .query(&format!("SELECT * FROM ({original}) q22_original"), &[])
+            .await?;
+        target
+            .cli(
+                "grant-reader",
+                "mainnet",
+                &["--role", &target.reader, "--check"],
+            )
+            .await?;
+        assert_eq!(source_before, source.rows().await?);
+        source_holder.batch_execute(&gate).await?;
+        println!(
+            "{}",
+            json!({"f10_normal_convert_reader_compatible":true,"cancel_then_retry":cancel,"all11_literal4_nested_prepared_55000":true,"source_released":true,"final_model_and_verify_parity":true})
+        );
+        drop(reader);
+        drop(owner);
+        drop(source_holder);
+        source.cleanup().await?;
+        target.cleanup().await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
 async fn convert_true_legacy_public_reader_model_and_snapshot() -> Result {
