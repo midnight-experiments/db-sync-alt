@@ -1590,7 +1590,9 @@ async fn restore_repeatable_read_recheck_preserves_late_owner_row() -> Result {
         let restore = tokio::spawn(async move { command.output().await });
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            let waiting:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event_type='Lock' AND query LIKE 'LOCK TABLE%')",&[&dest.name]).await?.get(0);
+            // A different autocommit connection avoids pg_stat_activity's
+            // transaction-cached snapshot on the deliberate lock holder.
+            let waiting:bool=dest.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event_type='Lock' AND query LIKE 'LOCK TABLE%')",&[&dest.name]).await?.get(0);
             if waiting {
                 break;
             }
