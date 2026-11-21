@@ -88,12 +88,19 @@ fn projection_stage(
     query: &str,
     prepare: &str,
 ) -> Result<KeyStage, Error> {
+    // Replacing K4 with its hash checkpoint removes the last use of $4
+    // from some prefixes. Keep every node-domain parameter explicitly typed,
+    // even when all its consumers are now independent destination stages.
+    let bindings = "conversion_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,$3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,$6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,$9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names),\n";
+    let prefix = prefix(full)?;
+    let start = prefix
+        .find("WITH\n")
+        .map(|n| n + 5)
+        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+    let prefix = format!("{}{}{}", &prefix[..start], bindings, &prefix[start..]);
     Ok(KeyStage {
         table,
-        create_sql: format!(
-            "CREATE TEMP TABLE {table} ON COMMIT DROP AS {} {query}",
-            prefix(full)?
-        ),
+        create_sql: format!("CREATE TEMP TABLE {table} ON COMMIT DROP AS {prefix} {query}"),
         prepare_sql: prepare.to_owned(),
     })
 }
