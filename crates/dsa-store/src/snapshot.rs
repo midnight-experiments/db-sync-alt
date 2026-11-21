@@ -92,6 +92,24 @@ const FORMAT: u32 = 1;
 const MAX_DESCRIPTION: u64 = 1024 * 1024;
 const MAX_SECTION: u64 = 1 << 40;
 
+async fn restore_access<C: GenericClient>(client: &C) -> Result<(bool, &'static str), Error> {
+    let row = client.query_one(
+        "SELECT p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user),EXISTS(SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner) FROM pg_proc p WHERE p.oid='dsa.gate()'::regprocedure", &[],
+    ).await?;
+    let owner_matches: bool = row.get(0);
+    let other_grants: bool = row.get(1);
+    Ok((
+        owner_matches && !other_grants,
+        if !owner_matches {
+            "owner_changed"
+        } else if other_grants {
+            "non_owner_grant"
+        } else {
+            "owner_only"
+        },
+    ))
+}
+
 // Compare the server's index deparse with our fixed DDL, allowing only its
 // default btree spelling, quoted `index` column and implicit encode argument
 // casts from our bytea domains / hex literal. Other casts remain significant.
@@ -700,13 +718,12 @@ impl Store {
         // This metadata read stays outside ingest, so even REPEATABLE READ
         // starts its data snapshot only after the load locks. The session writer
         // advisory lock is already held across prepare/preflight/load.
-        let isolated_bulk: bool = self.client().query_one(
-            "SELECT p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND NOT EXISTS(SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner) FROM pg_proc p WHERE p.oid='dsa.gate()'::regprocedure",
-            &[],
-        ).await.map_err(|error| stage.error(error))?.get(0);
+        let (isolated_bulk, reason) = restore_access(self.client())
+            .await
+            .map_err(|error| stage.error(error))?;
         eprintln!(
             "{}",
-            serde_json::json!({"event":"restore_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"}})
+            serde_json::json!({"event":"restore_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"},"reason":reason})
         );
         let tx = self
             .writer_transaction()
@@ -732,6 +749,17 @@ impl Store {
         ))
         .await
         .map_err(|error| stage.error(error))?;
+        // Narrow an out-of-protocol manual GRANT race while we waited. This is
+        // after load locks, preserving the RR recheck snapshot ordering. Owner
+        // DDL after this check still bypasses the product's writer protocol.
+        if isolated_bulk
+            && !restore_access(&tx)
+                .await
+                .map_err(|error| stage.error(error))?
+                .0
+        {
+            return Err(stage.error(Error::Refusal("gate_access_changed")));
+        }
         let row = tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1 FOR UPDATE OF p,i", &[])
             .await.map_err(|error| stage.error(error))?;
         let occupied = locked

@@ -1173,6 +1173,22 @@ fn restore_mode(output: &std::process::Output) -> Result<String> {
     Ok(event["mode"].as_str().ok_or("invalid restore mode")?.into())
 }
 
+fn assert_no_restore_copy(output: &std::process::Output) {
+    assert!(
+        !String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|v| matches!(
+                v["event"].as_str(),
+                Some("restore_section_started" | "restore_copy_opened")
+            ))
+    );
+}
+
+async fn restore_catalogue(client: &Client) -> Result<Value> {
+    Ok(client.query_one("SELECT jsonb_build_object('tables',(SELECT jsonb_object_agg(n.nspname||'.'||c.relname,jsonb_build_array(c.oid::bigint,pg_relation_filenode(c.oid)::bigint,c.relacl::text,CASE WHEN c.relkind='i' THEN pg_get_indexdef(c.oid) WHEN c.relkind='v' THEN pg_get_viewdef(c.oid) ELSE NULL END)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('serve','public') AND c.relkind IN ('r','v','i')),'gate_acl',(SELECT proacl::text FROM pg_proc WHERE oid='dsa.gate()'::regprocedure))",&[]).await?.get(0))
+}
+
 async fn closed_reader_queries(reader: &Client) -> Result {
     for table in TABLES {
         let error = reader
@@ -1357,6 +1373,7 @@ async fn restore_reader_compatible_cli_copy_indexes_and_atomic_publication() -> 
     )
     .await?;
     let before = dest.cli("status", &f.profile.network, &[]).await?;
+    let before_catalogue = restore_catalogue(&client).await?;
     assert!(
         !dest
             .cli_raw("restore", &f.profile.network, &file_args(&path))
@@ -1365,6 +1382,18 @@ async fn restore_reader_compatible_cli_copy_indexes_and_atomic_publication() -> 
             .success()
     );
     assert_eq!(before, dest.cli("status", &f.profile.network, &[]).await?);
+    assert_eq!(before_catalogue, restore_catalogue(&client).await?);
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader, "--check"],
+    )
+    .await?;
+    for table in TABLES {
+        reader
+            .query(&format!("SELECT * FROM public.{table} LIMIT 1"), &[])
+            .await?;
+    }
     assert_eq!(rows(&source).await?, rows(&dest).await?);
     println!(
         "{}",
@@ -1415,6 +1444,12 @@ async fn restore_mode_acl_and_reader_compatible_conflicting_index_retry() -> Res
                         .batch_execute(&format!("GRANT EXECUTE ON FUNCTION dsa.gate() TO {role}"))
                         .await?;
                 } else {
+                    dest.cli(
+                        "grant-reader",
+                        &f.profile.network,
+                        &["--role", &dest.reader],
+                    )
+                    .await?;
                     let mut root = dest.config.clone();
                     let admin_user: String = dest
                         .admin
@@ -1435,6 +1470,7 @@ async fn restore_mode_acl_and_reader_compatible_conflicting_index_retry() -> Res
                 )
                 .await?;
                 client.batch_execute("DROP INDEX serve.idx_multi_asset_policy_name_hex;CREATE INDEX idx_multi_asset_policy_name_hex ON serve.multi_asset(encode(policy,'h e x'),encode(name,'hex'))").await?;
+                let before_catalogue = restore_catalogue(&client).await?;
                 let failed = dest
                     .cli_raw("restore", &f.profile.network, &file_args(&path))
                     .await?;
@@ -1443,6 +1479,8 @@ async fn restore_mode_acl_and_reader_compatible_conflicting_index_retry() -> Res
                 assert!(
                     String::from_utf8_lossy(&failed.stderr).contains("destination_index_mismatch")
                 );
+                assert_no_restore_copy(&failed);
+                assert_eq!(before_catalogue, restore_catalogue(&client).await?);
                 assert_eq!(
                     client
                         .query_one("SELECT count(*) FROM serve.block", &[])
@@ -1527,6 +1565,29 @@ async fn restore_mode_acl_and_reader_compatible_conflicting_index_retry() -> Res
         ] {
             assert_eq!(report[key], description["verified"][key], "{mode}/{key}");
         }
+        let mode_event = String::from_utf8_lossy(&restored.stderr)
+            .lines()
+            .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+            .find(|v| v["event"] == "restore_load_mode")
+            .ok_or("missing mode event")?;
+        assert_eq!(
+            mode_event["reason"],
+            match mode {
+                "fresh" => "owner_only",
+                "changed_owner" => "owner_changed",
+                _ => "non_owner_grant",
+            }
+        );
+        if mode == "changed_owner" {
+            let mut config = dest.config.clone();
+            config.user(&dest.reader);
+            let reader = connect(&config).await?;
+            for table in TABLES {
+                reader
+                    .query(&format!("SELECT * FROM public.{table} LIMIT 1"), &[])
+                    .await?;
+            }
+        }
         println!(
             "{}",
             json!({"q22_restore_acl_case":mode,"mode":restore_mode(&restored)?,"logical_parity":true})
@@ -1555,7 +1616,7 @@ async fn restore_repeatable_read_recheck_preserves_late_owner_row() -> Result {
     source
         .cli("snapshot", &f.profile.network, &file_args(&path))
         .await?;
-    for provisioned in [false, true] {
+    for (provisioned, late_grant) in [(false, false), (true, false), (false, true)] {
         let dest = Database::new().await?;
         dest.cli("create", &f.profile.network, &[]).await?;
         if provisioned {
@@ -1602,10 +1663,34 @@ async fn restore_repeatable_read_recheck_preserves_late_owner_row() -> Result {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        client.batch_execute("INSERT INTO serve.block VALUES(1,decode(repeat('ab',32),'hex'),0,1,1,timestamp '2026-01-01',0);COMMIT").await?;
+        if late_grant {
+            client
+                .batch_execute(&format!(
+                    "GRANT EXECUTE ON FUNCTION dsa.gate() TO {};COMMIT",
+                    dest.reader
+                ))
+                .await?;
+        } else {
+            client.batch_execute("INSERT INTO serve.block VALUES(1,decode(repeat('ab',32),'hex'),0,1,1,timestamp '2026-01-01',0);COMMIT").await?;
+        }
         let output = restore.await??;
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("destination_not_empty"));
+        assert_eq!(
+            restore_mode(&output)?,
+            if provisioned {
+                "reader_compatible"
+            } else {
+                "isolated_bulk"
+            }
+        );
+        assert_no_restore_copy(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(if late_grant {
+                "gate_access_changed"
+            } else {
+                "destination_not_empty"
+            })
+        );
         assert_eq!(
             client
                 .query_one(
@@ -1614,15 +1699,108 @@ async fn restore_repeatable_read_recheck_preserves_late_owner_row() -> Result {
                 )
                 .await?
                 .get::<_, i64>(0),
-            1
+            if late_grant { 0 } else { 1 }
         );
+        if late_grant {
+            assert!(
+                client
+                    .query_one(
+                        "SELECT has_function_privilege($1,'dsa.gate()','EXECUTE')",
+                        &[&dest.reader]
+                    )
+                    .await?
+                    .get::<_, bool>(0)
+            );
+        }
         assert_eq!(
             dest.cli("status", &f.profile.network, &[]).await?["position"]["serving"],
             false
         );
         println!(
             "{}",
-            json!({"q22_repeatable_read_late_row_preserved":true,"provisioned_reader":provisioned,"mode":restore_mode(&output)?})
+            json!({"q22_repeatable_read_late_row_preserved":!late_grant,"q22_late_grant_refused":late_grant,"provisioned_reader":provisioned,"mode":restore_mode(&output)?})
+        );
+        drop(client);
+        dest.cleanup().await?;
+    }
+    source.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_conflicting_catalogue_objects_are_preserved_before_copy() -> Result {
+    let f = fixture(164);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("wrong-objects.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    for kind in ["table", "wrong_table_index"] {
+        let dest = Database::new().await?;
+        dest.cli("create", &f.profile.network, &[]).await?;
+        dest.cli(
+            "grant-reader",
+            &f.profile.network,
+            &["--role", &dest.reader],
+        )
+        .await?;
+        let client = connect(&dest.config).await?;
+        client
+            .batch_execute("DROP INDEX serve.idx_multi_asset_policy_name_hex")
+            .await?;
+        client
+            .batch_execute(if kind == "table" {
+                "CREATE TABLE serve.idx_multi_asset_policy_name_hex(id bigint)"
+            } else {
+                "CREATE INDEX idx_multi_asset_policy_name_hex ON serve.block(id)"
+            })
+            .await?;
+        let before = restore_catalogue(&client).await?;
+        let failed = dest
+            .cli_raw("restore", &f.profile.network, &file_args(&path))
+            .await?;
+        assert!(!failed.status.success());
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("destination_index_mismatch"));
+        assert_no_restore_copy(&failed);
+        assert_eq!(before, restore_catalogue(&client).await?);
+        assert_eq!(
+            client
+                .query_one("SELECT count(*) FROM serve.block", &[])
+                .await?
+                .get::<_, i64>(0),
+            0
+        );
+        assert_eq!(
+            dest.cli("status", &f.profile.network, &[]).await?["position"]["serving"],
+            false
+        );
+        client
+            .batch_execute(if kind == "table" {
+                "DROP TABLE serve.idx_multi_asset_policy_name_hex"
+            } else {
+                "DROP INDEX serve.idx_multi_asset_policy_name_hex"
+            })
+            .await?;
+        client.batch_execute("CREATE INDEX idx_multi_asset_policy_name_hex ON serve.multi_asset(encode(policy,'hex'),encode(name,'hex'))").await?;
+        let report = dest
+            .cli("restore", &f.profile.network, &file_args(&path))
+            .await?;
+        for key in [
+            "content_digest",
+            "state_digest",
+            "families",
+            "protected_state",
+            "state",
+            "supply",
+        ] {
+            assert_eq!(report[key], description["verified"][key]);
+        }
+        println!(
+            "{}",
+            json!({"q22_conflicting_object":kind,"preserved_before_copy":true,"retry_parity":true})
         );
         drop(client);
         dest.cleanup().await?;
