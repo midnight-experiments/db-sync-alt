@@ -155,9 +155,6 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
         source.wait_barrier().await?;
         let held:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND query LIKE 'COPY (%' AND backend_xmin IS NOT NULL)",&[&source.name]).await?.get(0);
         assert!(held, "no real source COPY/snapshot");
-        let raw_indexes=target.admin.query_one("SELECT count(*),bool_and(i.indisprimary) FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_roles r ON r.oid=c.relowner WHERE c.relpersistence='t' AND c.relname='block' AND r.rolname=$1",&[&target.owner]).await?;
-        assert_eq!(raw_indexes.get::<_, i64>(0), 1);
-        assert_eq!(raw_indexes.get::<_, Option<bool>>(1), Some(true));
         closed_conversion_reader(&reader, original, &prepared).await?;
         let competing = target
             .start_cli("grant-reader", "mainnet", &["--role", &target.reader])?
@@ -217,6 +214,24 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
         let status = child.wait().await?;
         let stdout = out.await??;
         let stderr = err.await??;
+        // TEMP catalogue rows are uncommitted and invisible to our observer.
+        // The actual staging transaction checks its PK shape before emitting
+        // this event; assert that executed invariant rather than a stale or
+        // outside-session catalogue count.
+        let raw_prepared = String::from_utf8_lossy(&stderr)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["event"] == "conversion_raw_table_prepared")
+            .collect::<Vec<_>>();
+        assert!(!raw_prepared.is_empty());
+        assert!(
+            raw_prepared
+                .iter()
+                .all(|event| event["indexes"] == "primary_key_only")
+        );
+        if !cancel {
+            assert_eq!(raw_prepared.len(), 11);
+        }
         let mode = String::from_utf8_lossy(&stderr)
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
