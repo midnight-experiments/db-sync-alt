@@ -40,6 +40,10 @@
 //! failed restore may retry. Identity/state are committed closed before ingest.
 //! All section hashes and total file framing are preflighted outside the load
 //! transaction. Compressed bytes actually decoded are hashed again during COPY.
+//! Empty COPY tables are rechecked under relation/identity locks and truncated
+//! in the ingest transaction, allowing minimal-WAL COPY when the server already
+//! uses that WAL mode. No CASCADE, sequence reset or server-policy change occurs.
+//! Load-table readers can wait on these locks; partial data never becomes served.
 //! Caller statement/idle transaction timeouts remain in force; no timeout is
 //! silently disabled. Long operations need explicit operator-chosen limits.
 //! Restore reports separate COPY/index/analyze/verification/publication times.
@@ -574,11 +578,53 @@ impl Store {
             read_description(&mut file, profile).map_err(|error| stage.error(error))?;
         preflight(&mut file, &description).map_err(|error| stage.error(error))?;
         stage.finish();
-        let stage = RestoreStage::start("restore_drop_indexes", "database");
+        let stage = RestoreStage::start("restore_recheck_empty", "database");
         let tx = self
             .writer_transaction()
             .await
             .map_err(|error| stage.error(error))?;
+        // The closed layout was committed before file preflight. Recheck it
+        // under relation/identity locks before replacing even empty storage.
+        // Truncating here permits minimal-WAL COPY on a server already using
+        // wal_level=minimal; replica-mode servers keep their normal WAL policy.
+        let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
+        let mut locked = copied.clone();
+        locked.extend([
+            "dsa.supply".into(),
+            "dsa.first_served".into(),
+            "dsa.calls".into(),
+        ]);
+        tx.batch_execute(&format!(
+            "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+            locked.join(",")
+        ))
+        .await
+        .map_err(|error| stage.error(error))?;
+        let row = tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1 FOR UPDATE OF p,i", &[])
+            .await.map_err(|error| stage.error(error))?;
+        let occupied = locked
+            .iter()
+            .map(|name| format!("EXISTS(SELECT 1 FROM {name})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let occupied: bool = tx
+            .query_one(&format!("SELECT {occupied}"), &[])
+            .await
+            .map_err(|error| stage.error(error))?
+            .get(0);
+        if row.get::<_, bool>(0)
+            || row.get::<_, Option<String>>(1).as_deref() != Some("restore_failed")
+            || occupied
+        {
+            return Err(stage.error(Error::Refusal("destination_not_empty")));
+        }
+        // No CASCADE/identity reset: ACLs, relation identities, sequences and
+        // unknown dependencies are preserved; failure rolls back this rewrite.
+        tx.batch_execute(&format!("TRUNCATE TABLE {}", copied.join(",")))
+            .await
+            .map_err(|error| stage.error(error))?;
+        stage.finish();
+        let stage = RestoreStage::start("restore_drop_indexes", "database");
         // A manually initialized empty layout may already have secondary indexes.
         for line in include_str!("indexes.sql")
             .lines()

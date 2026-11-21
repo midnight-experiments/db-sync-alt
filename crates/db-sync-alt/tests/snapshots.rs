@@ -379,6 +379,15 @@ async fn snapshot_corruption_refusal_retry_and_serving_protection() -> Result {
     dest.cli("restore", &f.profile.network, &file_args(&good))
         .await?;
     let before = dest.cli("verify", &f.profile.network, &[]).await?;
+    let before_status = dest.cli("status", &f.profile.network, &[]).await?;
+    let client = connect(&dest.config).await?;
+    let before_storage: i64 = client
+        .query_one(
+            "SELECT pg_relation_filenode('serve.tx_out'::regclass)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
     assert!(
         !dest
             .cli_raw("restore", &f.profile.network, &file_args(&good))
@@ -388,7 +397,23 @@ async fn snapshot_corruption_refusal_retry_and_serving_protection() -> Result {
     );
     let after = dest.cli("verify", &f.profile.network, &[]).await?;
     assert_eq!(before["content_digest"], after["content_digest"]);
+    assert_eq!(
+        before_status,
+        dest.cli("status", &f.profile.network, &[]).await?
+    );
+    let after_storage: i64 = client
+        .query_one(
+            "SELECT pg_relation_filenode('serve.tx_out'::regclass)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        before_storage, after_storage,
+        "serving storage was rewritten"
+    );
     assert_eq!(rows(&source).await?, rows(&dest).await?);
+    drop(client);
     source.cleanup().await?;
     dest.cleanup().await?;
     Ok(())
@@ -992,6 +1017,13 @@ async fn restore_copy_sqlstate_privacy_and_pipeline_timings() -> Result {
     let dest = Database::new().await?;
     dest.cli("create", &f.profile.network, &[]).await?;
     let client = connect(&dest.config).await?;
+    let original_storage: i64 = client
+        .query_one(
+            "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
     client.batch_execute("CREATE FUNCTION serve.copy_error_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION USING ERRCODE='P0001',MESSAGE='generated-private-message-marker',DETAIL='generated-private-detail-marker',HINT='generated-private-hint-marker';END$$;CREATE TRIGGER copy_error_guard BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.copy_error_guard()").await?;
     let failed = dest
         .cli_raw("restore", &f.profile.network, &file_args(&path))
@@ -1035,6 +1067,17 @@ async fn restore_copy_sqlstate_privacy_and_pipeline_timings() -> Result {
     let closed = dest.cli("status", &f.profile.network, &[]).await?;
     assert_eq!(closed["position"]["serving"], false);
     assert_eq!(closed["position"]["reason"], "restore_failed");
+    let failed_storage: i64 = client
+        .query_one(
+            "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        original_storage, failed_storage,
+        "failed COPY did not roll back its empty-table rewrite"
+    );
     assert_eq!(
         client
             .query_one("SELECT count(*) FROM serve.block", &[])
@@ -1066,6 +1109,17 @@ async fn restore_copy_sqlstate_privacy_and_pipeline_timings() -> Result {
         String::from_utf8_lossy(&retry.stderr)
     );
     let restored: Value = serde_json::from_slice(&retry.stdout)?;
+    let restored_storage: i64 = client
+        .query_one(
+            "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_ne!(
+        original_storage, restored_storage,
+        "successful retry did not replace empty storage in its ingest transaction"
+    );
     assert_eq!(
         restored["content_digest"],
         description["verified"]["content_digest"]
@@ -1081,6 +1135,7 @@ async fn restore_copy_sqlstate_privacy_and_pipeline_timings() -> Result {
     for name in [
         "restore_prepare",
         "restore_preflight",
+        "restore_recheck_empty",
         "restore_drop_indexes",
         "restore_load_state",
         "restore_indexes",
@@ -1101,7 +1156,7 @@ async fn restore_copy_sqlstate_privacy_and_pipeline_timings() -> Result {
     }
     println!(
         "{}",
-        json!({"restore_copy_server_failure":report,"server_message_detail_hint_and_context_omitted":true,"failed_gate_closed":true,"clean_retry_verified":true,"pipeline_stages_observed":10})
+        json!({"restore_copy_server_failure":report,"server_message_detail_hint_and_context_omitted":true,"failed_gate_closed":true,"failed_storage_rewrite_rolled_back":true,"clean_retry_verified":true,"successful_same_transaction_empty_rewrite":true,"pipeline_stages_observed":11})
     );
     drop(client);
     source.cleanup().await?;

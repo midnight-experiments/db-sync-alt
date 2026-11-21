@@ -23,6 +23,15 @@ checks every compressed section and exact file length before loading, then
 checks the compressed bytes actually consumed during COPY again. A failed load
 rolls back and may retry the original valid file in the same destination.
 
+After file preflight, restore locks and rechecks its owned empty destination,
+then truncates only the twelve empty COPY tables inside the load transaction.
+This preserves relation identities, ACLs and allocation sequences; no `CASCADE`
+or server setting is used. It permits PostgreSQL's bulk COPY WAL optimization
+when the server already uses `wal_level=minimal`; other WAL modes retain their
+normal durability policy. Failure rolls back the empty-storage replacement.
+Readers of the load tables can wait on these locks; no partial rows are served,
+and the gate remains closed until the final verified commit.
+
 Both commands preserve PostgreSQL's configured statement and idle transaction
 timeouts by default. File preflight runs outside the load transaction. Each COPY,
 index build and verification statement must finish within the owner's limits.
