@@ -1,11 +1,11 @@
 {
   "source": "6df6609136a16b29f36fb7075da1e19fe61fc216",
   "mode": "qualify",
-  "divisor": 100,
+  "divisor": 1,
   "target": "assembly",
   "reference_statement_seconds": 900,
   "candidate_statement_seconds": 600,
   "raw_width_target_bytes": 3050299392,
-  "scope": "Approved divisor100actualAPI20stage smoke before ONEfullwidth; commonfirst5/frozen d038 finalreference900/newcandidate600/overall7200; datum1280commonband/~56.8percentNULL; no source/convert/provider/archive",
+  "scope": "ONE approved full-width actualAPI20stage study after verifiedsmoke: commonfirst5/historical d038 final900/newcandidate600/overall7200, fixed1280common datum/~56.8percentNULL/100Bholder, rawwidthtarget measured, no source/convert/provider/archive",
   "portable_bytes": 268435456
 }

@@ -319,6 +319,7 @@ async fn assembly_focus_inner() -> Result {
     c.batch_execute("SAVEPOINT d038_reference").await?;
     c.batch_execute(&format!("SET LOCAL statement_timeout='{reference_limit}s'"))
         .await?;
+    save("assembly-reference-settings.json", &settings(&c).await?)?;
     let start = Instant::now();
     let reference_started = unix();
     save(
