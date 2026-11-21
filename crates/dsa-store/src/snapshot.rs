@@ -93,7 +93,8 @@ const MAX_DESCRIPTION: u64 = 1024 * 1024;
 const MAX_SECTION: u64 = 1 << 40;
 
 // Compare the server's index deparse with our fixed DDL, allowing only its
-// default btree spelling, quoted `index` column and text cast of the hex literal.
+// default btree spelling, quoted `index` column and implicit encode argument
+// casts from our bytea domains / hex literal. Other casts remain significant.
 // Keep quoted contents intact: whitespace inside a literal is significant.
 fn index_shape(sql: &str) -> Vec<String> {
     let mut chars = sql.trim_end_matches(';').chars().peekable();
@@ -138,6 +139,20 @@ fn index_shape(sql: &str) -> Vec<String> {
             i += 3;
         } else if tokens[i..].starts_with(&["USING".into(), "btree".into()]) {
             i += 2;
+        } else if i + 9 <= tokens.len()
+            && tokens[i] == "encode"
+            && tokens[i + 1] == "("
+            && tokens[i + 2] == "("
+            && matches!(tokens[i + 3].as_str(), "policy" | "name")
+            && tokens[i + 4..i + 9] == [")", ":", ":", "bytea", ","]
+        {
+            shape.extend([
+                "encode".into(),
+                "(".into(),
+                tokens[i + 3].clone(),
+                ",".into(),
+            ]);
+            i += 9;
         } else if tokens[i..].starts_with(&["'hex'".into(), ":".into(), ":".into(), "text".into()])
         {
             shape.push("'hex'".into());
@@ -175,7 +190,13 @@ async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'stati
             Some(row)
                 if row.get::<_, bool>(1)
                     && index_shape(&row.get::<_, String>(0)) == index_shape(sql) => {}
-            Some(_) => return Err(Error::Refusal("destination_index_mismatch")),
+            Some(_) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"restore_index_mismatch","index":name})
+                );
+                return Err(Error::Refusal("destination_index_mismatch"));
+            }
         }
     }
     Ok(missing)
@@ -930,7 +951,7 @@ mod index_tests {
         assert_eq!(
             index_shape(expression),
             index_shape(
-                "CREATE INDEX i ON serve.multi_asset USING btree (encode(policy, 'hex'::text), encode(name, 'hex'::text))"
+                "CREATE INDEX i ON serve.multi_asset USING btree (encode((policy)::bytea, 'hex'::text), encode((name)::bytea, 'hex'::text))"
             )
         );
         for wrong in [
