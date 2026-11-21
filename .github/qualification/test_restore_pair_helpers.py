@@ -9,6 +9,7 @@ class PreparationControls(unittest.TestCase):
         for candidate in ['main', 'a' * 39, PREDECESSOR, 'a' * 40 + '; echo unsafe']:
             with self.assertRaises(AssertionError): configuration(candidate)
         self.assertEqual(configuration('a' * 40)['target'], 'restore_pair')
+        self.assertEqual(configuration('a' * 40)['product_pair_owner_work_mem_mb'], 128)
 
     def test_query_durations_and_unmeasured_short_query_scope(self):
         log = ('LOG:  duration: 1234.500 ms  execute s12: SELECT 1\n'

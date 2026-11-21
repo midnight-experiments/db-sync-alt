@@ -38,6 +38,7 @@ def configuration(candidate, mode='product_pair', completed_work4_run=None):
             'completed_work4_run': completed_work4_run,
             'mode': 'qualify', 'divisor': 1, 'target': 'restore_pair',
             'restore_pair_mode': mode,
+            'product_pair_owner_work_mem_mb': 128,
             'portable_bytes': 134217728, 'restore_tcp_user_timeout_seconds': 600,
             'restore_server_settings': SERVER_SETTINGS,
             'scope': 'ONE retained GENERATED snapshot paired restore and independent verify; no source generation/conversion or actual archive timing'}
@@ -194,6 +195,7 @@ def run(g):
     g['thread'] = threading.Thread(target=g['monitor'], daemon=True); g['thread'].start()
     deadline = time.monotonic() + 7200
     results = []
+    matched_settings, matched_devices = [], []
     for label, pin, _ in pins:
         if previous and label == 'owner-work4':
             continue
@@ -201,10 +203,10 @@ def run(g):
         name, owner = 'restore_pair', 'restore_pair_owner'
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
                '-d', 'postgres', '-c', f'CREATE ROLE {owner} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
-        owner_work = 128 if label == 'owner-work128' else 4
-        if mode == 'owner_work_mem_pair':
-            docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
-                   '-d', 'postgres', '-c', f"ALTER ROLE {owner} SET work_mem='{owner_work}MB'")
+        assert config['product_pair_owner_work_mem_mb'] == 128
+        owner_work = 128 if mode == 'product_pair' or label == 'owner-work128' else 4
+        docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
+               '-d', 'postgres', '-c', f"ALTER ROLE {owner} SET work_mem='{owner_work}MB'")
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
                '-d', 'postgres', '-c', f'CREATE DATABASE {name} OWNER {owner}')
         save('databases.json', {'restored': name})
@@ -222,6 +224,8 @@ def run(g):
         assert all(settings[key]['setting'] == 'on' for key in ['fsync', 'synchronous_commit', 'full_page_writes'])
         assert settings['archive_mode']['setting'] == 'off'
         save(label + '-settings.json', settings)
+        matched_settings.append(settings)
+        matched_devices.append(sorted(fresh['admission']['admission']['devices']))
         # Exercise the actual observer's JSON contract before any long COPY.
         assert query(DISCONNECT_SQL) is False
         save(label + '-observer-smoke.json', {'disconnected_query_decodes_false': True})
@@ -293,7 +297,7 @@ def run(g):
         assert socket_limits and all(event['tcp_user_timeout_ms'] == 600000 for event in socket_limits)
         combined = phases['restore']['seconds'] + phases['verify']['seconds']
         item = {'label': label, 'source_head': pin, 'fresh_target': fresh, 'state': state,
-                'owner_work_mem_mb': owner_work, 'owner_work_mem_override': mode == 'owner_work_mem_pair',
+                'owner_work_mem_mb': owner_work, 'owner_work_mem_override': True,
                 'restore_seconds': phases['restore']['seconds'], 'independent_verify_seconds': phases['verify']['seconds'],
                 'restore_plus_independent_verify_seconds': combined, 'criterion_seconds': 180,
                 'criterion_met_on_this_generated_fixture': combined <= 180,
@@ -303,6 +307,19 @@ def run(g):
                           'combined_seconds': combined, 'functional_pass': True}), flush=True)
     if not previous:
         assert all(results[0]['verified'][k] == results[1]['verified'][k] for k in EXPECTED_FIELDS)
+    if mode == 'product_pair':
+        assert len(results) == 2 and matched_settings[0] == matched_settings[1]
+        assert matched_devices[0] == matched_devices[1]
+        rechecks = [any(event.get('event') == 'restore_stage_finished' and
+                        event.get('stage') == 'restore_recheck_empty'
+                        for event in item['phase_events']) for item in results]
+        if g['PIN'] == '0155daa0905ae6764bd753fdac5f5de50af39e47':
+            assert rechecks == [False, True], 'expected bulk-path recheck stage was not exercised'
+        save('matched-environment.json', {'same_runner_run': g['os'].environ['GITHUB_RUN_ID'],
+            'all_observed_owner_settings_identical': True, 'devices_both': matched_devices[0],
+            'owner_work_mem_mb_both': 128, 'fresh_target_per_variant': True,
+            'restore_recheck_empty_finished_by_variant': rechecks,
+            'caps_and_direct_io_probes': [item['fresh_target']['admission'] for item in results]})
     save('restore-pair-result.json', {'status': 'PASS_GENERATED_FUNCTIONAL_CONTINUATION' if previous else 'PASS_GENERATED_FUNCTIONAL_PAIR', 'variants': results,
         'previous_work4': previous,
         'restore_pair_mode': mode,

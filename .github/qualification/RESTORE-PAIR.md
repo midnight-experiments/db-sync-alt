@@ -48,8 +48,11 @@ parallel workers0, `wal_level=minimal`, `max_wal_senders=0`, `archive_mode=off`,
 fsync/synchronous_commit/full_page_writes on. Default `wal_skip_threshold`,
 checkpoint and memory GUCs are read back; none is tuned between variants.
 The former hosted128MiB shared buffer/30s checkpoint override is not used.
-In product-pair mode work_mem stays4MiB; only the explicitly selected setting-pair
-mode uses an owner128MiB override. Work_mem is allocated per executor operation,
+In the matched product-pair mode both private owners explicitly use128MiB
+work_mem. This mode checks that both targets have identical observed GUCs and
+device topology on the same runner; it preserves the earlier4/128 observations
+as separate evidence. The setting-pair mode still compares4 versus128MiB.
+Work_mem is allocated per executor operation,
 and hash_mem_multiplier and multiple operators/clients can multiply it;128MiB
 does not bound total memory. The1GiB cgroup cap remains enforced and OOM failure
 must be reported. No recommendation for a concurrent production setting follows.
