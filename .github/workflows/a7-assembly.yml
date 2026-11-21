@@ -1,0 +1,31 @@
+name: a7-assembly-generated
+on:
+  push:
+    branches: ['validation/a7-whole-conversion']
+    paths: ['.github/qualification/assembly-config.json']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  assembly:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 6df6609136a16b29f36fb7075da1e19fe61fc216
+          path: product
+          persist-credentials: false
+      - name: Isolated destination-only assembly equality and cost study
+        env:
+          DSA_QUALIFICATION_CONFIG: .github/qualification/assembly-config.json
+        run: python3 .github/qualification/run_whole.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a7-assembly-generated-${{github.run_id}}
+          path: ${{runner.temp}}/whole-evidence
+          retention-days: 5

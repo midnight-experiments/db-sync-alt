@@ -13,8 +13,8 @@ from pathlib import Path
 ROOT=Path(os.environ['GITHUB_WORKSPACE']);OUT=Path(os.environ['RUNNER_TEMP'])/'whole-evidence';OUT.mkdir(exist_ok=True)
 CONFIG_PATH=ROOT/os.environ.get('DSA_QUALIFICATION_CONFIG','.github/qualification/config.json');assert CONFIG_PATH.resolve().is_relative_to(ROOT.resolve())
 CONFIG=json.loads(CONFIG_PATH.read_text());PIN=CONFIG['source'];MODE=CONFIG['mode'];DIVISOR=CONFIG['divisor'];assert re.fullmatch('[0-9a-f]{40}',PIN)
-TARGET=CONFIG.get('target','whole');FOCUS=TARGET in ['index','selection','keys','stages'];TEST={'index':'a7_index_generated','selection':'a7_select_generated','restore':'a7_restore_generated','keys':'a7_keys_generated','stages':'a7_stages_generated'}.get(TARGET,'a7_whole_generated');HARNESS={'index':'a7_index.rs','selection':'a7_select.rs','restore':'a7_restore.rs','keys':'a7_keys.rs','stages':'a7_stages.rs'}.get(TARGET,'a7_whole.rs')
-PG_ROLES=['destination'] if TARGET in ['keys','stages'] else ['source','destination','restored']
+TARGET=CONFIG.get('target','whole');FOCUS=TARGET in ['index','selection','keys','stages','assembly'];TEST={'index':'a7_index_generated','selection':'a7_select_generated','restore':'a7_restore_generated','keys':'a7_keys_generated','stages':'a7_stages_generated','assembly':'a7_assembly_generated'}.get(TARGET,'a7_whole_generated');HARNESS={'index':'a7_index.rs','selection':'a7_select.rs','restore':'a7_restore.rs','keys':'a7_keys.rs','stages':'a7_stages.rs','assembly':'a7_assembly.rs'}.get(TARGET,'a7_whole.rs')
+PG_ROLES=['destination'] if TARGET in ['keys','stages','assembly'] else ['source','destination','restored']
 RESTORE_TCP=CONFIG.get('restore_tcp_user_timeout_seconds',600 if TARGET=='whole' else None)
 assert RESTORE_TCP is None or isinstance(RESTORE_TCP,int) and 1<=RESTORE_TCP<=86400
 RUST='rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea'
@@ -125,7 +125,7 @@ def fresh_restore_target(label):
    assert inspect(name)['Id']==IDS[name]
    (OUT/(label+'-previous-pg.log')).write_text(docker('logs',name));docker('stop','-t','120',name);save(label+'-previous-final.json',inspect(name));docker('rm',name);docker('volume','rm',VOLUMES[role])
   docker('volume','create',VOLUMES[role])
-  IDS[name]=docker('run','-d','--name',name,'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={VOLUMES[role]},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0',*(['-c','track_io_timing=on'] if TARGET=='stages' else [])).strip();wait_postgres(name)
+  IDS[name]=docker('run','-d','--name',name,'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={VOLUMES[role]},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0',*(['-c','track_io_timing=on'] if TARGET in ['stages','assembly'] else [])).strip();wait_postgres(name)
   admission=probe(name,4*1048576,2*1048576);value={'ready':True,'label':label,'target_inspect':inspect(name),'admission':admission,'scope':'fresh owned PG container/data per variant; source/converted unchanged'};save(label+'-fresh-target.json',value);return value
  finally:RESETTING.discard(role)
 
@@ -183,10 +183,12 @@ try:
  # Product files are the explicit untouched pin, with only one opt-in test copy.
  assert output(['git','-C',str(ROOT/'product'),'rev-parse','HEAD']).strip()==PIN
  shutil.copy2(ROOT/'.github/qualification'/HARNESS,ROOT/'product/crates/db-sync-alt/tests'/(TEST+'.rs'))
+ if TARGET=='assembly':
+  shutil.copy2(ROOT/'.github/qualification/a7_d038_stage_reference.json',ROOT/'product/crates/db-sync-alt/tests/a7_d038_stage_reference.json')
  if TARGET=='selection':
   for name in ['a7_candidate_indexes.sql','a7_closure.sql']:shutil.copy2(ROOT/'.github/qualification'/name,ROOT/'product/crates/db-sync-alt/tests'/name)
  tracked=output(['git','-C',str(ROOT/'product'),'diff','--name-only']);assert tracked==''
- save('source.json',{'product_head':PIN,'wrapper_head':os.environ['GITHUB_SHA'],'product_tracked_diff':tracked,'injected_test_sha256':hashlib.sha256((ROOT/'.github/qualification'/HARNESS).read_bytes()).hexdigest(),'config':CONFIG,'synthetic':True,'harness_connection_settings':{'restore_only_tcp_user_timeout_seconds':RESTORE_TCP,'source_statement_seconds':60,'source_idle_seconds':60,'reader_statement_seconds':60,'private_statement_seconds':600,'overall_seconds':7200},'injected_sql_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'.github/qualification').glob('a7_*.sql')} })
+ save('source.json',{'product_head':PIN,'wrapper_head':os.environ['GITHUB_SHA'],'product_tracked_diff':tracked,'injected_test_sha256':hashlib.sha256((ROOT/'.github/qualification'/HARNESS).read_bytes()).hexdigest(),'historical_reference_sha256':hashlib.sha256((ROOT/'.github/qualification/a7_d038_stage_reference.json').read_bytes()).hexdigest() if TARGET=='assembly' else None,'reference_only_statement_seconds':CONFIG.get('reference_statement_seconds',600) if TARGET=='assembly' else None,'config':CONFIG,'synthetic':True,'harness_connection_settings':{'restore_only_tcp_user_timeout_seconds':RESTORE_TCP,'source_statement_seconds':60,'source_idle_seconds':60,'reader_statement_seconds':60,'private_statement_seconds':600,'overall_seconds':7200},'injected_sql_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'.github/qualification').glob('a7_*.sql')} })
  call(['docker','pull',RUST]);call(['docker','pull',PG]);save('images.json',json.loads(docker('image','inspect',RUST,PG)))
  target=Path(os.environ['RUNNER_TEMP'])/'whole-target';target.mkdir(exist_ok=True)
  build=['docker','run','--rm','--name',PREFIX+'-build','-e','CARGO_TARGET_DIR=/work/target','-e','CARGO_PROFILE_RELEASE_DEBUG=0','--mount',f'type=bind,src={ROOT}/product,dst=/work/product','--mount',f'type=bind,src={target},dst=/work/target','-w','/work/product',RUST,'cargo','test','--locked','--release','-p','db-sync-alt','--test',TEST,'--no-run','--message-format=json']
@@ -199,6 +201,9 @@ try:
  if TARGET=='stages':
   mount=['--mount',f'type=bind,src={target},dst=/work/target,readonly'];listing=output(['docker','run','--rm',*mount,RUST,test_binary,'--list']);(OUT/'test-runner-list.txt').write_text(listing);assert 'stages_focus: test' in listing and 'stages_dispatch_smoke: test' in listing
   smoke=output(['docker','run','--rm',*mount,RUST,test_binary,'--exact','stages_dispatch_smoke','--nocapture']);(OUT/'dispatch-smoke.txt').write_text(smoke);assert 'stages_dispatch_smoke_entered_no_database' in smoke and '1 passed; 0 failed' in smoke
+ if TARGET=='assembly':
+  mount=['--mount',f'type=bind,src={target},dst=/work/target,readonly'];listing=output(['docker','run','--rm',*mount,RUST,test_binary,'--list']);(OUT/'test-runner-list.txt').write_text(listing);assert 'assembly_focus: test' in listing and 'assembly_dispatch_smoke: test' in listing
+  smoke=output(['docker','run','--rm',*mount,RUST,test_binary,'--exact','assembly_dispatch_smoke','--nocapture']);(OUT/'dispatch-smoke.txt').write_text(smoke);assert 'assembly_dispatch_smoke_entered_no_database' in smoke and '1 passed; 0 failed' in smoke
  if TARGET=='whole':
   mount=['--mount',f'type=bind,src={target},dst=/work/target,readonly']
   listing=output(['docker','run','--rm',*mount,RUST,test_binary,'--list']);(OUT/'test-runner-list.txt').write_text(listing);assert 'whole_conversion_qualification: test' in listing and 'qualification_dispatch_smoke: test' in listing
@@ -242,12 +247,15 @@ try:
  docker('network','create',NETWORK)
  for role in PG_ROLES:
   volume=VOLUMES[role];docker('volume','create',volume)
-  IDS[NAMES[role]]=docker('run','-d','--name',NAMES[role],'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={volume},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0',*(['-c','track_io_timing=on'] if TARGET=='stages' else [])).strip();wait_postgres(NAMES[role])
+  IDS[NAMES[role]]=docker('run','-d','--name',NAMES[role],'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={volume},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0',*(['-c','track_io_timing=on'] if TARGET in ['stages','assembly'] else [])).strip();wait_postgres(NAMES[role])
  save('startup-inspect.json',[inspect(NAMES[r]) for r in PG_ROLES])
  # Destination is slowed from its first write. Population itself is source-only;
  # source write cap is positively installed after generated setup/checkpoint.
  admission={} if FOCUS else {role:probe(NAMES[role],4*1048576,2*1048576) for role in ['destination','restored']};save('destination-io-admission.json',admission)
- worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,test_binary,'--ignored','--exact',({'index':'private_index_focus','selection':'selection_focus','restore':'restore_focus','keys':'keys_focus','stages':'stages_focus'}.get(TARGET,'whole_conversion_qualification')),'--nocapture']
+ worker=['docker','run','-d','--user',f'{os.getuid()}:{os.getgid()}','--name',NAMES['worker'],'--network',NETWORK,'--cpus','1','--memory','1g','--memory-swap','1g','--mount',f'type=bind,src={ROOT}/product,dst=/work/product,readonly','--mount',f'type=bind,src={target},dst=/work/target,readonly','--mount',f'type=bind,src={OUT},dst=/evidence','-w','/work/product','-e',('DSA_TEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable' if FOCUS else 'DSA_TEST_DATABASE=host=source port=5432 user=postgres dbname=postgres sslmode=disable'),'-e','DSA_DEST_DATABASE=host=destination port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_RESTORED_DATABASE=host=restored port=5432 user=postgres dbname=postgres sslmode=disable','-e','DSA_QUALIFICATION_OUT=/evidence','-e',f'DSA_WHOLE_DIVISOR={DIVISOR}','-e',f'DSA_WHOLE_MODE={MODE}',RUST,test_binary,'--ignored','--exact',({'index':'private_index_focus','selection':'selection_focus','restore':'restore_focus','keys':'keys_focus','stages':'stages_focus','assembly':'assembly_focus'}.get(TARGET,'whole_conversion_qualification')),'--nocapture']
+ if TARGET=='assembly':
+  reference_seconds=CONFIG.get('reference_statement_seconds',600);assert reference_seconds in [600,900]
+  worker[worker.index(RUST):worker.index(RUST)]=['-e',f'DSA_REFERENCE_STATEMENT_SECONDS={reference_seconds}']
  if TARGET=='restore':
   worker[worker.index(RUST):worker.index(RUST)]=['--mount',f'type=bind,src={old_target},dst=/work/target-old,readonly','-e','DSA_PREDECESSOR_CLI=/work/target-old/release/db-sync-alt']
   if CONFIG.get('reuse_run'):worker[worker.index(RUST):worker.index(RUST)]=['-e','DSA_RESTORE_REUSE=1']
