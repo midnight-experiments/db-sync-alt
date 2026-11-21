@@ -446,9 +446,9 @@ async fn convert_target_time_cutoff_clamp_k10_and_first_served() -> Result {
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
 async fn convert_corrupt_selected_parents_are_not_silently_dropped() -> Result {
-    for orphan_asset in [false, true] {
+    for invalid_case in 0..3 {
         let mut f = fixture(213);
-        if !orphan_asset {
+        if invalid_case == 0 {
             let old = f.output(1, 9, 12, "ics", "ics", None);
             f.chain.output_assets.retain(|_, a| a.output != old);
             f.add_asset(old, 9001, 19);
@@ -458,13 +458,30 @@ async fn convert_corrupt_selected_parents_are_not_silently_dropped() -> Result {
         }
         let source = Database::new().await?;
         source.legacy(&f).await?;
-        if orphan_asset {
+        if invalid_case == 1 {
             let id = dsa_chain::ids::asset_id(8, 0, 13, 19)?;
             source
                 .write(&format!(
                     "INSERT INTO serve.ma_tx_out VALUES({id},1,{},{})",
                     dsa_chain::ids::output_id(8, 0, 13)?,
                     f.asset_id("cnight")
+                ))
+                .await?;
+        }
+        if invalid_case == 2 {
+            // The window witness keeps an otherwise unclassifiable descriptor
+            // so canonical closure reports corruption instead of dropping it.
+            let output = *f
+                .chain
+                .outputs
+                .keys()
+                .find(|id| **id >= dsa_chain::ids::output_id(6, 0, 0).unwrap())
+                .unwrap();
+            let (height, tx, index) = dsa_chain::ids::output_position(output)?;
+            let id = dsa_chain::ids::asset_id(height, tx, index, 4000)?;
+            source
+                .write(&format!(
+                    "INSERT INTO serve.ma_tx_out VALUES({id},1,{output},999999999)"
                 ))
                 .await?;
         }

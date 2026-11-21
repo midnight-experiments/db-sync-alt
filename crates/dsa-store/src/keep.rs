@@ -82,6 +82,13 @@ fn replace_cte(full: &mut String, cte: &str, next: &str, body: &str) -> Result<(
     full.replace_range(begin..begin + old.len(), body);
     Ok(())
 }
+fn required_replace(sql: &str, original: &str, replacement: &str) -> Result<String, Error> {
+    if sql.matches(original).count() != 1 {
+        return Err(Error::Refusal("invalid_staging_keep_definition"));
+    }
+    Ok(sql.replacen(original, replacement, 1))
+}
+
 fn projection_stage(
     full: &str,
     table: &'static str,
@@ -194,7 +201,7 @@ impl Selection {
             &mut full,
             "keep_tx",
             "keep_tx_in",
-            &tx.replace("pg_temp.tx_out o", "pg_temp.conversion_output_facts o"),
+            &required_replace(&tx, "pg_temp.tx_out o", "pg_temp.conversion_output_facts o")?,
         )?;
 
         let catalogue = cte_body(&full, "keep_multi_asset", "keep_datum")?;
@@ -209,21 +216,34 @@ impl Selection {
             &mut full,
             "keep_multi_asset",
             "keep_datum",
-            &catalogue.replace("pg_temp.ma_tx_out a", "pg_temp.conversion_asset_facts a"),
+            &required_replace(
+                &catalogue,
+                "pg_temp.ma_tx_out a",
+                "pg_temp.conversion_asset_facts a",
+            )?,
         )?;
 
         let datum = cte_body(&full, "keep_datum", "keep_epoch_param")?;
-        let datum_driver = datum
-            .replace(
-                "SELECT DISTINCT d.id",
-                "SELECT DISTINCT o.data_hash AS hash",
-            )
-            .replace(
-                "pg_temp.tx_out o JOIN keep_tx_out k ON k.id=o.id",
-                "pg_temp.conversion_output_facts o",
-            )
-            .replace(" JOIN pg_temp.datum d ON d.hash=o.data_hash", "")
-            .replace("pg_temp.ma_tx_out a", "pg_temp.conversion_asset_facts a");
+        let datum_driver = required_replace(
+            &datum,
+            "SELECT DISTINCT d.id",
+            "SELECT DISTINCT o.data_hash AS hash",
+        )?;
+        let datum_driver = required_replace(
+            &datum_driver,
+            "pg_temp.tx_out o JOIN keep_tx_out k ON k.id=o.id",
+            "pg_temp.conversion_output_facts o",
+        )?;
+        let datum_driver = required_replace(
+            &datum_driver,
+            " JOIN pg_temp.datum d ON d.hash=o.data_hash",
+            "",
+        )?;
+        let datum_driver = required_replace(
+            &datum_driver,
+            "pg_temp.ma_tx_out a",
+            "pg_temp.conversion_asset_facts a",
+        )?;
         if datum_driver.contains("d.id") || datum_driver.contains("pg_temp.datum") {
             return Err(Error::Refusal("invalid_staging_keep_definition"));
         }
@@ -481,5 +501,21 @@ impl Selection {
             .get::<_, Option<serde_json::Value>>(0)
             .ok_or(Error::Refusal("keep_validation_too_large"))?;
         Ok(serde_json::from_value(value)?)
+    }
+}
+
+#[cfg(test)]
+mod stage_template_tests {
+    use super::required_replace;
+    use crate::Error;
+
+    #[test]
+    fn missing_or_ambiguous_stage_projection_refuses() {
+        for text in ["changed table", "raw table and raw table"] {
+            assert!(matches!(
+                required_replace(text, "raw table", "retained facts"),
+                Err(Error::Refusal("invalid_staging_keep_definition"))
+            ));
+        }
     }
 }

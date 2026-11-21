@@ -790,6 +790,16 @@ fn keep_rule_indexed_stage_dependencies_are_not_noops() -> Result {
             .create_sql
             .contains("FROM pg_temp.conversion_asset_facts a")
     );
+    assert!(
+        plan[9]
+            .create_sql
+            .contains("SELECT o.tx_id FROM pg_temp.conversion_output_facts o")
+    );
+    assert!(
+        plan[13]
+            .create_sql
+            .contains("SELECT a.ident FROM pg_temp.conversion_asset_facts a")
+    );
     assert!(plan[14].create_sql.contains("WHERE d.hash=h.hash OFFSET 0"));
     assert!(
         plan[12]
@@ -822,6 +832,18 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
         }
     }
     cases.push(empty_epochs);
+    // Supported Q4 outputs may carry a hash without an available preimage.
+    // Eligibility must not invent a datum for either address or exact-unit arm.
+    for (seed, address, unit) in [
+        (18, "mapping", "cnight"),
+        (19, "other", "permissioned_candidates"),
+    ] {
+        let mut missing = Fixture::base(seed);
+        missing.output(8, 12, 30, address, unit, Some(987654));
+        missing.chain.datums.remove(&987654);
+        cases.push(missing);
+    }
+    let plan = Selection::staging_plan()?;
     let mut duplicate_epoch_cases = 0;
     for fixture in &cases {
         let (_, full_ids) = db.replace(fixture).await?;
@@ -832,7 +854,6 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
         for table in TABLES {
             db.store.client().batch_execute(&format!("CREATE TEMP TABLE {table}(LIKE serve.{table} INCLUDING ALL) ON COMMIT DROP;INSERT INTO pg_temp.{table} SELECT * FROM serve.{table}")).await?;
         }
-        let plan = Selection::staging_plan()?;
         assert_eq!(plan.len(), 20);
         for stage in &plan {
             db.store
@@ -871,12 +892,17 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
         }
         assert_eq!(staged, model, "indexed stages seed{}", fixture.seed);
         db.store.client().batch_execute("ROLLBACK").await?;
-        assert!(db.store.client().query_one("SELECT to_regclass('pg_temp.conversion_keys_unspent') IS NULL AND to_regclass('pg_temp.conversion_keep_keys') IS NULL", &[]).await?.get::<_,bool>(0));
+        let temporary_names = plan
+            .iter()
+            .map(|stage| format!("pg_temp.{}", stage.table))
+            .chain(TABLES.iter().map(|table| format!("pg_temp.{table}")))
+            .collect::<Vec<_>>();
+        assert_eq!(db.store.client().query_one("SELECT count(*) FROM unnest($1::text[]) name WHERE to_regclass(name) IS NOT NULL",&[&temporary_names]).await?.get::<_,i64>(0),0);
     }
     assert!(duplicate_epoch_cases > 0);
     println!(
         "{}",
-        json!({"indexed_stage_cases":cases.len(),"stages":20,"family_comparisons":cases.len()*TABLES.len(),"duplicate_epoch_cases":duplicate_epoch_cases,"oracle":"independent pure model and original all11 CTEs","rollback_cleanup_verified":true})
+        json!({"indexed_stage_cases":cases.len(),"stages":20,"family_comparisons":cases.len()*TABLES.len(),"duplicate_epoch_cases":duplicate_epoch_cases,"oracle":"independent pure model and original all11 CTEs","rollback_cleanup_verified":true,"temporary_tables_checked":plan.len()+TABLES.len(),"ordered_staging_sql":plan.iter().map(|stage|json!({"table":stage.table,"create_sha256":format!("{:x}",Sha256::digest(stage.create_sql.as_bytes())),"prepare_sha256":format!("{:x}",Sha256::digest(stage.prepare_sql.as_bytes()))})).collect::<Vec<_>>()})
     );
     db.cleanup().await
 }
