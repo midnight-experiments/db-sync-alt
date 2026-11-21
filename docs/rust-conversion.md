@@ -67,16 +67,16 @@ lost connection; the served layout and snapshot format do not change.
 
 An already granted node reader remains supported during conversion. The
 destination uses the same conservative gate-access check and closed-empty
-recheck as restore. Before ingest it removes only matching fixed secondary
-indexes with bounded concurrent drops under the session writer lock; this
-preparation can commit index removals but imports no rows. Missing or matching
-invalid remnants on the owned empty failed layout can retry; conflicts are
-preserved and refused. The data transaction uses SELECT-compatible locks,
-rechecks empty and builds its missing-index plan before staging. It carries
-that plan through local selection and rebuilds indexes before verification and
-atomic publication. Gated reads, including prepared and nested node queries,
-continue to raise55000 until commit. Secondary-index catalogue probes can
-report missing prerequisites during the closed preparation/load interval.
+recheck as restore. The data transaction uses SELECT-compatible locks,
+rechecks empty and validates matching indexes before staging; conflicts and
+invalid indexes are preserved and refused. Matching public indexes remain,
+so node startup prerequisites stay present. A missing-index plan is carried
+through local selection and built before verification and atomic publication.
+The raw private TEMP copy retains only each family's primary key, as before;
+public secondary indexes are not cloned into it. Gated reads, including prepared
+and nested node queries, continue to raise55000 until commit. Maintaining public
+indexes during selected-row inserts has a cost; source-free/generated timings
+do not substitute for archive qualification.
 `conversion_load_mode` reports the chosen path. Source permissions, its single
 snapshot and its statement/idle limits are unchanged; no keep predicate,
 positional ID, format, digest or verification rule changes.

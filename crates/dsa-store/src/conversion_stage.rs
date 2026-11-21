@@ -265,9 +265,12 @@ pub(crate) async fn stage(
     for table in NODE_RELATIONS {
         destination
             .batch_execute(&format!(
-                "CREATE TEMP TABLE {table}(LIKE serve.{table} INCLUDING ALL) ON COMMIT DROP"
+                "CREATE TEMP TABLE {table}(LIKE serve.{table} INCLUDING ALL EXCLUDING INDEXES) ON COMMIT DROP;ALTER TABLE pg_temp.{table} ADD PRIMARY KEY({})",key(table)
             ))
             .await?;
+        // The raw private copy has always needed only its unique page key.
+        // A reader-compatible destination retains public secondary indexes;
+        // do not clone/maintain those while streaming raw source history.
         let began = Instant::now();
         let mut cost = RawFamilyCost::default();
         let mut hash = FamilyHasher::new(table);

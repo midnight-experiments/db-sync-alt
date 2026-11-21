@@ -919,25 +919,14 @@ impl Store {
         // Source/selection preflight precedes all destination changes. Reuse
         // restore's conservative reader classification and closed-empty checks;
         // an already granted reader must reach its gate during raw staging and
-        // local selection as well as publication. Only catalogue preparation
-        // commits separately; selected rows still publish in this one data TX.
+        // local selection as well as publication. Retain matching public
+        // indexes in this mode, so node startup prerequisites also stay present.
         let (isolated_bulk, reason) = crate::snapshot::restore_access(self.client()).await?;
         eprintln!(
             "{}",
             json!({"event":"conversion_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"},"reason":reason})
         );
         let (_, locked) = crate::snapshot::restore_tables()?;
-        if !isolated_bulk {
-            let tx = self.writer_transaction().await?;
-            crate::snapshot::lock_empty_restore(&tx, &locked, false, "convert_failed").await?;
-            let indexes = crate::snapshot::restore_indexes(&tx, true).await?;
-            tx.commit().await?;
-            for name in indexes.present {
-                self.client()
-                    .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS serve.{name}"))
-                    .await?;
-            }
-        }
         let tx = self.writer_transaction().await?;
         crate::snapshot::lock_empty_restore(&tx, &locked, isolated_bulk, "convert_failed").await?;
         let indexes = if isolated_bulk {

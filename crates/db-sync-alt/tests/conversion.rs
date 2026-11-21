@@ -26,6 +26,22 @@ async fn closed_conversion_reader(
     original: &str,
     prepared: &tokio_postgres::Statement,
 ) -> Result {
+    let names = [
+        "idx_block_block_no",
+        "idx_tx_block_id",
+        "idx_tx_out_tx_id",
+        "idx_tx_out_data_hash",
+        "idx_tx_out_address",
+        "idx_tx_in_tx_in_id",
+        "idx_tx_in_tx_out_id_tx_out_index",
+        "idx_multi_asset_policy_name",
+        "idx_multi_asset_policy_name_hex",
+        "idx_ma_tx_out_ident",
+        "idx_ma_tx_out_id_ident",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(reader.query_one("SELECT count(*) FROM pg_indexes WHERE schemaname='serve' AND indexname=ANY($1::text[])", &[&names]).await?.get::<_,i64>(0),11,"node startup indexes changed while closed");
     for sql in TABLES
         .iter()
         .map(|table| format!("SELECT * FROM public.{table}"))
@@ -89,6 +105,14 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
             )
             .await?;
         let owner = connect(&target.config).await?;
+        if !cancel {
+            // A missing storage-only index must be built by the carried finish
+            // plan, while every node startup index remains present throughout.
+            owner
+                .batch_execute("DROP INDEX serve.serve_pool_hash_raw")
+                .await?;
+        }
+        let catalogue:Value=owner.query_one("SELECT jsonb_object_agg(n.nspname||'.'||c.relname,jsonb_build_array(c.oid::bigint,pg_relation_filenode(c.oid)::bigint,c.relacl::text)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('serve','public') AND c.relkind IN ('r','v')",&[]).await?.get(0);
         let mut config = target.reader_config();
         config.options("-c default_transaction_read_only=on -c statement_timeout=500ms");
         let reader = connect(&config).await?;
@@ -131,6 +155,9 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
         source.wait_barrier().await?;
         let held:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND query LIKE 'COPY (%' AND backend_xmin IS NOT NULL)",&[&source.name]).await?.get(0);
         assert!(held, "no real source COPY/snapshot");
+        let raw_indexes=target.admin.query_one("SELECT count(*),bool_and(i.indisprimary) FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_roles r ON r.oid=c.relowner WHERE c.relpersistence='t' AND c.relname='block' AND r.rolname=$1",&[&target.owner]).await?;
+        assert_eq!(raw_indexes.get::<_, i64>(0), 1);
+        assert_eq!(raw_indexes.get::<_, Option<bool>>(1), Some(true));
         closed_conversion_reader(&reader, original, &prepared).await?;
         let competing = target
             .start_cli("grant-reader", "mainnet", &["--role", &target.reader])?
@@ -255,6 +282,11 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
                 &["--role", &target.reader, "--check"],
             )
             .await?;
+        let after:Value=owner.query_one("SELECT jsonb_object_agg(n.nspname||'.'||c.relname,jsonb_build_array(c.oid::bigint,pg_relation_filenode(c.oid)::bigint,c.relacl::text)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname IN ('serve','public') AND c.relkind IN ('r','v')",&[]).await?.get(0);
+        assert_eq!(
+            catalogue, after,
+            "table/view identity, ACL or storage changed"
+        );
         assert_eq!(source_before, source.rows().await?);
         source_holder.batch_execute(&gate).await?;
         println!(
