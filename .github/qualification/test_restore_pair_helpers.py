@@ -1,7 +1,7 @@
 """Small offline preparation controls; not a PostgreSQL/product qualification."""
 import math
 import unittest
-from restore_pair import PREDECESSOR, configuration, io_delta, query_timings, snapshot_description, wal_delta
+from restore_pair import PREDECESSOR, checked_publication, configuration, io_delta, query_timings, snapshot_description, wal_delta
 
 
 class PreparationControls(unittest.TestCase):
@@ -27,6 +27,18 @@ class PreparationControls(unittest.TestCase):
         self.assertEqual(value['product_pair_owner_work_mem_mb'], 128)
         self.assertEqual(value['reuse_run'], 44724041124)
         with self.assertRaises(AssertionError): configuration('a' * 40, 'reader_mode_pair', 44933813334)
+
+    def test_publication_requires_exact_complete_valid_catalogue(self):
+        expected = [{'name': str(i), 'definition': 'definition ' + str(i)} for i in range(31)]
+        rows = [{**r, 'valid': True, 'ready': True, 'live': True} for r in expected]
+        self.assertTrue(checked_publication(expected, {'serving': True, 'indexes': rows})['serving'])
+        for key in ['valid', 'ready', 'live']:
+            changed = [dict(r) for r in rows]; changed[-1][key] = False
+            with self.assertRaises(AssertionError): checked_publication(expected, {'serving': True, 'indexes': changed})
+        with self.assertRaises(AssertionError): checked_publication(expected, {'serving': False, 'indexes': rows})
+        with self.assertRaises(AssertionError): checked_publication(expected, {'serving': True, 'indexes': rows[:-1]})
+        changed = [dict(r) for r in rows]; changed[-1]['definition'] = 'wrong index'
+        with self.assertRaises(AssertionError): checked_publication(expected, {'serving': True, 'indexes': changed})
 
     def test_setting_pair_keeps_exact_predecessor_code(self):
         self.assertEqual(configuration(PREDECESSOR, 'owner_work_mem_pair')['source'], PREDECESSOR)

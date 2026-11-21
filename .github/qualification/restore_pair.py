@@ -28,6 +28,15 @@ PREDECESSOR = 'c384207b9bffaffb7995d26a815bdfb333b97555'
 DISCONNECT_SQL = "SELECT to_json(EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND application_name='db-sync-alt'))"
 
 
+def checked_publication(expected_indexes, actual):
+    """Check the committed public catalogue without changing serving data."""
+    assert actual['serving'] is True
+    assert len(expected_indexes) == len(actual['indexes']) == 31
+    assert [{k: row[k] for k in ['name', 'definition']} for row in actual['indexes']] == expected_indexes
+    assert all(row[k] is True for row in actual['indexes'] for k in ['valid', 'ready', 'live'])
+    return actual
+
+
 def configuration(candidate, mode='product_pair', completed_work4_run=None):
     assert mode in ['product_pair', 'owner_work_mem_pair', 'reader_mode_pair']
     assert re.fullmatch('[0-9a-f]{40}', candidate)
@@ -217,7 +226,7 @@ def run(g):
         def query(sql, user='postgres'):
             return json.loads(output(['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=3000',
                 names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', user, '-d', name, '-c', sql]))
-        settings = query("SELECT json_object_agg(name,json_build_object('setting',setting,'unit',unit,'source',source)) FROM pg_settings WHERE name=ANY(ARRAY['wal_level','max_wal_senders','archive_mode','fsync','synchronous_commit','full_page_writes','wal_skip_threshold','shared_buffers','maintenance_work_mem','work_mem','hash_mem_multiplier','temp_buffers','jit','random_page_cost','max_parallel_workers_per_gather','max_parallel_maintenance_workers','max_wal_size','min_wal_size','checkpoint_timeout','checkpoint_completion_target','log_min_duration_statement','track_io_timing','log_parameter_max_length','log_parameter_max_length_on_error','log_line_prefix','server_version_num'])", user=owner)
+        settings = query("SELECT json_object_agg(name,json_build_object('setting',setting,'unit',unit,'source',source)) FROM pg_settings WHERE name=ANY(ARRAY['wal_level','wal_compression','wal_buffers','max_wal_senders','archive_mode','fsync','synchronous_commit','full_page_writes','wal_skip_threshold','shared_buffers','maintenance_work_mem','work_mem','hash_mem_multiplier','temp_buffers','jit','random_page_cost','max_parallel_workers_per_gather','max_parallel_maintenance_workers','max_wal_size','min_wal_size','checkpoint_timeout','checkpoint_completion_target','log_min_duration_statement','track_io_timing','log_parameter_max_length','log_parameter_max_length_on_error','log_line_prefix','server_version_num'])", user=owner)
         assert settings['wal_level']['setting'] == 'minimal' and settings['shared_buffers']['setting'] == '8192'
         assert int(settings['work_mem']['setting']) == owner_work * 1024 and settings['work_mem']['unit'] == 'kB'
         assert settings['maintenance_work_mem']['setting'] == '65536' and settings['temp_buffers']['setting'] == '1024'
@@ -324,6 +333,11 @@ def run(g):
         if reader_thread:
             reader_thread.join(timeout=10)
             assert not reader_thread.is_alive() and not reader_errors and reader_probe.get('passed'), reader_errors
+        publication = None
+        if reader_pair:
+            publication = query("SELECT json_build_object('serving',(SELECT serving FROM dsa.position),'indexes',(SELECT json_agg(json_build_object('name',c.relname,'definition',pg_get_indexdef(c.oid),'valid',i.indisvalid,'ready',i.indisready,'live',i.indislive) ORDER BY c.relname) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='serve'))")
+            checked_publication(matched_empty_indexes[-1], publication)
+            save(label+'-committed-publication-catalogue.json', publication)
         verify = execute('verify', [])
         state = query('SELECT to_jsonb(p) FROM dsa.position p')
         assert state['serving']
@@ -359,6 +373,9 @@ def run(g):
                 'restore_seconds': phases['restore']['seconds'], 'independent_verify_seconds': phases['verify']['seconds'],
                 'restore_plus_independent_verify_seconds': combined, 'criterion_seconds': 180,
                 'criterion_met_on_this_generated_fixture': combined <= 180,
+                'observed_restore_start_to_verify_finish_wall_seconds': phases['verify']['finished_unix']-phases['restore']['started_unix'],
+                'wall_span_includes_inter_command_counter_and_catalogue_observations': True,
+                'committed_publication_catalogue': publication,
                 'phase_events': events, 'socket_limits': socket_limits, 'verified': verify, 'restored': restore}
         results.append(item); save(label + '-result.json', item)
         print(json.dumps({'event': 'generated_restore_pair_variant_finished', 'label': label,
