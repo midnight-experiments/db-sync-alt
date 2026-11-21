@@ -1163,3 +1163,383 @@ async fn restore_copy_sqlstate_privacy_and_pipeline_timings() -> Result {
     dest.cleanup().await?;
     Ok(())
 }
+
+fn restore_mode(output: &std::process::Output) -> Result<String> {
+    let event = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["event"] == "restore_load_mode")
+        .ok_or("missing restore mode")?;
+    Ok(event["mode"].as_str().ok_or("invalid restore mode")?.into())
+}
+
+async fn closed_reader_queries(reader: &Client) -> Result {
+    for table in TABLES {
+        let error = reader
+            .query(&format!("SELECT * FROM public.{table}"), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code().map(|code| code.code()),
+            Some("55000"),
+            "{table}: {error}"
+        );
+    }
+    Ok(())
+}
+
+async fn wait_restore_barrier(client: &Client, database: &str, prefix: &str) -> Result {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let blocked: bool = client.query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory' AND query LIKE $2)",
+            &[&database, &prefix],
+        ).await?.get(0);
+        if blocked {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("restore barrier not reached: {prefix}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_reader_compatible_cli_copy_indexes_and_atomic_publication() -> Result {
+    let f = fixture(161);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("reader-compatible.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    let client = connect(&dest.config).await?;
+    client
+        .batch_execute("DROP INDEX serve.idx_tx_out_data_hash")
+        .await?;
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader],
+    )
+    .await?;
+    let original_storage: i64 = client
+        .query_one(
+            "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",
+            &[],
+        )
+        .await?
+        .get(0);
+    let original_index: u32 = client
+        .query_one("SELECT 'serve.idx_tx_out_address'::regclass::oid", &[])
+        .await?
+        .get(0);
+    let mut reader_config = dest.config.clone();
+    reader_config
+        .user(&dest.reader)
+        .options("-c default_transaction_read_only=on -c statement_timeout=500ms");
+    let reader = connect(&reader_config).await?;
+    let prepared = reader
+        .prepare("SELECT * FROM public.block WHERE id=$1")
+        .await?;
+    closed_reader_queries(&reader).await?;
+    client.batch_execute("CREATE FUNCTION serve.q22_copy_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(722,1);RETURN NEW;END$$; REVOKE ALL ON FUNCTION serve.q22_copy_barrier() FROM PUBLIC; CREATE TRIGGER q22_copy_barrier BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.q22_copy_barrier(); CREATE FUNCTION dsa.q22_publish_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(722,2);RETURN NEW;END$$; REVOKE ALL ON FUNCTION dsa.q22_publish_barrier() FROM PUBLIC; CREATE TRIGGER q22_publish_barrier AFTER UPDATE ON dsa.position FOR EACH ROW WHEN(NEW.serving) EXECUTE FUNCTION dsa.q22_publish_barrier(); SELECT pg_advisory_lock(722,1); SELECT pg_advisory_lock(722,2)").await?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    command
+        .args([
+            "restore",
+            "--database",
+            &dest.dsn(),
+            "--network",
+            &f.profile.network,
+        ])
+        .args(file_args(&path))
+        .kill_on_drop(true);
+    let restore = tokio::spawn(async move { command.output().await });
+    wait_restore_barrier(&client, &dest.name, "COPY serve.block%").await?;
+    closed_reader_queries(&reader).await?;
+    assert_eq!(
+        reader
+            .query(&prepared, &[&1_i64])
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "55000"
+    );
+    let competing = dest
+        .cli_raw(
+            "grant-reader",
+            &f.profile.network,
+            &["--role", &dest.reader],
+        )
+        .await?;
+    assert!(!competing.status.success());
+    assert!(String::from_utf8_lossy(&competing.stderr).contains("writer_busy"));
+    client
+        .batch_execute("SELECT pg_advisory_unlock(722,1)")
+        .await?;
+    wait_restore_barrier(&client, &dest.name, "UPDATE dsa.position SET serving=true%").await?;
+    // Missing index creation and all verification precede this uncommitted gate.
+    closed_reader_queries(&reader).await?;
+    assert_eq!(
+        reader
+            .query(&prepared, &[&1_i64])
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "55000"
+    );
+    client
+        .batch_execute("SELECT pg_advisory_unlock(722,2)")
+        .await?;
+    let output = restore.await??;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(restore_mode(&output)?, "reader_compatible");
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    for key in [
+        "content_digest",
+        "state_digest",
+        "families",
+        "protected_state",
+        "state",
+        "supply",
+    ] {
+        assert_eq!(report[key], description["verified"][key]);
+    }
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",
+                &[]
+            )
+            .await?
+            .get::<_, i64>(0),
+        original_storage
+    );
+    assert_eq!(
+        client
+            .query_one("SELECT 'serve.idx_tx_out_address'::regclass::oid", &[])
+            .await?
+            .get::<_, u32>(0),
+        original_index
+    );
+    assert!(
+        client
+            .query_one(
+                "SELECT to_regclass('serve.idx_tx_out_data_hash') IS NOT NULL",
+                &[]
+            )
+            .await?
+            .get::<_, bool>(0)
+    );
+    for table in TABLES {
+        reader
+            .query(&format!("SELECT * FROM public.{table} LIMIT 1"), &[])
+            .await?;
+    }
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader],
+    )
+    .await?;
+    let before = dest.cli("status", &f.profile.network, &[]).await?;
+    assert!(
+        !dest
+            .cli_raw("restore", &f.profile.network, &file_args(&path))
+            .await?
+            .status
+            .success()
+    );
+    assert_eq!(before, dest.cli("status", &f.profile.network, &[]).await?);
+    assert_eq!(rows(&source).await?, rows(&dest).await?);
+    println!(
+        "{}",
+        json!({"q22_cli_reader_compatible":true,"all11_copy_and_precommit_55000":true,"prepared_reader":true,"grant_reader_writer_busy":true,"existing_index_retained":true,"missing_index_created":true,"atomic_commit_exact_parity":true})
+    );
+    drop(reader);
+    drop(client);
+    source.cleanup().await?;
+    dest.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_mode_acl_and_reader_compatible_conflicting_index_retry() -> Result {
+    let f = fixture(162);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("modes.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    for mode in [
+        "fresh",
+        "public",
+        "group",
+        "changed_owner",
+        "conflicting_index",
+    ] {
+        let dest = Database::new().await?;
+        let mut extra_role = None;
+        if mode != "fresh" {
+            dest.cli("create", &f.profile.network, &[]).await?;
+        }
+        let client = connect(&dest.config).await?;
+        match mode {
+            "public" => {
+                client
+                    .batch_execute("GRANT EXECUTE ON FUNCTION dsa.gate() TO PUBLIC")
+                    .await?
+            }
+            "group" | "changed_owner" => {
+                let role = format!("{}_extra", dest.owner);
+                dest.admin.batch_execute(&format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS")).await?;
+                if mode == "group" {
+                    client
+                        .batch_execute(&format!("GRANT EXECUTE ON FUNCTION dsa.gate() TO {role}"))
+                        .await?;
+                } else {
+                    let mut root = dest.config.clone();
+                    let admin_user: String = dest
+                        .admin
+                        .query_one("SELECT current_user", &[])
+                        .await?
+                        .get(0);
+                    root.user(&admin_user);
+                    let admin = connect(&root).await?;
+                    admin.batch_execute(&format!("ALTER FUNCTION dsa.gate() OWNER TO {role}; GRANT USAGE ON SCHEMA dsa TO {role}; GRANT SELECT ON dsa.identity,dsa.position TO {role}")).await?;
+                }
+                extra_role = Some(role);
+            }
+            "conflicting_index" => {
+                dest.cli(
+                    "grant-reader",
+                    &f.profile.network,
+                    &["--role", &dest.reader],
+                )
+                .await?;
+                client.batch_execute("DROP INDEX serve.idx_multi_asset_policy_name_hex;CREATE INDEX idx_multi_asset_policy_name_hex ON serve.multi_asset(encode(policy,'h e x'),encode(name,'hex'))").await?;
+                let failed = dest
+                    .cli_raw("restore", &f.profile.network, &file_args(&path))
+                    .await?;
+                assert!(!failed.status.success());
+                assert_eq!(restore_mode(&failed)?, "reader_compatible");
+                assert!(
+                    String::from_utf8_lossy(&failed.stderr).contains("destination_index_mismatch")
+                );
+                assert_eq!(
+                    client
+                        .query_one("SELECT count(*) FROM serve.block", &[])
+                        .await?
+                        .get::<_, i64>(0),
+                    0
+                );
+                client.batch_execute("DROP INDEX serve.idx_multi_asset_policy_name_hex;CREATE INDEX idx_multi_asset_policy_name_hex ON serve.multi_asset(encode(policy,'hex'),encode(name,'hex'))").await?;
+                // Real COPY failure in compatible mode must preserve empty storage.
+                client.batch_execute("CREATE FUNCTION serve.q22_error() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION USING ERRCODE='P0001',MESSAGE='generated';END$$;REVOKE ALL ON FUNCTION serve.q22_error() FROM PUBLIC;CREATE TRIGGER q22_error BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.q22_error()").await?;
+                let old: i64 = client
+                    .query_one(
+                        "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                let failed = dest
+                    .cli_raw("restore", &f.profile.network, &file_args(&path))
+                    .await?;
+                assert!(!failed.status.success());
+                assert!(String::from_utf8_lossy(&failed.stderr).contains("P0001"));
+                assert_eq!(
+                    old,
+                    client
+                        .query_one(
+                            "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",
+                            &[]
+                        )
+                        .await?
+                        .get::<_, i64>(0)
+                );
+                assert_eq!(
+                    client
+                        .query_one("SELECT count(*) FROM serve.block", &[])
+                        .await?
+                        .get::<_, i64>(0),
+                    0
+                );
+                assert_eq!(
+                    client
+                        .query("SELECT * FROM public.block", &[])
+                        .await
+                        .unwrap_err()
+                        .code()
+                        .unwrap()
+                        .code(),
+                    "55000"
+                );
+                client
+                    .batch_execute(
+                        "DROP TRIGGER q22_error ON serve.block;DROP FUNCTION serve.q22_error()",
+                    )
+                    .await?;
+            }
+            _ => {}
+        }
+        let restored = dest
+            .cli_raw("restore", &f.profile.network, &file_args(&path))
+            .await?;
+        assert!(
+            restored.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&restored.stderr)
+        );
+        assert_eq!(
+            restore_mode(&restored)?,
+            if mode == "fresh" {
+                "isolated_bulk"
+            } else {
+                "reader_compatible"
+            }
+        );
+        let report: Value = serde_json::from_slice(&restored.stdout)?;
+        for key in [
+            "content_digest",
+            "state_digest",
+            "families",
+            "protected_state",
+            "state",
+            "supply",
+        ] {
+            assert_eq!(report[key], description["verified"][key], "{mode}/{key}");
+        }
+        println!(
+            "{}",
+            json!({"q22_restore_acl_case":mode,"mode":restore_mode(&restored)?,"logical_parity":true})
+        );
+        drop(client);
+        dest.cleanup().await?;
+        if let Some(role) = extra_role {
+            source
+                .admin
+                .batch_execute(&format!("DROP ROLE {role}"))
+                .await?;
+        }
+    }
+    source.cleanup().await?;
+    Ok(())
+}

@@ -23,14 +23,28 @@ checks every compressed section and exact file length before loading, then
 checks the compressed bytes actually consumed during COPY again. A failed load
 rolls back and may retry the original valid file in the same destination.
 
-After file preflight, restore locks and rechecks its owned empty destination,
-then truncates only the twelve empty COPY tables inside the load transaction.
-This preserves relation identities, ACLs and allocation sequences; no `CASCADE`
-or server setting is used. It permits PostgreSQL's bulk COPY WAL optimization
-when the server already uses `wal_level=minimal`; other WAL modes retain their
-normal durability policy. Failure rolls back the empty-storage replacement.
-Readers of the load tables can wait on these locks; no partial rows are served,
-and the gate remains closed until the final verified commit.
+After file preflight, restore locks and rechecks its owned empty destination.
+It reports `restore_load_mode` with one of two automatic paths. Before any
+non-owner has gate EXECUTE and while the gate still belongs to the database
+owner, `isolated_bulk` truncates only the twelve empty COPY tables inside the
+load transaction. This permits PostgreSQL's bulk COPY WAL optimization when the
+server already uses `wal_level=minimal`; other WAL modes keep their normal WAL
+policy. Failure rolls back the empty-storage replacement.
+
+If gate access has been granted to another role, PUBLIC or a group, or ownership
+differs, `reader_compatible` retains empty storage and matching secondary indexes,
+builds missing indexes and uses locks compatible with SELECT. Conflicting or
+invalid named indexes are refused as `destination_index_mismatch`. A legitimate
+node reader keeps getting SQLSTATE55000 while loading and verification run,
+including queries prepared earlier; complete checked rows appear only at commit.
+This path writes normal row WAL and may take longer. Both paths preserve
+relation identities, ACLs, private allocation sequences and atomic publication;
+no `CASCADE`, server setting or reader privilege change is used.
+
+Product `grant-reader` takes the same session writer lock and cannot attach a
+reader during restore. Concurrent manual owner DDL or GRANT does not follow that
+protocol. Restore refuses a serving/nonempty target before either load path.
+The180-second target applies to both modes; a measured miss remains a miss.
 
 Both commands preserve PostgreSQL's configured statement and idle transaction
 timeouts by default. File preflight runs outside the load transaction. Each COPY,

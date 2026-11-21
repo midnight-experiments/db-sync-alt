@@ -40,10 +40,13 @@
 //! failed restore may retry. Identity/state are committed closed before ingest.
 //! All section hashes and total file framing are preflighted outside the load
 //! transaction. Compressed bytes actually decoded are hashed again during COPY.
-//! Empty COPY tables are rechecked under relation/identity locks and truncated
-//! in the ingest transaction, allowing minimal-WAL COPY when the server already
-//! uses that WAL mode. No CASCADE, sequence reset or server-policy change occurs.
-//! Load-table readers can wait on these locks; partial data never becomes served.
+//! Empty COPY tables are rechecked under relation/identity locks. Before a node
+//! reader has gate access, the ingest transaction truncates them, allowing
+//! minimal-WAL COPY when the server already uses that WAL mode. Once gate access
+//! is granted, compatible relation locks preserve prompt closed-reader errors:
+//! no TRUNCATE or index drop, matching indexes stay and missing ones are built.
+//! No CASCADE, sequence reset or server-policy change occurs. Product reader
+//! grants share the writer lock, so they cannot race the isolated fast path.
 //! Caller statement/idle transaction timeouts remain in force; no timeout is
 //! silently disabled. Long operations need explicit operator-chosen limits.
 //! Restore reports separate COPY/index/analyze/verification/publication times.
@@ -88,6 +91,95 @@ const MAGIC: &[u8; 8] = b"DSASNAP\0";
 const FORMAT: u32 = 1;
 const MAX_DESCRIPTION: u64 = 1024 * 1024;
 const MAX_SECTION: u64 = 1 << 40;
+
+// Compare the server's index deparse with our fixed DDL, allowing only its
+// default btree spelling, quoted `index` column and text cast of the hex literal.
+// Keep quoted contents intact: whitespace inside a literal is significant.
+fn index_shape(sql: &str) -> Vec<String> {
+    let mut chars = sql.trim_end_matches(';').chars().peekable();
+    let mut tokens = Vec::new();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        let mut token = ch.to_string();
+        if ch == '\'' || ch == '"' {
+            while let Some(next) = chars.next() {
+                token.push(next);
+                if next == ch {
+                    if chars.peek() == Some(&ch) {
+                        token.push(chars.next().expect("peeked quote"));
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if ch.is_alphanumeric() || ch == '_' {
+            while chars
+                .peek()
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
+                token.push(chars.next().expect("peeked identifier"));
+            }
+        }
+        tokens.push(if token == "\"index\"" {
+            "index".into()
+        } else {
+            token
+        });
+    }
+    let mut shape = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        // pg_get_indexdef may omit the table schema when it is in search_path.
+        // The catalogue query independently requires the exact served table OID.
+        if tokens[i..].starts_with(&["ON".into(), "serve".into(), ".".into()]) {
+            shape.push("ON".into());
+            i += 3;
+        } else if tokens[i..].starts_with(&["USING".into(), "btree".into()]) {
+            i += 2;
+        } else if tokens[i..].starts_with(&["'hex'".into(), ":".into(), ":".into(), "text".into()])
+        {
+            shape.push("'hex'".into());
+            i += 4;
+        } else {
+            shape.push(tokens[i].clone());
+            i += 1;
+        }
+    }
+    shape
+}
+
+async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'static str>, Error> {
+    let mut missing = Vec::new();
+    for sql in include_str!("indexes.sql")
+        .lines()
+        .filter(|line| line.starts_with("CREATE"))
+    {
+        let name = sql
+            .split("INDEX ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .ok_or(Error::Refusal("invalid_index_catalogue"))?;
+        let table = sql
+            .split(" ON ")
+            .nth(1)
+            .and_then(|s| s.split(['(', ' ']).next())
+            .ok_or(Error::Refusal("invalid_index_catalogue"))?;
+        let row = tx.query_opt(
+            "SELECT CASE WHEN i.indexrelid IS NOT NULL THEN pg_get_indexdef(c.oid) ELSE '' END,coalesce(i.indisvalid AND i.indisready AND i.indislive AND i.indrelid=to_regclass($2),false) FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass($1)",
+            &[&format!("serve.{name}"), &table],
+        ).await?;
+        match row {
+            None => missing.push(sql),
+            Some(row)
+                if row.get::<_, bool>(1)
+                    && index_shape(&row.get::<_, String>(0)) == index_shape(sql) => {}
+            Some(_) => return Err(Error::Refusal("destination_index_mismatch")),
+        }
+    }
+    Ok(missing)
+}
 
 // Restore-local stage timings contain only fixed operation and table labels.
 // They neither change the SQL grouping nor adjust any operational timeout.
@@ -583,10 +675,21 @@ impl Store {
             .writer_transaction()
             .await
             .map_err(|error| stage.error(error))?;
-        // The closed layout was committed before file preflight. Recheck it
-        // under relation/identity locks before replacing even empty storage.
-        // Truncating here permits minimal-WAL COPY on a server already using
-        // wal_level=minimal; replica-mode servers keep their normal WAL policy.
+        // A supported reader needs gate EXECUTE. Conservatively keep read locks
+        // compatible if any other role (including PUBLIC or a group) has it, or
+        // the gate owner differs. Do not base this on currently active sessions.
+        // grant-reader uses this same session writer lock, across preflight and
+        // commit. Concurrent manual owner DDL/GRANT is outside that protocol.
+        let isolated_bulk: bool = tx.query_one(
+            "SELECT p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND NOT EXISTS(SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner) FROM pg_proc p WHERE p.oid='dsa.gate()'::regprocedure",
+            &[],
+        ).await.map_err(|error| stage.error(error))?.get(0);
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"restore_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"}})
+        );
+        // Recheck the committed closed layout under locks excluding other DML.
+        // Only the isolated path replaces empty storage for minimal-WAL COPY.
         let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
         let mut locked = copied.clone();
         locked.extend([
@@ -595,8 +698,13 @@ impl Store {
             "dsa.calls".into(),
         ]);
         tx.batch_execute(&format!(
-            "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
-            locked.join(",")
+            "LOCK TABLE {} IN {} MODE",
+            locked.join(","),
+            if isolated_bulk {
+                "ACCESS EXCLUSIVE"
+            } else {
+                "SHARE ROW EXCLUSIVE"
+            }
         ))
         .await
         .map_err(|error| stage.error(error))?;
@@ -618,17 +726,25 @@ impl Store {
         {
             return Err(stage.error(Error::Refusal("destination_not_empty")));
         }
-        // No CASCADE/identity reset: ACLs, relation identities, sequences and
-        // unknown dependencies are preserved; failure rolls back this rewrite.
-        tx.batch_execute(&format!("TRUNCATE TABLE {}", copied.join(",")))
-            .await
-            .map_err(|error| stage.error(error))?;
+        let missing_indexes = if isolated_bulk {
+            // No CASCADE/identity reset; failure rolls back this rewrite.
+            tx.batch_execute(&format!("TRUNCATE TABLE {}", copied.join(",")))
+                .await
+                .map_err(|error| stage.error(error))?;
+            Vec::new()
+        } else {
+            // DROP INDEX also takes ACCESS EXCLUSIVE on its table. Retain
+            // matching indexes and reject conflicting definitions before COPY.
+            missing_restore_indexes(&tx)
+                .await
+                .map_err(|error| stage.error(error))?
+        };
         stage.finish();
         let stage = RestoreStage::start("restore_drop_indexes", "database");
         // A manually initialized empty layout may already have secondary indexes.
         for line in include_str!("indexes.sql")
             .lines()
-            .filter(|line| line.starts_with("CREATE"))
+            .filter(|line| isolated_bulk && line.starts_with("CREATE"))
         {
             let name = line
                 .split("INDEX ")
@@ -742,9 +858,13 @@ impl Store {
         tx.execute("UPDATE dsa.position SET horizon_height=$1::integer,horizon_hash=decode($2,'hex'),horizon_time=$3::text::timestamptz,target_height=$4::integer,target_hash=decode($5,'hex'),target_time=$6::text::timestamptz,tip_height=$7::integer,tip_hash=decode($8,'hex'),tip_time=$9::text::timestamptz,retention_seconds=$10,updated_at=now() WHERE id=1",&[&(s.horizon.height as i32),&s.horizon.hash,&s.horizon.time,&(s.target.height as i32),&s.target.hash,&s.target.time,&(s.tip.height as i32),&s.tip.hash,&s.tip.time,&s.retention_seconds]).await.map_err(|error| stage.error(error))?;
         stage.finish();
         let stage = RestoreStage::start("restore_indexes", "database");
-        tx.batch_execute(include_str!("indexes.sql"))
-            .await
-            .map_err(|error| stage.error(error))?;
+        tx.batch_execute(&if isolated_bulk {
+            include_str!("indexes.sql").to_owned()
+        } else {
+            missing_indexes.join("\n")
+        })
+        .await
+        .map_err(|error| stage.error(error))?;
         stage.finish();
         for table in tables() {
             let stage = RestoreStage::start("restore_analyze", table);
@@ -788,5 +908,42 @@ impl Store {
         tx.commit().await.map_err(|error| stage.error(error))?;
         stage.finish();
         Ok(verified)
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::index_shape;
+
+    #[test]
+    fn restore_index_shapes_preserve_literals_and_nondefault_semantics() {
+        let expected = "CREATE INDEX i ON serve.tx_out(tx_id,index);";
+        assert_eq!(
+            index_shape(expected),
+            index_shape("CREATE INDEX i ON serve.tx_out USING btree (tx_id, \"index\")")
+        );
+        let expression =
+            "CREATE INDEX i ON serve.multi_asset(encode(policy,'hex'),encode(name,'hex'));";
+        assert_eq!(
+            index_shape(expression),
+            index_shape(
+                "CREATE INDEX i ON serve.multi_asset USING btree (encode(policy, 'hex'::text), encode(name, 'hex'::text))"
+            )
+        );
+        for wrong in [
+            "CREATE INDEX i ON serve.tx_out(index,tx_id)",
+            "CREATE UNIQUE INDEX i ON serve.tx_out(tx_id,index)",
+            "CREATE INDEX i ON serve.tx_out(tx_id,index) WHERE tx_id>0",
+            "CREATE INDEX i ON serve.tx_out(tx_id DESC,index)",
+            "CREATE INDEX i ON serve.tx_out(tx_id,index) INCLUDE(address)",
+        ] {
+            assert_ne!(index_shape(expected), index_shape(wrong));
+        }
+        for literal in ["h e x", "USINGbtreehex", "hex'':text"] {
+            assert_ne!(
+                index_shape(expression),
+                index_shape(&expression.replace("'hex'", &format!("'{literal}'")))
+            );
+        }
     }
 }
