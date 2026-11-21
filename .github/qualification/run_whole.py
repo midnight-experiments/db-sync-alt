@@ -101,7 +101,7 @@ def monitor():
       path=cg(name);data['memory_current']=stat_file(path/'memory.current');data['memory_peak']=stat_file(path/'memory.peak');data['io_stat']=io_stat(path);data['io_max']=stat_file(path/'io.max');data['cpu_stat']=stat_file(path/'cpu.stat');data['memory_stat']=stat_file(path/'memory.stat');data['memory_events']=stat_file(path/'memory.events');data['io_pressure']=stat_file(path/'io.pressure')
       if role=='worker':
        data['process_memory']=process_memory(d['State']['Pid'],d['Id'])
-       if TARGET in ['restore','control','restore_stage']:
+       if TARGET in ['restore','control','restore_stage','restore_pair']:
         result=subprocess.run(['sudo','nsenter','-t',str(d['State']['Pid']),'-n','ss','-tin'],text=True,capture_output=True,timeout=2);data['socket_kernel_info']={'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr}
       if role!='worker':
        data['volume_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data').split()[0]);data['volume_allocated_bytes']=int(docker('exec',name,'du','-sB1','/var/lib/postgresql/data').split()[0]);data['wal_bytes']=int(docker('exec',name,'du','-sb','/var/lib/postgresql/data/pg_wal').split()[0]);database=databases.get(role)
@@ -125,7 +125,8 @@ def fresh_restore_target(label):
    assert inspect(name)['Id']==IDS[name]
    (OUT/(label+'-previous-pg.log')).write_text(docker('logs',name));docker('stop','-t','120',name);save(label+'-previous-final.json',inspect(name));docker('rm',name);docker('volume','rm',VOLUMES[role])
   docker('volume','create',VOLUMES[role])
-  IDS[name]=docker('run','-d','--name',name,'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={VOLUMES[role]},dst=/var/lib/postgresql/data',PG,'-c','max_wal_size=256MB','-c','min_wal_size=32MB','-c','checkpoint_timeout=30s','-c','track_activity_query_size=16384','-c','log_min_duration_statement=1000','-c','log_temp_files=0',*(['-c','track_io_timing=on'] if TARGET in ['stages','assembly'] else [])).strip();wait_postgres(name)
+  settings=CONFIG['restore_server_settings'] if TARGET=='restore_pair' else ['max_wal_size=256MB','min_wal_size=32MB','checkpoint_timeout=30s','track_activity_query_size=16384','log_min_duration_statement=1000','log_temp_files=0',*(['track_io_timing=on'] if TARGET in ['stages','assembly'] else [])]
+  IDS[name]=docker('run','-d','--name',name,'--network',NETWORK,'--network-alias',role,'--cpus','1','--memory','1g','--memory-swap','1g','--shm-size','256m','-e','POSTGRES_HOST_AUTH_METHOD=trust','--mount',f'type=volume,src={VOLUMES[role]},dst=/var/lib/postgresql/data',PG,*[arg for setting in settings for arg in ['-c',setting]]).strip();wait_postgres(name)
   admission=probe(name,4*1048576,2*1048576);value={'ready':True,'label':label,'target_inspect':inspect(name),'admission':admission,'scope':'fresh owned PG container/data per variant; source/converted unchanged'};save(label+'-fresh-target.json',value);return value
  finally:RESETTING.discard(role)
 
@@ -176,6 +177,10 @@ def start_socket_trace(label):
 thread=None
 class ControlCompleted(Exception):pass
 try:
+ if TARGET=='restore_pair':
+  from restore_pair import run
+  run(globals())
+  raise ControlCompleted
  if TARGET in ['control','restore_stage']:
   from restore_control import run
   run(globals())

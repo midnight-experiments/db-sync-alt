@@ -4,6 +4,11 @@ on:
     branches: ['validation/a7-whole-conversion']
     paths: ['.github/qualification/config.json']
   workflow_dispatch:
+    inputs:
+      restore_pair_candidate:
+        description: 'Reviewed full product SHA for the authorized retained-generated restore-only pair'
+        required: true
+        type: string
 permissions:
   contents: read
   actions: read
@@ -16,10 +21,22 @@ jobs:
         with:
           persist-credentials: false
       - id: pin
+        env:
+          RESTORE_PAIR_CANDIDATE: ${{ inputs.restore_pair_candidate }}
         run: |
           python3 - <<'PY'
-          import json,os,re
-          config=json.load(open('.github/qualification/config.json'));assert re.fullmatch('[0-9a-f]{40}',config['source'])
+          import json,os,re,sys
+          path='.github/qualification/config.json'
+          if os.environ['GITHUB_EVENT_NAME']=='workflow_dispatch':
+            candidate=os.environ['RESTORE_PAIR_CANDIDATE'];assert re.fullmatch('[0-9a-f]{40}',candidate)
+            sys.path.insert(0,'.github/qualification')
+            from restore_pair import configuration
+            config=configuration(candidate)
+            path='.github/qualification/restore-pair-run.json'
+            with open(path,'w') as f:json.dump(config,f,indent=2)
+          else:config=json.load(open(path))
+          assert re.fullmatch('[0-9a-f]{40}',config['source'])
+          with open(os.environ['GITHUB_ENV'],'a') as f:f.write('DSA_QUALIFICATION_CONFIG='+path+'\n')
           with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('source='+config['source']+'\npredecessor='+config.get('predecessor','')+'\nreuse='+str(config.get('reuse_run',''))+'\n')
           PY
       - uses: actions/checkout@v4
