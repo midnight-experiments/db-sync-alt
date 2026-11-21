@@ -1543,3 +1543,88 @@ async fn restore_mode_acl_and_reader_compatible_conflicting_index_retry() -> Res
     source.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_repeatable_read_recheck_preserves_late_owner_row() -> Result {
+    let f = fixture(163);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("late-row.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    for provisioned in [false, true] {
+        let dest = Database::new().await?;
+        dest.cli("create", &f.profile.network, &[]).await?;
+        if provisioned {
+            dest.cli(
+                "grant-reader",
+                &f.profile.network,
+                &["--role", &dest.reader],
+            )
+            .await?;
+        }
+        let client = connect(&dest.config).await?;
+        client
+            .batch_execute(&format!(
+                "ALTER ROLE {} IN DATABASE {} SET default_transaction_isolation='repeatable read'",
+                dest.owner, dest.name
+            ))
+            .await?;
+        client
+            .batch_execute("BEGIN;LOCK TABLE serve.block IN SHARE ROW EXCLUSIVE MODE")
+            .await?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+        command
+            .args([
+                "restore",
+                "--database",
+                &dest.dsn(),
+                "--network",
+                &f.profile.network,
+            ])
+            .args(file_args(&path))
+            .kill_on_drop(true);
+        let restore = tokio::spawn(async move { command.output().await });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let waiting:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event_type='Lock' AND query LIKE 'LOCK TABLE%')",&[&dest.name]).await?.get(0);
+            if waiting {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no restore lock barrier"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        client.batch_execute("INSERT INTO serve.block VALUES(1,decode(repeat('ab',32),'hex'),0,1,1,timestamp '2026-01-01',0);COMMIT").await?;
+        let output = restore.await??;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("destination_not_empty"));
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT count(*) FROM serve.block WHERE hash=decode(repeat('ab',32),'hex')",
+                    &[]
+                )
+                .await?
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(
+            dest.cli("status", &f.profile.network, &[]).await?["position"]["serving"],
+            false
+        );
+        println!(
+            "{}",
+            json!({"q22_repeatable_read_late_row_preserved":true,"provisioned_reader":provisioned,"mode":restore_mode(&output)?})
+        );
+        drop(client);
+        dest.cleanup().await?;
+    }
+    source.cleanup().await?;
+    Ok(())
+}

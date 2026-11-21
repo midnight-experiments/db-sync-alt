@@ -671,16 +671,15 @@ impl Store {
         preflight(&mut file, &description).map_err(|error| stage.error(error))?;
         stage.finish();
         let stage = RestoreStage::start("restore_recheck_empty", "database");
-        let tx = self
-            .writer_transaction()
-            .await
-            .map_err(|error| stage.error(error))?;
         // A supported reader needs gate EXECUTE. Conservatively keep read locks
         // compatible if any other role (including PUBLIC or a group) has it, or
         // the gate owner differs. Do not base this on currently active sessions.
         // grant-reader uses this same session writer lock, across preflight and
         // commit. Concurrent manual owner DDL/GRANT is outside that protocol.
-        let isolated_bulk: bool = tx.query_one(
+        // This metadata read stays outside ingest, so even REPEATABLE READ
+        // starts its data snapshot only after the load locks. The session writer
+        // advisory lock is already held across prepare/preflight/load.
+        let isolated_bulk: bool = self.client().query_one(
             "SELECT p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND NOT EXISTS(SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner) FROM pg_proc p WHERE p.oid='dsa.gate()'::regprocedure",
             &[],
         ).await.map_err(|error| stage.error(error))?.get(0);
@@ -688,6 +687,10 @@ impl Store {
             "{}",
             serde_json::json!({"event":"restore_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"}})
         );
+        let tx = self
+            .writer_transaction()
+            .await
+            .map_err(|error| stage.error(error))?;
         // Recheck the committed closed layout under locks excluding other DML.
         // Only the isolated path replaces empty storage for minimal-WAL COPY.
         let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
