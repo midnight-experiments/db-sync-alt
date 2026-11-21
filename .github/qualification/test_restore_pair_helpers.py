@@ -24,6 +24,8 @@ class PreparationControls(unittest.TestCase):
         self.assertEqual(configuration(PREDECESSOR, 'owner_work_mem_pair')['source'], PREDECESSOR)
         with self.assertRaises(AssertionError): configuration('a' * 40, 'owner_work_mem_pair')
         with self.assertRaises(AssertionError): configuration(PREDECESSOR, 'unbounded')
+        self.assertEqual(configuration(PREDECESSOR, 'owner_work_mem_pair', 44933813334)['completed_work4_run'], 44933813334)
+        with self.assertRaises(AssertionError): configuration(PREDECESSOR, 'owner_work_mem_pair', 123)
 
     def test_stacked_devices_are_not_added(self):
         before = {'252:0': {'wbytes': 10}, '259:3': {'wbytes': 10}}

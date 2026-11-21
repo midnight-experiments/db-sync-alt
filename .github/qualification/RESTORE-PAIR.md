@@ -14,6 +14,16 @@ bytes stay equal. This is a controlled diagnostic setting variant, not a product
 patch or default/cap change. It is still not dispatched. The actual source-free
 ABBA verification study is a separate operator-owned experiment.
 
+Run44933813334 earned the4MiB restore and normal verify, then failed only in a
+post-verify observation that decoded psql `t/f` as JSON. Its original reports,
+timings and artifact seal are retained. `restore_pair_continue_run=44933813334`
+validates that exact prior artifact and logical reports and executes only128MiB.
+The rebuilt executable must have the same SHA-256 as the original4MiB executable.
+The fixed JSON observation is exercised on the fresh empty PG before COPY.
+This continuation uses another hosted runner; report it as two observations,
+not an isolated paired setting speedup. The first variant's final checkpoint
+drain was not measured; do not invent it or repeat an earned baseline to fill it.
+
 The predecessor is c384207b9bffaffb7995d26a815bdfb333b97555. Both executables
 are built from clean exact public checkouts in the pinned Rust image, identified
 by SHA-256, and their actual version/restore/verify/status help is checked before

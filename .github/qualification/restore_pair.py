@@ -25,13 +25,17 @@ FULL_SNAPSHOT_BYTES = 18_523_014
 FULL_PLAIN_BYTES = 77_564_270
 EXPECTED_FIELDS = ['content_digest', 'state_digest', 'families', 'protected_state', 'state', 'supply']
 PREDECESSOR = 'c384207b9bffaffb7995d26a815bdfb333b97555'
+DISCONNECT_SQL = "SELECT to_json(EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND application_name='db-sync-alt'))"
 
 
-def configuration(candidate, mode='product_pair'):
+def configuration(candidate, mode='product_pair', completed_work4_run=None):
     assert mode in ['product_pair', 'owner_work_mem_pair']
     assert re.fullmatch('[0-9a-f]{40}', candidate)
     assert (candidate != PREDECESSOR) if mode == 'product_pair' else (candidate == PREDECESSOR)
+    assert completed_work4_run in [None, 44933813334]
+    assert completed_work4_run is None or mode == 'owner_work_mem_pair'
     return {'source': candidate, 'predecessor': PREDECESSOR, 'reuse_run': 44724041124,
+            'completed_work4_run': completed_work4_run,
             'mode': 'qualify', 'divisor': 1, 'target': 'restore_pair',
             'restore_pair_mode': mode,
             'portable_bytes': 134217728, 'restore_tcp_user_timeout_seconds': 600,
@@ -112,6 +116,30 @@ def run(g):
     expected = description['verified']
     original = json.loads((reused / 'conversion.json').read_text())['snapshot']['verified']
     assert all(expected[key] == original[key] for key in EXPECTED_FIELDS)
+    previous = None
+    if config.get('completed_work4_run'):
+        assert mode == 'owner_work_mem_pair' and config['completed_work4_run'] == 44933813334
+        prior = root / 'prior'
+        prior_seal = json.loads((prior / 'SHA256SUMS.json').read_text())
+        for name, sha in prior_seal.items():
+            assert Path(name).name == name and hashlib.sha256((prior / name).read_bytes()).hexdigest() == sha
+        prior_source = json.loads((prior / 'source.json').read_text())
+        assert prior_source['product_head'] == PREDECESSOR and prior_source['wrapper_head'] == 'b738f34d160c4af705fd5902e1a014814a2a42ae'
+        measurements = {}
+        for verb in ['restore', 'verify']:
+            value = json.loads((prior / ('owner-work4-' + verb + '.stdout')).read_text())
+            assert all(value[key] == expected[key] for key in EXPECTED_FIELDS)
+            measurement = json.loads((prior / ('owner-work4-' + verb + '-measurement.json')).read_text())
+            assert measurement['exit_code'] == 0
+            measurements[verb] = measurement
+        previous = {'run': config['completed_work4_run'], 'original_files_verified': len(prior_seal),
+                    'manifest_sha256': hashlib.sha256((prior / 'SHA256SUMS.json').read_bytes()).hexdigest(),
+                    'measurements': measurements,
+                    'completed_restore_and_normal_verify': True,
+                    'post_verify_disconnect_observation_failed_in_harness': True,
+                    'post_verify_checkpoint_drain_was_not_measured': True,
+                    'different_hosted_runner': True}
+        save('previous-work4-validated.json', previous)
     shutil.copyfile(reused / 'converted.snapshot', out / 'converted.snapshot')
     save('reuse-origin.json', {'run': config['reuse_run'], 'verified_original_files': len(seal),
                              'snapshot_sha256': FULL_SNAPSHOT_SHA,
@@ -154,6 +182,9 @@ def run(g):
                                      'sha256': hashlib.sha256((target / 'release/db-sync-alt').read_bytes()).hexdigest(),
                                      'rust_image': g['RUST'], 'normal_cli_help_checked_before_pg': True})
     docker('network', 'create', g['NETWORK'])
+    if previous:
+        prior_binary = json.loads((root / 'prior/owner-work4-binary.json').read_text())['sha256']
+        assert all(hashlib.sha256((target / 'release/db-sync-alt').read_bytes()).hexdigest() == prior_binary for target in targets.values()), 'rebuilt immutable executable differs from prior work4'
     mount_args = [arg for label, target in targets.items() for arg in
                   ['--mount', f'type=bind,src={target},dst=/work/{label},readonly']]
     ids[names['worker']] = docker('run', '-d', '--name', names['worker'],
@@ -164,6 +195,8 @@ def run(g):
     deadline = time.monotonic() + 7200
     results = []
     for label, pin, _ in pins:
+        if previous and label == 'owner-work4':
+            continue
         fresh = g['fresh_restore_target'](label)
         name, owner = 'restore_pair', 'restore_pair_owner'
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
@@ -189,6 +222,9 @@ def run(g):
         assert all(settings[key]['setting'] == 'on' for key in ['fsync', 'synchronous_commit', 'full_page_writes'])
         assert settings['archive_mode']['setting'] == 'off'
         save(label + '-settings.json', settings)
+        # Exercise the actual observer's JSON contract before any long COPY.
+        assert query(DISCONNECT_SQL) is False
+        save(label + '-observer-smoke.json', {'disconnected_query_decodes_false': True})
         def counters():
             value = query("SELECT json_build_object('at',clock_timestamp(),'insert_lsn',pg_current_wal_insert_lsn(),'flush_lsn',pg_current_wal_flush_lsn(),'wal',row_to_json(w),'checkpointer',(SELECT row_to_json(c) FROM pg_stat_checkpointer c),'io',(SELECT json_agg(i) FROM pg_stat_io i),'database',(SELECT row_to_json(d) FROM pg_stat_database d WHERE datname=current_database())) FROM pg_stat_wal w")
             value['cgroup_io'] = g['io_stat'](g['cg'](names['restored']))
@@ -231,7 +267,7 @@ def run(g):
         state = query('SELECT to_jsonb(p) FROM dsa.position p')
         assert state['serving']
         release_deadline = time.monotonic() + 5
-        while query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND application_name='db-sync-alt')"):
+        while query(DISCONNECT_SQL):
             assert time.monotonic() < release_deadline, 'own CLI backend did not disconnect'
             time.sleep(.1)
         # Drain is deliberately outside restore + verify: it exposes delayed physical IO,
@@ -265,13 +301,16 @@ def run(g):
         results.append(item); save(label + '-result.json', item)
         print(json.dumps({'event': 'generated_restore_pair_variant_finished', 'label': label,
                           'combined_seconds': combined, 'functional_pass': True}), flush=True)
-    assert all(results[0]['verified'][k] == results[1]['verified'][k] for k in EXPECTED_FIELDS)
-    save('restore-pair-result.json', {'status': 'PASS_GENERATED_FUNCTIONAL_PAIR', 'variants': results,
+    if not previous:
+        assert all(results[0]['verified'][k] == results[1]['verified'][k] for k in EXPECTED_FIELDS)
+    save('restore-pair-result.json', {'status': 'PASS_GENERATED_FUNCTIONAL_CONTINUATION' if previous else 'PASS_GENERATED_FUNCTIONAL_PAIR', 'variants': results,
+        'previous_work4': previous,
         'restore_pair_mode': mode,
         'snapshot_file_bytes': FULL_SNAPSHOT_BYTES, 'plain_section_bytes': FULL_PLAIN_BYTES,
         'source_generation': False, 'source_conversion': False, 'historical_timing_proven': False,
         'limitations': ['one predecessor-first/candidate-second pair, not order-balanced speedup proof',
                         'fresh PGDATA each; no forced cache eviction', 'per-statement logs omit executions below 250 ms',
+                        'a continued variant uses another hosted runner; do not claim an isolated setting speedup',
                         'checkpoint drain is reported separately; per-device IO must not be summed',
                         'work_mem is per operation, not a total memory bound; multiple operators/clients can multiply memory',
                         'generated addresses/payloads and storage differ from real archived data']})
