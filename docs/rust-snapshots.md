@@ -32,14 +32,25 @@ server already uses `wal_level=minimal`; other WAL modes keep their normal WAL
 policy. Failure rolls back the empty-storage replacement.
 
 If gate access has been granted to another role, PUBLIC or a group, or ownership
-differs, `reader_compatible` retains empty storage and matching secondary indexes,
-builds missing indexes and uses locks compatible with SELECT. Conflicting or
-invalid named indexes are refused as `destination_index_mismatch`. A legitimate
+differs, `reader_compatible` retains empty table storage and uses locks compatible
+with SELECT. It first locks/rechecks the closed empty layout and validates every
+fixed secondary index. Matching standalone secondary indexes are dropped with
+individual `DROP INDEX CONCURRENTLY` commands outside the ingest transaction;
+the same session writer lock spans preparation and ingest. Primary keys remain.
+An interrupted preparation can leave missing or invalid matching indexes: a
+retry on this still-empty `restore_failed` layout removes and rebuilds them.
+Conflicting objects, definitions, table bindings or constraint-backed indexes
+are preserved and refused as `destination_index_mismatch`, before any drop.
+A legitimate
 node reader keeps getting SQLSTATE 55000 while loading and verification run,
 including queries prepared earlier; complete checked rows appear only at commit.
-This path writes normal row WAL and maintains existing indexes during COPY, so
-it can take materially longer. Both paths preserve
-relation identities, ACLs, private allocation sequences and atomic publication;
+Secondary-index catalogue probes can report missing indexes during the closed
+preparation/load interval; all required indexes are rebuilt inside the data,
+verification and publication transaction. Preparation failure imports no rows;
+load failure rolls back rows and new indexes, leaving the gate closed for retry.
+This path writes normal row WAL while avoiding secondary-index maintenance
+during COPY. Its total timing must still be measured under the stated limits.
+Both paths preserve table/view identities, ACLs, private allocation sequences and atomic publication;
 no `CASCADE`, server setting or reader privilege change is used.
 
 Product `grant-reader` takes the same session writer lock and cannot attach a

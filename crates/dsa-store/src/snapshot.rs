@@ -44,7 +44,12 @@
 //! reader has gate access, the ingest transaction truncates them, allowing
 //! minimal-WAL COPY when the server already uses that WAL mode. Once gate access
 //! is granted, compatible relation locks preserve prompt closed-reader errors:
-//! no TRUNCATE or index drop, matching indexes stay and missing ones are built.
+//! no TRUNCATE or table-exclusive index drop occurs. A closed/empty precheck
+//! validates all fixed secondary indexes before any change, then removes them
+//! concurrently outside ingest under the same session writer lock. A canceled
+//! concurrent drop may leave a matching invalid index; retry can remove it.
+//! Ingest rechecks empty and rebuilds missing indexes before publication.
+//! Catalogue probes can see missing secondary indexes while the gate is closed.
 //! No CASCADE, sequence reset or server-policy change occurs. Product reader
 //! grants share the writer lock, so they cannot race the isolated fast path.
 //! Caller statement/idle transaction timeouts remain in force; no timeout is
@@ -183,8 +188,17 @@ fn index_shape(sql: &str) -> Vec<String> {
     shape
 }
 
-async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'static str>, Error> {
+struct RestoreIndexes {
+    missing: Vec<&'static str>,
+    present: Vec<String>,
+}
+
+async fn restore_indexes<C: GenericClient>(
+    tx: &C,
+    retry_concurrent_drop: bool,
+) -> Result<RestoreIndexes, Error> {
     let mut missing = Vec::new();
+    let mut present = Vec::new();
     for sql in include_str!("indexes.sql")
         .lines()
         .filter(|line| line.starts_with("CREATE"))
@@ -200,14 +214,18 @@ async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'stati
             .and_then(|s| s.split(['(', ' ']).next())
             .ok_or(Error::Refusal("invalid_index_catalogue"))?;
         let row = tx.query_opt(
-            "SELECT CASE WHEN i.indexrelid IS NOT NULL THEN pg_get_indexdef(c.oid) ELSE '' END,coalesce(i.indisvalid AND i.indisready AND i.indislive AND i.indrelid=to_regclass($2),false) FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass($1)",
+            "SELECT CASE WHEN i.indexrelid IS NOT NULL THEN pg_get_indexdef(c.oid) ELSE '' END,coalesce(i.indrelid=to_regclass($2) AND NOT EXISTS(SELECT 1 FROM pg_constraint p WHERE p.conindid=c.oid),false),coalesce(i.indisvalid AND i.indisready AND i.indislive,false) FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass($1)",
             &[&format!("serve.{name}"), &table],
         ).await?;
         match row {
             None => missing.push(sql),
             Some(row)
                 if row.get::<_, bool>(1)
-                    && index_shape(&row.get::<_, String>(0)) == index_shape(sql) => {}
+                    && (retry_concurrent_drop || row.get::<_, bool>(2))
+                    && index_shape(&row.get::<_, String>(0)) == index_shape(sql) =>
+            {
+                present.push(name.to_owned());
+            }
             Some(_) => {
                 eprintln!(
                     "{}",
@@ -217,7 +235,56 @@ async fn missing_restore_indexes<C: GenericClient>(tx: &C) -> Result<Vec<&'stati
             }
         }
     }
-    Ok(missing)
+    Ok(RestoreIndexes { missing, present })
+}
+
+fn restore_tables() -> Result<(Vec<String>, Vec<String>), Error> {
+    let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
+    let mut locked = copied.clone();
+    locked.extend([
+        "dsa.supply".into(),
+        "dsa.first_served".into(),
+        "dsa.calls".into(),
+    ]);
+    Ok((copied, locked))
+}
+
+async fn lock_empty_restore<C: GenericClient>(
+    tx: &C,
+    locked: &[String],
+    isolated_bulk: bool,
+) -> Result<(), Error> {
+    // Lock before taking a data snapshot, also for a caller using RR isolation.
+    tx.batch_execute(&format!(
+        "LOCK TABLE {} IN {} MODE",
+        locked.join(","),
+        if isolated_bulk {
+            "ACCESS EXCLUSIVE"
+        } else {
+            "SHARE ROW EXCLUSIVE"
+        }
+    ))
+    .await?;
+    if isolated_bulk && !restore_access(tx).await?.0 {
+        return Err(Error::Refusal("gate_access_changed"));
+    }
+    let row = tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1 FOR UPDATE OF p,i", &[]).await?;
+    let occupied = locked
+        .iter()
+        .map(|name| format!("EXISTS(SELECT 1 FROM {name})"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let occupied: bool = tx
+        .query_one(&format!("SELECT {occupied}"), &[])
+        .await?
+        .get(0);
+    if row.get::<_, bool>(0)
+        || row.get::<_, Option<String>>(1).as_deref() != Some("restore_failed")
+        || occupied
+    {
+        return Err(Error::Refusal("destination_not_empty"));
+    }
+    Ok(())
 }
 
 // Restore-local stage timings contain only fixed operation and table labels.
@@ -709,7 +776,7 @@ impl Store {
             read_description(&mut file, profile).map_err(|error| stage.error(error))?;
         preflight(&mut file, &description).map_err(|error| stage.error(error))?;
         stage.finish();
-        let stage = RestoreStage::start("restore_recheck_empty", "database");
+        let stage = RestoreStage::start("restore_access", "database");
         // A supported reader needs gate EXECUTE. Conservatively keep read locks
         // compatible if any other role (including PUBLIC or a group) has it, or
         // the gate owner differs. Do not base this on currently active sessions.
@@ -725,59 +792,46 @@ impl Store {
             "{}",
             serde_json::json!({"event":"restore_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"},"reason":reason})
         );
+        stage.finish();
+        let (copied, locked) = restore_tables()?;
+        if !isolated_bulk {
+            let stage = RestoreStage::start("restore_prepare_indexes", "database");
+            let tx = self
+                .writer_transaction()
+                .await
+                .map_err(|error| stage.error(error))?;
+            lock_empty_restore(&tx, &locked, false)
+                .await
+                .map_err(|error| stage.error(error))?;
+            // Validate the complete catalogue before dropping anything. Only a
+            // matching fixed standalone index on this owned empty layout may be
+            // removed, including an invalid remnant of a canceled concurrent
+            // drop. Conflicting objects/constraints are preserved and refused.
+            let indexes = restore_indexes(&tx, true)
+                .await
+                .map_err(|error| stage.error(error))?;
+            tx.commit().await.map_err(|error| stage.error(error))?;
+            // CONCURRENTLY cannot run in a transaction block. The product's
+            // session advisory writer lock spans these individual commands and
+            // ingest. Caller statement timeouts still apply to every command.
+            for name in indexes.present {
+                self.client()
+                    .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS serve.{name}"))
+                    .await
+                    .map_err(|error| stage.error(error))?;
+            }
+            stage.finish();
+        }
+        let stage = RestoreStage::start("restore_recheck_empty", "database");
         let tx = self
             .writer_transaction()
             .await
             .map_err(|error| stage.error(error))?;
         // Recheck the committed closed layout under locks excluding other DML.
         // Only the isolated path replaces empty storage for minimal-WAL COPY.
-        let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
-        let mut locked = copied.clone();
-        locked.extend([
-            "dsa.supply".into(),
-            "dsa.first_served".into(),
-            "dsa.calls".into(),
-        ]);
-        tx.batch_execute(&format!(
-            "LOCK TABLE {} IN {} MODE",
-            locked.join(","),
-            if isolated_bulk {
-                "ACCESS EXCLUSIVE"
-            } else {
-                "SHARE ROW EXCLUSIVE"
-            }
-        ))
-        .await
-        .map_err(|error| stage.error(error))?;
-        // Narrow an out-of-protocol manual GRANT race while we waited. This is
-        // after load locks, preserving the RR recheck snapshot ordering. Owner
-        // DDL after this check still bypasses the product's writer protocol.
-        if isolated_bulk
-            && !restore_access(&tx)
-                .await
-                .map_err(|error| stage.error(error))?
-                .0
-        {
-            return Err(stage.error(Error::Refusal("gate_access_changed")));
-        }
-        let row = tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1 FOR UPDATE OF p,i", &[])
-            .await.map_err(|error| stage.error(error))?;
-        let occupied = locked
-            .iter()
-            .map(|name| format!("EXISTS(SELECT 1 FROM {name})"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let occupied: bool = tx
-            .query_one(&format!("SELECT {occupied}"), &[])
+        lock_empty_restore(&tx, &locked, isolated_bulk)
             .await
-            .map_err(|error| stage.error(error))?
-            .get(0);
-        if row.get::<_, bool>(0)
-            || row.get::<_, Option<String>>(1).as_deref() != Some("restore_failed")
-            || occupied
-        {
-            return Err(stage.error(Error::Refusal("destination_not_empty")));
-        }
+            .map_err(|error| stage.error(error))?;
         let missing_indexes = if isolated_bulk {
             // No CASCADE/identity reset; failure rolls back this rewrite.
             tx.batch_execute(&format!("TRUNCATE TABLE {}", copied.join(",")))
@@ -785,11 +839,12 @@ impl Store {
                 .map_err(|error| stage.error(error))?;
             Vec::new()
         } else {
-            // DROP INDEX also takes ACCESS EXCLUSIVE on its table. Retain
-            // matching indexes and reject conflicting definitions before COPY.
-            missing_restore_indexes(&tx)
+            // A manual owner can bypass the product writer protocol. Recheck
+            // any indexes it added during preparation before ingesting rows.
+            restore_indexes(&tx, false)
                 .await
                 .map_err(|error| stage.error(error))?
+                .missing
         };
         stage.finish();
         let stage = RestoreStage::start("restore_drop_indexes", "database");

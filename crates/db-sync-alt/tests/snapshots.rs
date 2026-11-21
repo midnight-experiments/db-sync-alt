@@ -1345,7 +1345,7 @@ async fn restore_reader_compatible_cli_copy_indexes_and_atomic_publication() -> 
             .get::<_, i64>(0),
         original_storage
     );
-    assert_eq!(
+    assert_ne!(
         client
             .query_one("SELECT 'serve.idx_tx_out_address'::regclass::oid", &[])
             .await?
@@ -1397,10 +1397,146 @@ async fn restore_reader_compatible_cli_copy_indexes_and_atomic_publication() -> 
     assert_eq!(rows(&source).await?, rows(&dest).await?);
     println!(
         "{}",
-        json!({"q22_cli_reader_compatible":true,"all11_copy_and_precommit_55000":true,"prepared_reader":true,"grant_reader_writer_busy":true,"existing_index_retained":true,"missing_index_created":true,"atomic_commit_exact_parity":true})
+        json!({"q22_cli_reader_compatible":true,"all11_copy_and_precommit_55000":true,"prepared_reader":true,"grant_reader_writer_busy":true,"secondary_index_rebuilt":true,"missing_index_created":true,"atomic_commit_exact_parity":true})
     );
     drop(reader);
     drop(client);
+    source.cleanup().await?;
+    dest.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_concurrent_index_preparation_closed_reader_timeout_and_retry() -> Result {
+    let f = fixture(165);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("concurrent-index.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader],
+    )
+    .await?;
+    let holder = connect(&dest.config).await?;
+    let before = holder.query_one("SELECT 'serve.serve_block_hash'::regclass::oid,pg_get_indexdef('serve.serve_block_hash'::regclass),pg_relation_filenode('serve.block'::regclass)::bigint", &[]).await?;
+    let mut config = dest.config.clone();
+    config
+        .user(&dest.reader)
+        .options("-c default_transaction_read_only=on -c statement_timeout=500ms");
+    let reader = connect(&config).await?;
+    let prepared = reader
+        .prepare("SELECT * FROM public.block WHERE id=$1")
+        .await?;
+    holder
+        .batch_execute("BEGIN;LOCK TABLE serve.block IN ACCESS SHARE MODE")
+        .await?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    command
+        .args([
+            "restore",
+            "--database",
+            &dest.dsn(),
+            "--network",
+            &f.profile.network,
+        ])
+        .args(file_args(&path))
+        .args(["--statement-timeout-seconds", "3"])
+        .kill_on_drop(true);
+    let restore = tokio::spawn(async move { command.output().await });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let waiting: bool = dest.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND query LIKE 'DROP INDEX CONCURRENTLY%' AND wait_event_type='Lock' AND wait_event='virtualxid')", &[&dest.name]).await?.get(0);
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no concurrent index wait"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    closed_reader_queries(&reader).await?;
+    assert_eq!(
+        reader
+            .query(&prepared, &[&1_i64])
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "55000"
+    );
+    let competing = dest
+        .cli_raw(
+            "grant-reader",
+            &f.profile.network,
+            &["--role", &dest.reader],
+        )
+        .await?;
+    assert!(!competing.status.success());
+    assert!(String::from_utf8_lossy(&competing.stderr).contains("writer_busy"));
+    let failed = restore.await??;
+    assert!(!failed.status.success());
+    assert_no_restore_copy(&failed);
+    let error = String::from_utf8_lossy(&failed.stderr)
+        .lines()
+        .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        .find(|v| v["error"] == "database_error")
+        .ok_or("missing timeout report")?;
+    assert_eq!(error["sqlstate"], "57014");
+    assert_eq!(error["stage"], "restore_prepare_indexes");
+    // Read with a separate autocommit session: the holder deliberately has an
+    // old transaction snapshot. The canceled concurrent DROP retains this OID
+    // and definition but invalidates it; a normal retry must repair that state.
+    let observer = connect(&dest.config).await?;
+    let after = observer.query_one("SELECT i.indexrelid,pg_get_indexdef(i.indexrelid),i.indisvalid,i.indisready,i.indislive,pg_relation_filenode('serve.block'::regclass)::bigint FROM pg_index i WHERE i.indexrelid='serve.serve_block_hash'::regclass", &[]).await?;
+    assert_eq!(after.get::<_, u32>(0), before.get::<_, u32>(0));
+    assert_eq!(after.get::<_, String>(1), before.get::<_, String>(1));
+    assert!(!after.get::<_, bool>(2));
+    assert!(after.get::<_, bool>(3) && after.get::<_, bool>(4));
+    assert_eq!(after.get::<_, i64>(5), before.get::<_, i64>(2));
+    assert_eq!(
+        dest.cli("status", &f.profile.network, &[]).await?["position"]["serving"],
+        false
+    );
+    closed_reader_queries(&reader).await?;
+    holder.batch_execute("COMMIT").await?;
+    let report = dest
+        .cli("restore", &f.profile.network, &file_args(&path))
+        .await?;
+    for key in [
+        "content_digest",
+        "state_digest",
+        "families",
+        "protected_state",
+        "state",
+        "supply",
+    ] {
+        assert_eq!(report[key], description["verified"][key]);
+    }
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader, "--check"],
+    )
+    .await?;
+    reader.query(&prepared, &[&1_i64]).await?;
+    assert_eq!(rows(&source).await?, rows(&dest).await?);
+    println!(
+        "{}",
+        json!({"q22_normal_cli_concurrent_drop_wait_55000":true,"caller_timeout_57014":true,"matching_invalid_index_retry":true,"atomic_parity":true})
+    );
+    drop(observer);
+    drop(reader);
+    drop(holder);
     source.cleanup().await?;
     dest.cleanup().await?;
     Ok(())
