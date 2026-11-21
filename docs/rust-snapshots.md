@@ -48,6 +48,11 @@ Secondary-index catalogue probes can report missing indexes during the closed
 preparation/load interval; all required indexes are rebuilt inside the data,
 verification and publication transaction. Preparation failure imports no rows;
 load failure rolls back rows and new indexes, leaving the gate closed for retry.
+Node startup helpers that attempt CREATE after a missing-index probe can fail
+startup during this interval; startup must be retried after restore commits.
+Concurrent preparation waits for other sessions holding table locks, including
+idle transactions. Choose an explicit finite statement timeout; a canceled
+preparation can be retried once the blocking session releases its transaction.
 This path writes normal row WAL while avoiding secondary-index maintenance
 during COPY. Its total timing must still be measured under the stated limits.
 Both paths preserve table/view identities, ACLs, private allocation sequences and atomic publication;
