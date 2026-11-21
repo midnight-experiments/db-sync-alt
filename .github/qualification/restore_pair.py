@@ -29,12 +29,12 @@ DISCONNECT_SQL = "SELECT to_json(EXISTS(SELECT 1 FROM pg_stat_activity WHERE dat
 
 
 def configuration(candidate, mode='product_pair', completed_work4_run=None):
-    assert mode in ['product_pair', 'owner_work_mem_pair']
+    assert mode in ['product_pair', 'owner_work_mem_pair', 'reader_mode_pair']
     assert re.fullmatch('[0-9a-f]{40}', candidate)
-    assert (candidate != PREDECESSOR) if mode == 'product_pair' else (candidate == PREDECESSOR)
+    assert (candidate == PREDECESSOR) if mode == 'owner_work_mem_pair' else (candidate != PREDECESSOR)
     assert completed_work4_run in [None, 44933813334]
     assert completed_work4_run is None or mode == 'owner_work_mem_pair'
-    return {'source': candidate, 'predecessor': PREDECESSOR, 'reuse_run': 44724041124,
+    return {'source': candidate, 'predecessor': candidate if mode == 'reader_mode_pair' else PREDECESSOR, 'reuse_run': 44724041124,
             'completed_work4_run': completed_work4_run,
             'mode': 'qualify', 'divisor': 1, 'target': 'restore_pair',
             'restore_pair_mode': mode,
@@ -91,11 +91,13 @@ def run(g):
     assert config['restore_server_settings'] == SERVER_SETTINGS
     assert config['reuse_run'] == 44724041124
     mode = config['restore_pair_mode']
-    assert mode in ['product_pair', 'owner_work_mem_pair']
-    labels = ['predecessor', 'candidate'] if mode == 'product_pair' else ['owner-work4', 'owner-work128']
+    assert mode in ['product_pair', 'owner_work_mem_pair', 'reader_mode_pair']
+    reader_pair = mode == 'reader_mode_pair'
+    labels = ['ungranted', 'pregranted'] if reader_pair else (['predecessor', 'candidate'] if mode == 'product_pair' else ['owner-work4', 'owner-work128'])
     pins = [(labels[0], config['predecessor'], root / 'predecessor'),
             (labels[1], g['PIN'], root / 'product')]
-    assert (pins[0][1] != pins[1][1]) if mode == 'product_pair' else (pins[0][1] == pins[1][1] == PREDECESSOR)
+    if reader_pair: assert pins[0][1] == pins[1][1] == g['PIN']
+    else: assert (pins[0][1] != pins[1][1]) if mode == 'product_pair' else (pins[0][1] == pins[1][1] == PREDECESSOR)
     for label, pin, path in pins:
         assert re.fullmatch('[0-9a-f]{40}', pin)
         assert output(['git', '-C', str(path), 'rev-parse', 'HEAD']).strip() == pin
@@ -195,7 +197,7 @@ def run(g):
     g['thread'] = threading.Thread(target=g['monitor'], daemon=True); g['thread'].start()
     deadline = time.monotonic() + 7200
     results = []
-    matched_settings, matched_devices = [], []
+    matched_settings, matched_devices, matched_empty_indexes = [], [], []
     for label, pin, _ in pins:
         if previous and label == 'owner-work4':
             continue
@@ -204,7 +206,7 @@ def run(g):
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
                '-d', 'postgres', '-c', f'CREATE ROLE {owner} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
         assert config['product_pair_owner_work_mem_mb'] == 128
-        owner_work = 128 if mode == 'product_pair' or label == 'owner-work128' else 4
+        owner_work = 128 if mode in ['product_pair', 'reader_mode_pair'] or label == 'owner-work128' else 4
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
                '-d', 'postgres', '-c', f"ALTER ROLE {owner} SET work_mem='{owner_work}MB'")
         docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
@@ -240,6 +242,53 @@ def run(g):
         cli = ['docker', 'exec', names['worker'], f'/work/{label}/release/db-sync-alt']
         common = ['--database', dsn, '--network', 'mainnet', '--statement-timeout-seconds', '600',
                   '--idle-transaction-timeout-seconds', '7200']
+        reader_probe = {'required': reader_pair and label == 'pregranted'}
+        reader_errors = []
+        reader_done = threading.Event()
+        reader_thread = None
+        if reader_pair:
+            # Equal normal product-created empty schemas/indexes and role
+            # defaults. Only the normal grant-reader operation differs.
+            for verb in ['create', 'grant-reader']:
+                if verb == 'grant-reader' and label != 'pregranted': continue
+                if verb == 'grant-reader':
+                    extra = ['--role', 'restore_pair_reader']
+                else: extra = []
+                if verb == 'create':
+                    docker('exec', names['restored'], 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres',
+                           '-d', 'postgres', '-c', "CREATE ROLE restore_pair_reader LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 36; ALTER ROLE restore_pair_reader SET default_transaction_read_only=on; ALTER ROLE restore_pair_reader SET search_path=public; ALTER ROLE restore_pair_reader SET statement_timeout='60s'; ALTER ROLE restore_pair_reader SET idle_in_transaction_session_timeout='60s'")
+                prepared = subprocess.run([*cli, verb, *common, *extra], capture_output=True, text=True, timeout=120)
+                (out/(label+'-'+verb+'-prestate.stdout')).write_text(prepared.stdout)
+                (out/(label+'-'+verb+'-prestate.stderr')).write_text(prepared.stderr)
+                assert prepared.returncode == 0, (label, verb, 'normal CLI prestate failed')
+                if verb == 'create':
+                    empty = query("SELECT json_build_object('indexes',(SELECT json_agg(json_build_object('name',indexname,'definition',indexdef) ORDER BY indexname) FROM pg_indexes WHERE schemaname='serve'),'rows',(SELECT json_object_agg(n,rows) FROM (SELECT c.relname n,coalesce(s.n_live_tup,0) rows FROM pg_class c JOIN pg_namespace ns ON ns.oid=c.relnamespace LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid WHERE ns.nspname='serve' AND c.relkind='r') t),'serving',(SELECT serving FROM dsa.position))")
+                    assert len(empty['indexes']) == 31 and not empty['serving'] and all(v == 0 for v in empty['rows'].values())
+                    matched_empty_indexes.append(empty['indexes']); save(label+'-equal-empty-prestate.json',empty)
+            def probe_reader_during_copy():
+                try:
+                    until = time.monotonic()+600
+                    while not reader_done.is_set() and time.monotonic()<until:
+                        rows = query("SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'query',query,'state',state)), '[]'::json) FROM pg_stat_activity WHERE datname=current_database() AND application_name='db-sync-alt' AND state='active' AND query LIKE 'COPY serve.% FROM STDIN%'")
+                        if rows:
+                            begin = time.monotonic()
+                            check = subprocess.run(['docker','exec','-e','PGOPTIONS=-c statement_timeout=500',
+                                names['restored'],'psql','-XAt','-v','ON_ERROR_STOP=1','-v','VERBOSITY=verbose',
+                                '-h','127.0.0.1','-U','restore_pair_reader','-d',name,'-c','SELECT count(*) FROM public.block'],
+                                capture_output=True,text=True,timeout=5)
+                            elapsed = time.monotonic()-begin
+                            after = query("SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'query',query,'state',state)), '[]'::json) FROM pg_stat_activity WHERE datname=current_database() AND application_name='db-sync-alt' AND state='active' AND query LIKE 'COPY serve.% FROM STDIN%'")
+                            reader_probe.update(before=rows,after=after,seconds=elapsed,exit_code=check.returncode,
+                                                stdout=check.stdout,stderr=check.stderr)
+                            save(label+'-reader-during-copy.json',reader_probe)
+                            assert check.returncode != 0 and '55000' in check.stderr and '57014' not in check.stderr and elapsed < .5
+                            assert any((a['pid'],a['backend_start'],a['xact_start'],a['query']) ==
+                                       (b['pid'],b['backend_start'],b['xact_start'],b['query']) for a in rows for b in after), 'COPY changed during reader observation'
+                            reader_probe['passed'] = True; save(label+'-reader-during-copy.json',reader_probe)
+                            return
+                        time.sleep(.05)
+                    raise AssertionError('no actual compatible COPY reached by reader probe')
+                except BaseException as exc: reader_errors.append(type(exc).__name__+': '+str(exc))
         def execute(verb, extra):
             before = counters(); started = time.time(); clock = time.monotonic()
             save('active-command.json', {'name': label + '-' + verb, 'started_unix': started})
@@ -266,7 +315,15 @@ def run(g):
             actual = value
             assert all(actual[key] == expected[key] for key in EXPECTED_FIELDS), (label, verb, 'digest/state/family/supply mismatch')
             return value
-        restore = execute('restore', ['--file', '/evidence/converted.snapshot'])
+        if reader_probe['required']:
+            reader_thread=threading.Thread(target=probe_reader_during_copy,daemon=True);reader_thread.start()
+        try:
+            restore = execute('restore', ['--file', '/evidence/converted.snapshot'])
+        finally:
+            reader_done.set()
+        if reader_thread:
+            reader_thread.join(timeout=10)
+            assert not reader_thread.is_alive() and not reader_errors and reader_probe.get('passed'), reader_errors
         verify = execute('verify', [])
         state = query('SELECT to_jsonb(p) FROM dsa.position p')
         assert state['serving']
@@ -297,6 +354,7 @@ def run(g):
         assert socket_limits and all(event['tcp_user_timeout_ms'] == 600000 for event in socket_limits)
         combined = phases['restore']['seconds'] + phases['verify']['seconds']
         item = {'label': label, 'source_head': pin, 'fresh_target': fresh, 'state': state,
+                'reader_during_copy': reader_probe,
                 'owner_work_mem_mb': owner_work, 'owner_work_mem_override': True,
                 'restore_seconds': phases['restore']['seconds'], 'independent_verify_seconds': phases['verify']['seconds'],
                 'restore_plus_independent_verify_seconds': combined, 'criterion_seconds': 180,
@@ -307,7 +365,7 @@ def run(g):
                           'combined_seconds': combined, 'functional_pass': True}), flush=True)
     if not previous:
         assert all(results[0]['verified'][k] == results[1]['verified'][k] for k in EXPECTED_FIELDS)
-    if mode == 'product_pair':
+    if mode in ['product_pair', 'reader_mode_pair']:
         assert len(results) == 2 and matched_settings[0] == matched_settings[1]
         assert matched_devices[0] == matched_devices[1]
         rechecks = [any(event.get('event') == 'restore_stage_finished' and
@@ -320,12 +378,19 @@ def run(g):
             'owner_work_mem_mb_both': 128, 'fresh_target_per_variant': True,
             'restore_recheck_empty_finished_by_variant': rechecks,
             'caps_and_direct_io_probes': [item['fresh_target']['admission'] for item in results]})
+    if reader_pair:
+        assert matched_empty_indexes[0] == matched_empty_indexes[1]
+        observed_modes = [[e for e in item['phase_events'] if e.get('event') == 'restore_load_mode'] for item in results]
+        assert [v[0]['mode'] for v in observed_modes] == ['isolated_bulk','reader_compatible']
+        save('reader-modes-matched.json', {'same_source_and_binary':True,'same_initial_indexes':True,
+             'sole_prestate_difference':'normal grant-reader on pregranted target',
+             'observed_modes':observed_modes,'actual_reader_during_compatible_copy':results[1]['reader_during_copy']})
     save('restore-pair-result.json', {'status': 'PASS_GENERATED_FUNCTIONAL_CONTINUATION' if previous else 'PASS_GENERATED_FUNCTIONAL_PAIR', 'variants': results,
         'previous_work4': previous,
         'restore_pair_mode': mode,
         'snapshot_file_bytes': FULL_SNAPSHOT_BYTES, 'plain_section_bytes': FULL_PLAIN_BYTES,
         'source_generation': False, 'source_conversion': False, 'historical_timing_proven': False,
-        'limitations': ['one predecessor-first/candidate-second pair, not order-balanced speedup proof',
+        'limitations': ['one ungranted/pregranted or predecessor/candidate pair, not order-balanced speedup proof',
                         'fresh PGDATA each; no forced cache eviction', 'per-statement logs omit executions below 250 ms',
                         'a continued variant uses another hosted runner; do not claim an isolated setting speedup',
                         'checkpoint drain is reported separately; per-device IO must not be summed',

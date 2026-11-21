@@ -12,7 +12,7 @@ on:
       restore_pair_mode:
         description: 'Product comparison or explicitly authorized same-c384 owner work_mem control'
         type: choice
-        options: [product_pair, owner_work_mem_pair]
+        options: [product_pair, owner_work_mem_pair, reader_mode_pair]
         default: product_pair
       restore_pair_continue_run:
         description: 'Optional sealed failed-observer run44933813334; continues work128 only'

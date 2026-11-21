@@ -21,6 +21,13 @@ class PreparationControls(unittest.TestCase):
         self.assertTrue(math.isclose(items[1]['seconds'], .250001))
         self.assertEqual(items[0]['first_sql_line'], 'SELECT 1')
 
+    def test_reader_pair_uses_same_candidate_and_no_work4_continuation(self):
+        value = configuration('a' * 40, 'reader_mode_pair')
+        self.assertEqual(value['source'], value['predecessor'])
+        self.assertEqual(value['product_pair_owner_work_mem_mb'], 128)
+        self.assertEqual(value['reuse_run'], 44724041124)
+        with self.assertRaises(AssertionError): configuration('a' * 40, 'reader_mode_pair', 44933813334)
+
     def test_setting_pair_keeps_exact_predecessor_code(self):
         self.assertEqual(configuration(PREDECESSOR, 'owner_work_mem_pair')['source'], PREDECESSOR)
         with self.assertRaises(AssertionError): configuration('a' * 40, 'owner_work_mem_pair')
