@@ -52,6 +52,52 @@ pub struct KeyStage {
     pub prepare_sql: String,
 }
 
+const KEY_UNION_MARKER: &str = " SELECT 'block'::text AS family,id FROM keep_block";
+fn prefix(full: &str) -> Result<&str, Error> {
+    full.split_once(KEY_UNION_MARKER)
+        .and_then(|(prefix, _)| {
+            prefix.strip_prefix("CREATE TEMP TABLE conversion_keep_keys ON COMMIT DROP AS ")
+        })
+        .ok_or(Error::Refusal("invalid_staging_keep_definition"))
+}
+fn cte_body(full: &str, cte: &str, next: &str) -> Result<String, Error> {
+    let begin = full
+        .find(&format!("{cte} AS MATERIALIZED ("))
+        .map(|n| n + format!("{cte} AS MATERIALIZED (").len())
+        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+    let end = full
+        .find(&format!("{next} AS MATERIALIZED ("))
+        .and_then(|n| full[..n].rfind("),"))
+        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+    full.get(begin..end)
+        .map(str::to_owned)
+        .ok_or(Error::Refusal("invalid_staging_keep_definition"))
+}
+fn replace_cte(full: &mut String, cte: &str, next: &str, body: &str) -> Result<(), Error> {
+    let old = cte_body(full, cte, next)?;
+    let begin = full
+        .find(&format!("{cte} AS MATERIALIZED ("))
+        .map(|n| n + format!("{cte} AS MATERIALIZED (").len())
+        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+    full.replace_range(begin..begin + old.len(), body);
+    Ok(())
+}
+fn projection_stage(
+    full: &str,
+    table: &'static str,
+    query: &str,
+    prepare: &str,
+) -> Result<KeyStage, Error> {
+    Ok(KeyStage {
+        table,
+        create_sql: format!(
+            "CREATE TEMP TABLE {table} ON COMMIT DROP AS {} {query}",
+            prefix(full)?
+        ),
+        prepare_sql: prepare.to_owned(),
+    })
+}
+
 fn bytes(value: &str) -> Result<Vec<u8>, Error> {
     hex::decode(value).map_err(|_| Error::Refusal("invalid_keep_profile"))
 }
@@ -125,11 +171,106 @@ impl Selection {
                 &format!("{cte} AS MATERIALIZED (SELECT * FROM pg_temp.{table}),\n"),
             );
         }
-        stages.push(KeyStage {
-            table: "conversion_keep_keys",
-            create_sql: full,
-            prepare_sql: "ALTER TABLE pg_temp.conversion_keep_keys ADD PRIMARY KEY(family,id);ANALYZE pg_temp.conversion_keep_keys".to_owned(),
-        });
+        // Freeze only the retained join fields before planning eligibility.
+        // They use exactly the source/bounds joins from K3/K4/K9. A small,
+        // analyzed relation prevents a datum preimage join from driving a scan
+        // of the full-width source copy before output eligibility is known.
+        let tx = cte_body(&full, "keep_tx", "keep_tx_in")?;
+        let output_join = tx
+            .split_once(" UNION SELECT o.tx_id ")
+            .map(|(_, tail)| tail)
+            .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+        let outputs = format!("SELECT o.id,o.tx_id,o.address,o.data_hash {output_join}");
+        stages.push(projection_stage(&full, "conversion_output_facts", &outputs,
+            "CREATE UNIQUE INDEX conversion_output_facts_lookup ON pg_temp.conversion_output_facts(id);ANALYZE pg_temp.conversion_output_facts")?);
+        replace_cte(
+            &mut full,
+            "keep_tx",
+            "keep_tx_in",
+            &tx.replace("pg_temp.tx_out o", "pg_temp.conversion_output_facts o"),
+        )?;
+
+        let catalogue = cte_body(&full, "keep_multi_asset", "keep_datum")?;
+        let asset_join = catalogue
+            .split_once(" UNION SELECT a.ident ")
+            .map(|(_, tail)| tail)
+            .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+        let assets = format!("SELECT a.id,a.tx_out_id,a.ident {asset_join}");
+        stages.push(projection_stage(&full, "conversion_asset_facts", &assets,
+            "CREATE UNIQUE INDEX conversion_asset_facts_lookup ON pg_temp.conversion_asset_facts(id);CREATE INDEX conversion_asset_facts_outpoint ON pg_temp.conversion_asset_facts(tx_out_id,ident);ANALYZE pg_temp.conversion_asset_facts")?);
+        replace_cte(
+            &mut full,
+            "keep_multi_asset",
+            "keep_datum",
+            &catalogue.replace("pg_temp.ma_tx_out a", "pg_temp.conversion_asset_facts a"),
+        )?;
+
+        let datum = cte_body(&full, "keep_datum", "keep_epoch_param")?;
+        let datum_driver = datum
+            .replace(
+                "SELECT DISTINCT d.id",
+                "SELECT DISTINCT o.data_hash AS hash",
+            )
+            .replace(
+                "pg_temp.tx_out o JOIN keep_tx_out k ON k.id=o.id",
+                "pg_temp.conversion_output_facts o",
+            )
+            .replace(" JOIN pg_temp.datum d ON d.hash=o.data_hash", "")
+            .replace("pg_temp.ma_tx_out a", "pg_temp.conversion_asset_facts a");
+        if datum_driver.contains("d.id") || datum_driver.contains("pg_temp.datum") {
+            return Err(Error::Refusal("invalid_staging_keep_definition"));
+        }
+        // An exact permissioned unit at a retained output is always an eligible
+        // v2 asset. Thus its retained asset facts preserve every K4 token probe;
+        // unknown descriptors still cannot match the original catalogue join.
+        stages.push(projection_stage(&full, "conversion_datum_hashes", &datum_driver,
+            "CREATE UNIQUE INDEX conversion_datum_hashes_lookup ON pg_temp.conversion_datum_hashes(hash);ANALYZE pg_temp.conversion_datum_hashes")?);
+        replace_cte(
+            &mut full,
+            "keep_datum",
+            "keep_epoch_param",
+            " SELECT DISTINCT d.id FROM pg_temp.conversion_datum_hashes h CROSS JOIN LATERAL (SELECT d.id FROM pg_temp.datum d WHERE d.hash=h.hash OFFSET 0) d\n",
+        )?;
+
+        // Each original family is evaluated once, with a separate finite
+        // command budget. No large joins survive into final key assembly.
+        let family_tables = [
+            ("block", "conversion_family_block"),
+            ("tx", "conversion_family_tx"),
+            ("tx_out", "conversion_family_tx_out"),
+            ("tx_in", "conversion_family_tx_in"),
+            ("ma_tx_out", "conversion_family_ma_tx_out"),
+            ("multi_asset", "conversion_family_multi_asset"),
+            ("datum", "conversion_family_datum"),
+            ("epoch_param", "conversion_family_epoch_param"),
+            ("pool_hash", "conversion_family_pool_hash"),
+            ("epoch_stake", "conversion_family_epoch_stake"),
+            ("tx_metadata", "conversion_family_tx_metadata"),
+        ];
+        if family_tables
+            .iter()
+            .map(|(family, _)| *family)
+            .ne(crate::NODE_RELATIONS.iter().copied())
+        {
+            return Err(Error::Refusal("invalid_staging_keep_definition"));
+        }
+        for (family, table) in family_tables {
+            stages.push(projection_stage(
+                &full,
+                table,
+                &crate::canonical::staging_key_family(family),
+                &format!(
+                    "ALTER TABLE pg_temp.{table} ADD PRIMARY KEY(family,id);ANALYZE pg_temp.{table}"
+                ),
+            )?);
+        }
+        let union = family_tables
+            .iter()
+            .map(|(_, table)| format!("SELECT family,id FROM pg_temp.{table}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        stages.push(projection_stage(&full, "conversion_keep_keys", &union,
+            "ALTER TABLE pg_temp.conversion_keep_keys ADD PRIMARY KEY(family,id);ANALYZE pg_temp.conversion_keep_keys")?);
         Ok(stages)
     }
 

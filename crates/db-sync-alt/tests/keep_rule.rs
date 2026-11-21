@@ -726,6 +726,88 @@ async fn verify_observations(
     Ok(counts)
 }
 
+#[test]
+fn keep_rule_indexed_stage_dependencies_are_not_noops() -> Result {
+    let plan = Selection::staging_plan()?;
+    assert_eq!(plan.len(), 20);
+    let expected = [
+        "conversion_keys_unspent",
+        "conversion_keys_permissioned",
+        "conversion_keys_epochs",
+        "conversion_keys_outputs",
+        "conversion_keys_assets",
+    ];
+    for (index, name) in expected.iter().enumerate() {
+        assert_eq!(plan[index].table, *name);
+        for stage in plan.iter().skip(index + 1) {
+            assert!(
+                stage
+                    .create_sql
+                    .contains(&format!("SELECT * FROM pg_temp.{name}")),
+                "{} missing {}",
+                stage.table,
+                name
+            );
+        }
+    }
+    for stage in &plan {
+        for bind in 1..=10 {
+            assert!(
+                stage.create_sql.contains(&format!("${bind}::")),
+                "{} missing bind{}",
+                stage.table,
+                bind
+            );
+        }
+    }
+    assert!(
+        plan[0]
+            .create_sql
+            .contains("SELECT o.id FROM pg_temp.tx_out o")
+    );
+    assert!(
+        !plan[1]
+            .create_sql
+            .contains("old_unspent AS MATERIALIZED (\n SELECT o.id")
+    );
+    assert!(
+        plan[5]
+            .create_sql
+            .contains("SELECT o.id,o.tx_id,o.address,o.data_hash")
+    );
+    assert!(
+        plan[6]
+            .create_sql
+            .contains("SELECT a.id,a.tx_out_id,a.ident")
+    );
+    assert!(
+        plan[7]
+            .create_sql
+            .contains("SELECT DISTINCT o.data_hash AS hash FROM pg_temp.conversion_output_facts o")
+    );
+    assert!(
+        plan[7]
+            .create_sql
+            .contains("FROM pg_temp.conversion_asset_facts a")
+    );
+    assert!(plan[14].create_sql.contains("WHERE d.hash=h.hash OFFSET 0"));
+    assert!(
+        plan[12]
+            .create_sql
+            .contains("UNION SELECT a.id FROM pg_temp.ma_tx_out a WHERE a.id BETWEEN")
+    );
+    assert!(plan[12].create_sql.contains("ident NOT IN"));
+    assert!(!plan[1].prepare_sql.contains("UNIQUE"));
+    assert!(!plan[2].prepare_sql.contains("UNIQUE"));
+    for (index, family) in TABLES.iter().enumerate() {
+        assert_eq!(plan[8 + index].table, format!("conversion_family_{family}"));
+        assert!(plan.last().unwrap().create_sql.contains(&format!(
+            "SELECT family,id FROM pg_temp.conversion_family_{family}"
+        )));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_indexed_stages_match_independent_model() -> Result {
@@ -751,7 +833,7 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
             db.store.client().batch_execute(&format!("CREATE TEMP TABLE {table}(LIKE serve.{table} INCLUDING ALL) ON COMMIT DROP;INSERT INTO pg_temp.{table} SELECT * FROM serve.{table}")).await?;
         }
         let plan = Selection::staging_plan()?;
-        assert_eq!(plan.len(), 6);
+        assert_eq!(plan.len(), 20);
         for stage in &plan {
             db.store
                 .client()
@@ -794,7 +876,7 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
     assert!(duplicate_epoch_cases > 0);
     println!(
         "{}",
-        json!({"indexed_stage_cases":cases.len(),"stages":6,"family_comparisons":cases.len()*TABLES.len(),"duplicate_epoch_cases":duplicate_epoch_cases,"oracle":"independent pure model and original all11 CTEs","rollback_cleanup_verified":true})
+        json!({"indexed_stage_cases":cases.len(),"stages":20,"family_comparisons":cases.len()*TABLES.len(),"duplicate_epoch_cases":duplicate_epoch_cases,"oracle":"independent pure model and original all11 CTEs","rollback_cleanup_verified":true})
     );
     db.cleanup().await
 }
