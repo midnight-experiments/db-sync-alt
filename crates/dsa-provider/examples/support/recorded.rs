@@ -6,7 +6,7 @@ use dsa_chain::{
 };
 use dsa_provider::{
     supplements::resolve_outputs,
-    types::{CborHex, Metadata, TransactionOutputs},
+    types::{Hex, MetadataEntry, TransactionOutputs},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -86,7 +86,7 @@ pub fn load(
         SupplementRequest::Datum(hash) => {
             let shared = root.join(format!("datums/{hash}.json"));
             if shared.exists() {
-                let value: Option<CborHex> = serde_json::from_reader(File::open(&shared)?)?;
+                let value: Option<Hex> = serde_json::from_reader(File::open(&shared)?)?;
                 if value.is_some() && verified_shared_datum(&shared, hash)? {
                     shared
                 } else {
@@ -127,10 +127,9 @@ pub fn load(
     }
     match request {
         SupplementRequest::Datum(hash) => {
-            let datum: Option<CborHex> = serde_json::from_slice(&bytes)?;
+            let datum: Option<Hex> = serde_json::from_slice(&bytes)?;
             let availability = match datum {
-                Some(raw) => {
-                    let bytes = hex::decode(raw.as_str())?;
+                Some(Hex(bytes)) => {
                     if transaction::hash(&bytes) != *hash {
                         return Err("provider_datum_hash_mismatch".into());
                     }
@@ -141,7 +140,7 @@ pub fn load(
             supplements.datums.insert(hash.clone(), availability);
         }
         SupplementRequest::Metadata(hash) => {
-            let entries: Vec<Metadata> = serde_json::from_slice(&bytes)?;
+            let entries: Vec<MetadataEntry> = serde_json::from_slice(&bytes)?;
             let matches: Vec<_> = entries
                 .into_iter()
                 .filter(|m| m.label.0 == 6500973)

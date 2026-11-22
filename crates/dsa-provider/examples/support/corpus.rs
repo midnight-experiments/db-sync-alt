@@ -212,15 +212,12 @@ fn compare(path: &Path, planning: bool) {
         let records: Vec<TransactionCbor> =
             read(provider_path.join(format!("transactions/{}.json", block.height)));
         assert_eq!(records.len(), block.tx_count);
-        let raw: Vec<_> = records
-            .iter()
-            .map(|r| hex::decode(r.cbor.as_str()).unwrap())
-            .collect();
+        let raw: Vec<&[u8]> = records.iter().map(|r| r.cbor.0.as_slice()).collect();
         let transactions = transaction::decode_all(
             records
                 .iter()
                 .zip(&raw)
-                .map(|(record, bytes)| (record.tx_hash.as_str(), bytes.as_slice())),
+                .map(|(record, bytes)| (record.tx_hash.as_str(), *bytes)),
         )
         .unwrap();
         let transactions = transactions.as_slice();

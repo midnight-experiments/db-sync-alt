@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use dsa_chain::transaction::{self, Asset, Output, Transaction};
 
-use crate::types::{Endpoint, TransactionOutputs};
+use crate::types::{Hash32, TransactionOutputs};
 
 /// A valid transaction exposes ordinary outputs plus an optional collateral
 /// return. An invalid transaction exposes its collateral return as an ordinary
@@ -13,13 +13,11 @@ pub fn resolve_outputs(
     transaction: &Transaction<'_>,
     reply: &TransactionOutputs,
 ) -> Result<BTreeMap<u16, Output>, &'static str> {
-    let endpoint = Endpoint::TransactionOutputs(
-        transaction
-            .hash()
-            .parse()
-            .map_err(|_| "provider_invalid_transaction_hash")?,
-    );
-    endpoint.validate_outputs(reply)?;
+    let hash: Hash32 = transaction
+        .hash()
+        .parse()
+        .map_err(|_| "provider_invalid_transaction_hash")?;
+    reply.validate(&hash)?;
     let count = transaction.outputs().len();
     let valid = transaction.is_valid();
     let has_return = transaction.has_collateral_return();
@@ -77,11 +75,7 @@ pub fn resolve_outputs(
             coin: coin.ok_or("provider_output_value_mismatch")?,
             assets,
             data_hash: row.data_hash.as_ref().map(ToString::to_string),
-            inline_datum: row
-                .inline_datum
-                .as_ref()
-                .map(|bytes| hex::decode(bytes.as_str()).map_err(|_| "provider_invalid_response"))
-                .transpose()?,
+            inline_datum: row.inline_datum.as_ref().map(|bytes| bytes.0.clone()),
         };
         if let Some(bytes) = &output.inline_datum
             && output.data_hash.as_deref() != Some(transaction::hash(bytes).as_str())

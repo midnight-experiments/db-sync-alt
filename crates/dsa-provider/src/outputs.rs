@@ -6,11 +6,15 @@ use std::{
     rc::Rc,
 };
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::types::{Hash32, TransactionOutputs};
+
+/// Nesting allowed in a streamed answer; the input rendering it skips can be
+/// arbitrarily large, so its depth is bounded here.
+const MAXIMUM_DEPTH: u32 = 2048;
 
 struct Budget {
     active: Cell<bool>,
@@ -23,7 +27,6 @@ struct Reader {
     receiver: mpsc::Receiver<Bytes>,
     current: Bytes,
     budget: Rc<Budget>,
-    maximum_depth: u16,
     depth: u32,
     string: bool,
     escape: bool,
@@ -63,7 +66,7 @@ impl Read for Reader {
                     b'"' => self.string = true,
                     b'[' | b'{' => {
                         self.depth += 1;
-                        if self.depth > u32::from(self.maximum_depth) {
+                        if self.depth > MAXIMUM_DEPTH {
                             self.budget.fault.set(Some("provider_json_depth_limit"));
                             return Err(io::Error::other("provider_json_depth_limit"));
                         }
@@ -74,7 +77,7 @@ impl Read for Reader {
             }
             output[index] = byte;
         }
-        self.current = self.current.slice(length..);
+        self.current.advance(length);
         Ok(length)
     }
 }
@@ -123,13 +126,14 @@ impl<'de> Visitor<'de> for Seed {
         Ok(TransactionOutputs {
             hash: hash.ok_or_else(|| de::Error::missing_field("hash"))?,
             outputs: outputs.ok_or_else(|| de::Error::missing_field("outputs"))?,
+            body: None,
         })
     }
 }
 
 pub(crate) type DecodeTask = JoinHandle<Result<TransactionOutputs, &'static str>>;
 
-pub(crate) fn start(maximum: usize, maximum_depth: u16) -> (mpsc::Sender<Bytes>, DecodeTask) {
+pub(crate) fn start(maximum: usize) -> (mpsc::Sender<Bytes>, DecodeTask) {
     let (sender, receiver) = mpsc::channel(2);
     let task = tokio::task::spawn_blocking(move || {
         let budget = Rc::new(Budget {
@@ -142,7 +146,6 @@ pub(crate) fn start(maximum: usize, maximum_depth: u16) -> (mpsc::Sender<Bytes>,
             receiver,
             current: Bytes::new(),
             budget: budget.clone(),
-            maximum_depth,
             depth: 0,
             string: false,
             escape: false,

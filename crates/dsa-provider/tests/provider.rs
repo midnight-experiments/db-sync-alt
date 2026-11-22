@@ -1,24 +1,68 @@
-mod common;
+//! The client against loopback fakes: outcome classes, isolation of one
+//! endpoint's answer, pacing, waits, timeouts, hostile answers and counts.
 
 use std::{
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
-use common::*;
+use chrono::NaiveDate;
 use dsa_provider::{
-    Action, Config, Endpoint, Provider, Reply,
+    Clock, Config, Error, Kind, Provider,
+    pages::BlockPages,
     types::{Hash32, Page, PoolId},
 };
-use futures_util::StreamExt;
-use serde_json::json;
+use dsa_testkit::{
+    chain::Chain,
+    server::{Behavior, KEY, Server},
+};
+use serde_json::{Value, json};
+use tokio::time::Instant;
 
-fn point() -> Hash32 {
-    hash('1').parse().unwrap()
+const NOW: u64 = 1_795_000_000;
+const MIDNIGHT: u64 = 1_795_046_400;
+
+struct TestClock(AtomicU64);
+impl Clock for TestClock {
+    fn unix_seconds(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
-fn page() -> Page {
-    Page::new(1).unwrap()
+impl TestClock {
+    fn set(&self, time: u64) {
+        self.0.store(time, Ordering::SeqCst);
+    }
 }
+
+fn client(url: &str, configure: impl FnOnce(&mut Config)) -> (Provider, Arc<TestClock>) {
+    let key = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(key.path(), KEY).unwrap();
+    let mut config = Config::new(url, key.path());
+    config.requests_per_second = 10.0;
+    configure(&mut config);
+    let clock = Arc::new(TestClock(AtomicU64::new(NOW)));
+    (Provider::with_clock(config, clock.clone()).unwrap(), clock)
+}
+
+fn hash(character: char) -> Hash32 {
+    character.to_string().repeat(64).parse().unwrap()
+}
+
+fn header(height: u32) -> Value {
+    json!({"hash":format!("{height:064x}"),"height":height,"slot":height as u64*20,
+        "epoch":667,"time":NOW,"tx_count":1,"size":400,
+        "previous_block":format!("{:064x}",height.saturating_sub(1)),
+        "next_block":null,"confirmations":1,"unknown":{"nested":[1,2,3]}})
+}
+
+fn genesis() -> Value {
+    json!({"network_magic":764824073,"security_param":2160,"epoch_length":432000,
+        "system_start":1506203091,"slot_length":1,"active_slots_coefficient":0.05})
+}
+
 fn pool() -> PoolId {
     bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("pool").unwrap(), &[7; 28])
         .unwrap()
@@ -26,300 +70,500 @@ fn pool() -> PoolId {
         .unwrap()
 }
 
+fn day(unix: u64) -> NaiveDate {
+    chrono::DateTime::from_timestamp(unix as i64, 0)
+        .unwrap()
+        .date_naive()
+}
+
 #[tokio::test]
-async fn paced_overlap_is_bounded_and_answers_keep_request_order() {
+async fn pace_and_in_flight_never_exceed_the_configuration() {
     let server = Server::start(|path, _| {
         let height = path.rsplit('/').next().unwrap().parse::<u32>().unwrap();
         Behavior::json(header(height)).delayed(if height == 1 { 450 } else { 250 })
     })
     .await;
-    let (provider, _, recorder) = client(&server.url, |config| config.max_in_flight = 3);
-    let results: Vec<_> = provider
-        .ordered((1..=8).map(Endpoint::BlockAtHeight).collect())
-        .collect()
-        .await;
-    let heights: Vec<_> = results
+    let (provider, _) = client(&server.url, |config| config.max_in_flight = 3);
+    let calls = (1..=8).map(|height| provider.block_at(height));
+    let heights: Vec<_> = futures_util::future::join_all(calls)
+        .await
         .into_iter()
-        .map(|result| match result.unwrap() {
-            Reply::Header(header) => header.height,
-            _ => panic!("header expected"),
-        })
+        .map(|header| header.unwrap().unwrap().height)
         .collect();
     assert_eq!(heights, (1..=8).collect::<Vec<_>>());
-    let requests = server.state.requests.lock().unwrap();
+    let requests = server.state.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 8);
-    let sent_heights: Vec<u32> = requests
-        .iter()
-        .map(|request| request.path.rsplit('/').next().unwrap().parse().unwrap())
-        .collect();
-    assert_eq!(sent_heights, (1..=8).collect::<Vec<_>>());
     assert!(requests.iter().all(|request| request.had_key));
     for pair in requests.windows(2) {
         assert!(pair[1].at.duration_since(pair[0].at) >= Duration::from_millis(90));
     }
-    let reservations = recorder.reserved_at.lock().unwrap();
-    for pair in reservations.windows(2) {
-        assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(100));
-    }
-    for (reserved, received) in reservations.iter().zip(requests.iter()) {
-        assert!(
-            *reserved <= received.at,
-            "attempt persistence must precede the send"
-        );
-    }
     let maximum = server.state.maximum_active.load(Ordering::SeqCst);
-    assert!((2..=3).contains(&maximum));
-    assert_eq!(provider.status().unwrap().requests_in_flight, 0);
-    assert_eq!(provider.status().unwrap().calls_today, 8);
-    assert_eq!(recorder.counts.lock().unwrap().last().unwrap().requests, 8);
+    assert!((2..=3).contains(&maximum), "{maximum} answered at once");
+    assert_eq!(provider.status().requests_in_flight, 0);
+    assert_eq!(provider.counts(), vec![(day(NOW), 8)]);
 }
 
 #[tokio::test]
-async fn sequential_requests_reuse_a_connection_and_persist_before_send() {
+async fn sequential_requests_reuse_one_connection() {
     let server = Server::start(|_, _| Behavior::json(genesis())).await;
-    let (provider, _, recorder) = client(&server.url, |_| {});
+    let (provider, _) = client(&server.url, |_| {});
     for _ in 0..3 {
-        assert!(matches!(
-            provider.fetch(Endpoint::Genesis).await.unwrap(),
-            Reply::Genesis(_)
-        ));
+        provider.genesis().await.unwrap();
     }
     assert_eq!(server.state.connections.load(Ordering::SeqCst), 1);
-    assert_eq!(recorder.counts.lock().unwrap().len(), 3);
-    assert_eq!(provider.status().unwrap().calls_today, 3);
+    assert_eq!(provider.counts(), vec![(day(NOW), 3)]);
 }
 
 #[tokio::test]
-async fn outcome_classes_have_explicit_actions_and_no_hidden_retry() {
-    for (status, code, action) in [
-        (400, "provider_request_rejected", Action::Retry),
-        (401, "provider_key_rejected", Action::Fatal),
-        (402, "quota_exhausted", Action::Retry),
-        (403, "provider_key_rejected", Action::Fatal),
-        (404, "provider_block_not_ready", Action::Retry),
-        (418, "provider_banned", Action::Retry),
-        (429, "provider_rate_limited", Action::Retry),
-        (500, "provider_unavailable", Action::Retry),
-        (503, "provider_unavailable", Action::Retry),
-    ] {
-        let server = Server::start(move |_, _| Behavior::status(status)).await;
-        let (provider, _, recorder) = client(&server.url, |_| {});
-        let error = provider.fetch(Endpoint::LatestBlock).await.unwrap_err();
-        assert_eq!(error.code, code);
-        assert_eq!(error.action, action);
-        assert_eq!(error.http_status, Some(status));
-        if action == Action::Fatal {
-            assert_eq!(error.field, Some("provider.key_file"));
+async fn each_outcome_class_is_typed_and_only_global_refusals_gate() {
+    let redirect = |mut behavior: Behavior| {
+        behavior.location = Some("http://127.0.0.1:9/elsewhere".to_owned());
+        behavior
+    };
+    let mut chunked = Behavior::raw(" ".repeat(65_536));
+    chunked.chunked = true;
+    // Noon UTC: the 402 class waits for the next midnight.
+    const T: u64 = MIDNIGHT - 43_200;
+    let retry = |delay| Kind::Retry { until: T + delay };
+    let wait = |until| Kind::Wait { until };
+    let fatal = Kind::Fatal {
+        field: "provider.key_file",
+    };
+    /// Name, first answer, code, kind, HTTP status, whether it gates.
+    type Class = (
+        &'static str,
+        Behavior,
+        &'static str,
+        Kind,
+        Option<u16>,
+        bool,
+    );
+    let classes: Vec<Class> = vec![
+        (
+            "404 without meaning",
+            Behavior::status(404),
+            "provider_not_found",
+            retry(0),
+            None,
+            false,
+        ),
+        (
+            "400",
+            Behavior::status(400),
+            "provider_request_rejected",
+            retry(0),
+            Some(400),
+            false,
+        ),
+        (
+            "redirect",
+            redirect(Behavior::status(302)),
+            "provider_request_rejected",
+            retry(0),
+            Some(302),
+            false,
+        ),
+        (
+            "401",
+            Behavior::status(401),
+            "provider_key_rejected",
+            fatal,
+            Some(401),
+            true,
+        ),
+        (
+            "403",
+            Behavior::status(403),
+            "provider_key_rejected",
+            fatal,
+            Some(403),
+            true,
+        ),
+        (
+            "402",
+            Behavior::status(402),
+            "quota_exhausted",
+            wait(MIDNIGHT + 120),
+            Some(402),
+            true,
+        ),
+        (
+            "418",
+            Behavior::status(418),
+            "provider_banned",
+            wait(T + 3600),
+            Some(418),
+            true,
+        ),
+        (
+            "429",
+            Behavior::status(429),
+            "provider_rate_limited",
+            wait(T + 60),
+            Some(429),
+            true,
+        ),
+        (
+            "500",
+            Behavior::status(500),
+            "provider_unavailable",
+            retry(1),
+            Some(500),
+            true,
+        ),
+        (
+            "503",
+            Behavior::status(503),
+            "provider_unavailable",
+            retry(1),
+            Some(503),
+            true,
+        ),
+        (
+            "dropped connection",
+            Behavior::dropped(),
+            "provider_unavailable",
+            retry(1),
+            None,
+            true,
+        ),
+        (
+            "broken body",
+            Behavior::json(header(1)).broken_after(10),
+            "provider_unavailable",
+            retry(1),
+            None,
+            true,
+        ),
+        (
+            "truncated body",
+            Behavior::json(header(1)).truncated(40),
+            "provider_invalid_response",
+            retry(0),
+            None,
+            false,
+        ),
+        (
+            "wrong shape",
+            Behavior::json(json!({"x":1})),
+            "provider_invalid_response",
+            retry(0),
+            None,
+            false,
+        ),
+        (
+            "oversized",
+            Behavior::raw(" ".repeat(65_536)),
+            "provider_response_size_limit",
+            retry(0),
+            None,
+            false,
+        ),
+        (
+            "oversized without length",
+            chunked,
+            "provider_response_size_limit",
+            retry(0),
+            None,
+            false,
+        ),
+    ];
+    for (name, first, code, kind, http_status, gates) in classes {
+        let server = Server::start(move |_, index| {
+            if index == 0 {
+                first.clone()
+            } else {
+                Behavior::json(genesis())
+            }
+        })
+        .await;
+        let (provider, clock) = client(&server.url, |config| config.limits.small = 1024);
+        clock.set(T);
+        let error = provider.latest_block().await.unwrap_err();
+        assert_eq!(
+            (error.code, error.kind, error.http_status),
+            (code, kind, http_status),
+            "{name}"
+        );
+        assert_eq!(provider.counts()[0].1, 1, "{name}: the attempt is counted");
+        let next = provider.genesis().await;
+        if gates {
+            let blocked = next.unwrap_err();
+            assert_eq!((blocked.code, blocked.kind), (code, kind), "{name}");
+            assert_eq!(blocked.http_status, None, "{name}: not sent");
+            assert_eq!(server.state.count(), 1, "{name}: every request waits");
+        } else {
+            next.unwrap_or_else(|error| panic!("{name}: another request failed with {error}"));
+            assert_eq!(server.state.count(), 2, "{name}: nothing shared changed");
         }
-        let again = provider.fetch(Endpoint::LatestBlock).await.unwrap_err();
-        assert_eq!(again, error);
-        assert_eq!(server.state.requests.lock().unwrap().len(), 1);
-        assert_eq!(recorder.counts.lock().unwrap().len(), 1);
     }
 }
 
 #[tokio::test]
-async fn quota_wait_survives_a_concurrent_success_and_resumes_at_utc_midnight() {
-    let server = Server::start(|_, index| {
-        if index == 0 {
-            Behavior::status(402).delayed(150)
+async fn a_404_with_a_meaning_is_a_value() {
+    let server = Server::start(|_, _| Behavior::status(404)).await;
+    let (provider, _) = client(&server.url, |_| {});
+    assert_eq!(provider.block_at(5).await.unwrap(), None);
+    assert!(
+        provider
+            .next_blocks(&hash('1'), Page::first())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        provider
+            .block_transactions(&hash('1'), Page::first())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(provider.datum(&hash('1')).await.unwrap(), None);
+    assert_eq!(provider.epoch_parameters(667).await.unwrap(), None);
+    assert_eq!(provider.epoch(667).await.unwrap(), None);
+    assert_eq!(provider.pool(&pool()).await.unwrap(), None);
+    assert!(provider.status().blocked.is_none());
+    for (path, body) in [
+        (
+            "/epochs/667/parameters",
+            json!({"epoch":667,"nonce":null,"max_tx_size":16384}),
+        ),
+        ("/epochs/667", json!({"epoch":667,"active_stake":null})),
+    ] {
+        let server = Server::start(move |_, _| Behavior::json(body.clone())).await;
+        let (provider, _) = client(&server.url, |_| {});
+        let ready = if path.ends_with("parameters") {
+            provider.epoch_parameters(667).await.unwrap().is_some()
         } else {
-            Behavior::json(header(2)).delayed(200)
+            provider.epoch(667).await.unwrap().is_some()
+        };
+        assert!(!ready, "{path}: an epoch without its value is not ready");
+    }
+}
+
+#[tokio::test]
+async fn a_404_on_one_endpoint_does_not_delay_or_change_another_request() {
+    let server = Server::start(|path, _| {
+        if path.contains("/utxos") {
+            Behavior::status(404).delayed(100)
+        } else if path.contains("/next") {
+            Behavior::status(404).delayed(150)
+        } else {
+            Behavior::json(header(9)).delayed(300)
         }
     })
     .await;
-    let (provider, clock, _) = client(&server.url, |config| config.max_in_flight = 2);
-    clock.set(1795046399);
-    let results: Vec<_> = provider
-        .ordered(vec![Endpoint::LatestBlock, Endpoint::LatestBlock])
-        .collect()
-        .await;
-    assert_eq!(results[0].as_ref().unwrap_err().retry_at, Some(1795046400));
-    assert!(results[1].is_ok());
-    assert_eq!(
-        provider
-            .fetch(Endpoint::LatestBlock)
-            .await
-            .unwrap_err()
-            .code,
-        "quota_exhausted"
+    let (provider, _) = client(&server.url, |config| config.max_in_flight = 3);
+    let (spent, stored) = (hash('2'), hash('3'));
+    let (outputs, tip, fork) = tokio::join!(
+        provider.transaction_outputs(&spent),
+        provider.latest_block(),
+        provider.next_blocks(&stored, Page::first()),
     );
-    assert_eq!(server.state.requests.lock().unwrap().len(), 2);
-    clock.set(1795046400);
-    assert!(provider.fetch(Endpoint::LatestBlock).await.is_ok());
-    let status = provider.status().unwrap();
-    assert_eq!(status.calls_today, 1);
-    assert_eq!(status.calls_previous_days[0].requests, 2);
-    assert_eq!(status.last_refusal.unwrap().http_status, 402);
+    assert_eq!(outputs.unwrap_err().code, "provider_not_found");
+    assert_eq!(tip.unwrap().height, 9);
+    assert!(
+        fork.unwrap().is_none(),
+        "the tip's own 404 still means a fork"
+    );
+    let started = Instant::now();
+    assert_eq!(provider.latest_block().await.unwrap().height, 9);
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "not delayed"
+    );
+    assert_eq!(server.state.count(), 4, "every request was sent");
+    assert!(provider.status().blocked.is_none());
 }
 
 #[tokio::test]
 async fn backoff_progression_and_retry_after_are_honored() {
     let server = Server::start(|_, _| Behavior::status(503)).await;
-    let (provider, clock, _) = client(&server.url, |_| {});
+    let (provider, clock) = client(&server.url, |_| {});
     let mut now = NOW;
     for delay in [1, 2, 4, 8, 16, 30, 30] {
-        let error = provider.fetch(Endpoint::Genesis).await.unwrap_err();
-        assert_eq!(error.retry_at, Some(now + delay));
+        let error = provider.genesis().await.unwrap_err();
+        assert_eq!(error.kind, Kind::Retry { until: now + delay });
         now += delay;
         clock.set(now);
     }
-    for (http, header, expected) in [
+    for (status, header, expected) in [
         (429, "7", 7),
         (418, "7", 3600),
-        (429, "Wed, 18 Nov 2026 23:00:00 GMT", 1795042800 - NOW),
+        (429, "Wed, 18 Nov 2026 23:00:00 GMT", 1_795_042_800 - NOW),
     ] {
-        let server = Server::start(move |_, _| {
-            let mut answer = Behavior::status(http);
-            answer.retry_after = Some(header.to_owned());
-            answer
-        })
-        .await;
-        let (provider, _, _) = client(&server.url, |_| {});
+        let server = Server::start(move |_, _| Behavior::status(status).retry_after(header)).await;
+        let (provider, _) = client(&server.url, |_| {});
         assert_eq!(
-            provider
-                .fetch(Endpoint::Genesis)
-                .await
-                .unwrap_err()
-                .retry_at,
-            Some(NOW + expected)
+            provider.genesis().await.unwrap_err().kind,
+            Kind::Wait {
+                until: NOW + expected
+            }
         );
     }
 }
 
 #[tokio::test]
-async fn transport_timeout_truncation_and_response_limits_are_counted_retries() {
-    for kind in ["disconnect", "timeout", "truncated", "oversized", "chunked"] {
-        let server = Server::start(move |_, index| {
-            if index > 0 {
-                return Behavior::json(header(2));
-            }
-            match kind {
-                "disconnect" => {
-                    let mut reply = Behavior::raw(String::new());
-                    reply.disconnect = true;
-                    reply
-                }
-                "timeout" => Behavior::json(header(1)).delayed(300),
-                "truncated" => Behavior::raw("[{\"tx_hash\":".to_owned()),
-                "oversized" => Behavior::raw(" ".repeat(65536)),
-                _ => {
-                    let mut reply = Behavior::raw(" ".repeat(65536));
-                    reply.chunked = true;
-                    reply
-                }
+async fn a_spent_allowance_waits_for_the_next_day_and_an_early_refusal_retries_within_ten_minutes()
+{
+    for (refused_at, expected) in [
+        (MIDNIGHT - 1, MIDNIGHT + 120),
+        (MIDNIGHT + 1, MIDNIGHT + 301),
+    ] {
+        let server = Server::start(|_, index| {
+            if index == 0 {
+                Behavior::status(402)
+            } else {
+                Behavior::json(genesis())
             }
         })
         .await;
-        let (provider, clock, _) = client(&server.url, |config| {
-            config.limits.headers = 1024;
-            if kind == "timeout" {
-                config.request_timeout = Duration::from_millis(50);
-            }
-        });
-        let error = provider.fetch(Endpoint::LatestBlock).await.unwrap_err();
-        assert_eq!(error.action, Action::Retry);
+        let (provider, clock) = client(&server.url, |_| {});
+        clock.set(refused_at);
+        let error = provider.genesis().await.unwrap_err();
+        assert_eq!(error.code, "quota_exhausted");
+        let until = error.until().unwrap();
+        assert_eq!(until, expected);
+        if refused_at > MIDNIGHT {
+            assert!(until - refused_at <= 600, "retried within ten minutes");
+        }
+        assert_eq!(provider.status().last_refusal.unwrap().http_status, 402);
+        clock.set(until - 1);
         assert_eq!(
-            error.code,
-            match kind {
-                "disconnect" => "provider_unavailable",
-                "timeout" => "provider_timeout",
-                "truncated" => "provider_invalid_response",
-                _ => "provider_response_size_limit",
-            }
+            provider.genesis().await.unwrap_err().code,
+            "quota_exhausted"
         );
-        assert_eq!(provider.status().unwrap().calls_today, 1);
-        assert_eq!(provider.status().unwrap().requests_in_flight, 0);
-        clock.set(error.retry_at.unwrap());
-        assert!(provider.fetch(Endpoint::LatestBlock).await.is_ok());
-        assert_eq!(provider.status().unwrap().calls_today, 2);
-        assert_eq!(server.state.requests.lock().unwrap().len(), 2);
+        assert_eq!(server.state.count(), 1, "nothing is sent while waiting");
+        clock.set(until);
+        provider.genesis().await.unwrap();
+        assert_eq!(server.state.count(), 2);
     }
 }
 
 #[tokio::test]
-async fn absent_datums_and_unready_epochs_have_distinct_meanings() {
-    let server = Server::start(|_, _| Behavior::status(404)).await;
-    let (provider, _, _) = client(&server.url, |_| {});
-    assert!(matches!(
-        provider.fetch(Endpoint::Datum(point())).await.unwrap(),
-        Reply::Datum(None)
-    ));
-    assert_eq!(
-        provider.fetch(Endpoint::Epoch(667)).await.unwrap_err().code,
-        "provider_epoch_not_ready"
+async fn truncated_and_hostile_answers_return_an_error_or_a_value() {
+    let deep_metadata = format!(
+        "[{{\"label\":\"6500973\",\"json_metadata\":{}1{}}}]",
+        "[".repeat(5_000),
+        "]".repeat(5_000)
     );
-    assert_eq!(provider.status().unwrap().calls_today, 2);
-    for value in [
-        json!({"epoch":667,"active_stake":null}),
-        json!({"epoch":667,"nonce":null,"max_tx_size":16384,"max_block_size":90112}),
-    ] {
-        let parameters = value.get("nonce").is_some();
-        let server = Server::start(move |_, _| Behavior::json(value.clone())).await;
-        let (provider, _, _) = client(&server.url, |_| {});
-        let endpoint = if parameters {
-            Endpoint::EpochParameters(667)
-        } else {
-            Endpoint::Epoch(667)
-        };
-        assert_eq!(
-            provider.fetch(endpoint).await.unwrap_err().code,
-            "provider_epoch_not_ready"
-        );
+    let deep_inputs = format!(
+        "{{\"hash\":\"{}\",\"inputs\":{}0{},\"outputs\":[]}}",
+        hash('2'),
+        "[".repeat(5_000),
+        "]".repeat(5_000)
+    );
+    let page = json!([{"tx_hash": hash('2'), "cbor": "84a300d90102800180020af5f6a0"}]).to_string();
+    let answers = Arc::new(Mutex::new(vec![
+        "{\"hash\":\"abc\\".to_owned(),
+        deep_metadata.clone(),
+        deep_inputs,
+    ]));
+    let offsets: Vec<_> = (0..page.len()).step_by(7).collect();
+    for offset in &offsets {
+        answers.lock().unwrap().push(page[..*offset].to_owned());
     }
+    let served = answers.clone();
+    let server =
+        Server::start(move |_, index| Behavior::raw(served.lock().unwrap()[index].clone())).await;
+    let (provider, _) = client(&server.url, |_| {});
+    assert_eq!(
+        provider.latest_block().await.unwrap_err().code,
+        "provider_invalid_response",
+        "a body ending in a backslash"
+    );
+    let metadata = provider.transaction_metadata(&hash('1')).await.unwrap();
+    let raw = metadata.label(6_500_973).unwrap();
+    assert_eq!(raw.len(), 10_001);
+    assert_eq!(
+        dsa_chain::metadata::normalize(raw).unwrap(),
+        None,
+        "deeper than the database renders: stored as NULL"
+    );
+    assert_eq!(&metadata.body[..], deep_metadata.as_bytes());
+    assert_eq!(
+        provider
+            .transaction_outputs(&hash('2'))
+            .await
+            .unwrap_err()
+            .code,
+        "provider_json_depth_limit",
+        "the streamed reader bounds the depth it skips"
+    );
+    for offset in offsets {
+        let result = provider.block_transactions(&hash('1'), Page::first()).await;
+        assert!(result.is_err(), "a page cut at byte {offset} is refused");
+    }
+    assert!(provider.status().blocked.is_none());
 }
 
 #[tokio::test]
-async fn accounting_failure_prevents_send_and_restored_counts_continue() {
-    let server = Server::start(|_, _| Behavior::json(genesis())).await;
-    let (provider, clock, recorder) = client(&server.url, |_| {});
-    recorder.fail.store(true, Ordering::SeqCst);
-    let error = provider.fetch(Endpoint::Genesis).await.unwrap_err();
-    assert_eq!(error.code, "provider_accounting_unavailable");
-    assert_eq!(server.state.requests.lock().unwrap().len(), 0);
-    recorder.fail.store(false, Ordering::SeqCst);
-    clock.set(error.retry_at.unwrap());
-    provider.fetch(Endpoint::Genesis).await.unwrap();
-    let seed = recorder.counts.lock().unwrap().clone();
-    let key = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(key.path(), KEY).unwrap();
-    let restored = Provider::with_clock(
-        Config::new(&server.url, key.path()),
-        Arc::new(Recorder::default()),
-        seed,
-        clock,
-    )
-    .unwrap();
-    restored.fetch(Endpoint::Genesis).await.unwrap();
-    assert_eq!(restored.status().unwrap().calls_today, 2);
-}
-
-#[tokio::test]
-async fn credential_reflection_and_redirects_are_refused() {
-    let target = Server::start(|_, _| Behavior::json(genesis())).await;
-    let destination = target.url.clone();
-    let redirect = Server::start(move |_, _| {
-        let mut reply = Behavior::status(302);
-        reply.location = Some(destination.clone());
-        reply
+async fn a_stalled_answer_ends_at_the_idle_timeout() {
+    // The total time (10 s) is far above the stall (3 s): only the idle
+    // timeout can end this answer early.
+    let server = Server::start(|_, index| match index {
+        0 => Behavior::json(header(1)).stalled(10, Duration::from_secs(3)),
+        _ => Behavior::json(header(1)),
     })
     .await;
-    let (provider, _, _) = client(&redirect.url, |_| {});
-    assert_eq!(
-        provider.fetch(Endpoint::Genesis).await.unwrap_err().code,
-        "provider_request_rejected"
+    let (provider, _) = client(&server.url, |config| {
+        config.idle_timeout = Duration::from_millis(300);
+        config.request_timeout = Duration::from_secs(10);
+    });
+    let started = Instant::now();
+    let error = provider.latest_block().await.unwrap_err();
+    assert_eq!(error.code, "provider_timeout");
+    assert!(started.elapsed() < Duration::from_millis(1_500));
+    assert!(
+        provider.status().blocked.is_none(),
+        "a slow answer is not an outage"
     );
-    assert!(target.state.requests.lock().unwrap().is_empty());
-    for key in [
-        KEY.to_owned(),
-        "synthetic-blockfrost-project-\\u0069d".to_owned(),
-    ] {
-        let server=Server::start(move |_,_|Behavior::raw(format!("{{\"network_magic\":764824073,\"security_param\":2160,\"epoch_length\":432000,\"system_start\":1506203091,\"slot_length\":1,\"unknown\":\"{key}\"}}"))).await;
-        let (provider, _, _) = client(&server.url, |_| {});
-        let error = provider.fetch(Endpoint::Genesis).await.unwrap_err();
-        assert_eq!(error.code, "unsafe_provider_response");
-        assert!(!format!("{error:?}").contains(KEY));
-    }
+    provider.latest_block().await.unwrap();
+    let server = Server::start(|_, index| match index {
+        0 => Behavior::json(header(1)).delayed(2_000),
+        _ => Behavior::json(header(1)),
+    })
+    .await;
+    let (provider, clock) = client(&server.url, |config| {
+        config.request_timeout = Duration::from_secs(1);
+    });
+    let error = provider.latest_block().await.unwrap_err();
+    assert_eq!(
+        error.code, "provider_timeout",
+        "no answer within the total time"
+    );
+    clock.set(error.until().unwrap());
+    provider.latest_block().await.unwrap();
+}
+
+#[tokio::test]
+async fn call_counts_are_kept_per_utc_day_and_seeded_at_start() {
+    let server = Server::start(|_, index| {
+        if index == 1 {
+            Behavior::status(400)
+        } else {
+            Behavior::json(genesis())
+        }
+    })
+    .await;
+    let (provider, clock) = client(&server.url, |_| {});
+    clock.set(MIDNIGHT - 10);
+    provider.genesis().await.unwrap();
+    provider.genesis().await.unwrap_err();
+    provider.genesis().await.unwrap();
+    clock.set(MIDNIGHT);
+    provider.genesis().await.unwrap();
+    let counts = provider.counts();
+    assert_eq!(counts, vec![(day(MIDNIGHT - 10), 3), (day(MIDNIGHT), 1)]);
+    let (restarted, restarted_clock) = client(&server.url, |_| {});
+    restarted_clock.set(MIDNIGHT + 5);
+    restarted.seed_counts(&counts);
+    restarted.genesis().await.unwrap();
+    restarted.seed_counts(&[(day(MIDNIGHT), 1)]);
+    assert_eq!(
+        restarted.counts(),
+        vec![(day(MIDNIGHT - 10), 3), (day(MIDNIGHT), 2)]
+    );
 }
 
 #[tokio::test]
@@ -329,240 +573,252 @@ async fn https_checks_certificate_trust_and_hostname() {
         let server = Server::tls(|_, _| Behavior::json(genesis()), names).await;
         let certificate = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(certificate.path(), server.certificate.as_ref().unwrap()).unwrap();
-        let (provider, _, _) = client(&server.url, |config| {
+        let (provider, _) = client(&server.url, |config| {
             config.root_certificate = Some(certificate.path().to_owned())
         });
-        let result = provider.fetch(Endpoint::Genesis).await;
+        let result = provider.genesis().await;
         assert_eq!(result.is_ok(), matching);
         if !matching {
             assert_eq!(result.unwrap_err().code, "provider_unavailable");
         }
-        assert_eq!(provider.status().unwrap().calls_today, 1);
     }
     let server = Server::tls(
         |_, _| Behavior::json(genesis()),
         vec!["127.0.0.1".to_owned()],
     )
     .await;
-    let (provider, _, _) = client(&server.url, |_| {});
+    let (provider, _) = client(&server.url, |_| {});
     assert_eq!(
-        provider.fetch(Endpoint::Genesis).await.unwrap_err().code,
+        provider.genesis().await.unwrap_err().code,
         "provider_unavailable"
     );
 }
 
 #[tokio::test]
-async fn cbor_exact_page_boundary_and_synthetic_forks_are_available_to_checks() {
-    let server = Server::start(|path, index| {
-        if path.contains("/txs/cbor") {
-            if path.contains("page=2") {
-                return Behavior::json(json!([]));
-            }
-            return Behavior::json(json!(
-                (0..100)
-                    .map(|number| json!({"tx_hash":format!("{number:064x}"),"cbor":"84a000f5f6"}))
-                    .collect::<Vec<_>>()
-            ));
-        }
-        let mut answer = header(10);
-        answer["hash"] = json!(if index.is_multiple_of(2) {
-            hash('a')
-        } else {
-            hash('b')
-        });
-        answer["tx_count"] = json!(2);
-        Behavior::json(answer)
-    })
-    .await;
-    let (provider, _, _) = client(&server.url, |_| {});
-    let first = provider
-        .fetch(Endpoint::BlockCbor {
-            block: point(),
-            page: page(),
-        })
-        .await
-        .unwrap();
-    assert!(matches!(first,Reply::Transactions(rows) if rows.len()==100));
-    let second = provider
-        .fetch(Endpoint::BlockCbor {
-            block: point(),
-            page: Page::new(2).unwrap(),
-        })
-        .await
-        .unwrap();
-    assert!(matches!(second,Reply::Transactions(rows) if rows.is_empty()));
-    let first = provider.fetch(Endpoint::LatestBlock).await.unwrap();
-    let second = provider.fetch(Endpoint::LatestBlock).await.unwrap();
-    match (first, second) {
-        (Reply::Header(a), Reply::Header(b)) => {
-            assert_eq!(a.height, b.height);
-            assert_ne!(a.hash, b.hash);
-        }
-        _ => panic!("headers expected"),
-    }
-}
-
-#[tokio::test]
-async fn every_typed_endpoint_accepts_the_primary_response_shape() {
+async fn every_endpoint_reads_its_primary_shape_at_its_path() {
     let pool = pool();
-    let pool_id = pool.to_string();
-    let block = point();
-    let block_hash = block.to_string();
-    let mut by_hash = header(1);
-    by_hash["hash"] = json!(block_hash);
-    let cases = vec![
+    let block = hash('1');
+    let mut by_height = header(1);
+    by_height["hash"] = json!(block.to_string());
+    let output = json!({"address":"addr1synthetic","output_index":0,
+        "amount":[{"unit":"lovelace","quantity":"2"}],"data_hash":null,"inline_datum":null,
+        "collateral":false,"reference_script_hash":null,"consumed_by_tx":null});
+    let answers: Vec<(String, Value)> = vec![
+        ("/blocks/latest".into(), header(1)),
+        ("/blocks/1".into(), by_height),
         (
-            Endpoint::LatestBlock,
-            "/blocks/latest".to_owned(),
-            header(1),
-        ),
-        (
-            Endpoint::BlockAtHeight(1),
-            "/blocks/1".to_owned(),
-            header(1),
-        ),
-        (
-            Endpoint::Block(block.clone()),
-            format!("/blocks/{block_hash}"),
-            by_hash,
-        ),
-        (
-            Endpoint::NextBlocks {
-                block: block.clone(),
-                page: page(),
-            },
-            format!("/blocks/{block_hash}/next?count=100&page=1"),
+            format!("/blocks/{block}/next?count=100&page=1"),
             json!([header(2)]),
         ),
         (
-            Endpoint::BlockCbor {
-                block: block.clone(),
-                page: page(),
-            },
-            format!("/blocks/{block_hash}/txs/cbor?count=100&page=1&order=asc"),
+            format!("/blocks/{block}/txs/cbor?count=100&page=2&order=asc"),
             json!([{"tx_hash": hash('2'), "cbor": "84a0a0f5f6"}]),
         ),
-        (Endpoint::Genesis, "/genesis".to_owned(), genesis()),
+        ("/genesis".into(), genesis()),
         (
-            Endpoint::Epoch(667),
-            "/epochs/667".to_owned(),
+            "/epochs/667".into(),
             json!({"epoch": 667, "active_stake": "1000"}),
         ),
         (
-            Endpoint::EpochParameters(667),
-            "/epochs/667/parameters".to_owned(),
-            json!({"epoch": 667, "nonce": hash('1'), "max_tx_size": 16384, "max_block_size": 90112, "unknown": {}}),
+            "/epochs/667/parameters".into(),
+            json!({"epoch": 667, "nonce": hash('1'), "max_tx_size": 16384, "max_block_size": 90112}),
         ),
         (
-            Endpoint::EpochBlocks {
-                epoch: 667,
-                page: page(),
-            },
-            "/epochs/667/blocks?count=100&page=1&order=desc".to_owned(),
-            json!([block_hash]),
-        ),
-        (
-            Endpoint::EpochPoolStake {
-                epoch: 667,
-                pool: pool.clone(),
-            },
-            format!("/epochs/667/stakes/{pool_id}?count=1&page=1"),
+            format!("/epochs/667/stakes/{pool}?count=1&page=1"),
             json!([{"stake_address": "stake1synthetic", "amount": "0"}]),
         ),
         (
-            Endpoint::Pools(page()),
-            "/pools?count=100&page=1&order=asc".to_owned(),
-            json!([pool_id]),
+            "/pools?count=100&page=1&order=asc".into(),
+            json!([pool.to_string()]),
         ),
         (
-            Endpoint::ExtendedPools(page()),
-            "/pools/extended?count=100&page=1&order=asc".to_owned(),
-            json!([{"pool_id": pool_id, "active_stake": "1000", "metadata": {"anything": true}}]),
+            "/pools/extended?count=100&page=1&order=asc".into(),
+            json!([{"pool_id": pool.to_string(), "active_stake": "1000", "metadata": {"anything": true}}]),
         ),
         (
-            Endpoint::RetiredPools(page()),
-            "/pools/retired?count=100&page=1&order=desc".to_owned(),
-            json!([{"pool_id": pool_id, "epoch": 666}]),
+            "/pools/retired?count=100&page=1&order=desc".into(),
+            json!([{"pool_id": pool.to_string(), "epoch": 666}]),
         ),
         (
-            Endpoint::Pool(pool.clone()),
-            format!("/pools/{pool_id}"),
-            json!({"pool_id": pool_id, "active_stake": "1000"}),
+            format!("/pools/{pool}"),
+            json!({"pool_id": pool.to_string(), "active_stake": "1000"}),
         ),
         (
-            Endpoint::PoolHistory { pool, page: page() },
-            format!("/pools/{pool_id}/history?count=100&page=1&order=desc"),
+            format!("/pools/{pool}/history?count=100&page=1&order=desc"),
             json!([{"epoch": 667, "active_stake": "1000", "delegators_count": 1}]),
         ),
         (
-            Endpoint::Datum(block.clone()),
-            format!("/scripts/datum/{block_hash}/cbor"),
+            format!("/scripts/datum/{block}/cbor"),
             json!({"cbor": "19a6aa"}),
         ),
         (
-            Endpoint::Metadata(block.clone()),
-            format!("/txs/{block_hash}/metadata"),
+            format!("/txs/{block}/metadata"),
             json!([{"label": "6500973", "json_metadata": ["0x0123"]}]),
         ),
         (
-            Endpoint::TransactionOutputs(block),
-            format!("/txs/{block_hash}/utxos"),
-            json!({"hash": block_hash, "inputs": [{"ignored": "input rendering"}], "outputs": [{
-                "address": "addr1synthetic", "output_index": 0,
-                "amount": [{"unit": "lovelace", "quantity": "2"}],
-                "data_hash": null, "inline_datum": null, "collateral": false,
-                "reference_script_hash": null, "consumed_by_tx": null
-            }]}),
+            format!("/txs/{block}/utxos"),
+            json!({"hash": block.to_string(), "inputs": [{"ignored": true}], "outputs": [output]}),
         ),
     ];
-    let responses: Vec<_> = cases
-        .iter()
-        .map(|(_, path, body)| (path.clone(), body.clone()))
-        .collect();
+    let expected = answers.clone();
     let server = Server::start(move |path, index| {
-        let (expected, body) = &responses[index];
-        assert_eq!(path, format!("/api/v0{expected}"));
+        let (want, body) = &expected[index];
+        assert_eq!(path, format!("/api/v0{want}"));
         Behavior::json(body.clone())
     })
     .await;
-    let (provider, _, _) = client(&server.url, |_| {});
-    let count = cases.len();
-    for (endpoint, _, _) in cases {
-        provider.fetch(endpoint).await.unwrap();
-    }
-    assert_eq!(server.state.requests.lock().unwrap().len(), count);
+    let (provider, _) = client(&server.url, |_| {});
+    let p = Page::first();
+    assert_eq!(provider.latest_block().await.unwrap().height, 1);
+    assert_eq!(provider.block_at(1).await.unwrap().unwrap().hash, block);
+    assert_eq!(
+        provider.next_blocks(&block, p).await.unwrap().unwrap()[0].height,
+        2
+    );
+    let page = provider
+        .block_transactions(&block, Page::new(2).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        page.transactions[0].cbor.0,
+        vec![0x84, 0xa0, 0xa0, 0xf5, 0xf6]
+    );
+    assert_eq!(provider.genesis().await.unwrap().security_param, 2160);
+    assert!(provider.epoch(667).await.unwrap().is_some());
+    assert_eq!(
+        provider
+            .epoch_parameters(667)
+            .await
+            .unwrap()
+            .unwrap()
+            .max_tx_size,
+        16384
+    );
+    assert_eq!(
+        provider.epoch_pool_stake(667, &pool).await.unwrap().len(),
+        1
+    );
+    assert_eq!(provider.pools(p).await.unwrap(), vec![pool.clone()]);
+    assert_eq!(
+        provider.extended_pools(p).await.unwrap()[0].active_stake.0,
+        1000
+    );
+    assert_eq!(provider.retired_pools(p).await.unwrap()[0].epoch, 666);
+    assert!(provider.pool(&pool).await.unwrap().is_some());
+    assert_eq!(provider.pool_history(&pool, p).await.unwrap()[0].epoch, 667);
+    assert_eq!(
+        provider.datum(&block).await.unwrap().unwrap().cbor,
+        vec![0x19, 0xa6, 0xaa]
+    );
+    assert_eq!(
+        provider
+            .transaction_metadata(&block)
+            .await
+            .unwrap()
+            .label(6_500_973),
+        Some("[\"0x0123\"]")
+    );
+    let outputs = provider.transaction_outputs(&block).await.unwrap();
+    assert_eq!(outputs.outputs.len(), 1);
+    assert!(outputs.body.is_some());
+    assert_eq!(server.state.count(), answers.len());
 }
 
 #[tokio::test]
-async fn utxo_fallback_discards_large_inputs_and_limits_retained_outputs() {
+async fn utxo_answers_stream_past_large_inputs_and_keep_bounded_bodies() {
     let output = json!({"address":"addr1synthetic","output_index":0,"amount":[{"unit":"lovelace","quantity":"2"}],
-        "data_hash":null,"inline_datum":null,"collateral":false,"consumed_by_tx":null});
-    let normal = output.clone();
-    let server=Server::start(move |_,_|Behavior::json(json!({"hash":hash('1'),
-        "inputs":[{"address":"historical input","amount":[{"unit":"lovelace","quantity":"1"}],"ignored":"x".repeat(2*1024*1024)}],
-        "outputs":[normal.clone()]}))).await;
-    let (provider, _, _) = client(&server.url, |config| {
-        config.limits.transaction_outputs = 4 * 1024 * 1024;
-        config.limits.transaction_output_values = 1024;
+        "data_hash":null,"inline_datum":null,"collateral":false});
+    let answer = |padding: usize, outputs: usize| {
+        json!({"hash": hash('1'), "inputs": [{"ignored": "x".repeat(padding)}],
+            "outputs": (0..outputs).map(|index| {let mut row = output.clone(); row["output_index"] = json!(index); row}).collect::<Vec<_>>()})
+        .to_string()
+    };
+    let bodies = [answer(2 << 20, 1), answer(9 << 20, 1), answer(0, 100)];
+    let served = bodies.clone();
+    let server = Server::start(move |_, index| Behavior::raw(served[index].clone())).await;
+    let (provider, _) = client(&server.url, |config| {
+        config.limits.outputs = 16 << 20;
+        config.limits.output_values = 1024;
     });
-    let row = provider
-        .fetch(Endpoint::TransactionOutputs(point()))
-        .await
-        .unwrap();
-    assert!(matches!(row,Reply::TransactionOutputs(row) if row.outputs.len()==1));
-    let server = Server::start(move |_, _| {
-        Behavior::json(json!({"hash":hash('1'),"inputs":[],"outputs":(0..100).map(|index|{let mut row=output.clone();row["output_index"]=json!(index);row}).collect::<Vec<_>>()}))
-    })
-    .await;
-    let (provider, _, _) = client(&server.url, |config| {
-        config.limits.transaction_output_values = 1024
-    });
+    let kept = provider.transaction_outputs(&hash('1')).await.unwrap();
+    assert_eq!(kept.outputs.len(), 1);
+    assert_eq!(kept.body.as_deref(), Some(bodies[0].as_bytes()));
+    let large = provider.transaction_outputs(&hash('1')).await.unwrap();
+    assert_eq!(large.outputs.len(), 1);
+    assert!(large.body.is_none(), "an answer above 8 MiB is not kept");
     assert_eq!(
         provider
-            .fetch(Endpoint::TransactionOutputs(point()))
+            .transaction_outputs(&hash('1'))
             .await
             .unwrap_err()
             .code,
         "provider_response_size_limit"
     );
+}
+
+#[tokio::test]
+async fn a_scripted_chain_reads_through_the_client() {
+    let chain = Arc::new(Mutex::new(Chain::new(100, &[0, 100, 201, 1, 1])));
+    let server = Server::with_handler(Chain::handler(chain.clone())).await;
+    let (provider, _) = client(&server.url, |_| {});
+    let tip = provider.latest_block().await.unwrap();
+    assert_eq!(tip.height, 104);
+    for (height, pages) in [(101, 1), (102, 3)] {
+        let header = provider.block_at(height).await.unwrap().unwrap();
+        let before = server.state.count();
+        let mut collected = BlockPages::new(header.hash.clone(), header.tx_count).unwrap();
+        while let Some(page) = collected.next_page() {
+            let page = provider
+                .block_transactions(&header.hash, page)
+                .await
+                .unwrap()
+                .unwrap();
+            collected.push(page).unwrap();
+        }
+        let transactions = collected.finish().unwrap();
+        assert_eq!(
+            server.state.count() - before,
+            pages,
+            "exactly 100 needs no extra page"
+        );
+        assert_eq!(transactions.pages.len(), pages);
+        assert_eq!(
+            dsa_chain::transaction::decode_all(transactions.records())
+                .unwrap()
+                .len(),
+            header.tx_count as usize
+        );
+    }
+    let old_tip = tip.hash.clone();
+    let stored_101 = provider.block_at(101).await.unwrap().unwrap().hash;
+    chain.lock().unwrap().fork(2);
+    assert!(
+        provider
+            .next_blocks(&old_tip, Page::first())
+            .await
+            .unwrap()
+            .is_none(),
+        "the stored tip left the chain"
+    );
+    let below: Hash32 = provider.block_at(102).await.unwrap().unwrap().hash;
+    let replaced = provider
+        .next_blocks(&below, Page::first())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replaced.len(), 2);
+    assert_ne!(replaced[1].hash, old_tip);
+    chain.lock().unwrap().contradict(101);
+    assert_ne!(
+        provider.block_at(101).await.unwrap().unwrap().hash,
+        stored_101,
+        "a final block the provider contradicts"
+    );
+    chain
+        .lock()
+        .unwrap()
+        .fault("/blocks/latest", Behavior::status(429).retry_after("5"), 1);
+    let error: Error = provider.latest_block().await.unwrap_err();
+    assert_eq!(error.kind, Kind::Wait { until: NOW + 5 });
 }

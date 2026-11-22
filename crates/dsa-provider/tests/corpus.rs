@@ -161,8 +161,7 @@ fn replay(network: &str) -> (tempfile::TempDir, serde_json::Value) {
                 .iter()
                 .find(|record| record.tx_hash.as_str() == hash)
                 .unwrap();
-            let bytes = hex::decode(record.cbor.as_str()).unwrap();
-            let tx = dsa_chain::transaction::decode(&bytes, hash).unwrap();
+            let tx = dsa_chain::transaction::decode(&record.cbor.0, hash).unwrap();
             let supplements = dsa_chain::block::Supplements::default();
             let outputs = dsa_chain::block::effective_outputs(&tx, &supplements).unwrap();
             let output = outputs
@@ -301,8 +300,7 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
             .iter()
             .find(|record| record.tx_hash.as_str() == hash)
             .unwrap();
-        let raw = hex::decode(record.cbor.as_str()).unwrap();
-        let tx = dsa_chain::transaction::decode(&raw, hash).unwrap();
+        let tx = dsa_chain::transaction::decode(&record.cbor.0, hash).unwrap();
         assert!(!tx.is_valid() && tx.has_collateral_return());
         assert_eq!(tx.effective_inputs(), tx.collateral());
         let row = expected.tx.iter().find(|row| row.hash == hash).unwrap();
@@ -333,8 +331,7 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
         .unwrap();
     let mut stored_byron = 0;
     for (index, record) in records(byron_block).iter().enumerate() {
-        let raw = hex::decode(record.cbor.as_str()).unwrap();
-        let tx = dsa_chain::transaction::decode(&raw, record.tx_hash.as_str()).unwrap();
+        let tx = dsa_chain::transaction::decode(&record.cbor.0, record.tx_hash.as_str()).unwrap();
         for (output_index, output) in
             dsa_chain::block::effective_outputs(&tx, &dsa_chain::block::Supplements::default())
                 .unwrap()
@@ -376,8 +373,7 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
         .iter()
         .find(|record| record.tx_hash.as_str() == tx.hash)
         .unwrap();
-    let raw = hex::decode(record.cbor.as_str()).unwrap();
-    let decoded = dsa_chain::transaction::decode(&raw, &tx.hash).unwrap();
+    let decoded = dsa_chain::transaction::decode(&record.cbor.0, &tx.hash).unwrap();
     let supplements = dsa_chain::block::Supplements::default();
     let effective = dsa_chain::block::effective_outputs(&decoded, &supplements).unwrap();
     let original = effective
@@ -401,7 +397,7 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
     let metadata_hash = manifest["witnesses"]["other_metadata_transaction"]
         .as_str()
         .unwrap();
-    let metadata: Vec<dsa_provider::types::Metadata> = serde_json::from_slice(
+    let metadata: Vec<dsa_provider::types::MetadataEntry> = serde_json::from_slice(
         &std::fs::read(
             scratch
                 .path()
