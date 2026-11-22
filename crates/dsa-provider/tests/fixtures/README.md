@@ -1,7 +1,7 @@
 The compressed corpora pair intact finalized block responses with independently
 exported schema-5 SQL rows and spent-output origins. Each bundle has an external
 compressed SHA256, exact byte/member/count assertions, and a SHA256 per member.
-The test checks and builds each block from the same immutable decoded capture,
+The test decodes each block once and processes it with the block function,
 then compares rows and available Pallas facts. Original positional IDs and asset
 ordinals survive token filtering. These are selected block contexts, rather than
 one consecutive public chain.
