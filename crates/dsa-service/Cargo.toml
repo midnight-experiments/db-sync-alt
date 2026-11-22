@@ -5,46 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
 [lints]
 workspace = true
-[dependencies]
-dsa-chain.workspace = true
-dsa-provider = { path = "../dsa-provider" }
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
-tokio-postgres.workspace = true
-[dev-dependencies]
-tokio.workspace = true
-hex = "0.4"
-tempfile = "3"
-dsa-store.workspace = true
-[dev-dependencies.bytes]
-version = "1"
-[dev-dependencies.http-body-util]
-version = "0.1"
-[dev-dependencies.hyper]
-version = "1"
-features = ["server", "http1"]
-[dev-dependencies.hyper-util]
-version = "0.1"
-features = ["tokio"]
-[dev-dependencies.rcgen]
-version = "0.14"
-default-features = false
-features = ["ring", "pem"]
-[dev-dependencies.tokio-rustls]
-version = "0.26"
-default-features = false
-features = ["ring", "tls12"]
-[dev-dependencies.rustls]
-version = "0.23"
-default-features = false
-features = ["std", "ring", "tls12"]
-[dev-dependencies.futures-util]
-version = "0.3"
 
-[dev-dependencies.jsonschema]
-version = "0.61.2"
-default-features = false

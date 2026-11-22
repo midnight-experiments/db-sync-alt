@@ -491,7 +491,7 @@ async fn identity_refusals_status_and_single_writer() -> Result {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
-async fn status_capabilities_and_evidence_are_read_only_additions() -> Result {
+async fn status_prints_identity_position_and_capabilities_without_writing() -> Result {
     let db = Database::new().await?;
     let profile = Profile::load("preprod")?;
     let mut store = db.store().await?;
@@ -502,46 +502,15 @@ async fn status_capabilities_and_evidence_are_read_only_additions() -> Result {
     let first: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(first["identity"], before["identity"]);
     assert_eq!(first["position"], before["position"]);
+    assert_eq!(first["position"]["serving"], false);
     assert_eq!(
         first["capabilities"],
         serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?
     );
-    for shape in dsa_chain::observations::Shape::ALL {
-        assert_eq!(
-            first["real_data_evidence"][shape.as_str()]["historical_validation"],
-            "not_proven_on_real_data"
-        );
-        assert!(first["real_data_evidence"][shape.as_str()]["first_stored_observation"].is_null());
-    }
-    assert!(
-        store
-            .client()
-            .query_one("SELECT to_regnamespace('dsa_follower') IS NULL", &[])
-            .await?
-            .get::<_, bool>(0),
-        "status must not migrate an A-created database"
-    );
-    // Serialization/readback control, seeded through one committed transaction.
-    // Actual decoder->selected rows->witness atomicity is exercised separately
-    // by dsa-service's provider/PG tests, not claimed by this status seed.
-    let transaction = store.writer_transaction().await?;
-    dsa_service::observations::migrate(&transaction).await?;
-    let observation = json!({"block_height":10,"block_hash":"01".repeat(32),"transaction_hash":"02".repeat(32),"transaction_index":0,"observed_at":1,"output_index":0,"datum_hash":null,"raw_datum_bytes":null,"metadata_key":null,"sources":[{"source":"block_cbor","endpoint":format!("/blocks/{}/txs/cbor?count=100&page=1&order=asc","01".repeat(32)),"response_sha256":"03".repeat(32)}]});
-    transaction.execute("INSERT INTO dsa_follower.first_witness(shape,network,observation) VALUES('stored_pointer_address','preprod',$1)",&[&observation]).await?;
-    transaction.commit().await?;
-    let output = db.cli("status", "preprod", &[]).await?;
-    assert!(output.status.success());
-    let committed: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(committed["identity"], before["identity"]);
-    assert_eq!(committed["position"], before["position"]);
-    assert_eq!(committed["position"]["serving"], false);
     assert_eq!(
-        committed["real_data_evidence"]["stored_pointer_address"]["first_stored_observation"],
-        observation
-    );
-    assert_eq!(
-        committed["real_data_evidence"],
-        serde_json::to_value(dsa_service::observations::status(store.client()).await?)?
+        store.status(&profile).await?,
+        before,
+        "status writes nothing"
     );
     store.grant_reader(&profile, &db.reader).await?;
     let dsn = db.dsn().replace(

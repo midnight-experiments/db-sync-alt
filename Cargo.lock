@@ -583,7 +583,6 @@ dependencies = [
  "chrono",
  "clap",
  "dsa-chain",
- "dsa-service",
  "dsa-store",
  "futures-util",
  "hex",
@@ -737,28 +736,6 @@ dependencies = [
 [[package]]
 name = "dsa-service"
 version = "0.5.0"
-dependencies = [
- "bytes",
- "dsa-chain",
- "dsa-provider",
- "dsa-store",
- "futures-util",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "jsonschema",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-postgres",
- "tokio-rustls",
-]
 
 [[package]]
 name = "dsa-store"

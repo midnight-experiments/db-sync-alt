@@ -3,7 +3,6 @@
 //! cooldowns prevent queued requests from bypassing a provider refusal.
 
 mod accounting;
-pub mod evidence;
 mod outputs;
 pub mod pages;
 pub mod supplements;
@@ -15,7 +14,6 @@ pub use accounting::{
 pub use types::{Endpoint, Reply};
 
 use std::{
-    collections::BTreeSet,
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -89,8 +87,6 @@ pub struct Limits {
     pub transaction_outputs: usize,
     pub transaction_output_values: usize,
     pub json_depth: u16,
-    pub evidence_memory: usize,
-    pub evidence_spool: usize,
 }
 
 impl Default for Limits {
@@ -106,8 +102,6 @@ impl Default for Limits {
             transaction_outputs: 128 * 1024 * 1024,
             transaction_output_values: 8 * 1024 * 1024,
             json_depth: 2048,
-            evidence_memory: 4 * 1024 * 1024,
-            evidence_spool: 256 * 1024 * 1024,
         }
     }
 }
@@ -127,8 +121,6 @@ impl Limits {
     }
     fn validate(&self) -> Result<(), Error> {
         for (field, value) in [
-            ("provider.limits.evidence_memory", self.evidence_memory),
-            ("provider.limits.evidence_spool", self.evidence_spool),
             ("provider.limits.headers", self.headers),
             ("provider.limits.block_cbor", self.block_cbor),
             ("provider.limits.genesis", self.genesis),
@@ -266,7 +258,6 @@ struct Inner {
     counts: Mutex<Counts>,
     recorder: Arc<dyn AttemptRecorder>,
     clock: Arc<dyn Clock>,
-    evidence_budget: Arc<evidence::Budget>,
 }
 
 #[derive(Clone)]
@@ -359,10 +350,6 @@ impl Provider {
             .build()
             .map_err(|_| Error::configuration("provider.base_url"))?;
         Ok(Self(Arc::new(Inner {
-            evidence_budget: evidence::Budget::new(
-                config.limits.evidence_memory,
-                config.limits.evidence_spool,
-            ),
             http,
             base_url,
             key,
@@ -464,33 +451,12 @@ impl Provider {
         error
     }
 
-    fn local_evidence_error(&self, code: &'static str) -> Error {
-        Error::retry(code, self.0.clock.unix_seconds().saturating_add(1))
-    }
-    fn evidence_io_error(&self, error: std::io::Error) -> Error {
-        match error.to_string().as_str() {
-            "unsafe_provider_response" => self.failure("unsafe_provider_response", None, None),
-            "provider_invalid_response" => self.failure("provider_invalid_response", None, None),
-            "evidence_capture_budget" => self.local_evidence_error("evidence_capture_budget"),
-            _ => self.local_evidence_error("evidence_storage_unavailable"),
-        }
-    }
-    fn size_error(&self, evidence_limited: bool) -> Error {
-        if evidence_limited {
-            self.local_evidence_error("evidence_response_size_limit")
-        } else {
-            self.failure("provider_response_size_limit", None, None)
-        }
-    }
-
     async fn output_response(
         &self,
         mut response: reqwest::Response,
         endpoint: &Endpoint,
         limit: usize,
-        evidence_limited: bool,
-        mut spool: Option<evidence::Spool>,
-    ) -> Result<evidence::CapturedReply, Error> {
+    ) -> Result<Reply, Error> {
         let (sender, decoder) = outputs::start(
             self.0.config.limits.transaction_output_values,
             self.0.config.limits.json_depth,
@@ -504,19 +470,10 @@ impl Provider {
                         .checked_add(chunk.len())
                         .is_none_or(|length| length > limit)
                     {
-                        transport_error = Some(if evidence_limited {
-                            "evidence_response_size_limit"
-                        } else {
-                            "provider_response_size_limit"
-                        });
+                        transport_error = Some("provider_response_size_limit");
                         break;
                     }
                     received += chunk.len();
-                    if let Some(spool) = spool.as_mut() {
-                        spool
-                            .write(&chunk)
-                            .map_err(|error| self.evidence_io_error(error))?;
-                    }
                     if sender.send(chunk).await.is_err() {
                         break;
                     }
@@ -537,11 +494,7 @@ impl Provider {
             .await
             .map_err(|_| self.failure("provider_unavailable", None, None))?;
         if let Some(code) = transport_error {
-            return Err(if code == "evidence_response_size_limit" {
-                self.local_evidence_error(code)
-            } else {
-                self.failure(code, None, None)
-            });
+            return Err(self.failure(code, None, None));
         }
         let row = decoded.map_err(|code| self.failure(code, None, None))?;
         endpoint
@@ -570,33 +523,10 @@ impl Provider {
         if reflected {
             return Err(self.failure("unsafe_provider_response", None, None));
         }
-        Ok(evidence::CapturedReply {
-            endpoint: endpoint.clone(),
-            reply: Reply::TransactionOutputs(row),
-            evidence: spool
-                .map(|spool| spool.finish(endpoint.clone(), self.0.clock.unix_seconds())),
-        })
+        Ok(Reply::TransactionOutputs(row))
     }
 
     pub async fn fetch(&self, endpoint: Endpoint) -> Result<Reply, Error> {
-        Ok(self.fetch_inner(endpoint, None).await?.reply)
-    }
-    /// Retain only still-unobserved source families. Uses exactly the same send,
-    /// limits and decoder as fetch; never issues an evidence-specific request.
-    pub async fn fetch_with_evidence(
-        &self,
-        endpoint: Endpoint,
-        pending: &BTreeSet<dsa_chain::observations::Shape>,
-        spool_directory: &Path,
-    ) -> Result<evidence::CapturedReply, Error> {
-        let directory = evidence::wanted(&endpoint, pending).then_some(spool_directory);
-        self.fetch_inner(endpoint, directory).await
-    }
-    async fn fetch_inner(
-        &self,
-        endpoint: Endpoint,
-        evidence_directory: Option<&Path>,
-    ) -> Result<evidence::CapturedReply, Error> {
         let path = endpoint.path()?;
         if path.contains(&self.0.key) {
             return Err(Error::configuration("request.path"));
@@ -649,11 +579,7 @@ impl Provider {
         })?;
         let status = response.status().as_u16();
         if status == 404 && matches!(endpoint, Endpoint::Datum(_)) {
-            return Ok(evidence::CapturedReply {
-                endpoint,
-                reply: Reply::Datum(None),
-                evidence: None,
-            });
+            return Ok(Reply::Datum(None));
         }
         if status != 200 {
             let after = response
@@ -672,25 +598,15 @@ impl Provider {
             };
             return Err(self.failure(code, Some(status), after));
         }
-        let ordinary_limit = self.0.config.limits.maximum(endpoint.family());
-        let limit = evidence::response_limit(ordinary_limit, evidence_directory.is_some());
-        let evidence_limited = limit < ordinary_limit;
+        let limit = self.0.config.limits.maximum(endpoint.family());
         if response
             .content_length()
             .is_some_and(|length| length > limit as u64)
         {
-            return Err(self.size_error(evidence_limited));
+            return Err(self.failure("provider_response_size_limit", None, None));
         }
         if matches!(endpoint, Endpoint::TransactionOutputs(_)) {
-            let spool = evidence_directory
-                .map(|directory| {
-                    evidence::Spool::new(directory, &self.0.key, &self.0.evidence_budget)
-                })
-                .transpose()
-                .map_err(|error| self.evidence_io_error(error))?;
-            let reply = self
-                .output_response(response, &endpoint, limit, evidence_limited, spool)
-                .await?;
+            let reply = self.output_response(response, &endpoint, limit).await?;
             self.0.control.lock().unwrap().failures = 0;
             return Ok(reply);
         }
@@ -711,7 +627,7 @@ impl Provider {
                 .checked_add(chunk.len())
                 .is_none_or(|length| length > limit)
             {
-                return Err(self.size_error(evidence_limited));
+                return Err(self.failure("provider_response_size_limit", None, None));
             }
             body.extend_from_slice(&chunk);
         }
@@ -722,24 +638,7 @@ impl Provider {
             .map_err(|code| self.failure(code, None, None))?;
         // A successful in-flight response cannot erase a concurrent refusal.
         self.0.control.lock().unwrap().failures = 0;
-        let evidence = evidence_directory
-            .map(|directory| {
-                evidence::RawResponse::buffered(
-                    endpoint.clone(),
-                    body,
-                    self.0.clock.unix_seconds(),
-                    directory,
-                    &self.0.key,
-                    &self.0.evidence_budget,
-                )
-            })
-            .transpose()
-            .map_err(|error| self.evidence_io_error(error))?;
-        Ok(evidence::CapturedReply {
-            endpoint,
-            reply,
-            evidence,
-        })
+        Ok(reply)
     }
 }
 

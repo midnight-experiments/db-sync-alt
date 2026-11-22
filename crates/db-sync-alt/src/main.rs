@@ -93,7 +93,7 @@ enum Command {
         #[command(flatten)]
         database: DatabaseArguments,
     },
-    /// Read identity, serving position, capabilities and local field evidence.
+    /// Read identity, serving position and capabilities.
     Status {
         #[command(flatten)]
         database: DatabaseArguments,
@@ -340,16 +340,8 @@ async fn database_command(
         }
         Command::Status { .. } => {
             let mut value = store.status(profile).await?;
-            let evidence = dsa_service::observations::status(store.client())
-                .await
-                .map_err(|error| match error {
-                    dsa_service::observations::Error::Sql(error) => Error::Postgres(error),
-                    dsa_service::observations::Error::Json(error) => Error::Profile(error),
-                    _ => Error::Refusal("invalid_field_evidence_status"),
-                })?;
             value["capabilities"] =
                 serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?;
-            value["real_data_evidence"] = serde_json::to_value(evidence)?;
             Ok(value)
         }
         Command::Verify { .. } => Ok(serde_json::to_value(store.verify(profile).await?)?),

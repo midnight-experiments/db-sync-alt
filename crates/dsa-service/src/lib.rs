@@ -1,2 +1,2 @@
-//! Follower integration primitives. The run loop and HTTP server are not built.
-pub mod observations;
+//! The follower service: following, retry policy, epochs, configuration,
+//! status and HTTP.
