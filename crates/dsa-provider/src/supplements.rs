@@ -15,16 +15,18 @@ pub fn resolve_outputs(
 ) -> Result<BTreeMap<u16, Output>, &'static str> {
     let endpoint = Endpoint::TransactionOutputs(
         transaction
-            .hash
+            .hash()
             .parse()
             .map_err(|_| "provider_invalid_transaction_hash")?,
     );
     endpoint.validate_outputs(reply)?;
-    let count = transaction.outputs.len();
-    let expected_count = if transaction.valid {
-        count + usize::from(transaction.has_collateral_return)
+    let count = transaction.outputs().len();
+    let valid = transaction.is_valid();
+    let has_return = transaction.has_collateral_return();
+    let expected_count = if valid {
+        count + usize::from(has_return)
     } else {
-        usize::from(transaction.has_collateral_return)
+        usize::from(has_return)
     };
     if reply.outputs.len() != expected_count {
         return Err("provider_output_count_mismatch");
@@ -33,22 +35,22 @@ pub fn resolve_outputs(
     for row in &reply.outputs {
         let index =
             usize::try_from(row.output_index).map_err(|_| "provider_output_count_mismatch")?;
-        let collateral = index == count && transaction.has_collateral_return;
-        if !(collateral || transaction.valid && index < count) {
+        let collateral = index == count && has_return;
+        if !(collateral || valid && index < count) {
             return Err("provider_output_count_mismatch");
         }
-        if row.collateral != (transaction.valid && collateral) {
+        if row.collateral != (valid && collateral) {
             return Err("provider_output_role_mismatch");
         }
         // A valid transaction never creates its collateral return. The real
         // provider may omit its native assets, so only its index/role matters.
-        if transaction.valid && collateral {
+        if valid && collateral {
             continue;
         }
         let original = if collateral {
-            transaction.collateral_output.as_ref()
+            transaction.collateral_return()
         } else {
-            transaction.outputs[index].as_ref()
+            transaction.outputs()[index].as_ref()
         };
         let parsed =
             transaction::address_bytes(&row.address).ok_or("provider_output_address_mismatch")?;
@@ -80,11 +82,12 @@ pub fn resolve_outputs(
                 .as_ref()
                 .map(|bytes| hex::decode(bytes.as_str()).map_err(|_| "provider_invalid_response"))
                 .transpose()?,
-            classification_safe: true,
         };
-        output
-            .check_inline_hash()
-            .map_err(|_| "provider_inline_datum_hash_mismatch")?;
+        if let Some(bytes) = &output.inline_datum
+            && output.data_hash.as_deref() != Some(transaction::hash(bytes).as_str())
+        {
+            return Err("provider_inline_datum_hash_mismatch");
+        }
         if let Some(original) = original {
             if original.coin != output.coin
                 || original.assets != output.assets

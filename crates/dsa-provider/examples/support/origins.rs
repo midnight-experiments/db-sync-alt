@@ -1,9 +1,9 @@
-//! Initial held origins exported independently from the legacy public views.
+//! Initial held outputs exported independently from the legacy public views.
 
 use dsa_chain::{
+    block::Held,
     ids,
-    rows::HeldOutput,
-    transaction::{Asset, Outpoint, Output},
+    transaction::{Asset, Outpoint},
 };
 use serde::Deserialize;
 use std::{
@@ -23,7 +23,6 @@ struct Origin {
     index: u16,
     hash: String,
     address: String,
-    value: String,
     data_hash: Option<String>,
 }
 #[derive(Deserialize)]
@@ -37,7 +36,7 @@ struct OriginAsset {
 pub fn load(
     path: &Path,
     projected: &BTreeSet<u32>,
-) -> Result<BTreeMap<Outpoint, HeldOutput>, Box<dyn std::error::Error>> {
+) -> Result<BTreeMap<Outpoint, Held>, Box<dyn std::error::Error>> {
     let origins: Origins = serde_json::from_reader(File::open(path)?)?;
     let mut assets = BTreeMap::<i64, Vec<Asset>>::new();
     for asset in origins.assets {
@@ -59,17 +58,11 @@ pub fn load(
                 hash: origin.hash,
                 index: origin.index,
             },
-            HeldOutput {
+            Held {
                 transaction_id: origin.tx_id,
-                output: Output {
-                    address_raw: Vec::new(),
-                    address: Some(origin.address),
-                    coin: origin.value.parse()?,
-                    assets: assets.remove(&output_id).unwrap_or_default(),
-                    data_hash: origin.data_hash,
-                    inline_datum: None,
-                    classification_safe: true,
-                },
+                address: origin.address,
+                assets: assets.remove(&output_id).unwrap_or_default(),
+                data_hash: origin.data_hash,
             },
         );
     }

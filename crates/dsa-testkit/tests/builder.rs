@@ -73,7 +73,7 @@ fn built_transactions_round_trip_through_both_decoders() {
         let ours = transaction::decode(&built.cbor, &built.hash).unwrap();
         let theirs = MultiEraTx::decode(&built.cbor).unwrap();
         assert_eq!(theirs.hash().to_string(), built.hash);
-        assert_eq!(ours.valid, theirs.is_valid());
+        assert_eq!(ours.is_valid(), theirs.is_valid());
         let points = |inputs: Vec<pallas_traverse::MultiEraInput<'_>>| {
             let mut points: Vec<_> = inputs
                 .iter()
@@ -88,10 +88,10 @@ fn built_transactions_round_trip_through_both_decoders() {
                 .map(|point| (point.hash.clone(), point.index))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(our_points(&ours.ordinary), points(theirs.inputs()));
-        assert_eq!(our_points(&ours.collateral), points(theirs.collateral()));
-        assert_eq!(ours.outputs.len(), theirs.outputs().len());
-        for (index, (mine, other)) in ours.outputs.iter().zip(theirs.outputs()).enumerate() {
+        assert_eq!(our_points(ours.inputs()), points(theirs.inputs()));
+        assert_eq!(our_points(ours.collateral()), points(theirs.collateral()));
+        assert_eq!(ours.outputs().len(), theirs.outputs().len());
+        for (index, (mine, other)) in ours.outputs().iter().zip(theirs.outputs()).enumerate() {
             let mine = mine.as_ref().unwrap();
             assert_eq!(mine.address_raw, other.address().unwrap().to_vec());
             assert_eq!(
@@ -112,11 +112,11 @@ fn built_transactions_round_trip_through_both_decoders() {
             assert_eq!(mine.inline_datum, inline_datum);
         }
         assert_eq!(
-            ours.has_collateral_return,
+            ours.has_collateral_return(),
             theirs.collateral_return().is_some()
         );
         assert_eq!(
-            ours.mint,
+            ours.mint(),
             sorted(
                 theirs
                     .mints()
@@ -140,17 +140,25 @@ fn built_transactions_round_trip_through_both_decoders() {
                 )
             })
             .collect();
-        assert_eq!(ours.datums, witnessed);
+        let datums: std::collections::BTreeMap<_, _> = ours
+            .datums()
+            .iter()
+            .map(|(hash, raw)| (hash.clone(), raw.to_vec()))
+            .collect();
+        assert_eq!(datums, witnessed);
     }
     let ours = transaction::decode(&valid.cbor, &valid.hash).unwrap();
-    assert_eq!(ours.outputs[2].as_ref().unwrap().inline_datum, Some(inline));
     assert_eq!(
-        ours.outputs[2].as_ref().unwrap().address_raw.first(),
+        ours.outputs()[2].as_ref().unwrap().inline_datum,
+        Some(inline)
+    );
+    assert_eq!(
+        ours.outputs()[2].as_ref().unwrap().address_raw.first(),
         Some(&0x41),
         "pointer address header"
     );
     assert!(
-        ours.outputs[2]
+        ours.outputs()[2]
             .as_ref()
             .unwrap()
             .address
@@ -158,7 +166,7 @@ fn built_transactions_round_trip_through_both_decoders() {
             .is_some_and(|text| text.starts_with("addr1"))
     );
     assert_eq!(
-        dsa_chain::metadata::observe(ours.auxiliary),
+        dsa_chain::metadata::observe(ours.auxiliary()),
         dsa_chain::metadata::Observation::Present(Some(vec![1, 2, 3]))
     );
     let mut tampered = valid.cbor.clone();

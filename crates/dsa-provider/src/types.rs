@@ -148,7 +148,7 @@ pub struct TransactionCbor {
     pub cbor: CborHex,
 }
 
-impl From<&Header> for dsa_chain::checks::Header {
+impl From<&Header> for dsa_chain::block::Header {
     fn from(header: &Header) -> Self {
         Self {
             height: header.height,

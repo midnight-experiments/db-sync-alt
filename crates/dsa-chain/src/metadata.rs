@@ -9,7 +9,8 @@ use crate::{
     transaction::{Transaction, hash},
 };
 
-const LABEL: u64 = 6500973;
+/// The bridge metadatum label.
+pub const LABEL: u64 = 6500973;
 
 /// The provider's rendering is authoritative. Preserve exact integer tokens;
 /// integral floating tokens follow the legacy normalization through f64.

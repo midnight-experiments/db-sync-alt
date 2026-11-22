@@ -2,6 +2,8 @@
 //! scripts, metadata, certificates or governance content into value trees.
 //! The endpoint supplies the four-element Alonzo-and-later envelope. Byron
 //! addresses inside later transactions are supported by address rendering.
+//! A [`Transaction`] exists only as the result of [`decode`], so its body hash
+//! has always been checked against the bytes it was read from.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,6 +12,21 @@ use pallas_crypto::hash::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::cbor::{Error, Item, error};
+
+/// The largest transaction read, checked before parsing. It is 16 times the
+/// protocol's current maximum transaction size (16,384 bytes) and above the
+/// largest block body (90,112 bytes), so it bounds parser memory without
+/// refusing a transaction the ledger accepts.
+pub const TRANSACTION_SIZE_LIMIT: usize = 262_144;
+
+/// The highest transaction body key of the Conway ledger. A body with a later
+/// key stops the block with `unsupported_transaction_body_field`: a field this
+/// release cannot read could create or spend outputs, so skipping it could
+/// lose a relevant output. Each era that adds a body field needs a release.
+pub const LAST_BODY_KEY: u64 = 22;
+
+/// Body keys no era assigns.
+const UNASSIGNED_BODY_KEYS: [u64; 2] = [10, 12];
 
 pub fn hash(bytes: &[u8]) -> String {
     Hasher::<256>::hash(bytes).to_string()
@@ -34,7 +51,9 @@ impl Asset {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A decoded output. `address` is `None` when the address cannot be
+/// rendered; such an output is resolved through the provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
     pub address_raw: Vec<u8>,
     pub address: Option<String>,
@@ -42,45 +61,90 @@ pub struct Output {
     pub assets: Vec<Asset>,
     pub data_hash: Option<String>,
     pub inline_datum: Option<Vec<u8>>,
-    pub classification_safe: bool,
 }
 
-impl Output {
-    pub fn check_inline_hash(&self) -> Result<(), Error> {
-        if let Some(bytes) = &self.inline_datum
-            && self.data_hash.as_deref() != Some(hash(bytes).as_str())
-        {
-            return Err(error("provider_inline_datum_hash_mismatch", 0));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Transaction<'a> {
-    pub hash: String,
-    pub valid: bool,
-    pub ordinary: Vec<Outpoint>,
-    pub collateral: Vec<Outpoint>,
-    pub reference: Vec<Outpoint>,
-    pub outputs: Vec<Option<Output>>,
-    pub collateral_output: Option<Output>,
-    pub has_collateral_return: bool,
-    pub mint: Vec<Asset>,
-    pub datums: BTreeMap<String, Vec<u8>>,
-    pub body: &'a [u8],
-    pub auxiliary: Option<&'a [u8]>,
-    pub auxiliary_hash: Option<String>,
+    hash: String,
+    valid: bool,
+    inputs: Vec<Outpoint>,
+    collateral: Vec<Outpoint>,
+    outputs: Vec<Option<Output>>,
+    collateral_return: Option<Option<Output>>,
+    mint: Vec<Asset>,
+    datums: BTreeMap<String, &'a [u8]>,
+    pub(crate) auxiliary: Option<&'a [u8]>,
+    pub(crate) auxiliary_hash: Option<String>,
 }
 
-impl Transaction<'_> {
+impl<'a> Transaction<'a> {
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+    /// False for a transaction that failed phase 2: its collateral is spent
+    /// and its collateral return is created instead.
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+    pub fn inputs(&self) -> &[Outpoint] {
+        &self.inputs
+    }
+    pub fn collateral(&self) -> &[Outpoint] {
+        &self.collateral
+    }
     pub fn effective_inputs(&self) -> &[Outpoint] {
         if self.valid {
-            &self.ordinary
+            &self.inputs
         } else {
             &self.collateral
         }
     }
+    /// Body outputs in order; `None` where an output could not be decoded.
+    pub fn outputs(&self) -> &[Option<Output>] {
+        &self.outputs
+    }
+    pub fn has_collateral_return(&self) -> bool {
+        self.collateral_return.is_some()
+    }
+    pub fn collateral_return(&self) -> Option<&Output> {
+        self.collateral_return.as_ref().and_then(Option::as_ref)
+    }
+    pub fn mint(&self) -> &[Asset] {
+        &self.mint
+    }
+    /// Witness-set datums by hash, as their original bytes.
+    pub fn datums(&self) -> &BTreeMap<String, &'a [u8]> {
+        &self.datums
+    }
+    pub fn auxiliary(&self) -> Option<&'a [u8]> {
+        self.auxiliary
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("transaction_decode at position {position}, transaction {transaction}: {source}")]
+pub struct DecodeError {
+    pub position: usize,
+    pub transaction: String,
+    #[source]
+    pub source: Error,
+}
+
+/// Decode a block's transactions in block order from `(hash, bytes)` pairs.
+pub fn decode_all<'a>(
+    records: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<Vec<Transaction<'a>>, DecodeError> {
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(position, (hash, raw))| {
+            decode(raw, hash).map_err(|source| DecodeError {
+                position,
+                transaction: hash.to_owned(),
+                source,
+            })
+        })
+        .collect()
 }
 
 fn fields(item: Item<'_>) -> Result<BTreeMap<u64, Item<'_>>, Error> {
@@ -227,7 +291,6 @@ fn output(item: Item<'_>) -> Result<Output, Error> {
         assets,
         data_hash: None,
         inline_datum: None,
-        classification_safe: true,
     };
     // A script reference does not alter any consumed output field. Its bytes
     // have already been structurally skipped; the reference is never decoded.
@@ -255,24 +318,30 @@ fn output(item: Item<'_>) -> Result<Output, Error> {
             }
         }
     }
-    result.classification_safe = result.address.is_some();
     Ok(result)
 }
 
 pub fn decode<'a>(raw: &'a [u8], expected_hash: &str) -> Result<Transaction<'a>, Error> {
+    if raw.len() > TRANSACTION_SIZE_LIMIT {
+        return Err(error("transaction_size_limit", 0));
+    }
     let root = Item::parse(raw)?;
     let envelope = root.array()?;
     if envelope.len() != 4 {
         return Err(error("cbor_unsupported_envelope", 0));
     }
     let body = fields(envelope[0])?;
-    if ![0, 1, 2].iter().all(|k| body.contains_key(k))
-        || body.keys().any(|k| *k > 22 || [10, 12].contains(k))
-    {
-        return Err(error("cbor_unsupported_body", 0));
+    if ![0, 1, 2].iter().all(|k| body.contains_key(k)) {
+        return Err(error("cbor_transaction_body_shape", 0));
     }
-    let hash = hash(envelope[0].raw);
-    if hash != expected_hash {
+    if body
+        .keys()
+        .any(|k| *k > LAST_BODY_KEY || UNASSIGNED_BODY_KEYS.contains(k))
+    {
+        return Err(error("unsupported_transaction_body_field", 0));
+    }
+    let body_hash = hash(envelope[0].raw);
+    if body_hash != expected_hash {
         return Err(error("cbor_body_hash_mismatch", 0));
     }
     body[&2].unsigned()?;
@@ -284,18 +353,12 @@ pub fn decode<'a>(raw: &'a [u8], expected_hash: &str) -> Result<Transaction<'a>,
         .map(input_set)
         .transpose()?
         .unwrap_or_default();
-    let reference = body
-        .get(&18)
-        .copied()
-        .map(input_set)
-        .transpose()?
-        .unwrap_or_default();
     let outputs = body[&1]
         .array()?
         .into_iter()
         .map(|x| output(x).ok())
         .collect();
-    let collateral_output = body.get(&16).copied().and_then(|x| output(x).ok());
+    let collateral_return = body.get(&16).copied().map(|x| output(x).ok());
     let mint = body
         .get(&9)
         .copied()
@@ -315,21 +378,18 @@ pub fn decode<'a>(raw: &'a [u8], expected_hash: &str) -> Result<Transaction<'a>,
             datum_set
         };
         for datum in datum_set.array()? {
-            datums.insert(crate::transaction::hash(datum.raw), datum.raw.to_vec());
+            datums.insert(hash(datum.raw), datum.raw);
         }
     }
     Ok(Transaction {
-        hash,
+        hash: body_hash,
         valid,
-        ordinary,
+        inputs: ordinary,
         collateral,
-        reference,
         outputs,
-        collateral_output,
-        has_collateral_return: body.contains_key(&16),
+        collateral_return,
         mint,
         datums,
-        body: envelope[0].raw,
         auxiliary: (!envelope[3].is_null()).then_some(envelope[3].raw),
         auxiliary_hash: body
             .get(&7)
@@ -342,28 +402,6 @@ pub fn decode<'a>(raw: &'a [u8], expected_hash: &str) -> Result<Transaction<'a>,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ra_14_b_1_7_inline_bytes_match_hash_even_when_value_not_stored() {
-        let mut output = Output {
-            address_raw: Vec::new(),
-            address: Some("ordinary".to_owned()),
-            coin: 1,
-            assets: Vec::new(),
-            data_hash: None,
-            inline_datum: Some(vec![0]),
-            classification_safe: true,
-        };
-        assert_eq!(
-            output.check_inline_hash().unwrap_err().code,
-            "provider_inline_datum_hash_mismatch"
-        );
-        output.data_hash = Some("00".repeat(32));
-        assert!(output.check_inline_hash().is_err());
-        output.data_hash =
-            Some("03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".to_owned());
-        output.check_inline_hash().unwrap();
-    }
 
     #[test]
     fn ra_14_a_4_4_interpreted_map_keys_are_semantically_unique() {

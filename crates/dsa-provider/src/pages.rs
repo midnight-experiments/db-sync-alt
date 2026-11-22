@@ -1,6 +1,6 @@
 //! Freeze the hash/CBOR order at the successful provider-response boundary.
 
-use dsa_chain::{ids, inventory::CapturedTransactions};
+use dsa_chain::ids;
 
 use crate::types::{Hash32, Page, TransactionCbor};
 
@@ -9,7 +9,7 @@ pub struct TransactionPage {
     block: Hash32,
     page: Page,
     records: Vec<TransactionCbor>,
-    captured: CapturedTransactions,
+    captured: Vec<(String, Vec<u8>)>,
 }
 
 impl TransactionPage {
@@ -30,7 +30,7 @@ impl TransactionPage {
             block,
             page,
             records,
-            captured: CapturedTransactions::from_records(source),
+            captured: source,
         })
     }
 
@@ -52,7 +52,7 @@ pub struct CapturedBlock {
     expected_count: usize,
     next_page: u32,
     complete: bool,
-    captured: CapturedTransactions,
+    captured: Vec<(String, Vec<u8>)>,
 }
 
 impl CapturedBlock {
@@ -65,7 +65,7 @@ impl CapturedBlock {
             expected_count: expected_count as usize,
             next_page: 1,
             complete: expected_count == 0,
-            captured: CapturedTransactions::default(),
+            captured: Vec::new(),
         })
     }
 
@@ -88,7 +88,7 @@ impl CapturedBlock {
             .checked_add(1)
             .ok_or("provider_page_order_mismatch")?;
         self.complete = count == self.expected_count;
-        self.captured.append(page.captured);
+        self.captured.extend(page.captured);
         Ok(())
     }
 
@@ -96,7 +96,7 @@ impl CapturedBlock {
         self.complete
     }
 
-    pub fn finish(self) -> Result<CapturedTransactions, &'static str> {
+    pub fn finish(self) -> Result<Vec<(String, Vec<u8>)>, &'static str> {
         if !self.complete || self.captured.len() != self.expected_count {
             return Err("provider_transaction_count_mismatch");
         }
@@ -107,6 +107,12 @@ impl CapturedBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dsa_chain::{
+        block::{BlockError, Header, Outcome, Selection, Supplements, process_block},
+        profiles::Profile,
+        transaction,
+    };
+    use std::collections::BTreeMap;
 
     fn records() -> Vec<TransactionCbor> {
         let mut records: Vec<TransactionCbor> = serde_json::from_str(include_str!(
@@ -117,36 +123,27 @@ mod tests {
         records
     }
 
+    fn hashes(captured: &[(String, Vec<u8>)]) -> Vec<&str> {
+        captured.iter().map(|(hash, _)| hash.as_str()).collect()
+    }
+
     #[test]
     fn captured_pages_preserve_original_items_and_refuse_page_changes() {
         let block: Hash32 = "01".repeat(32).parse().unwrap();
         let original = records();
         let page = TransactionPage::capture(block.clone(), Page::new(1).unwrap(), original.clone())
             .unwrap();
-        let mut detached = page.records().to_vec();
-        detached.reverse();
-        assert_eq!(
-            page.records(),
-            original,
-            "a detached cache copy cannot mutate the received page"
-        );
         let mut collected = CapturedBlock::new(block.clone(), 2).unwrap();
         collected.push(page).unwrap();
         assert!(collected.is_complete());
         let captured = collected.finish().unwrap();
-        let decoded = captured.decode().unwrap();
         assert_eq!(
-            decoded
-                .transactions()
-                .iter()
-                .map(|tx| tx.hash.as_str())
-                .collect::<Vec<_>>(),
+            hashes(&captured),
             original
                 .iter()
                 .map(|record| record.tx_hash.as_str())
                 .collect::<Vec<_>>()
         );
-        decoded.validate().unwrap();
         let mut out_of_order = CapturedBlock::new(block.clone(), 2).unwrap();
         assert_eq!(
             out_of_order
@@ -241,51 +238,39 @@ mod tests {
             "provider_page_after_complete"
         );
         let source = captured.finish().unwrap();
-        let decoded = source.decode().unwrap();
         assert_eq!(
-            decoded
-                .transactions()
-                .iter()
-                .map(|tx| tx.hash.as_str())
-                .collect::<Vec<_>>(),
+            hashes(&source),
             records
                 .iter()
                 .map(|record| record.tx_hash.as_str())
                 .collect::<Vec<_>>()
         );
-        let profile = dsa_chain::profiles::Profile::load("preprod").unwrap();
-        let previous = dsa_chain::checks::Header {
-            height: 9,
-            hash: "02".repeat(32),
-            previous_hash: None,
-            transaction_count: 0,
-        };
-        let header = dsa_chain::checks::Header {
+        let profile = Profile::load("preprod").unwrap();
+        let selection = Selection::new(&profile);
+        let header = Header {
             height: 10,
             hash: block.to_string(),
-            previous_hash: Some(previous.hash.clone()),
+            previous_hash: Some("02".repeat(32)),
             transaction_count: 103,
         };
-        let mut held = std::collections::BTreeMap::new();
-        let supplements = dsa_chain::rows::Supplements::default();
-        assert_eq!(
-            dsa_chain::checks::check_block(
-                &profile,
-                &previous,
-                &header,
-                9,
-                &decoded,
-                &held,
-                &supplements
+        fn decode(source: &[(String, Vec<u8>)]) -> Vec<transaction::Transaction<'_>> {
+            transaction::decode_all(
+                source
+                    .iter()
+                    .map(|(hash, raw)| (hash.as_str(), raw.as_slice())),
             )
             .unwrap()
-            .transactions_checked,
-            103
-        );
-        let rows =
-            dsa_chain::rows::build_block(&profile, 10, &decoded, &mut held, &supplements).unwrap();
+        }
+        let held = BTreeMap::new();
+        let supplements = Supplements::default();
+        let decoded = decode(&source);
+        let Outcome::Ready(output) =
+            process_block(&selection, &header, &decoded, &held, &supplements).unwrap()
+        else {
+            panic!("quiet block needs nothing")
+        };
         assert!(
-            rows.tx.is_empty() && held.is_empty(),
+            output.rows.tx.is_empty() && output.created.is_empty(),
             "the quiet real sources have no selected facts"
         );
         let mut duplicate_tail = records[100..].to_vec();
@@ -294,19 +279,16 @@ mod tests {
         duplicate.push(page(1, &records[..100])).unwrap();
         duplicate.push(page(2, &duplicate_tail)).unwrap();
         let duplicate_source = duplicate.finish().unwrap();
-        let duplicate_decoded = duplicate_source.decode().unwrap();
         assert_eq!(
-            dsa_chain::checks::check_block(
-                &profile,
-                &previous,
+            process_block(
+                &selection,
                 &header,
-                9,
-                &duplicate_decoded,
+                &decode(&duplicate_source),
                 &held,
                 &supplements
             )
             .unwrap_err(),
-            dsa_chain::checks::CheckError::DuplicateTransaction {
+            BlockError::DuplicateTransaction {
                 height: 10,
                 transaction: records[0].tx_hash.to_string()
             }

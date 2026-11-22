@@ -1,7 +1,7 @@
-//! Resolve only supplements requested by the current row-building attempt.
+//! Resolve the supplements a block attempt names from a recording.
 
 use dsa_chain::{
-    rows::{DatumAvailability, SupplementRequest, Supplements},
+    block::{DatumAvailability, SupplementRequest, Supplements},
     transaction::{self, Transaction},
 };
 use dsa_provider::{
@@ -158,7 +158,7 @@ pub fn load(
             let reply: TransactionOutputs = serde_json::from_slice(&bytes)?;
             let tx = transactions
                 .iter()
-                .find(|tx| tx.hash == *transaction)
+                .find(|tx| tx.hash() == transaction)
                 .ok_or("unknown requested transaction")?;
             let outputs = resolve_outputs(tx, &reply)?;
             if !outputs.contains_key(index) {

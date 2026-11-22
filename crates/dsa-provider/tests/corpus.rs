@@ -142,7 +142,7 @@ fn replay(network: &str) -> (tempfile::TempDir, serde_json::Value) {
         // These real bootstrap outpoints exercise token selection separately from
         // projection-row and shape counts. Their original block remains support-only.
         let profile = dsa_chain::profiles::Profile::load("preprod").unwrap();
-        let selection = dsa_chain::rows::Selection::new(&profile);
+        let selection = dsa_chain::block::Selection::new(&profile);
         let bootstrap: Vec<dsa_provider::types::TransactionCbor> = serde_json::from_slice(
             &std::fs::read(scratch.path().join("provider/transactions/4318350.json")).unwrap(),
         )
@@ -163,9 +163,14 @@ fn replay(network: &str) -> (tempfile::TempDir, serde_json::Value) {
                 .unwrap();
             let bytes = hex::decode(record.cbor.as_str()).unwrap();
             let tx = dsa_chain::transaction::decode(&bytes, hash).unwrap();
-            let supplements = dsa_chain::rows::Supplements::default();
-            let outputs = dsa_chain::rows::effective_outputs(&tx, &supplements).unwrap();
-            let output = outputs.iter().find(|(index, _)| *index == 2).unwrap().1;
+            let supplements = dsa_chain::block::Supplements::default();
+            let outputs = dsa_chain::block::effective_outputs(&tx, &supplements).unwrap();
+            let output = outputs
+                .iter()
+                .find(|(index, _)| *index == 2)
+                .unwrap()
+                .1
+                .unwrap();
             assert!(
                 selection.relevant(output),
                 "the address retains the original output"
@@ -268,9 +273,12 @@ fn recorded_corpus_subset_matches_sql_and_comparison_decoder() {
 #[test]
 fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
     let (scratch, manifest) = replay("mainnet");
-    let expected: dsa_chain::rows::Rows =
-        serde_json::from_slice(&std::fs::read(scratch.path().join("expected.json")).unwrap())
-            .unwrap();
+    let expected_json = std::fs::read(scratch.path().join("expected.json")).unwrap();
+    let expected: dsa_chain::block::Rows = serde_json::from_slice(&expected_json).unwrap();
+    let mints: Vec<corpus::MintRow> = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(&expected_json).unwrap()["mint"].clone(),
+    )
+    .unwrap();
     let records = |height: u64| -> Vec<dsa_provider::types::TransactionCbor> {
         serde_json::from_slice(
             &std::fs::read(
@@ -295,8 +303,8 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
             .unwrap();
         let raw = hex::decode(record.cbor.as_str()).unwrap();
         let tx = dsa_chain::transaction::decode(&raw, hash).unwrap();
-        assert!(!tx.valid && tx.has_collateral_return);
-        assert_eq!(tx.effective_inputs(), tx.collateral);
+        assert!(!tx.is_valid() && tx.has_collateral_return());
+        assert_eq!(tx.effective_inputs(), tx.collateral());
         let row = expected.tx.iter().find(|row| row.hash == hash).unwrap();
         assert!(!row.valid_contract);
         let outputs: Vec<_> = expected
@@ -307,7 +315,7 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
         assert_eq!(outputs.len(), 1);
         assert_eq!(
             usize::from(outputs[0].index),
-            tx.outputs.len(),
+            tx.outputs().len(),
             "invalid effective output retains collateral-return index"
         );
         assert_eq!(
@@ -318,7 +326,7 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
                 .count(),
             1
         );
-        assert!(!expected.mint.iter().any(|mint| mint.tx_hash == hash));
+        assert!(!mints.iter().any(|mint| mint.tx_hash == hash));
     }
     let byron_block = manifest["witnesses"]["stored_byron_block"]
         .as_u64()
@@ -328,9 +336,10 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
         let raw = hex::decode(record.cbor.as_str()).unwrap();
         let tx = dsa_chain::transaction::decode(&raw, record.tx_hash.as_str()).unwrap();
         for (output_index, output) in
-            dsa_chain::rows::effective_outputs(&tx, &dsa_chain::rows::Supplements::default())
+            dsa_chain::block::effective_outputs(&tx, &dsa_chain::block::Supplements::default())
                 .unwrap()
         {
+            let output = output.unwrap();
             if output.address_raw.first().map(|byte| byte >> 4) == Some(8) {
                 let tx_id = ((byron_block as i64) << 12) | index as i64;
                 if let Some(row) = expected
@@ -349,7 +358,7 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
         "real Byron output is independently stored, not only an ordinary full-block fact"
     );
     let witness = &manifest["witnesses"]["asset_ordinal"];
-    let asset: dsa_chain::rows::AssetRow = serde_json::from_value(witness["row"].clone()).unwrap();
+    let asset: dsa_chain::block::AssetRow = serde_json::from_value(witness["row"].clone()).unwrap();
     assert!(expected.ma_tx_out.contains(&asset));
     assert_eq!(asset.id % 4096, 15);
     let output = expected
@@ -369,13 +378,14 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
         .unwrap();
     let raw = hex::decode(record.cbor.as_str()).unwrap();
     let decoded = dsa_chain::transaction::decode(&raw, &tx.hash).unwrap();
-    let supplements = dsa_chain::rows::Supplements::default();
-    let effective = dsa_chain::rows::effective_outputs(&decoded, &supplements).unwrap();
+    let supplements = dsa_chain::block::Supplements::default();
+    let effective = dsa_chain::block::effective_outputs(&decoded, &supplements).unwrap();
     let original = effective
         .iter()
         .find(|(index, _)| *index == output.index)
         .unwrap()
-        .1;
+        .1
+        .unwrap();
     assert_eq!(
         (
             original.assets[15].policy.as_str(),

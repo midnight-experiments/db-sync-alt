@@ -22,14 +22,14 @@ fn real_output_fallback_preserves_body_coordinates_value_and_collateral_role() {
     ))
     .unwrap();
     let resolved = resolve_outputs(&tx, &reply).unwrap();
-    assert_eq!(resolved.len(), tx.outputs.len());
-    for (index, output) in tx.outputs.iter().enumerate() {
+    assert_eq!(resolved.len(), tx.outputs().len());
+    for (index, output) in tx.outputs().iter().enumerate() {
         let output = output.as_ref().unwrap();
         assert_eq!(resolved[&(index as u16)].address_raw, output.address_raw);
         assert_eq!(resolved[&(index as u16)].assets, output.assets);
     }
     assert!(
-        !resolved.contains_key(&(tx.outputs.len() as u16)),
+        !resolved.contains_key(&(tx.outputs().len() as u16)),
         "valid collateral return is outside the transaction's effects"
     );
     let mut bad = reply.clone();
@@ -67,12 +67,12 @@ fn real_output_fallback_preserves_body_coordinates_value_and_collateral_role() {
     let scratch = tempfile::tempdir().unwrap();
     std::fs::create_dir(scratch.path().join("outputs")).unwrap();
     std::fs::write(
-        scratch.path().join(format!("outputs/{}.json", tx.hash)),
+        scratch.path().join(format!("outputs/{}.json", tx.hash())),
         serde_json::to_vec(&bad).unwrap(),
     )
     .unwrap();
-    let request = dsa_chain::rows::SupplementRequest::Output {
-        transaction: tx.hash.clone(),
+    let request = dsa_chain::block::SupplementRequest::Output {
+        transaction: tx.hash().to_owned(),
         index: 0,
     };
     assert_eq!(
@@ -81,7 +81,7 @@ fn real_output_fallback_preserves_body_coordinates_value_and_collateral_role() {
             &request,
             1,
             std::slice::from_ref(&tx),
-            &mut dsa_chain::rows::Supplements::default()
+            &mut dsa_chain::block::Supplements::default()
         )
         .unwrap_err()
         .to_string(),
@@ -114,38 +114,26 @@ fn real_output_fallback_preserves_body_coordinates_value_and_collateral_role() {
 }
 
 #[test]
-fn invalid_native_model_requires_only_the_return_at_body_output_count() {
-    // Native projection model only. No serialized transaction or external decoder.
+fn an_invalid_transaction_resolves_only_its_return_at_the_body_output_count() {
+    use dsa_testkit::tx::{Output, Tx, hash};
     let address = dsa_chain::profiles::Profile::load("mainnet")
         .unwrap()
         .addresses["mapping"]
         .clone();
-    let output = transaction::Output {
-        address_raw: transaction::address_bytes(&address).unwrap(),
-        address: Some(address.clone()),
-        coin: 100,
-        assets: Vec::new(),
-        data_hash: None,
-        inline_datum: None,
-        classification_safe: true,
-    };
-    let tx = transaction::Transaction {
-        hash: "03".repeat(32),
-        valid: false,
-        ordinary: Vec::new(),
-        collateral: Vec::new(),
-        reference: Vec::new(),
-        outputs: vec![None, None, None],
-        collateral_output: Some(output.clone()),
-        has_collateral_return: true,
-        mint: Vec::new(),
-        datums: Default::default(),
-        body: &[],
-        auxiliary: None,
-        auxiliary_hash: None,
-    };
-    let mut reply:TransactionOutputs=serde_json::from_value(serde_json::json!({"hash":tx.hash,"outputs":[{"address":address,"output_index":3,"amount":[{"unit":"lovelace","quantity":"100"}],"data_hash":null,"inline_datum":null,"collateral":false,"consumed_by_tx":null}]})).unwrap();
-    assert_eq!(resolve_outputs(&tx, &reply).unwrap()[&3], output);
+    let built = Tx::new()
+        .collateral(&hash(b"collateral"), 0)
+        .output(Output::new(Vec::new(), 1))
+        .output(Output::new(Vec::new(), 1))
+        .output(Output::new(Vec::new(), 1))
+        .collateral_return(Output::to(&address, 100))
+        .invalid()
+        .build();
+    let tx = transaction::decode(&built.cbor, &built.hash).unwrap();
+    let mut reply: TransactionOutputs = serde_json::from_value(serde_json::json!({"hash":built.hash,"outputs":[{"address":address,"output_index":3,"amount":[{"unit":"lovelace","quantity":"100"}],"data_hash":null,"inline_datum":null,"collateral":false}]})).unwrap();
+    assert_eq!(
+        &resolve_outputs(&tx, &reply).unwrap()[&3],
+        tx.collateral_return().unwrap()
+    );
     reply.outputs[0].collateral = true;
     assert_eq!(
         resolve_outputs(&tx, &reply).unwrap_err(),
@@ -164,7 +152,7 @@ mod recorded;
 
 #[test]
 fn recorded_404_is_scoped_to_the_requesting_block() {
-    use dsa_chain::rows::{DatumAvailability, SupplementRequest, Supplements};
+    use dsa_chain::block::{DatumAvailability, SupplementRequest, Supplements};
     let scratch = tempfile::tempdir().unwrap();
     std::fs::create_dir(scratch.path().join("datums")).unwrap();
     let hash = transaction::hash(&[0]);
@@ -226,7 +214,7 @@ fn recorded_404_is_scoped_to_the_requesting_block() {
 
 #[test]
 fn shared_positive_datum_requires_bound_capture_provenance() {
-    use dsa_chain::rows::{DatumAvailability, SupplementRequest, Supplements};
+    use dsa_chain::block::{DatumAvailability, SupplementRequest, Supplements};
     use sha2::{Digest, Sha256};
     let scratch = tempfile::tempdir().unwrap();
     std::fs::create_dir(scratch.path().join("datums")).unwrap();

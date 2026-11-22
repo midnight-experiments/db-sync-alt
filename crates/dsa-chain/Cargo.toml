@@ -22,6 +22,7 @@ num-traits = "0.2"
 
 [dev-dependencies]
 bech32 = "0.11"
+dsa-testkit = { path = "../dsa-testkit" }
 clap.workspace = true
 pallas-traverse = "=0.33.0"
 pallas-primitives = "=0.33.0"

@@ -8,11 +8,15 @@ use std::{
 };
 
 use dsa_chain::{
+    block::{
+        DatumAvailability, Held, Outcome, Rows, Selection, SupplementRequest, Supplements,
+        process_block,
+    },
     profiles::Profile,
-    rows::{self, BuildError, DatumAvailability, Rows, SupplementRequest, Supplements},
     transaction::{self, Asset, Outpoint, Output},
 };
 use dsa_provider::types::TransactionCbor;
+use serde::Serialize;
 
 #[path = "origins.rs"]
 pub(crate) mod origins;
@@ -31,6 +35,21 @@ struct Plan {
 struct Block {
     height: u32,
     tx_count: usize,
+}
+
+/// A mint row as the legacy tables export it; the store keeps no mint rows,
+/// so the replay derives them from the decoded transactions.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MintRow {
+    pub tx_hash: String,
+    pub policy: String,
+    pub name: String,
+    pub quantity: String,
+}
+
+#[derive(Deserialize)]
+struct ExpectedMints {
+    mint: Vec<MintRow>,
 }
 fn read<T: DeserializeOwned>(path: impl AsRef<Path>) -> T {
     serde_json::from_reader(File::open(path).expect("corpus file")).expect("corpus JSON")
@@ -67,7 +86,7 @@ fn resolved_output<'a>(
     supplements: &'a Supplements,
     effective: bool,
 ) -> Result<Option<&'a Output>, &'static str> {
-    let resolved = output.filter(|o| o.classification_safe).or_else(|| {
+    let resolved = output.filter(|o| o.address.is_some()).or_else(|| {
         supplements
             .outputs
             .get(hash)
@@ -128,71 +147,41 @@ fn large_datum_observation(bytes: &[u8], source: &str, height: Option<u32>) -> s
     })
 }
 
-#[cfg(test)]
-fn check_recorded_block(
+/// Fixed-unit mint effects must equal the independently exported mint rows.
+fn check_mint_delta(
     profile: &Profile,
-    path: &Path,
-    block: &Block,
-    decoded: &dsa_chain::inventory::DecodedTransactions<'_>,
-    held: &BTreeMap<Outpoint, rows::HeldOutput>,
-    supplements: &Supplements,
-    expected: &Rows,
-) -> Result<(), BuildError> {
-    let provider: dsa_provider::types::Header =
-        read(path.join(format!("provider/headers/{}.json", block.height)));
-    let header = dsa_chain::checks::Header::from(&provider);
-    // Historical independent contexts: parent hash is the captured header's
-    // declared predecessor, not an independently obtained durable checkpoint.
-    let previous = dsa_chain::checks::Header {
-        height: block.height - 1,
-        hash: header.previous_hash.clone().unwrap(),
-        previous_hash: None,
-        transaction_count: 0,
-    };
-    let effects = match dsa_chain::checks::check_block(
-        profile,
-        &previous,
-        &header,
-        block.height - 1,
-        decoded,
-        held,
-        supplements,
-    ) {
-        Ok(effects) => effects,
-        Err(dsa_chain::checks::CheckError::Supplement(error)) => return Err(error),
-        Err(error) => panic!("normal captured check failed at {}: {error}", block.height),
-    };
-    let hashes: BTreeSet<_> = decoded
-        .transactions()
-        .iter()
-        .map(|tx| tx.hash.as_str())
-        .collect();
+    hashes: &BTreeSet<&str>,
+    actual: &BTreeMap<String, i128>,
+    expected: &[MintRow],
+) {
     let fixed = dsa_chain::assets::fixed_units(profile);
-    let mut expected_delta = BTreeMap::new();
+    let mut delta = BTreeMap::new();
     for mint in expected
-        .mint
         .iter()
         .filter(|mint| hashes.contains(mint.tx_hash.as_str()))
     {
         let unit = format!("{}{}", mint.policy, mint.name);
         if fixed.contains(&unit) {
-            *expected_delta.entry(unit).or_insert(0i128) += mint.quantity.parse::<i128>().unwrap();
+            *delta.entry(unit).or_insert(0i128) += mint.quantity.parse::<i128>().unwrap();
         }
     }
     assert_eq!(
-        effects.mint_delta, expected_delta,
+        actual, &delta,
         "fixed-unit effects vs independently exported SQL"
     );
-    Ok(())
 }
 
 fn compare(path: &Path, planning: bool) {
     let plan: Plan = read(path.join("recording-plan.json"));
     let profile = Profile::load(&plan.network).unwrap();
+    let selection = Selection::new(&profile);
     let provider_path = path.join("provider");
     let mut expected: Rows = read(path.join("expected.json"));
+    let mut expected_mints = read::<ExpectedMints>(path.join("expected.json")).mint;
+    let mut actual_mints = Vec::new();
     let projected = plan.blocks.iter().map(|block| block.height).collect();
-    let mut held = origins::load(&path.join("origins.json"), &projected).unwrap();
+    let mut held: BTreeMap<Outpoint, Held> =
+        origins::load(&path.join("origins.json"), &projected).unwrap();
     let eligible: BTreeSet<_> = expected
         .datum
         .iter()
@@ -227,14 +216,18 @@ fn compare(path: &Path, planning: bool) {
             .iter()
             .map(|r| hex::decode(r.cbor.as_str()).unwrap())
             .collect();
-        let source = dsa_chain::inventory::CapturedTransactions::from_records(
+        let transactions = transaction::decode_all(
             records
                 .iter()
                 .zip(&raw)
-                .map(|(record, bytes)| (record.tx_hash.to_string(), bytes.clone())),
-        );
-        let decoded_capture = source.decode().unwrap();
-        let transactions = decoded_capture.transactions();
+                .map(|(record, bytes)| (record.tx_hash.as_str(), bytes.as_slice())),
+        )
+        .unwrap();
+        let transactions = transactions.as_slice();
+        let provider: dsa_provider::types::Header =
+            read(provider_path.join(format!("headers/{}.json", block.height)));
+        let header = dsa_chain::block::Header::from(&provider);
+        assert_eq!(header.height, block.height);
         let mut supplements = Supplements::default();
         supplements.datums.extend(
             known_datums
@@ -242,72 +235,73 @@ fn compare(path: &Path, planning: bool) {
                 .map(|hash| (hash.clone(), DatumAvailability::Stored)),
         );
         let mut requests = BTreeSet::new();
-        let rows = loop {
-            #[cfg(test)]
-            let checked = check_recorded_block(
-                &profile,
-                path,
-                block,
-                &decoded_capture,
-                &held,
-                &supplements,
-                &expected,
-            );
-            #[cfg(not(test))]
-            let checked: Result<(), BuildError> = Ok(());
-            let attempt = checked.and_then(|()| {
-                rows::build_block(
-                    &profile,
+        let output = loop {
+            let outcome = process_block(&selection, &header, transactions, &held, &supplements)
+                .unwrap_or_else(|error| panic!("block failed at {}: {error}", block.height));
+            let needs = match outcome {
+                Outcome::Ready(output) => break output,
+                Outcome::Needs(needs) => needs,
+            };
+            for request in needs {
+                assert!(
+                    requests.insert(serde_json::to_string(&request).unwrap()),
+                    "cached supplement did not satisfy repeated request at block {}: {request:?}",
+                    block.height
+                );
+                if let Some(source) = recorded::load(
+                    &provider_path,
+                    &request,
                     block.height,
-                    &decoded_capture,
-                    &mut held,
-                    &supplements,
+                    transactions,
+                    &mut supplements,
                 )
-            });
-            match attempt {
-                Ok(rows) => break rows,
-                Err(BuildError::Required(request)) => {
-                    assert!(
-                        requests.insert(serde_json::to_string(&request).unwrap()),
-                        "cached supplement did not satisfy repeated request at block {}: {request:?}",
-                        block.height
-                    );
-                    if let Some(source) = recorded::load(
-                        &provider_path,
-                        &request,
-                        block.height,
-                        transactions,
-                        &mut supplements,
-                    )
-                    .unwrap()
-                    {
-                        serde_json::to_writer(&mut request_trace,&serde_json::json!({"block":block.height,"request":request,"recording":source})).unwrap();
-                        request_trace.write_all(b"\n").unwrap();
-                        request_trace.flush().unwrap();
-                    } else {
-                        missing.insert(
-                            serde_json::to_string(
-                                &serde_json::json!({"block":block.height,"request":request}),
-                            )
-                            .unwrap(),
-                        );
-                        serde_json::to_writer_pretty(
-                            File::create(path.join("missing-supplements.json")).unwrap(),
-                            &missing,
+                .unwrap()
+                {
+                    serde_json::to_writer(&mut request_trace,&serde_json::json!({"block":block.height,"request":request,"recording":source})).unwrap();
+                    request_trace.write_all(b"\n").unwrap();
+                    request_trace.flush().unwrap();
+                } else {
+                    missing.insert(
+                        serde_json::to_string(
+                            &serde_json::json!({"block":block.height,"request":request}),
                         )
-                        .unwrap();
-                        if planning && let SupplementRequest::Datum(hash) = request {
+                        .unwrap(),
+                    );
+                    serde_json::to_writer_pretty(
+                        File::create(path.join("missing-supplements.json")).unwrap(),
+                        &missing,
+                    )
+                    .unwrap();
+                    match request {
+                        SupplementRequest::Datum(hash) if planning => {
                             supplements.datums.insert(hash, DatumAvailability::NotFound);
-                            continue;
                         }
-                        panic!("required supplement is unrecorded: {request:?}");
+                        _ => panic!("required supplement is unrecorded: {request:?}"),
                     }
                 }
-                Err(error) => panic!("row building failed at {}: {error}", block.height),
             }
         };
+        let hashes: BTreeSet<_> = transactions.iter().map(|tx| tx.hash()).collect();
+        check_mint_delta(&profile, &hashes, &output.mint_delta, &expected_mints);
+        for (point, entry) in &output.created {
+            held.insert(point.clone(), entry.clone());
+        }
+        for point in &output.spent {
+            held.remove(point);
+        }
+        for tx in transactions.iter().filter(|tx| tx.is_valid()) {
+            for asset in tx.mint().iter().filter(|asset| selection.required(asset)) {
+                actual_mints.push(MintRow {
+                    tx_hash: tx.hash().to_owned(),
+                    policy: asset.policy.clone(),
+                    name: asset.name.clone(),
+                    quantity: asset.quantity.to_string(),
+                });
+            }
+        }
+        let rows = output.rows;
         for tx in transactions {
-            for (hash, bytes) in &tx.datums {
+            for (hash, bytes) in tx.datums() {
                 preimage_sources
                     .entry(hash.clone())
                     .or_default()
@@ -320,12 +314,7 @@ fn compare(path: &Path, planning: bool) {
                     );
                 }
             }
-            for output in tx
-                .outputs
-                .iter()
-                .flatten()
-                .chain(tx.collateral_output.iter())
-            {
+            for output in tx.outputs().iter().flatten().chain(tx.collateral_return()) {
                 if let (Some(hash), Some(bytes)) = (&output.data_hash, &output.inline_datum) {
                     preimage_sources
                         .entry(hash.clone())
@@ -359,30 +348,25 @@ fn compare(path: &Path, planning: bool) {
         known_datums.extend(rows.datum.iter().map(|datum| datum.hash.clone()));
         for (tx, raw) in transactions.iter().zip(&raw) {
             decoded += 1;
-            multi_input_transactions += usize::from(tx.ordinary.len() > 1);
-            if !tx.valid {
+            multi_input_transactions += usize::from(tx.inputs().len() > 1);
+            if !tx.is_valid() {
                 invalid_transactions += 1;
                 shape_witnesses.entry("phase2_invalid").or_insert_with(
-                    || serde_json::json!({"block":block.height,"transaction":tx.hash}),
+                    || serde_json::json!({"block":block.height,"transaction":tx.hash()}),
                 );
             }
-            for output in tx
-                .outputs
-                .iter()
-                .flatten()
-                .chain(tx.collateral_output.iter())
-            {
+            for output in tx.outputs().iter().flatten().chain(tx.collateral_return()) {
                 match output.address_raw.first().map(|h| h >> 4) {
                     Some(8) => {
                         byron_outputs += 1;
                         shape_witnesses.entry("byron_output").or_insert_with(
-                            || serde_json::json!({"block":block.height,"transaction":tx.hash}),
+                            || serde_json::json!({"block":block.height,"transaction":tx.hash()}),
                         );
                     }
                     Some(4 | 5) => {
                         pointer_outputs += 1;
                         shape_witnesses.entry("pointer_output").or_insert_with(
-                            || serde_json::json!({"block":block.height,"transaction":tx.hash}),
+                            || serde_json::json!({"block":block.height,"transaction":tx.hash()}),
                         );
                     }
                     _ => {}
@@ -394,11 +378,10 @@ fn compare(path: &Path, planning: bool) {
                     *decoder_eras
                         .entry(format!("{:?}", other.era()))
                         .or_default() += 1;
-                    assert_eq!(tx.hash, other.hash().to_string());
-                    assert_eq!(tx.valid, other.is_valid());
-                    assert_eq!(tx.ordinary, points(other.inputs()));
-                    assert_eq!(tx.collateral, points(other.collateral()));
-                    assert_eq!(tx.reference, points(other.reference_inputs()));
+                    assert_eq!(tx.hash(), other.hash().to_string());
+                    assert_eq!(tx.is_valid(), other.is_valid());
+                    assert_eq!(tx.inputs(), points(other.inputs()));
+                    assert_eq!(tx.collateral(), points(other.collateral()));
                     let witness_datums: BTreeMap<_, _> = other
                         .plutus_data()
                         .iter()
@@ -407,66 +390,69 @@ fn compare(path: &Path, planning: bool) {
                             (transaction::hash(bytes), bytes.to_vec())
                         })
                         .collect();
-                    assert_eq!(tx.datums, witness_datums, "original witness datum bytes");
+                    let datums: BTreeMap<_, _> = tx
+                        .datums()
+                        .iter()
+                        .map(|(hash, bytes)| (hash.clone(), bytes.to_vec()))
+                        .collect();
+                    assert_eq!(datums, witness_datums, "original witness datum bytes");
                     assert_eq!(
-                        tx.mint,
+                        tx.mint(),
                         assets(other.mints().iter().flat_map(|p| p.assets()).collect())
                     );
                     let outputs = other.outputs();
-                    assert_eq!(tx.outputs.len(), outputs.len());
-                    for (index, (ours, theirs)) in tx.outputs.iter().zip(outputs).enumerate() {
+                    assert_eq!(tx.outputs().len(), outputs.len());
+                    for (index, (ours, theirs)) in tx.outputs().iter().zip(outputs).enumerate() {
                         match resolved_output(
                             ours.as_ref(),
                             index,
-                            &tx.hash,
+                            tx.hash(),
                             &supplements,
-                            tx.valid,
+                            tx.is_valid(),
                         )
                         .expect("effective ordinary output must be independently compared")
                         {
                             Some(ours) => {
                                 fallback_outputs_compared += usize::from(
-                                    tx.outputs[index]
+                                    tx.outputs()[index]
                                         .as_ref()
-                                        .is_none_or(|o| !o.classification_safe),
+                                        .is_none_or(|o| o.address.is_none()),
                                 );
                                 compare_output(ours, &theirs);
                             }
                             None => {
                                 skipped_non_effective_ordinary_outputs += 1;
-                                shape_witnesses.entry("skipped_invalid_ordinary_output").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash,"index":index,"reason":"unresolved output has no chain effect"}));
+                                shape_witnesses.entry("skipped_invalid_ordinary_output").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash(),"index":index,"reason":"unresolved output has no chain effect"}));
                             }
                         }
                     }
                     assert_eq!(
-                        tx.has_collateral_return,
+                        tx.has_collateral_return(),
                         other.collateral_return().is_some()
                     );
                     if let Some(theirs) = other.collateral_return() {
                         match resolved_output(
-                            tx.collateral_output.as_ref(),
-                            tx.outputs.len(),
-                            &tx.hash,
+                            tx.collateral_return(),
+                            tx.outputs().len(),
+                            tx.hash(),
                             &supplements,
-                            !tx.valid,
+                            !tx.is_valid(),
                         )
                         .expect("effective collateral return must be independently compared")
                         {
                             Some(ours) => {
                                 collateral_outputs_compared += 1;
                                 fallback_outputs_compared += usize::from(
-                                    tx.collateral_output
-                                        .as_ref()
-                                        .is_none_or(|o| !o.classification_safe),
+                                    tx.collateral_return().is_none_or(|o| o.address.is_none()),
                                 );
                                 compare_output(ours, &theirs);
                             }
                             None => {
                                 skipped_non_effective_collateral_outputs += 1;
-                                shape_witnesses.entry("skipped_valid_collateral_return").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash,"index":tx.outputs.len(),"reason":"unresolved return has no chain effect"}));
+                                shape_witnesses.entry("skipped_valid_collateral_return").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash(),"index":tx.outputs().len(),"reason":"unresolved return has no chain effect"}));
                             }
                         }
-                        shape_witnesses.entry("collateral_return").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash,"valid":tx.valid}));
+                        shape_witnesses.entry("collateral_return").or_insert_with(||serde_json::json!({"block":block.height,"transaction":tx.hash(),"valid":tx.is_valid()}));
                     }
                 }
                 Err(_) => pallas_unavailable += 1,
@@ -478,16 +464,17 @@ fn compare(path: &Path, planning: bool) {
         actual.tx_in.extend(rows.tx_in);
         actual.datum.extend(rows.datum);
         actual.tx_metadata.extend(rows.tx_metadata);
-        actual.mint.extend(rows.mint);
     }
     actual.tx.sort_by_key(|r| r.id);
     actual.tx_out.sort_by_key(|r| r.id);
     actual.ma_tx_out.sort_by_key(|r| r.id);
     actual.tx_in.sort_by_key(|r| r.id);
     actual.tx_metadata.sort_by_key(|r| r.id);
-    actual
-        .mint
-        .sort_by(|a, b| (&a.tx_hash, &a.policy, &a.name).cmp(&(&b.tx_hash, &b.policy, &b.name)));
+    for mints in [&mut actual_mints, &mut expected_mints] {
+        mints.sort_by(|a, b| {
+            (&a.tx_hash, &a.policy, &a.name).cmp(&(&b.tx_hash, &b.policy, &b.name))
+        });
+    }
     actual.datum.sort_by(|a, b| a.hash.cmp(&b.hash));
     actual.datum.dedup_by(|a, b| {
         assert!(a.hash != b.hash || a.value == b.value);
@@ -565,8 +552,8 @@ fn compare(path: &Path, planning: bool) {
         ),
         (
             "mint",
-            serde_json::to_value(&actual.mint).unwrap(),
-            serde_json::to_value(&expected.mint).unwrap(),
+            serde_json::to_value(&actual_mints).unwrap(),
+            serde_json::to_value(&expected_mints).unwrap(),
         ),
     ] {
         if ours != theirs {
@@ -624,7 +611,7 @@ fn compare(path: &Path, planning: bool) {
         "spends": actual.tx_in.len(),
         "datums": actual.datum.len(),
         "metadata": actual.tx_metadata.len(),
-        "mints": actual.mint.len(),
+        "mints": actual_mints.len(),
         "differing_tables": differences,
         "result": if differences.is_empty() { "equal" } else { "different" },
     });
