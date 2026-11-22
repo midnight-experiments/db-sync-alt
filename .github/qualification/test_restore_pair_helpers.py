@@ -1,10 +1,15 @@
 """Small offline preparation controls; not a PostgreSQL/product qualification."""
 import math
 import unittest
-from restore_pair import PREDECESSOR, checked_publication, configuration, io_delta, query_timings, snapshot_description, wal_delta
+from restore_pair import PREDECESSOR, active_copy_query, checked_publication, configuration, io_delta, query_timings, snapshot_description, wal_delta
 
 
 class PreparationControls(unittest.TestCase):
+    def test_copy_observer_identity_cannot_be_sql_injected(self):
+        for owner in ['', 'owner;SELECT 1', "owner' OR true--", 'a' * 64]:
+            with self.assertRaises(AssertionError): active_copy_query(owner)
+        self.assertIn("usename='restore_pair_owner'", active_copy_query('restore_pair_owner'))
+
     def test_candidate_must_be_exact_and_distinct(self):
         for candidate in ['main', 'a' * 39, PREDECESSOR, 'a' * 40 + '; echo unsafe']:
             with self.assertRaises(AssertionError): configuration(candidate)

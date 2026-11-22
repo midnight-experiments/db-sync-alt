@@ -93,6 +93,20 @@ def wal_delta(before, after):
             'physical_bytes_must_be_read_from_cgroup_not_these_generated_byte_counts': True}
 
 
+def active_copy_query(owner):
+    """Observe this CLI owner's actual COPY, including a private payload relation.
+
+    The target database and db-sync-alt application remain bound by the query.
+    Never require the old serve schema and silently miss a new private loader.
+    """
+    assert re.fullmatch('[a-z_][a-z0-9_]{0,62}', owner)
+    return ("SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,"
+            "'xact_start',xact_start,'query',query,'state',state)), '[]'::json) "
+            "FROM pg_stat_activity WHERE datname=current_database() "
+            f"AND usename='{owner}' AND application_name='db-sync-alt' "
+            "AND state='active' AND query LIKE 'COPY % FROM STDIN%'")
+
+
 def run(g):
     root, out, config = g['ROOT'], g['OUT'], g['CONFIG']
     docker, output, save = (g[k] for k in ['docker', 'output', 'save'])
@@ -278,7 +292,7 @@ def run(g):
                 try:
                     until = time.monotonic()+600
                     while not reader_done.is_set() and time.monotonic()<until:
-                        rows = query("SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'query',query,'state',state)), '[]'::json) FROM pg_stat_activity WHERE datname=current_database() AND application_name='db-sync-alt' AND state='active' AND query LIKE 'COPY serve.% FROM STDIN%'")
+                        rows = query(active_copy_query(owner))
                         if rows:
                             begin = time.monotonic()
                             check = subprocess.run(['docker','exec','-e','PGOPTIONS=-c statement_timeout=500',
@@ -286,7 +300,7 @@ def run(g):
                                 '-h','127.0.0.1','-U','restore_pair_reader','-d',name,'-c','SELECT count(*) FROM public.block'],
                                 capture_output=True,text=True,timeout=5)
                             elapsed = time.monotonic()-begin
-                            after = query("SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start,'xact_start',xact_start,'query',query,'state',state)), '[]'::json) FROM pg_stat_activity WHERE datname=current_database() AND application_name='db-sync-alt' AND state='active' AND query LIKE 'COPY serve.% FROM STDIN%'")
+                            after = query(active_copy_query(owner))
                             reader_probe.update(before=rows,after=after,seconds=elapsed,exit_code=check.returncode,
                                                 stdout=check.stdout,stderr=check.stderr)
                             save(label+'-reader-during-copy.json',reader_probe)
