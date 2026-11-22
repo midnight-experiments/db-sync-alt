@@ -76,6 +76,8 @@ pub enum Error {
     },
     #[error("{reason}")]
     ConversionOutcomeUnknown { reason: &'static str },
+    #[error("{reason}")]
+    RestoreOutcomeUnknown { reason: &'static str },
     #[error("{error}")]
     AtStage {
         stage: &'static str,
@@ -135,6 +137,9 @@ impl Error {
             }
             Self::ConversionOutcomeUnknown { reason } => {
                 json!({"error":reason,"operation":"convert","phase":"conversion_or_optional_snapshot","outcome":"unknown","rollback_confirmed":false,"recovery":"Run status and verify on this exact destination before cleanup or retry. If it is serving and verifies, preserve it and run snapshot with a new writable --file path if needed. Do not repeat convert or restore into a serving or nonempty destination."})
+            }
+            Self::RestoreOutcomeUnknown { reason } => {
+                json!({"error":reason,"operation":"restore","phase":"build_publication_or_retention_settlement","outcome":"unknown","rollback_confirmed":false,"recovery":"Run status on this exact destination. A ready owned build can resume the exact input and reverify without COPY; published requires retention settlement. Preserve a complete/serving destination and verify it. Do not assume rollback, delete nonempty data or substitute another input."})
             }
             Self::AtStage {
                 stage,

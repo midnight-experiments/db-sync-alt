@@ -65,6 +65,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let clock = storage::first_served_at(&tx, i64::from(before.state.horizon.height)).await?;
     assert!(clock.is_some());
+    let target_clock = storage::first_served_at(&tx, i64::from(before.state.target.height)).await?;
+    let restored_cohort: bool = tx
+        .query_one("SELECT to_regclass('dsa.restore_build') IS NOT NULL", &[])
+        .await?
+        .get(0);
+    if restored_cohort {
+        assert_eq!(target_clock, clock);
+    }
+    let next_height = i64::from(before.state.target.height) + 1;
+    // Explicit uncommitted clock model, not a real follower/target advance.
+    tx.execute("INSERT INTO dsa.first_served(height,first_served_at) VALUES($1::bigint::integer,clock_timestamp()) ON CONFLICT(height) DO NOTHING",&[&next_height]).await?;
+    let ordinary_clock:Option<String>=tx.query_one("SELECT to_char(first_served_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM dsa.first_served WHERE height=$1::bigint",&[&next_height]).await?.get(0);
+    let next_clock = storage::first_served_at(&tx, next_height).await?;
+    assert_eq!(next_clock, ordinary_clock);
     tx.rollback().await?;
     let after = store.verify(&profile).await?;
     assert_eq!(before.content_digest, after.content_digest);
@@ -72,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(before.supply, after.supply);
     println!(
         "{}",
-        json!({"passed":true,"write_relation":table,"actual_store_api":true,"existing_id_on_conflict_ignored":true,"allocated_id_above_imported":true,"returning_id_exact":true,"node_visible_once":true,"parent_sqlstate":parent_sqlstate,"retention_clock_present":true,"tuples_rolled_back":true,"sequence_allocation_nontransactional":true,"content_state_supply_unchanged":true})
+        json!({"passed":true,"write_relation":table,"actual_store_api":true,"existing_id_on_conflict_ignored":true,"allocated_id_above_imported":true,"returning_id_exact":true,"node_visible_once":true,"parent_sqlstate":parent_sqlstate,"retention_clock_present":true,"restored_cohort_present":restored_cohort,"cohort_horizon_clock":clock,"cohort_target_clock":target_clock,"next_height_clock":next_clock,"ordinary_next_clock_model_exact":true,"real_follower_advance":false,"tuples_rolled_back":true,"sequence_allocation_nontransactional":true,"content_state_supply_unchanged":true})
     );
     Ok(())
 }

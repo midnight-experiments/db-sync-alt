@@ -767,6 +767,10 @@ impl Store {
         if let Some(report) = cold::resume(self, profile, path).await? {
             return Ok(report);
         }
+        let unowned:bool=self.client.query_one("SELECT to_regnamespace('dsa_restore') IS NOT NULL OR to_regprocedure('dsa.restore_parent_insert_guard()') IS NOT NULL OR EXISTS(SELECT 1 FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace n ON n.oid=p.relnamespace WHERE n.nspname='serve')",&[]).await?.get(0);
+        if unowned {
+            return Err(Error::Refusal("restore_private_storage_conflict"));
+        }
 
         let stage = RestoreStage::start("restore_prepare", "database");
         self.prepare_destination(profile, "restore_failed")
@@ -852,6 +856,10 @@ impl Store {
             || occupied
         {
             return Err(stage.error(Error::Refusal("destination_not_empty")));
+        }
+        let inherited:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace n ON n.oid=p.relnamespace WHERE n.nspname='serve')",&[]).await?.get(0);
+        if inherited {
+            return Err(Error::Refusal("restore_private_storage_conflict"));
         }
         let missing_indexes = if isolated_bulk {
             // No CASCADE/identity reset; failure rolls back this rewrite.
@@ -1016,6 +1024,7 @@ impl Store {
         stage.finish();
         let stage = RestoreStage::start("restore_publish", "database");
         cold::record_direct(&tx, &input_binding, &description, &verified).await?;
+        crate::storage::validate_routes(&tx).await?;
         tx.execute("INSERT INTO dsa.first_served SELECT id,transaction_timestamp() FROM serve.block WHERE id BETWEEN $1 AND $2",&[&i64::from(s.horizon.height),&i64::from(s.target.height)]).await.map_err(|error| stage.error(error))?;
         tx.execute(
             "UPDATE dsa.identity SET origin=$1,tool_version=$2 WHERE id=1",

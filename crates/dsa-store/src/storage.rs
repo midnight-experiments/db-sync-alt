@@ -12,6 +12,8 @@ use tokio_postgres::GenericClient;
 use crate::{Error, NODE_RELATIONS};
 
 pub(crate) const SCHEMA: &str = "dsa_restore";
+pub(crate) const PARENT_GUARD_BODY: &str =
+    "BEGIN RAISE EXCEPTION 'restore_write_route_required' USING ERRCODE='55000';END";
 
 pub(crate) async fn has_journal<C: GenericClient>(client: &C) -> Result<bool, Error> {
     Ok(client
@@ -37,6 +39,7 @@ pub async fn write_relation<C: GenericClient>(client: &C, family: &str) -> Resul
     if !NODE_RELATIONS.contains(&family) {
         return Err(Error::Refusal("unknown_write_family"));
     }
+    client.query_one("SELECT dsa.gate()", &[]).await?;
     let inherited: i64 = client
         .query_one(
             "SELECT count(*) FROM pg_inherits WHERE inhparent=to_regclass($1)",
@@ -67,9 +70,16 @@ pub async fn write_relation<C: GenericClient>(client: &C, family: &str) -> Resul
 }
 
 pub(crate) async fn validate_routes<C: GenericClient>(client: &C) -> Result<(), Error> {
-    let binding: bool = client.query_one("SELECT b.database_oid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND b.database_name=current_database() AND b.owner_oid=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND b.identity_created_at=i.created_at FROM dsa.restore_build b CROSS JOIN dsa.identity i WHERE b.id AND i.id=1",&[]).await?.get(0);
+    let binding: bool = client.query_one("SELECT b.database_oid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND b.database_name=current_database() AND b.owner_oid=(SELECT datdba FROM pg_database WHERE datname=current_database()) AND b.identity_created_at=i.created_at FROM dsa.restore_build b CROSS JOIN dsa.identity i WHERE b.id AND i.id=1",&[]).await?.get(0);
     if !binding {
         return Err(Error::Refusal("restore_destination_binding_mismatch"));
+    }
+    if !crate::snapshot::restore_indexes(client)
+        .await?
+        .missing
+        .is_empty()
+    {
+        return Err(Error::Refusal("restore_public_index_missing"));
     }
     let kind: String = client
         .query_one(
@@ -78,6 +88,12 @@ pub(crate) async fn validate_routes<C: GenericClient>(client: &C) -> Result<(), 
         )
         .await?
         .get(0);
+    if kind == "inherited" {
+        let guard:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang CROSS JOIN dsa.restore_build b WHERE b.id AND p.oid=to_regprocedure('dsa.restore_parent_insert_guard()') AND p.proowner=b.owner_oid AND p.prosrc=$1 AND NOT p.prosecdef AND NOT p.proretset AND p.pronargs=0 AND p.prorettype='trigger'::regtype AND l.lanname='plpgsql')",&[&PARENT_GUARD_BODY]).await?.get(0);
+        if !guard {
+            return Err(Error::Refusal("restore_parent_guard_mismatch"));
+        }
+    }
     for family in NODE_RELATIONS {
         if kind == "direct" {
             let valid: bool=client.query_one("SELECT b.parents->>($1::text)=(to_regclass('serve.'||$1)::oid)::text AND NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhparent=to_regclass('serve.'||$1)) FROM dsa.restore_build b WHERE b.id",&[&family]).await?.get(0);
@@ -160,7 +176,7 @@ pub async fn first_served_at<C: GenericClient>(
     height: i64,
 ) -> Result<Option<String>, Error> {
     if has_journal(client).await? {
-        return Ok(client.query_one("SELECT to_char(CASE WHEN $1::bigint BETWEEN b.initial_horizon AND b.initial_target THEN b.retention_anchor_at ELSE (SELECT first_served_at FROM dsa.first_served WHERE height=$1) END AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM dsa.restore_build b WHERE b.id",&[&height]).await?.get(0));
+        return Ok(client.query_one("SELECT to_char(CASE WHEN $1::bigint BETWEEN b.initial_horizon AND b.initial_target THEN b.retention_anchor_at ELSE (SELECT first_served_at FROM dsa.first_served WHERE height=$1::bigint) END AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM dsa.restore_build b WHERE b.id",&[&height]).await?.get(0));
     }
-    Ok(client.query_one("SELECT to_char((SELECT first_served_at FROM dsa.first_served WHERE height=$1) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",&[&height]).await?.get(0))
+    Ok(client.query_one("SELECT to_char((SELECT first_served_at FROM dsa.first_served WHERE height=$1::bigint) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",&[&height]).await?.get(0))
 }

@@ -231,7 +231,7 @@ pub(super) async fn restore_preflighted(
     // Any missing startup index is created over the empty stable parent, using
     // compatible locks. Canonical names never disappear or become duplicates.
     tx.batch_execute(&indexes.missing.join("\n")).await?;
-    tx.batch_execute("CREATE SCHEMA dsa_restore;REVOKE ALL ON SCHEMA dsa_restore FROM PUBLIC;CREATE FUNCTION dsa.restore_parent_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'restore_write_route_required' USING ERRCODE='55000';END$$;REVOKE ALL ON FUNCTION dsa.restore_parent_insert_guard() FROM PUBLIC").await?;
+    tx.batch_execute(&format!("CREATE SCHEMA dsa_restore;REVOKE ALL ON SCHEMA dsa_restore FROM PUBLIC;CREATE FUNCTION dsa.restore_parent_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $${}$$;REVOKE ALL ON FUNCTION dsa.restore_parent_insert_guard() FROM PUBLIC",storage::PARENT_GUARD_BODY)).await?;
     private_acl(&tx, "SCHEMA", "dsa_restore").await?;
     private_acl(&tx, "FUNCTION", "dsa.restore_parent_insert_guard()").await?;
     for family in NODE_RELATIONS {

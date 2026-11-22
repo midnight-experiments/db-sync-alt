@@ -210,9 +210,12 @@ async fn stopped() -> Result<(), Error> {
 }
 async fn execute(command: Command) -> Result<Value, Error> {
     let converting = matches!(&command, Command::Convert { .. });
+    let restoring = matches!(&command, Command::Restore { .. });
     let interrupted = |reason| {
         if converting {
             Error::ConversionOutcomeUnknown { reason }
+        } else if restoring {
+            Error::RestoreOutcomeUnknown { reason }
         } else {
             Error::Refusal(reason)
         }
@@ -233,6 +236,17 @@ async fn execute(command: Command) -> Result<Value, Error> {
             result=&mut work=>result,
             signal=stopped()=>match signal {Ok(())=>Err(interrupted("operation_interrupted")),Err(error)=>Err(error)},
             _=tokio::time::sleep(Duration::from_secs(u64::from(seconds)))=>Err(interrupted("operation_deadline_exceeded"))
+        };
+        if result.is_err() {
+            group.cancel().await;
+        }
+        result
+    } else if restoring {
+        let work = execute_inner(command, &group);
+        tokio::pin!(work);
+        let result = tokio::select! {
+            result=&mut work=>result,
+            signal=stopped()=>match signal {Ok(())=>Err(interrupted("operation_interrupted")),Err(error)=>Err(error)},
         };
         if result.is_err() {
             group.cancel().await;

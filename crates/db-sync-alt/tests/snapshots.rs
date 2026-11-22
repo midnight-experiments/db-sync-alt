@@ -87,6 +87,7 @@ impl Database {
         Ok(Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
             .args([command, "--database", &self.dsn(), "--network", network])
             .args(args)
+            .kill_on_drop(true)
             .output()
             .await?)
     }
@@ -1834,6 +1835,13 @@ async fn restore_private_ready_resume_and_stalled_gate_reader_contract() -> Resu
     let description = source
         .cli("snapshot", &f.profile.network, &file_args(&path))
         .await?;
+    assert!(
+        description["verified"]["protected_state"]["rows"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "private restore must exercise a nonempty old-spent marker section"
+    );
     let dest = Database::new().await?;
     dest.cli("create", &f.profile.network, &[]).await?;
     dest.cli(
@@ -1866,7 +1874,12 @@ async fn restore_private_ready_resume_and_stalled_gate_reader_contract() -> Resu
         ])
         .args(file_args(&path))
         .kill_on_drop(true);
-    let restore = tokio::spawn(async move { command.output().await });
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = command.spawn()?;
+    let process_id = child.id().ok_or("missing restore process")?;
+    let restore = tokio::spawn(async move { child.wait_with_output().await });
     wait_restore_barrier(&client, &dest.name, "UPDATE dsa.position SET serving=true%").await?;
     assert_eq!(restore_catalogue(&client).await?, original);
     let row=client.query_one("SELECT phase,retention_anchor_at IS NULL,(SELECT count(*) FROM serve.block)>0 FROM dsa.restore_build WHERE id",&[]).await?;
@@ -1913,13 +1926,15 @@ async fn restore_private_ready_resume_and_stalled_gate_reader_contract() -> Resu
     );
     let pid:i32=client.query_one("SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory' AND query LIKE 'UPDATE dsa.position SET serving=true%'",&[&dest.name]).await?.get(0);
     assert!(
-        client
-            .query_one("SELECT pg_cancel_backend($1)", &[&pid])
+        Command::new("kill")
+            .args(["-TERM", &process_id.to_string()])
+            .status()
             .await?
-            .get::<_, bool>(0)
+            .success()
     );
     let failed = restore.await??;
     assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("operation_interrupted"));
     let until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while client
         .query_one(
@@ -1935,6 +1950,23 @@ async fn restore_private_ready_resume_and_stalled_gate_reader_contract() -> Resu
     let ready = dest.cli("status", &f.profile.network, &[]).await?;
     assert_eq!(ready["restore"]["phase"], "ready");
     assert_eq!(ready["position"]["serving"], false);
+    let guard_definition: String = client
+        .query_one(
+            "SELECT pg_get_functiondef('dsa.restore_parent_insert_guard()'::regprocedure)",
+            &[],
+        )
+        .await?
+        .get(0);
+    client.batch_execute("CREATE OR REPLACE FUNCTION dsa.restore_parent_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW;END$$").await?;
+    let bad_guard = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dest.cli_raw("restore", &f.profile.network, &file_args(&path)),
+    )
+    .await??;
+    assert!(!bad_guard.status.success());
+    assert!(String::from_utf8_lossy(&bad_guard.stderr).contains("restore_parent_guard_mismatch"));
+    assert_no_restore_copy(&bad_guard);
+    client.batch_execute(&guard_definition).await?;
     let wrong = dir.path().join("other-valid-input.dsa");
     std::fs::write(
         &wrong,
@@ -2015,5 +2047,53 @@ async fn restore_private_ready_resume_and_stalled_gate_reader_contract() -> Resu
     drop(client);
     source.cleanup().await?;
     dest.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_refuses_unowned_private_objects_and_empty_inheritance() -> Result {
+    let f = fixture(282);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("unowned.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    for kind in ["schema", "guard", "inheritance"] {
+        let dest = Database::new().await?;
+        dest.cli("create", &f.profile.network, &[]).await?;
+        let client = connect(&dest.config).await?;
+        match kind {
+            "schema"=>client.batch_execute("CREATE SCHEMA dsa_restore;CREATE TABLE dsa_restore.keep_me(v integer);INSERT INTO dsa_restore.keep_me VALUES(7)").await?,
+            "guard"=>client.batch_execute("CREATE FUNCTION dsa.restore_parent_insert_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW;END$$").await?,
+            _=>client.batch_execute("CREATE SCHEMA unrelated;CREATE TABLE unrelated.block(LIKE serve.block INCLUDING ALL);ALTER TABLE unrelated.block INHERIT serve.block").await?,
+        }
+        let before = dest.cli("status", &f.profile.network, &[]).await?;
+        let catalogue = restore_catalogue(&client).await?;
+        let refusal = dest
+            .cli_raw("restore", &f.profile.network, &file_args(&path))
+            .await?;
+        assert!(!refusal.status.success());
+        assert!(
+            String::from_utf8_lossy(&refusal.stderr).contains("restore_private_storage_conflict")
+        );
+        assert_no_restore_copy(&refusal);
+        assert_eq!(dest.cli("status", &f.profile.network, &[]).await?, before);
+        assert_eq!(restore_catalogue(&client).await?, catalogue);
+        if kind == "schema" {
+            assert_eq!(
+                client
+                    .query_one("SELECT v FROM dsa_restore.keep_me", &[])
+                    .await?
+                    .get::<_, i32>(0),
+                7
+            );
+        }
+        drop(client);
+        dest.cleanup().await?;
+    }
+    source.cleanup().await?;
     Ok(())
 }
