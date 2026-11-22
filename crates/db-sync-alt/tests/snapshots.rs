@@ -1208,8 +1208,8 @@ async fn wait_restore_barrier(client: &Client, database: &str, prefix: &str) -> 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let blocked: bool = client.query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory' AND query LIKE $2)",
-            &[&database, &prefix],
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory' AND (query LIKE $2 OR query LIKE $3))",
+            &[&database, &prefix, &prefix.replace("COPY serve.","COPY dsa_restore.")],
         ).await?.get(0);
         if blocked {
             return Ok(());
@@ -1219,6 +1219,18 @@ async fn wait_restore_barrier(client: &Client, database: &str, prefix: &str) -> 
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+// Test-only admin fixture: apply an existing generated COPY guard to a newly
+// created private payload table. Product restore deliberately does not clone
+// arbitrary owner triggers. Each event trigger is local to this disposable DB.
+async fn private_copy_test_guard(db: &Database) -> Result {
+    let mut config = db.config.clone();
+    let user: String = db.admin.query_one("SELECT current_user", &[]).await?.get(0);
+    config.user(&user);
+    let admin = connect(&config).await?;
+    admin.batch_execute("CREATE FUNCTION dsa.test_private_copy_guard() RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$DECLARE command record;item record;family text;BEGIN FOR command IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP IF command.command_tag='CREATE TABLE' AND command.object_type='table' AND command.schema_name='dsa_restore' THEN SELECT relname INTO family FROM pg_class WHERE oid=command.objid;FOR item IN SELECT pg_get_triggerdef(oid) AS definition FROM pg_trigger WHERE tgrelid=to_regclass('serve.'||quote_ident(family)) AND NOT tgisinternal AND tgname<>'restore_empty_parent' LOOP EXECUTE replace(item.definition,' ON serve.'||quote_ident(family)||' ',' ON dsa_restore.'||quote_ident(family)||' ');END LOOP;END IF;END LOOP;END$$;REVOKE ALL ON FUNCTION dsa.test_private_copy_guard() FROM PUBLIC;CREATE EVENT TRIGGER test_private_copy_guard ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION dsa.test_private_copy_guard()").await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -1265,6 +1277,7 @@ async fn restore_reader_compatible_cli_copy_indexes_and_atomic_publication() -> 
         .await?;
     closed_reader_queries(&reader).await?;
     client.batch_execute("CREATE FUNCTION serve.q22_copy_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(722,1);RETURN NEW;END$$; REVOKE ALL ON FUNCTION serve.q22_copy_barrier() FROM PUBLIC; CREATE TRIGGER q22_copy_barrier BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.q22_copy_barrier(); CREATE FUNCTION dsa.q22_publish_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(722,2);RETURN NEW;END$$; REVOKE ALL ON FUNCTION dsa.q22_publish_barrier() FROM PUBLIC; CREATE TRIGGER q22_publish_barrier AFTER UPDATE ON dsa.position FOR EACH ROW WHEN(NEW.serving) EXECUTE FUNCTION dsa.q22_publish_barrier(); SELECT pg_advisory_lock(722,1); SELECT pg_advisory_lock(722,2)").await?;
+    private_copy_test_guard(&dest).await?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
     command
         .args([
@@ -1491,6 +1504,7 @@ async fn restore_mode_acl_and_reader_compatible_conflicting_index_retry() -> Res
                 client.batch_execute("DROP INDEX serve.idx_multi_asset_policy_name_hex;CREATE INDEX idx_multi_asset_policy_name_hex ON serve.multi_asset(encode(policy,'hex'),encode(name,'hex'))").await?;
                 // Real COPY failure in compatible mode must preserve empty storage.
                 client.batch_execute("CREATE FUNCTION serve.q22_error() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION USING ERRCODE='P0001',MESSAGE='generated';END$$;REVOKE ALL ON FUNCTION serve.q22_error() FROM PUBLIC;CREATE TRIGGER q22_error BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION serve.q22_error()").await?;
+                private_copy_test_guard(&dest).await?;
                 let old: i64 = client
                     .query_one(
                         "SELECT pg_relation_filenode('serve.block'::regclass)::bigint",

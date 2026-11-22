@@ -65,15 +65,17 @@ server already uses `wal_level=minimal`; other WAL modes keep their normal WAL
 policy. Failure rolls back the empty-storage replacement.
 
 If gate access has been granted to another role, PUBLIC or a group, or ownership
-differs, `reader_compatible` retains empty storage and matching secondary indexes,
-builds missing indexes and uses locks compatible with SELECT. Conflicting or
-invalid named indexes are refused as `destination_index_mismatch`. A legitimate
-node reader keeps getting SQLSTATE 55000 while loading and verification run,
-including queries prepared earlier; complete checked rows appear only at commit.
-This path writes normal row WAL and maintains existing indexes during COPY, so
-it can take materially longer. Both paths preserve
-relation identities, ACLs, private allocation sequences and atomic publication;
-no `CASCADE`, server setting or reader privilege change is used.
+differs, the prototype `reader_compatible` retains the empty stable parents and
+their matching startup indexes, builds missing prerequisites, and loads the
+fresh private children. Conflicting or invalid canonical indexes are refused as
+`destination_index_mismatch`. A legitimate node reader keeps getting SQLSTATE
+55000 through private load/verification/commit and a stalled gate publication,
+including previously prepared queries. Complete checked rows become public
+only at the later gate commit. Both paths preserve stable public relation
+identities, ACLs, imported IDs and private allocation sequences; no `CASCADE`,
+server setting or reader privilege change is used. The compatible prototype's
+new internal write-routing and retention contracts are described above. Full
+timing still needs measurement rather than a COPY/WAL-only prediction.
 
 Product `grant-reader` takes the same session writer lock and cannot attach a
 reader during restore. Concurrent manual owner DDL or GRANT does not follow that
