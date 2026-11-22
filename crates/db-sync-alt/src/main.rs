@@ -116,6 +116,9 @@ enum Command {
         database: DatabaseArguments,
         #[arg(long)]
         file: PathBuf,
+        /// Refuse the file unless its content digest is this one.
+        #[arg(long, value_parser = content_digest)]
+        expect_content_digest: Option<String>,
     },
     /// Convert a serving legacy public reader snapshot into this database.
     Convert {
@@ -160,6 +163,18 @@ enum Command {
     },
 }
 
+fn content_digest(value: &str) -> Result<String, String> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(value.to_owned())
+    } else {
+        Err("expected 64 lowercase hexadecimal characters".to_owned())
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     match execute(Arguments::parse().command).await {
@@ -183,6 +198,14 @@ struct CancelGroup(Arc<Mutex<Vec<dsa_store::Cancellation>>>);
 impl CancelGroup {
     fn add(&self, value: dsa_store::Cancellation) {
         self.0.lock().expect("cancellation registry").push(value);
+    }
+    /// Whether a load sent the commit that publishes it.
+    fn commit_sent(&self) -> bool {
+        self.0
+            .lock()
+            .expect("cancellation registry")
+            .iter()
+            .any(dsa_store::Cancellation::commit_sent)
     }
     async fn cancel(&self) {
         let handles = self.0.lock().expect("cancellation registry").clone();
@@ -209,16 +232,17 @@ async fn stopped() -> Result<(), Error> {
     }
 }
 async fn execute(command: Command) -> Result<Value, Error> {
-    let converting = matches!(&command, Command::Convert { .. });
-    let restoring = matches!(&command, Command::Restore { .. });
-    let interrupted = |reason| {
-        if converting {
-            Error::ConversionOutcomeUnknown { reason }
-        } else if restoring {
-            Error::RestoreOutcomeUnknown { reason }
-        } else {
-            Error::Refusal(reason)
-        }
+    let load = match &command {
+        Command::Convert { .. } => Some("convert"),
+        Command::Restore { .. } => Some("restore"),
+        _ => None,
+    };
+    let group = CancelGroup::default();
+    // A stopped load is unknown only once its publishing commit was sent.
+    let interrupted = |reason| match load {
+        Some(operation) if group.commit_sent() => Error::OutcomeUnknown { operation, reason },
+        Some(operation) => Error::Interrupted { operation, reason },
+        None => Error::Refusal(reason),
     };
     let seconds = match &command {
         Command::Compare(args) => Some(args.overall_timeout_seconds),
@@ -228,7 +252,6 @@ async fn execute(command: Command) -> Result<Value, Error> {
         } => Some(*overall_timeout_seconds),
         _ => None,
     };
-    let group = CancelGroup::default();
     if let Some(seconds) = seconds {
         let work = execute_inner(command, &group);
         tokio::pin!(work);
@@ -241,7 +264,7 @@ async fn execute(command: Command) -> Result<Value, Error> {
             group.cancel().await;
         }
         result
-    } else if restoring {
+    } else if load.is_some() {
         let work = execute_inner(command, &group);
         tokio::pin!(work);
         let result = tokio::select! {
@@ -356,9 +379,15 @@ async fn database_command(
         Command::Snapshot { file, .. } => {
             Ok(serde_json::to_value(store.snapshot(profile, file).await?)?)
         }
-        Command::Restore { file, .. } => {
-            Ok(serde_json::to_value(store.restore(profile, file).await?)?)
-        }
+        Command::Restore {
+            file,
+            expect_content_digest,
+            ..
+        } => Ok(serde_json::to_value(
+            store
+                .restore(profile, file, expect_content_digest.as_deref())
+                .await?,
+        )?),
         Command::Convert {
             source,
             source_password_file,
@@ -423,12 +452,8 @@ async fn database_command(
                     dsa_store::compare::capture(&tx, profile, &positions, &Default::default())
                         .await?;
                 tx.commit().await?;
-                eprintln!(
-                    "{}",
-                    json!({"event":"conversion_source_snapshot_committed"})
-                );
-                // Observation publication precedes destination publication. File
-                // failure drops the staged conversion with its gate closed.
+                // The capture file is written before the conversion publishes;
+                // a file failure drops the staged conversion with its gate closed.
                 let path = path.clone();
                 let published = tokio::task::spawn_blocking(move || {
                     dsa_store::source_capture::write(&path, &captured)

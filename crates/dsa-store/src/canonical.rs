@@ -86,7 +86,8 @@ pub(crate) fn selected_staging(table: &str) -> Result<String, Error> {
         table,
         crate::keep::SourceSchema::Temporary,
         format!(
-            "WITH conversion_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,$3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,$6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,$9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names), keep_{table} AS (SELECT id FROM pg_temp.conversion_keep_keys WHERE family='{table}')"
+            "WITH {} keep_{table} AS (SELECT id FROM pg_temp.conversion_keep_keys WHERE family='{table}')",
+            crate::keep::BINDINGS
         ),
     )
 }

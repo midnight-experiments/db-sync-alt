@@ -2080,7 +2080,7 @@ fn candidate_input(capture: &Capture, case: &Case) -> Option<CandidateInput> {
         reference_block: i32::try_from(row["block_no"].as_i64()?).ok()?,
     })
 }
-/// Q14 helper IDs are informational. Q19 excludes only the configured-address
+/// Helper IDs are informational. Only the configured-address
 /// registered-candidate observations; raw rows and differences remain present.
 /// Every other query/input and every identifier retains exact comparison.
 pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {

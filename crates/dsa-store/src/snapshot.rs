@@ -1,328 +1,42 @@
-//! Snapshot container and restore protocol, development format v1.
+//! The snapshot file: one consistent state of a serving database.
 //!
-//! Wire format 1 carries keep-rule version 2. Old rule-1 files are refused,
-//! never relabelled; regenerate by conversion from a genuine legacy source.
-//! Snapshots preserve all selected payloads and original pre-filter ordinals.
+//! Layout: the eight bytes `DSASNAP\0`, the format number (u32, big endian),
+//! the description length (u64, big endian), the SHA-256 of the description,
+//! the description (UTF-8 JSON), then one section per table. The description
+//! binds network, profile hash, keep-rule version, node and tool release, the
+//! origin, the verified state (horizon, target, tip, retention, per-family
+//! digests, content and state digests, supply) and, per section, its row
+//! count, compressed and plain sizes and hash. Each section is one
+//! zstd-compressed PostgreSQL binary COPY stream: the eleven served tables and
+//! the outputs consumed before the horizon. First-served times and provider
+//! call counts belong to an instance and are not in the file.
 //!
-//! File: eight-byte magic `DSASNAP\0`, u32 BE format number, u64 BE description
-//! byte length, SHA-256(description), then the UTF-8 JSON description. Description
-//! fields bind network/profile/node/rule/tool, H/T/P(height/hash/time), retention,
-//! provenance, canonical content and protected-state digests, natural-key family
-//! counts/hashes, supply
-//! quantities, and ordered section names/counts/compressed+plain sizes/hashes.
-//! Each section is one independently zstd-compressed PostgreSQL17 binary COPY
-//! stream. Sections cover all eleven served tables and sparse internal
-//! consumed-before-horizon state. Supply is protected in the description and
-//! canonical digest. First-served timestamps are deliberately reset on restore;
-//! provider accounting belongs to the instance and is not imported.
-//!
-//! Snapshot opens exactly one REPEATABLE READ READ ONLY transaction, verifies
-//! serving state and integrity in that snapshot, and streams COPY per family to
-//! temporary compressed sections beside the requested output. It takes no writer
-//! lock. Only after all hashes/sizes are known is a new complete file atomically
-//! published; an existing file is never overwritten. Every temporary is removed
-//! on error. Compression memory is bounded; whole tables are never buffered.
-//! Once COPY finishes, the read transaction commits before spool fsync/hash I/O.
-//! Temporary sections plus the final temporary output require roughly twice
-//! the compressed file size. Bytes copied into the final file are re-hashed.
-//! A directory fsync failure after publication is reported as published with
-//! durability uncertain; the file remains present and must not be overwritten.
-//!
-//! Provenance is a fixed flat record, not a recursively embedded snapshot chain.
-//! Original source kind/network/target/tip/creation time survive every restore;
-//! only the latest snapshot's two digests are retained. Each text field is
-//! bounded (64 bytes except small kind/network labels), so depth and maximum
-//! description size do not grow with generations.
-//!
-//! Restore validates the destination before any destructive change: an existing
-//! serving/nonempty database is preserved and refused. An empty database gets
-//! the layout without secondary indexes and a closed gate; an explicitly owned
-//! failed restore may retry. Identity/state are committed closed before ingest.
-//! All section hashes and total file framing are preflighted outside the load
-//! transaction. Compressed bytes actually decoded are hashed again during COPY.
-//! Empty COPY tables are rechecked under relation/identity locks. Before a node
-//! reader has gate access, the ingest transaction truncates them, allowing
-//! minimal-WAL COPY when the server already uses that WAL mode. Once gate access
-//! is granted, a prototype builds one private inherited child per stable served
-//! parent. Parent views/indexes/OIDs remain in place; no public binding DDL is
-//! used. Bulk commit stays closed, and final publication is a gate/state update.
-//! Direct parent INSERT/COPY is rejected; writers use the validated physical
-//! write route for ON CONFLICT and RETURNING. This new internal boundary still
-//! needs follower integration and performance qualification.
-//! No CASCADE, sequence reset or server-policy change occurs. Product reader
-//! grants share the writer lock, so they cannot race the isolated fast path.
-//! Caller statement/idle transaction timeouts remain in force; no timeout is
-//! silently disabled. Long operations need explicit operator-chosen limits.
-//! Restore reports separate COPY/index/analyze/verification/publication times.
-//! On a send failure, queued bytes count only earlier successful send awaits,
-//! not the attempted chunk or any server row acknowledgement.
-//! A writer-locked transaction streams bounded decompression into binary COPY,
-//! checks exact sizes/hashes/trailing EOF, creates indexes, analyzes, initializes
-//! private allocation sequences above imported identity IDs, verifies closure,
-//! positional ranges, header continuity, supply, sparse markers and digest, then
-//! publishes state/gate atomically. Invalid inputs roll back imported rows. A
-//! verified private build may commit closed and resume publication without COPY,
-//! bound to destination/input/verified result; it is never treated as empty.
-//! Completed/serving destinations remain refused. Successful restore also
-//! requires a subsequent once-only retention anchor, protecting the initial
-//! cohort until settlement. Later heights retain their ordinary clocks.
-//!
-//! Sparse state stores the retained outpoint ID; presence means consumed before
-//! H, derived inside the same source snapshot. It stores no spending height. Its
-//! separate natural-key state_digest uses creator hash/index instead of numeric
-//! ID, preserving the eleven served families' node-content digest definition.
-//! Verification rejects missing/non-old outputs or contradictory window spends.
-//! It is never exposed through public views, and consumed_by_tx_id stays NULL.
-//! This bit survives snapshots so an old spent carry output cannot become an
-//! unspent K3 output when its spend is no longer served and H advances again.
+//! `snapshot` reads one REPEATABLE READ READ ONLY transaction, verifies it,
+//! streams each table into a compressed temporary section beside the output,
+//! then writes the complete file under a temporary name and publishes it
+//! without overwriting; it needs about twice the file size in free space.
 
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
-    time::Instant,
 };
 
-use bytes::Bytes;
 use dsa_chain::{VERSION, profiles::Profile};
-use futures_util::{SinkExt, StreamExt, pin_mut};
+use futures_util::{StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{GenericClient, IsolationLevel};
 
-mod cold;
-
 use crate::{
     DATABASE_FORMAT, Error, KEEP_RULE_VERSION, NODE_RELATIONS, Store,
-    verify::{self, MARKERS, Verification},
+    verify::{self, Checks, MARKERS, Verification},
 };
 
 const MAGIC: &[u8; 8] = b"DSASNAP\0";
 const FORMAT: u32 = 1;
 const MAX_DESCRIPTION: u64 = 1024 * 1024;
 const MAX_SECTION: u64 = 1 << 40;
-
-pub(crate) async fn restore_access<C: GenericClient>(
-    client: &C,
-) -> Result<(bool, &'static str), Error> {
-    let row = client.query_one(
-        "SELECT p.proowner=(SELECT oid FROM pg_roles WHERE rolname=current_user),EXISTS(SELECT 1 FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner) FROM pg_proc p WHERE p.oid='dsa.gate()'::regprocedure", &[],
-    ).await?;
-    let owner_matches: bool = row.get(0);
-    let other_grants: bool = row.get(1);
-    Ok((
-        owner_matches && !other_grants,
-        if !owner_matches {
-            "owner_changed"
-        } else if other_grants {
-            "non_owner_grant"
-        } else {
-            "owner_only"
-        },
-    ))
-}
-
-// Compare the server's index deparse with our fixed DDL, allowing only its
-// default btree spelling, quoted `index` column and implicit encode argument
-// casts from our bytea domains / hex literal. Other casts remain significant.
-// Keep quoted contents intact: whitespace inside a literal is significant.
-pub(crate) fn index_shape(sql: &str) -> Vec<String> {
-    let mut chars = sql.trim_end_matches(';').chars().peekable();
-    let mut tokens = Vec::new();
-    while let Some(ch) = chars.next() {
-        if ch.is_whitespace() {
-            continue;
-        }
-        let mut token = ch.to_string();
-        if ch == '\'' || ch == '"' {
-            while let Some(next) = chars.next() {
-                token.push(next);
-                if next == ch {
-                    if chars.peek() == Some(&ch) {
-                        token.push(chars.next().expect("peeked quote"));
-                    } else {
-                        break;
-                    }
-                }
-            }
-        } else if ch.is_alphanumeric() || ch == '_' {
-            while chars
-                .peek()
-                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
-            {
-                token.push(chars.next().expect("peeked identifier"));
-            }
-        }
-        tokens.push(if token == "\"index\"" {
-            "index".into()
-        } else {
-            token
-        });
-    }
-    let mut shape = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        // pg_get_indexdef may omit the table schema when it is in search_path.
-        // The catalogue query independently requires the exact served table OID.
-        if tokens[i..].starts_with(&["ON".into(), "serve".into(), ".".into()]) {
-            shape.push("ON".into());
-            i += 3;
-        } else if tokens[i..].starts_with(&["USING".into(), "btree".into()]) {
-            i += 2;
-        } else if i + 9 <= tokens.len()
-            && tokens[i] == "encode"
-            && tokens[i + 1] == "("
-            && tokens[i + 2] == "("
-            && matches!(tokens[i + 3].as_str(), "policy" | "name")
-            && tokens[i + 4..i + 9] == [")", ":", ":", "bytea", ","]
-        {
-            shape.extend([
-                "encode".into(),
-                "(".into(),
-                tokens[i + 3].clone(),
-                ",".into(),
-            ]);
-            i += 9;
-        } else if tokens[i..].starts_with(&["'hex'".into(), ":".into(), ":".into(), "text".into()])
-        {
-            shape.push("'hex'".into());
-            i += 4;
-        } else {
-            shape.push(tokens[i].clone());
-            i += 1;
-        }
-    }
-    shape
-}
-
-pub(crate) struct RestoreIndexes {
-    pub missing: Vec<&'static str>,
-}
-
-pub(crate) async fn restore_indexes<C: GenericClient>(tx: &C) -> Result<RestoreIndexes, Error> {
-    let mut missing = Vec::new();
-    for sql in include_str!("indexes.sql")
-        .lines()
-        .filter(|line| line.starts_with("CREATE"))
-    {
-        let name = sql
-            .split("INDEX ")
-            .nth(1)
-            .and_then(|s| s.split_whitespace().next())
-            .ok_or(Error::Refusal("invalid_index_catalogue"))?;
-        let table = sql
-            .split(" ON ")
-            .nth(1)
-            .and_then(|s| s.split(['(', ' ']).next())
-            .ok_or(Error::Refusal("invalid_index_catalogue"))?;
-        let row = tx.query_opt(
-            "SELECT CASE WHEN i.indexrelid IS NOT NULL THEN pg_get_indexdef(c.oid) ELSE '' END,coalesce(i.indrelid=to_regclass($2),false),coalesce(i.indisvalid AND i.indisready AND i.indislive,false) FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.oid=to_regclass($1)",
-            &[&format!("serve.{name}"), &table],
-        ).await?;
-        match row {
-            None => missing.push(sql),
-            Some(row)
-                if row.get::<_, bool>(1)
-                    && row.get::<_, bool>(2)
-                    && index_shape(&row.get::<_, String>(0)) == index_shape(sql) => {}
-            Some(_) => {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"event":"restore_index_mismatch","index":name})
-                );
-                return Err(Error::Refusal("destination_index_mismatch"));
-            }
-        }
-    }
-    Ok(RestoreIndexes { missing })
-}
-
-pub(crate) fn restore_tables() -> Result<(Vec<String>, Vec<String>), Error> {
-    let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
-    let mut locked = copied.clone();
-    locked.extend([
-        "dsa.supply".into(),
-        "dsa.first_served".into(),
-        "dsa.calls".into(),
-    ]);
-    Ok((copied, locked))
-}
-
-pub(crate) async fn lock_empty_restore<C: GenericClient>(
-    tx: &C,
-    locked: &[String],
-    isolated_bulk: bool,
-    failed_kind: &'static str,
-) -> Result<(), Error> {
-    // Lock before taking a data snapshot, also for a caller using RR isolation.
-    tx.batch_execute(&format!(
-        "LOCK TABLE {} IN {} MODE",
-        locked.join(","),
-        if isolated_bulk {
-            "ACCESS EXCLUSIVE"
-        } else {
-            "SHARE ROW EXCLUSIVE"
-        }
-    ))
-    .await?;
-    if isolated_bulk && !restore_access(tx).await?.0 {
-        return Err(Error::Refusal("gate_access_changed"));
-    }
-    let row = tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1 FOR UPDATE OF p,i", &[]).await?;
-    let occupied = locked
-        .iter()
-        .map(|name| format!("EXISTS(SELECT 1 FROM {name})"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let occupied: bool = tx
-        .query_one(&format!("SELECT {occupied}"), &[])
-        .await?
-        .get(0);
-    if row.get::<_, bool>(0)
-        || row.get::<_, Option<String>>(1).as_deref() != Some(failed_kind)
-        || occupied
-    {
-        return Err(Error::Refusal("destination_not_empty"));
-    }
-    Ok(())
-}
-
-// Restore-local stage timings contain only fixed operation and table labels.
-// They neither change the SQL grouping nor adjust any operational timeout.
-struct RestoreStage<'a> {
-    stage: &'static str,
-    family: &'a str,
-    began: Instant,
-}
-impl<'a> RestoreStage<'a> {
-    fn start(stage: &'static str, family: &'a str) -> Self {
-        eprintln!(
-            "{}",
-            serde_json::json!({"event":"restore_stage_started","stage":stage,"family":family})
-        );
-        Self {
-            stage,
-            family,
-            began: Instant::now(),
-        }
-    }
-    fn error(&self, error: impl Into<Error>) -> Error {
-        Error::AtStage {
-            stage: self.stage,
-            family: self.family.to_owned(),
-            elapsed_seconds: self.began.elapsed().as_secs_f64(),
-            wait_seconds: None,
-            queued_plain_bytes: None,
-            error: Box::new(error.into()),
-        }
-    }
-    fn finish(&self) {
-        eprintln!(
-            "{}",
-            serde_json::json!({"event":"restore_stage_finished","stage":self.stage,"family":self.family,"elapsed_seconds":self.began.elapsed().as_secs_f64()})
-        );
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -407,7 +121,8 @@ impl Provenance {
         profile: &Profile,
         verified: &Verification,
     ) -> Result<Self, Error> {
-        let row=client.query_one("SELECT origin->>'kind',origin->>'source_kind',origin->>'source_network',origin->>'source_target_height',origin->>'source_target_hash',origin->>'source_target_time',origin->>'source_tip_height',origin->>'source_tip_hash',origin->>'source_tip_time',coalesce(origin->>'source_created_at',to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')),origin->>'snapshot_content_digest',origin->>'snapshot_state_digest' FROM dsa.identity WHERE id=1",&[]).await?;
+        let row=client.query_one("SELECT origin->>'kind',origin->>'source_kind',origin->>'source_network',origin->>'source_target_height',origin->>'source_target_hash',origin->>'source_target_time',origin->>'source_tip_height',origin->>'source_tip_hash',origin->>'source_tip_time',coalesce(origin->>'source_created_at',to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')),origin->>'snapshot_content_digest',origin->>'snapshot_state_digest' \
+            FROM dsa.identity WHERE id=1",&[]).await?;
         let text = |index: usize, default: &str| {
             row.get::<_, Option<String>>(index)
                 .unwrap_or_else(|| default.to_owned())
@@ -439,7 +154,7 @@ impl Provenance {
         Ok(result)
     }
 
-    fn restored(&self, verified: &Verification) -> Self {
+    pub(crate) fn restored(&self, verified: &Verification) -> Self {
         Self {
             kind: "restored".to_owned(),
             snapshot_content_digest: Some(verified.content_digest.clone()),
@@ -449,10 +164,10 @@ impl Provenance {
     }
 }
 
-fn tables() -> impl Iterator<Item = &'static str> {
+pub(crate) fn tables() -> impl Iterator<Item = &'static str> {
     NODE_RELATIONS.into_iter().chain([MARKERS])
 }
-fn qualified(table: &str) -> Result<String, Error> {
+pub(crate) fn qualified(table: &str) -> Result<String, Error> {
     if table == MARKERS {
         Ok(format!("dsa.{table}"))
     } else if NODE_RELATIONS.contains(&table) {
@@ -477,20 +192,20 @@ fn hash_reader(reader: &mut impl Read) -> Result<(u64, String), Error> {
     Ok((size, format!("{:x}", hash.finalize())))
 }
 
-struct CheckedReader<R> {
+pub(crate) struct CheckedReader<R> {
     inner: R,
     hash: Sha256,
     bytes: u64,
 }
 impl<R> CheckedReader<R> {
-    fn new(inner: R) -> Self {
+    pub(crate) fn new(inner: R) -> Self {
         Self {
             inner,
             hash: Sha256::new(),
             bytes: 0,
         }
     }
-    fn finish(self) -> (u64, String) {
+    pub(crate) fn finish(self) -> (u64, String) {
         (self.bytes, format!("{:x}", self.hash.finalize()))
     }
 }
@@ -503,7 +218,7 @@ impl<R: Read> Read for CheckedReader<R> {
     }
 }
 
-fn preflight(file: &mut File, description: &Description) -> Result<(), Error> {
+pub(crate) fn preflight(file: &mut File, description: &Description) -> Result<(), Error> {
     let first = file.stream_position()?;
     let expected = description
         .sections
@@ -523,7 +238,7 @@ fn preflight(file: &mut File, description: &Description) -> Result<(), Error> {
     Ok(())
 }
 
-fn read_description(file: &mut File, profile: &Profile) -> Result<Description, Error> {
+pub(crate) fn read_description(file: &mut File, profile: &Profile) -> Result<Description, Error> {
     let mut magic = [0; 8];
     file.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -616,7 +331,7 @@ impl Store {
             .read_only(true)
             .start()
             .await?;
-        let verified = verify::verify(&tx, profile, true).await?;
+        let verified = verify::verify(&tx, profile, Checks::SNAPSHOT).await?;
         let origin = Provenance::capture(&tx, profile, &verified).await?;
         let mut sections = Vec::new();
         for table in tables() {
@@ -660,9 +375,9 @@ impl Store {
                 sha256: String::new(),
             });
         }
+        // The spool files hold the snapshot; do not stay idle in it while they
+        // are synced and hashed.
         tx.commit().await?;
-        // COPY fixed the source snapshot in private spool files. Avoid holding
-        // an idle transaction during local sync/hash I/O.
         for section in &mut sections {
             let mut file = File::options()
                 .read(true)
@@ -712,377 +427,5 @@ impl Store {
             .and_then(|directory| directory.sync_all())
             .map_err(|_| Error::PublishedDurabilityUncertain)?;
         Ok(description)
-    }
-
-    /// Preserve serving/nonempty destinations. A failed restore owns only its
-    /// explicitly marked empty layout; its load transaction always rolls back.
-    pub(crate) async fn prepare_destination(
-        &mut self,
-        profile: &Profile,
-        failed_kind: &'static str,
-    ) -> Result<(), Error> {
-        if !matches!(failed_kind, "restore_failed" | "convert_failed") {
-            return Err(Error::Refusal("invalid_load_operation"));
-        }
-        let identity: bool = self
-            .client
-            .query_one("SELECT to_regclass('dsa.identity') IS NOT NULL", &[])
-            .await?
-            .get(0);
-        if !identity {
-            self.create_layout(profile, false).await?;
-        }
-        self.open(profile).await?;
-        let tx = self.writer_transaction().await?;
-        let row=tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1",&[]).await?;
-        let origin: Option<String> = row.get(1);
-        if row.get::<_, bool>(0) {
-            return Err(Error::Refusal("destination_not_empty"));
-        }
-        let counts = tables()
-            .map(|t| qualified(t).map(|q| format!("(SELECT count(*) FROM {q})")))
-            .collect::<Result<Vec<_>, _>>()?
-            .join("+");
-        let occupied: i64 = tx.query_one(&format!("SELECT {counts}+(SELECT count(*) FROM dsa.supply)+(SELECT count(*) FROM dsa.first_served)+(SELECT count(*) FROM dsa.calls)"), &[]).await?.get(0);
-        if occupied != 0
-            || !(origin.as_deref() == Some("empty") || origin.as_deref() == Some(failed_kind))
-        {
-            return Err(Error::Refusal("destination_not_empty"));
-        }
-        tx.execute(
-            "UPDATE dsa.position SET serving=false,reason=$1,updated_at=now() WHERE id=1",
-            &[&failed_kind],
-        )
-        .await?;
-        tx.execute(
-            "UPDATE dsa.identity SET origin=jsonb_build_object('kind',$1::text) WHERE id=1",
-            &[&failed_kind],
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn restore(&mut self, profile: &Profile, path: &Path) -> Result<Verification, Error> {
-        if let Some(report) = cold::resume(self, profile, path).await? {
-            return Ok(report);
-        }
-        let unowned:bool=self.client.query_one("SELECT to_regnamespace('dsa_restore') IS NOT NULL OR to_regprocedure('dsa.restore_parent_insert_guard()') IS NOT NULL OR EXISTS(SELECT 1 FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace n ON n.oid=p.relnamespace WHERE n.nspname='serve')",&[]).await?.get(0);
-        if unowned {
-            return Err(Error::Refusal("restore_private_storage_conflict"));
-        }
-
-        let stage = RestoreStage::start("restore_prepare", "database");
-        self.prepare_destination(profile, "restore_failed")
-            .await
-            .map_err(|error| stage.error(error))?;
-        stage.finish();
-        // Opening/parsing happens after a closed, identifiable retry state exists.
-        let stage = RestoreStage::start("restore_preflight", "database");
-        let mut file = File::open(path).map_err(|error| stage.error(error))?;
-        let description =
-            read_description(&mut file, profile).map_err(|error| stage.error(error))?;
-        preflight(&mut file, &description).map_err(|error| stage.error(error))?;
-        stage.finish();
-        let stage = RestoreStage::start("restore_recheck_empty", "database");
-        // A supported reader needs gate EXECUTE. Conservatively keep read locks
-        // compatible if any other role (including PUBLIC or a group) has it, or
-        // the gate owner differs. Do not base this on currently active sessions.
-        // grant-reader uses this same session writer lock, across preflight and
-        // commit. Concurrent manual owner DDL/GRANT is outside that protocol.
-        // This metadata read stays outside ingest, so even REPEATABLE READ
-        // starts its data snapshot only after the load locks. The session writer
-        // advisory lock is already held across prepare/preflight/load.
-        let (isolated_bulk, reason) = restore_access(self.client())
-            .await
-            .map_err(|error| stage.error(error))?;
-        eprintln!(
-            "{}",
-            serde_json::json!({"event":"restore_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"},"reason":reason})
-        );
-        if !isolated_bulk {
-            return cold::restore_preflighted(self, profile, file, description).await;
-        }
-        let input_binding = cold::input_hash(&mut file)?;
-        let tx = self
-            .writer_transaction()
-            .await
-            .map_err(|error| stage.error(error))?;
-        // Recheck the committed closed layout under locks excluding other DML.
-        // Only the isolated path replaces empty storage for minimal-WAL COPY.
-        let copied = tables().map(qualified).collect::<Result<Vec<_>, _>>()?;
-        let mut locked = copied.clone();
-        locked.extend([
-            "dsa.supply".into(),
-            "dsa.first_served".into(),
-            "dsa.calls".into(),
-        ]);
-        tx.batch_execute(&format!(
-            "LOCK TABLE {} IN {} MODE",
-            locked.join(","),
-            if isolated_bulk {
-                "ACCESS EXCLUSIVE"
-            } else {
-                "SHARE ROW EXCLUSIVE"
-            }
-        ))
-        .await
-        .map_err(|error| stage.error(error))?;
-        // Narrow an out-of-protocol manual GRANT race while we waited. This is
-        // after load locks, preserving the RR recheck snapshot ordering. Owner
-        // DDL after this check still bypasses the product's writer protocol.
-        if isolated_bulk
-            && !restore_access(&tx)
-                .await
-                .map_err(|error| stage.error(error))?
-                .0
-        {
-            return Err(stage.error(Error::Refusal("gate_access_changed")));
-        }
-        let row = tx.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1 FOR UPDATE OF p,i", &[])
-            .await.map_err(|error| stage.error(error))?;
-        let occupied = locked
-            .iter()
-            .map(|name| format!("EXISTS(SELECT 1 FROM {name})"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let occupied: bool = tx
-            .query_one(&format!("SELECT {occupied}"), &[])
-            .await
-            .map_err(|error| stage.error(error))?
-            .get(0);
-        if row.get::<_, bool>(0)
-            || row.get::<_, Option<String>>(1).as_deref() != Some("restore_failed")
-            || occupied
-        {
-            return Err(stage.error(Error::Refusal("destination_not_empty")));
-        }
-        let inherited:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace n ON n.oid=p.relnamespace WHERE n.nspname='serve')",&[]).await?.get(0);
-        if inherited {
-            return Err(Error::Refusal("restore_private_storage_conflict"));
-        }
-        let missing_indexes = if isolated_bulk {
-            // No CASCADE/identity reset; failure rolls back this rewrite.
-            tx.batch_execute(&format!("TRUNCATE TABLE {}", copied.join(",")))
-                .await
-                .map_err(|error| stage.error(error))?;
-            Vec::new()
-        } else {
-            // DROP INDEX also takes ACCESS EXCLUSIVE on its table. Retain
-            // matching indexes and reject conflicting definitions before COPY.
-            restore_indexes(&tx)
-                .await
-                .map_err(|error| stage.error(error))?
-                .missing
-        };
-        stage.finish();
-        let stage = RestoreStage::start("restore_drop_indexes", "database");
-        // A manually initialized empty layout may already have secondary indexes.
-        for line in include_str!("indexes.sql")
-            .lines()
-            .filter(|line| isolated_bulk && line.starts_with("CREATE"))
-        {
-            let name = line
-                .split("INDEX ")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .ok_or(Error::Refusal("invalid_index_catalogue"))?;
-            tx.batch_execute(&format!("DROP INDEX IF EXISTS serve.{name}"))
-                .await
-                .map_err(|error| stage.error(error))?;
-        }
-        stage.finish();
-        for section in &description.sections {
-            {
-                let table = qualified(&section.table)?;
-                let began = Instant::now();
-                let database_error =
-                    |stage, error: tokio_postgres::Error, wait_seconds, queued_plain_bytes| {
-                        Error::AtStage {
-                            stage,
-                            family: section.table.clone(),
-                            elapsed_seconds: began.elapsed().as_secs_f64(),
-                            wait_seconds,
-                            queued_plain_bytes,
-                            error: Box::new(Error::Postgres(error)),
-                        }
-                    };
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"event":"restore_section_started","family":section.table,"plain_bytes":section.plain_bytes,"compressed_bytes":section.compressed_bytes,"expected_rows":section.rows})
-                );
-                let mut decoder = zstd::stream::read::Decoder::new(CheckedReader::new(
-                    Read::by_ref(&mut file).take(section.compressed_bytes),
-                ))?;
-                decoder.window_log_max(27)?;
-                let query = format!("COPY {table} FROM STDIN (FORMAT binary)");
-                let sink = tx
-                    .copy_in::<_, Bytes>(&query)
-                    .await
-                    .map_err(|error| database_error("restore_copy_open", error, None, None))?;
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"event":"restore_copy_opened","family":section.table,"elapsed_seconds":began.elapsed().as_secs_f64()})
-                );
-                pin_mut!(sink);
-                let mut bytes = 0;
-                let mut buf = [0; 65536];
-                loop {
-                    let n = decoder.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    bytes += n as u64;
-                    if bytes > section.plain_bytes {
-                        return Err(Error::Refusal("snapshot_plain_size_mismatch"));
-                    }
-                    let send = Instant::now();
-                    sink.as_mut()
-                        .send(Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .map_err(|error| {
-                            database_error(
-                                "restore_copy_send",
-                                error,
-                                Some(send.elapsed().as_secs_f64()),
-                                Some(bytes - n as u64),
-                            )
-                        })?;
-                    if send.elapsed().as_secs() >= 1 {
-                        eprintln!(
-                            "{}",
-                            serde_json::json!({"event":"restore_copy_backpressure","family":section.table,"queued_plain_bytes":bytes,"send_seconds":send.elapsed().as_secs_f64(),"elapsed_seconds":began.elapsed().as_secs_f64(),"note":"queued bytes are not server row acknowledgements"})
-                        );
-                    }
-                }
-                let (size, hash) = decoder.finish().into_inner().finish();
-                if size != section.compressed_bytes || hash != section.sha256 {
-                    return Err(Error::Refusal("snapshot_section_hash_mismatch"));
-                }
-                let finish = Instant::now();
-                let rows = sink.as_mut().finish().await.map_err(|error| {
-                    database_error(
-                        "restore_copy_finish",
-                        error,
-                        Some(finish.elapsed().as_secs_f64()),
-                        Some(bytes),
-                    )
-                })?;
-                if bytes != section.plain_bytes || rows != section.rows {
-                    return Err(Error::Refusal("snapshot_row_count_mismatch"));
-                }
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"event":"restore_section_finished","family":section.table,"plain_bytes":bytes,"acknowledged_rows":rows,"elapsed_seconds":began.elapsed().as_secs_f64()})
-                );
-            }
-        }
-        let stage = RestoreStage::start("restore_load_state", "database");
-        let mut extra = [0];
-        if file.read(&mut extra).map_err(|error| stage.error(error))? != 0 {
-            return Err(stage.error(Error::Refusal("snapshot_trailing_bytes")));
-        }
-        for (unit, quantity) in &description.verified.supply {
-            tx.execute(
-                "INSERT INTO dsa.supply(unit,quantity) VALUES($1,$2::text::numeric)",
-                &[unit, quantity],
-            )
-            .await
-            .map_err(|error| stage.error(error))?;
-        }
-        let s = &description.verified.state;
-        tx.execute("UPDATE dsa.position SET horizon_height=$1::integer,horizon_hash=decode($2,'hex'),horizon_time=$3::text::timestamptz,target_height=$4::integer,target_hash=decode($5,'hex'),target_time=$6::text::timestamptz,tip_height=$7::integer,tip_hash=decode($8,'hex'),tip_time=$9::text::timestamptz,retention_seconds=$10,updated_at=now() WHERE id=1",&[&(s.horizon.height as i32),&s.horizon.hash,&s.horizon.time,&(s.target.height as i32),&s.target.hash,&s.target.time,&(s.tip.height as i32),&s.tip.hash,&s.tip.time,&s.retention_seconds]).await.map_err(|error| stage.error(error))?;
-        stage.finish();
-        let stage = RestoreStage::start("restore_indexes", "database");
-        tx.batch_execute(&if isolated_bulk {
-            include_str!("indexes.sql").to_owned()
-        } else {
-            missing_indexes.join("\n")
-        })
-        .await
-        .map_err(|error| stage.error(error))?;
-        stage.finish();
-        for table in tables() {
-            let stage = RestoreStage::start("restore_analyze", table);
-            tx.batch_execute(&format!("ANALYZE {}", qualified(table)?))
-                .await
-                .map_err(|error| stage.error(error))?;
-            stage.finish();
-        }
-        for table in ["multi_asset", "datum", "pool_hash", "epoch_stake"] {
-            let stage = RestoreStage::start("restore_sequences", table);
-            tx.query_one(&format!("SELECT setval('dsa.{table}_id_seq',greatest(coalesce(max(id),0)+1,1),false) FROM serve.{table}"),&[]).await.map_err(|error| stage.error(error))?;
-            stage.finish();
-        }
-        let stage = RestoreStage::start("restore_verify", "database");
-        let verified = verify::verify(&tx, profile, false)
-            .await
-            .map_err(|error| stage.error(error))?;
-        if !verify::logical_equal(&description.verified, &verified) {
-            return Err(stage.error(Error::Refusal("snapshot_content_digest_mismatch")));
-        }
-        stage.finish();
-        let stage = RestoreStage::start("restore_publish", "database");
-        cold::record_direct(&tx, &input_binding, &description, &verified).await?;
-        crate::storage::validate_routes(&tx).await?;
-        tx.execute("INSERT INTO dsa.first_served SELECT id,transaction_timestamp() FROM serve.block WHERE id BETWEEN $1 AND $2",&[&i64::from(s.horizon.height),&i64::from(s.target.height)]).await.map_err(|error| stage.error(error))?;
-        tx.execute(
-            "UPDATE dsa.identity SET origin=$1,tool_version=$2 WHERE id=1",
-            &[
-                &serde_json::to_value(description.origin.restored(&verified))
-                    .map_err(|error| stage.error(error))?,
-                &VERSION,
-            ],
-        )
-        .await
-        .map_err(|error| stage.error(error))?;
-        tx.batch_execute(
-            "UPDATE dsa.position SET serving=true,reason='serving',updated_at=now() WHERE id=1",
-        )
-        .await
-        .map_err(|error| stage.error(error))?;
-        stage.finish();
-        let stage = RestoreStage::start("restore_commit", "database");
-        tx.commit().await.map_err(|error| stage.error(error))?;
-        stage.finish();
-        cold::settle(self).await?;
-        Ok(verified)
-    }
-}
-
-#[cfg(test)]
-mod index_tests {
-    use super::index_shape;
-
-    #[test]
-    fn restore_index_shapes_preserve_literals_and_nondefault_semantics() {
-        let expected = "CREATE INDEX i ON serve.tx_out(tx_id,index);";
-        assert_eq!(
-            index_shape(expected),
-            index_shape("CREATE INDEX i ON serve.tx_out USING btree (tx_id, \"index\")")
-        );
-        let expression =
-            "CREATE INDEX i ON serve.multi_asset(encode(policy,'hex'),encode(name,'hex'));";
-        assert_eq!(
-            index_shape(expression),
-            index_shape(
-                "CREATE INDEX i ON serve.multi_asset USING btree (encode((policy)::bytea, 'hex'::text), encode((name)::bytea, 'hex'::text))"
-            )
-        );
-        for wrong in [
-            "CREATE INDEX i ON serve.tx_out(index,tx_id)",
-            "CREATE UNIQUE INDEX i ON serve.tx_out(tx_id,index)",
-            "CREATE INDEX i ON serve.tx_out(tx_id,index) WHERE tx_id>0",
-            "CREATE INDEX i ON serve.tx_out(tx_id DESC,index)",
-            "CREATE INDEX i ON serve.tx_out(tx_id,index) INCLUDE(address)",
-        ] {
-            assert_ne!(index_shape(expected), index_shape(wrong));
-        }
-        for literal in ["h e x", "USINGbtreehex", "hex'':text"] {
-            assert_ne!(
-                index_shape(expression),
-                index_shape(&expression.replace("'hex'", &format!("'{literal}'")))
-            );
-        }
     }
 }

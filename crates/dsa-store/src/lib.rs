@@ -5,15 +5,25 @@ pub mod catalogue;
 pub mod compare;
 mod conversion_stage;
 pub mod convert;
+pub mod horizon;
 pub mod keep;
+mod load;
+mod restore;
 pub mod snapshot;
 pub mod source_capture;
-pub mod storage;
 pub mod verify;
 
-use std::{io::BufReader, path::Path, time::Duration};
+use std::{
+    io::BufReader,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use dsa_chain::{VERSION, profiles::Profile};
+use dsa_chain::profiles::Profile;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -22,19 +32,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub const DATABASE_FORMAT: i32 = 1;
 pub const KEEP_RULE_VERSION: i32 = dsa_chain::assets::RULE_VERSION as i32;
-pub const NODE_RELATIONS: [&str; 11] = [
-    "block",
-    "tx",
-    "tx_out",
-    "tx_in",
-    "ma_tx_out",
-    "multi_asset",
-    "datum",
-    "epoch_param",
-    "pool_hash",
-    "epoch_stake",
-    "tx_metadata",
-];
+pub const NODE_RELATIONS: [&str; 11] = dsa_chain::keep::TABLES;
 const WRITER_NAMESPACE: i32 = 0x647361;
 const WRITER_LOCK: i32 = 1;
 const READER_SETTINGS: [&str; 4] = [
@@ -74,19 +72,30 @@ pub enum Error {
         content_digest: String,
         state_digest: String,
     },
+    /// Stopped by a signal or deadline before the publishing commit was sent.
     #[error("{reason}")]
-    ConversionOutcomeUnknown { reason: &'static str },
+    Interrupted {
+        operation: &'static str,
+        reason: &'static str,
+    },
+    /// Stopped after the publishing commit was sent.
     #[error("{reason}")]
-    RestoreOutcomeUnknown { reason: &'static str },
+    OutcomeUnknown {
+        operation: &'static str,
+        reason: &'static str,
+    },
     #[error("{error}")]
-    AtStage {
-        stage: &'static str,
+    InFamily {
         family: String,
-        elapsed_seconds: f64,
-        wait_seconds: Option<f64>,
-        queued_plain_bytes: Option<u64>,
         #[source]
         error: Box<Error>,
+    },
+    #[error("{error}")]
+    Mismatch {
+        error: &'static str,
+        item: String,
+        expected: String,
+        actual: String,
     },
     #[error("source_read_failed")]
     SourceRead {
@@ -97,27 +106,36 @@ pub enum Error {
 }
 
 impl Error {
-    /// Public diagnostics contain a named cause and never connection credentials.
+    /// The named cause, with the server's message for the store's own
+    /// statements. Never a connection string or password.
     pub fn report(&self) -> Value {
         match self {
             Self::ReaderPrivileges(details) => {
                 json!({"error": self.to_string(), "details": details})
             }
-            Self::Postgres(error) => {
-                let mut report = postgres_diagnostic(error);
-                report["error"] = json!("database_error");
-                report
-            }
+            Self::Postgres(error) => postgres_report(error),
             Self::SourceRead {
                 family,
                 elapsed_seconds,
                 error,
             } => {
-                let code = error.code().map(|code| code.code());
-                json!({"error":if code==Some("57014") {"source_statement_timeout"} else {"source_read_failed"},"family":family,"elapsed_seconds":elapsed_seconds,"sqlstate":code})
+                let mut report = postgres_report(error);
+                report["error"] = json!(if error.code().map(|c| c.code()) == Some("57014") {
+                    "source_statement_timeout"
+                } else {
+                    "source_read_failed"
+                });
+                report["family"] = json!(family);
+                report["elapsed_seconds"] = json!(elapsed_seconds);
+                report
             }
             Self::ComparisonQuery { query, sqlstate } => {
-                json!({"error":if sqlstate.as_deref()==Some("55000"){"comparison_not_serving"}else if sqlstate.as_deref()==Some("57014"){"comparison_statement_timeout"}else{"comparison_query_failed"},"query":query,"sqlstate":sqlstate})
+                let error = match sqlstate.as_deref() {
+                    Some("55000") => "comparison_not_serving",
+                    Some("57014") => "comparison_statement_timeout",
+                    _ => "comparison_query_failed",
+                };
+                json!({"error":error,"query":query,"sqlstate":sqlstate})
             }
             Self::ComparisonSource { side, error } => {
                 json!({"error":"comparison_source_failed","side":side,"cause":error.report()})
@@ -135,39 +153,35 @@ impl Error {
             } => {
                 json!({"error":"conversion_completed_snapshot_failed","converted":true,"content_digest":content_digest,"state_digest":state_digest,"recovery":"The database is serving. Run snapshot with this destination and a new writable --file path; do not repeat convert.","snapshot_error":error.report()})
             }
-            Self::ConversionOutcomeUnknown { reason } => {
-                json!({"error":reason,"operation":"convert","phase":"conversion_or_optional_snapshot","outcome":"unknown","rollback_confirmed":false,"recovery":"Run status and verify on this exact destination before cleanup or retry. If it is serving and verifies, preserve it and run snapshot with a new writable --file path if needed. Do not repeat convert or restore into a serving or nonempty destination."})
+            Self::Interrupted { operation, reason } => {
+                json!({"error":reason,"operation":operation,"published":false,"recovery":"Nothing was published and the database is not serving. Run the command again."})
             }
-            Self::RestoreOutcomeUnknown { reason } => {
-                json!({"error":reason,"operation":"restore","phase":"build_publication_or_retention_settlement","outcome":"unknown","rollback_confirmed":false,"recovery":"Run status on this exact destination. A ready owned build can resume the exact input and reverify without COPY; published requires retention settlement. Preserve a complete/serving destination and verify it. Do not assume rollback, delete nonempty data or substitute another input."})
+            Self::OutcomeUnknown { operation, reason } => {
+                let phase = if *operation == "convert" {
+                    "conversion_or_optional_snapshot"
+                } else {
+                    "publication"
+                };
+                json!({"error":reason,"operation":operation,"phase":phase,"outcome":"unknown","rollback_confirmed":false,"recovery":"Run status and verify on this exact destination. If it is serving and verifies, it is published; keep it. Otherwise run the command again."})
             }
-            Self::AtStage {
-                stage,
-                family,
-                elapsed_seconds,
-                wait_seconds,
-                queued_plain_bytes,
-                error,
-            } => {
+            Self::InFamily { family, error } => {
                 let mut report = error.report();
-                report["stage"] = json!(stage);
                 report["family"] = json!(family);
-                report["elapsed_seconds"] = json!(elapsed_seconds);
-                if let Some(seconds) = wait_seconds {
-                    report["wait_seconds"] = json!(seconds);
-                }
-                if let Some(bytes) = queued_plain_bytes {
-                    report["queued_plain_bytes"] = json!(bytes);
-                }
                 report
             }
+            Self::Mismatch {
+                error,
+                item,
+                expected,
+                actual,
+            } => json!({"error":error,"item":item,"expected":expected,"actual":actual}),
             _ => json!({"error": self.to_string()}),
         }
     }
 }
 
-// Error strings, Debug output, SQL text and connection configuration can contain
-// values or secrets. Only standard IO kinds/errno and PostgreSQL codes are public.
+// Error strings and Debug output of IO errors can carry paths or context.
+// Only their standard kinds and OS error numbers are reported.
 fn io_causes(mut error: Option<&(dyn std::error::Error + 'static)>) -> Vec<Value> {
     let mut causes = Vec::new();
     for _ in 0..16 {
@@ -179,8 +193,79 @@ fn io_causes(mut error: Option<&(dyn std::error::Error + 'static)>) -> Vec<Value
     }
     causes
 }
-fn postgres_diagnostic(error: &tokio_postgres::Error) -> Value {
-    json!({"sqlstate":error.code().map(|code|code.code()),"connection_closed":error.is_closed(),"io_causes":io_causes(Some(error))})
+
+fn tls_cause(error: &rustls::Error) -> &'static str {
+    use rustls::CertificateError as Certificate;
+    match error {
+        rustls::Error::InvalidCertificate(
+            Certificate::NotValidForName | Certificate::NotValidForNameContext { .. },
+        ) => "tls_host_name_mismatch",
+        rustls::Error::InvalidCertificate(Certificate::UnknownIssuer) => "tls_unknown_ca",
+        rustls::Error::InvalidCertificate(_) => "tls_certificate_invalid",
+        _ => "tls_error",
+    }
+}
+
+/// Names why a connection failed: TLS host name, CA or another TLS failure, a
+/// timeout, a refused connection, or a closed one.
+fn connection_cause(error: &tokio_postgres::Error) -> &'static str {
+    cause_in_chain(error).unwrap_or(if error.is_closed() {
+        "connection_closed"
+    } else {
+        "client_error"
+    })
+}
+
+fn cause_in_chain(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut current = Some(error);
+    for _ in 0..16 {
+        let Some(cause) = current else { break };
+        if let Some(tls) = cause.downcast_ref::<rustls::Error>() {
+            return Some(tls_cause(tls));
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if let Some(tls) = io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            {
+                return Some(tls_cause(tls));
+            }
+            match io.kind() {
+                std::io::ErrorKind::TimedOut => return Some("connection_timeout"),
+                std::io::ErrorKind::ConnectionRefused => return Some("connection_refused"),
+                _ => {}
+            }
+        }
+        current = cause.source();
+    }
+    None
+}
+
+fn postgres_report(error: &tokio_postgres::Error) -> Value {
+    let mut report =
+        json!({"error":"database_error","sqlstate":error.code().map(|code|code.code())});
+    if let Some(server) = error.as_db_error() {
+        report["message"] = json!(server.message());
+        for (key, value) in [
+            ("detail", server.detail()),
+            ("hint", server.hint()),
+            ("schema", server.schema()),
+            ("table", server.table()),
+            ("column", server.column()),
+            ("constraint", server.constraint()),
+        ] {
+            if let Some(value) = value {
+                report[key] = json!(value);
+            }
+        }
+    } else {
+        // The driver's own text names the failure (a closed connection, an
+        // unexpected type); it never contains the connection settings.
+        report["message"] = json!(error.to_string());
+        report["cause"] = json!(connection_cause(error));
+        report["io_causes"] = json!(io_causes(Some(error)));
+    }
+    report
 }
 
 pub struct Store {
@@ -189,16 +274,20 @@ pub struct Store {
     writer_locked: bool,
     cancellation: Cancellation,
 }
-/// Capability for this exact backend only, using the same TLS validation.
-/// No secret-bearing Debug/serialization implementation is exposed.
+/// Cancels this backend's statement using the same TLS validation, and tells
+/// whether the store sent the commit that publishes a load.
 #[derive(Clone)]
 pub struct Cancellation {
     token: tokio_postgres::CancelToken,
     tls: MakeRustlsConnect,
+    commit_sent: Arc<AtomicBool>,
 }
 impl Cancellation {
     pub async fn cancel(&self) -> Result<(), Error> {
         Ok(self.token.cancel_query(self.tls.clone()).await?)
+    }
+    pub fn commit_sent(&self) -> bool {
+        self.commit_sent.load(Ordering::SeqCst)
     }
 }
 
@@ -223,15 +312,6 @@ impl Store {
             config.tcp_user_timeout(Duration::from_secs(30));
         }
         config.keepalives_idle(config.get_keepalives_idle().min(Duration::from_secs(30)));
-        let connection_role = match config.get_application_name() {
-            Some("db-sync-alt-convert-source") => "legacy_source",
-            Some(value) if value.starts_with("db-sync-alt-compare") => "comparison_reader",
-            _ => "store",
-        };
-        eprintln!(
-            "{}",
-            json!({"event":"postgres_socket_limits","role":connection_role,"connect_timeout_ms":config.get_connect_timeout().map(|v|v.as_millis()),"tcp_user_timeout_ms":config.get_tcp_user_timeout().map(|v|v.as_millis()),"keepalives_idle_ms":config.get_keepalives_idle().as_millis()})
-        );
         let mut roots = rustls::RootCertStore::empty();
         if let Some(path) = root_certificate {
             if config.get_ssl_mode() == SslMode::Disable {
@@ -268,12 +348,13 @@ impl Store {
         let cancellation = Cancellation {
             token: client.cancel_token(),
             tls,
+            commit_sent: Arc::new(AtomicBool::new(false)),
         };
         let connection = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 eprintln!(
                     "{}",
-                    json!({"event":"postgres_connection_failed","role":connection_role,"diagnostic":postgres_diagnostic(&error)})
+                    json!({"event":"postgres_connection_failed","diagnostic":postgres_report(&error)})
                 );
             }
         });
@@ -312,10 +393,13 @@ impl Store {
 
     /// Every writing operation takes the database-local session lock first.
     /// It stays held until this Store closes, including between transactions.
-    pub async fn writer_transaction(&mut self) -> Result<Transaction<'_>, Error> {
+    /// A writer that just ended may still be rolling back on the server, so a
+    /// held lock is retried for a few seconds before `writer_busy`.
+    pub(crate) async fn lock_writer(&mut self) -> Result<(), Error> {
         validate_owner(&self.client).await?;
-        if !self.writer_locked {
-            let locked: bool = self
+        let mut attempts = 0;
+        while !self.writer_locked {
+            self.writer_locked = self
                 .client
                 .query_one(
                     "SELECT pg_try_advisory_lock($1,$2)",
@@ -323,103 +407,43 @@ impl Store {
                 )
                 .await?
                 .get(0);
-            if !locked {
-                return Err(Error::Refusal("writer_busy"));
+            attempts += 1;
+            if !self.writer_locked {
+                if attempts == 30 {
+                    return Err(Error::Refusal("writer_busy"));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            self.writer_locked = true;
         }
+        Ok(())
+    }
+
+    /// Ends a failed operation: waits for the rollback of its transaction and
+    /// releases the writer lock, so that a retry does not find it held.
+    pub async fn release_writer(&mut self) {
+        if self.writer_locked
+            && self
+                .client
+                .batch_execute("SELECT pg_advisory_unlock_all()")
+                .await
+                .is_ok()
+        {
+            self.writer_locked = false;
+        }
+    }
+
+    pub async fn writer_transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        self.lock_writer().await?;
         Ok(self.client.transaction().await?)
     }
 
-    /// Follower writes/pruning recover a committed restore's retention anchor
-    /// before using it. Restore/setup transactions keep their separate protocol.
-    pub async fn following_transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        // A closed gate after publication must not strand its protected cohort.
-        // Commit settlement separately before requiring the gate for writes.
-        self.settle_pending_retention().await?;
-        let transaction = self.writer_transaction().await?;
-        transaction.query_one("SELECT dsa.gate()", &[]).await?;
-        storage::recover_retention_anchor(&transaction).await?;
-        Ok(transaction)
-    }
-
-    /// Owner-only recovery of an already-published cohort, even if a later check
-    /// closed the gate. Never opens it, reloads rows or refreshes a settled clock.
-    pub async fn settle_restored_retention(&mut self, profile: &Profile) -> Result<bool, Error> {
-        self.open(profile).await?;
-        self.settle_pending_retention().await
-    }
-
-    async fn settle_pending_retention(&mut self) -> Result<bool, Error> {
-        if !storage::has_journal(&self.client).await? {
-            return Ok(false);
-        }
-        let pending:bool=self.client.query_one("SELECT phase='published' AND retention_anchor_at IS NULL FROM dsa.restore_build WHERE id",&[]).await?.get(0);
-        if !pending {
-            return Ok(false);
-        }
-        let transaction = self.writer_transaction().await?;
-        storage::recover_retention_anchor(&transaction).await?;
-        transaction.commit().await?;
-        Ok(true)
-    }
-
+    /// Initializes the closed layout in a blank database.
     pub async fn create(&mut self, profile: &Profile) -> Result<(), Error> {
-        self.create_layout(profile, true).await
-    }
-
-    pub(crate) async fn create_layout(
-        &mut self,
-        profile: &Profile,
-        indexes: bool,
-    ) -> Result<(), Error> {
-        let profile_hash = profile.hash()?;
-        let transaction = self.writer_transaction().await?;
-        let occupied: bool = transaction.query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('public','information_schema')) \
-             OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public') \
-             OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public') \
-             OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public') \
-             OR EXISTS(SELECT 1 FROM pg_extension WHERE extname<>'plpgsql')", &[]
-        ).await?.get(0);
-        if occupied {
-            return Err(Error::Refusal("destination_not_empty"));
+        self.lock_writer().await?;
+        match self.destination(profile).await? {
+            load::Destination::Blank => self.create_layout(profile).await,
+            _ => Err(Error::Refusal("destination_not_empty")),
         }
-        let database: String = transaction
-            .query_one("SELECT current_database()", &[])
-            .await?
-            .get(0);
-        transaction
-            .batch_execute(&format!(
-                "REVOKE ALL ON DATABASE {} FROM PUBLIC",
-                identifier(&database)
-            ))
-            .await?;
-        transaction
-            .batch_execute(include_str!("layout.sql"))
-            .await?;
-        transaction
-            .batch_execute(
-                &include_str!("state.sql")
-                    .replace("__KEEP_RULE_VERSION__", &KEEP_RULE_VERSION.to_string()),
-            )
-            .await?;
-        if indexes {
-            transaction
-                .batch_execute(include_str!("indexes.sql"))
-                .await?;
-        }
-        transaction.batch_execute(include_str!("views.sql")).await?;
-        transaction.execute(
-            "INSERT INTO dsa.identity(id,database_format,network,profile_hash,keep_rule_version,tool_version,node_release,origin) \
-             VALUES(1,$1,$2,$3,$4,$5,$6,$7)",
-            &[&DATABASE_FORMAT, &profile.network, &profile_hash, &KEEP_RULE_VERSION, &VERSION, &profile.node_release, &json!({"kind":"empty"})]
-        ).await?;
-        transaction
-            .execute("INSERT INTO dsa.position(id) VALUES(1)", &[])
-            .await?;
-        transaction.commit().await?;
-        Ok(())
     }
 
     pub async fn open(&self, profile: &Profile) -> Result<(), Error> {
@@ -451,14 +475,10 @@ impl Store {
 
     pub async fn status(&self, profile: &Profile) -> Result<Value, Error> {
         self.open(profile).await?;
-        let mut status: Value=self.client.query_one(
+        Ok(self.client.query_one(
             "SELECT jsonb_build_object('identity',(SELECT to_jsonb(i)-'id' FROM dsa.identity i WHERE id=1), \
              'position',(SELECT to_jsonb(p)-'id' FROM dsa.position p WHERE id=1))", &[]
-        ).await?.get(0);
-        if storage::has_journal(&self.client).await? {
-            status["restore"]=self.client.query_one("SELECT jsonb_build_object('protocol',protocol,'phase',phase,'storage_kind',storage_kind,'input_sha256',input_sha256,'initial_horizon',initial_horizon,'initial_target',initial_target,'retention_anchor_at',retention_anchor_at,'content_digest',verified->>'content_digest','state_digest',verified->>'state_digest') FROM dsa.restore_build WHERE id",&[]).await?.get(0);
-        }
-        Ok(status)
+        ).await?.get(0))
     }
 
     pub async fn grant_reader(&mut self, profile: &Profile, role: &str) -> Result<Value, Error> {
@@ -490,7 +510,7 @@ impl Store {
     }
 }
 
-fn identifier(name: &str) -> String {
+pub(crate) fn identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -604,6 +624,56 @@ mod diagnostic_tests {
         }
     }
     #[test]
+    fn connection_failures_name_tls_host_name_ca_and_timeout() {
+        use rustls::CertificateError;
+        let tls = |error: rustls::Error| {
+            cause_in_chain(&std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        };
+        assert_eq!(
+            tls(rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForName
+            )),
+            Some("tls_host_name_mismatch")
+        );
+        assert_eq!(
+            tls(rustls::Error::InvalidCertificate(
+                CertificateError::UnknownIssuer
+            )),
+            Some("tls_unknown_ca")
+        );
+        assert_eq!(
+            tls(rustls::Error::InvalidCertificate(CertificateError::Expired)),
+            Some("tls_certificate_invalid")
+        );
+        assert_eq!(tls(rustls::Error::DecryptError), Some("tls_error"));
+        let timeout = SecretContext(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(cause_in_chain(&timeout), Some("connection_timeout"));
+        assert_eq!(
+            cause_in_chain(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            Some("connection_refused")
+        );
+        assert_eq!(cause_in_chain(&std::io::Error::other("other")), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_named_without_its_settings() {
+        let config: Config = "host=127.0.0.1 port=1 user=generated-user password=generated-secret dbname=x sslmode=disable connect_timeout=2"
+            .parse()
+            .unwrap();
+        let report = match Store::connect(config, None).await {
+            Err(error) => error.report(),
+            Ok(_) => panic!("connected to port 1"),
+        };
+        assert_eq!(report["error"], "database_error");
+        assert_eq!(report["cause"], "connection_refused");
+        let text = report.to_string();
+        assert!(
+            !text.contains("generated-secret") && !text.contains("generated-user"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn io_diagnostics_keep_kind_errno_without_context_or_message() {
         let error = SecretContext(std::io::Error::from_raw_os_error(110));
         let value = serde_json::to_value(io_causes(Some(&error))).unwrap();
@@ -628,17 +698,12 @@ mod diagnostic_tests {
             Error::Io(std::io::Error::from_raw_os_error(110)).report()["os_error"],
             110
         );
-        let staged = Error::AtStage {
-            stage: "restore_copy_send",
+        let staged = Error::InFamily {
             family: "block".to_owned(),
-            elapsed_seconds: 3.0,
-            wait_seconds: Some(2.0),
-            queued_plain_bytes: Some(65536),
             error: Box::new(Error::Io(other)),
         }
         .report();
-        assert_eq!(staged["wait_seconds"], 2.0);
-        assert_eq!(staged["queued_plain_bytes"], 65536);
+        assert_eq!(staged["family"], "block");
         assert!(!staged.to_string().contains("another-secret"));
     }
 }

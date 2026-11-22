@@ -190,7 +190,10 @@ pub struct KeyStage {
 }
 
 /// Every parameter stays typed when a staged form no longer references it.
-const BINDINGS: &str = "conversion_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,$3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,$6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,$9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names),\n";
+pub(crate) const BINDINGS: &str = "conversion_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,\
+    $3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,\
+    $6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,\
+    $9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names),\n";
 
 /// The final selection of one family. The asset family also keeps every
 /// eligible window row, so that an orphan in a corrupt source reaches the
@@ -405,7 +408,10 @@ impl Selection {
     /// foreign by absence.
     pub(crate) fn asset_predicate(schema: SourceSchema, alias: &str) -> String {
         format!(
-            "{alias}.ident NOT IN(SELECT catalogue.id FROM {schema}.multi_asset catalogue) OR {alias}.ident IN(SELECT catalogue.id FROM {schema}.multi_asset catalogue WHERE catalogue.policy=ANY($6::bytea[]) OR EXISTS(SELECT 1 FROM unnest($9::bytea[],$10::bytea[]) fixed(policy,name) WHERE fixed.policy=catalogue.policy AND fixed.name=catalogue.name))",
+            "{alias}.ident NOT IN(SELECT catalogue.id FROM {schema}.multi_asset catalogue) \
+             OR {alias}.ident IN(SELECT catalogue.id FROM {schema}.multi_asset catalogue \
+             WHERE catalogue.policy=ANY($6::bytea[]) OR EXISTS(SELECT 1 FROM unnest($9::bytea[],$10::bytea[]) \
+             fixed(policy,name) WHERE fixed.policy=catalogue.policy AND fixed.name=catalogue.name))",
             schema = schema.name()
         )
     }

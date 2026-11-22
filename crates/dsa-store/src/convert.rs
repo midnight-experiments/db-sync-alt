@@ -1,54 +1,38 @@
-//! Convert an unchanged serving schema5 legacy public reader snapshot.
+//! Convert a serving 0.4.x database (schema 5) through its public reader.
 //!
-//! `LegacySource` always sets default_transaction_read_only=on. Its snapshot is
-//! REPEATABLE READ READ ONLY; all source facts, sparse old-spent bits, supply and
-//! anchors come from that one transaction. Catalog checks require schema5's
-//! eleven public gated views and the legacy gate, with the exact reader grant:
-//! no TEMP, private facts, writes, ownership, privileged role or membership.
-//! Network evidence is a positive non-placeholder pinned start hash or a held
-//! positive asset from a policy exclusive to this network's generated profiles.
-//! Shared Preprod/Preview units alone are ambiguous. No private facts are read.
+//! The source session is read-only (`default_transaction_read_only=on`) and
+//! all reads (facts, spent-before-H state, supply, anchors) come from one
+//! REPEATABLE READ READ ONLY transaction. The reader must hold exactly the
+//! legacy grant: the eleven gated views and the legacy gate, nothing else.
+//! The network is proven by the profile's pinned start header or by a held
+//! asset of a policy only this network's profile uses.
 //!
-//! The newest source header P determines target T=P-k, independently of the last
-//! event. Indexed endpoint seeks and a bounded count verify the promised suffix,
-//! accepting isolated older origin/epoch headers below a verified start anchor.
-//! Default H is the newest header at/before target.time-retention, found
-//! by indexed height bisection on monotone Cardano header times, without a time
-//! index or a block-rate estimate. Shorter source history clamps H to its verified
-//! continuous beginning, ignoring older isolated origin/epoch headers. Report chosen times, elapsed target-H seconds, clamp and read cost.
-//! Explicit --horizon-block takes precedence. Retention is still a duration:
-//! every retained window header gets first_served=publication time, preserving
-//! the full configured period after conversion, as after restore.
+//! The newest source header P sets the target T = P - k. The default horizon
+//! is the newest header at or before target time minus the retention, found
+//! by bisection on header times; a shorter source history clamps it to its
+//! continuous beginning, and `--horizon-block` overrides it. Every height H…T
+//! counts as first served at publication, so the full retention follows.
 //!
-//! Bounded, byte-limited unique-key binary COPY pages first populate private
-//! destination TEMP facts. Each source query is fully drained before any
-//! destination write; a single oversized row travels alone within caller limits.
-//! Source raw binary digests are independently rechecked on the local copy.
-//! The unchanged A3 predicate is then materialized once locally for all families,
-//! after source capture/commit. Server-side selected INSERTs preserve types,
-//! JSON null versus SQL NULL, original IDs and all payloads. Natural-key digest,
-//! sparse old-spent state, closure and supply checks gate publication.
-//!
-//! stage_conversion accepts the caller's already-open readonly transaction. An
-//! A6/A7 coordinator can capture original node statements, including the newest
-//! header, before closing it. The convenience CLI commits the source after
-//! staging, then finishes destination indexes/verification/publication. Failures
-//! roll back loaded rows and leave only a closed, owned convert_failed layout;
-//! serving/nonempty destinations are preserved. No source DSN, password, user,
-//! hostname, certificate path or other connection secret enters provenance.
-//! Source limits/work_mem and family wall times are reported explicitly; default
-//! owner limits are preserved unless the operator supplies positive overrides.
+//! Bounded binary COPY pages fill a private temporary copy in the destination
+//! transaction; the source digests are checked again on the copy. The keep
+//! rule is then evaluated on the copy in stages, and the kept rows are
+//! inserted with their original IDs and payloads. Digests, the spent-before-H
+//! state, closure and supply are verified before the gate opens. The whole
+//! load is one destination transaction that holds the served tables, so a
+//! reader granted before a conversion waits for it. A failure rolls back and
+//! leaves a closed `convert_failed` layout that a new load accepts.
 
 use crate::{
     Error, NODE_RELATIONS, Store,
     keep::Selection,
+    load,
     snapshot::Description,
-    verify::{self, MARKERS, Position, ServingState, Verification},
+    verify::{self, Checks, MARKERS, Position, ServingState, Verification},
 };
-use dsa_chain::{VERSION, digest::root, keep::Bounds, profiles::Profile};
+use dsa_chain::{digest::root, keep::Bounds, profiles::Profile};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -240,7 +224,7 @@ pub struct StagedConversion<'a> {
     options: ConvertOptions,
     supply: BTreeMap<String, String>,
     destination: DestinationCost,
-    indexes: Vec<&'static str>,
+    commit_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl StagedConversion<'_> {
     pub fn source(&self) -> &SourceReport {
@@ -273,52 +257,32 @@ impl StagedConversion<'_> {
         let families = selected.families;
         let protected_state = selected.markers;
         let state = &self.source.state;
-        write_state(tx, state).await?;
-        for (unit, quantity) in &self.supply {
-            tx.execute(
-                "INSERT INTO dsa.supply(unit,quantity) VALUES($1,$2::text::numeric)",
-                &[unit, quantity],
-            )
-            .await?;
-        }
+        load::write_position(tx, state).await?;
+        load::write_supply(tx, &self.supply).await?;
         let index_started = Instant::now();
-        tx.batch_execute(&self.indexes.join("\n")).await?;
-        for table in NODE_RELATIONS.into_iter().chain([MARKERS]) {
-            let schema = if table == MARKERS { "dsa" } else { "serve" };
-            tx.batch_execute(&format!("ANALYZE {schema}.{table}"))
-                .await?;
-        }
-        for table in ["multi_asset", "datum", "pool_hash", "epoch_stake"] {
-            tx.query_one(&format!("SELECT setval('dsa.{table}_id_seq',greatest(coalesce(max(id),0)+1,1),false) FROM serve.{table}"),&[]).await?;
-        }
+        tx.batch_execute(include_str!("indexes.sql")).await?;
+        load::analyze_and_sequences(tx).await?;
         self.destination.index_analyze_sequence_seconds = index_started.elapsed().as_secs_f64();
         let verify_started = Instant::now();
-        let verified = verify::verify(tx, profile, false).await?;
+        let verified = verify::verify(tx, profile, Checks::LOAD).await?;
         self.destination.verify_seconds = verify_started.elapsed().as_secs_f64();
-        if verified.families != families
-            || verified.content_digest != root(&families)
-            || verified.protected_state != protected_state
-            || verified.state_digest
-                != root(&BTreeMap::from([(
-                    MARKERS.to_owned(),
-                    protected_state.clone(),
-                )]))
-            || verified.supply != self.supply
-        {
-            return Err(Error::Refusal("conversion_source_digest_mismatch"));
-        }
-        tx.execute("INSERT INTO dsa.first_served SELECT id,clock_timestamp() FROM serve.block WHERE id BETWEEN $1 AND $2",&[&i64::from(state.horizon.height),&i64::from(state.target.height)]).await?;
+        let selected = Verification {
+            families: families.clone(),
+            content_digest: root(&families),
+            state_digest: root(&BTreeMap::from([(
+                MARKERS.to_owned(),
+                protected_state.clone(),
+            )])),
+            protected_state,
+            supply: self.supply.clone(),
+            ..verified.clone()
+        };
+        verify::same(&selected, &verified, "conversion_source_digest_mismatch")?;
         let origin = json!({"kind":"converted","source_kind":"legacy_schema5","source_network":self.source.network,"source_target_height":state.target.height,"source_target_hash":state.target.hash,"source_target_time":state.target.time,"source_tip_height":state.tip.height,"source_tip_hash":state.tip.hash,"source_tip_time":state.tip.time,"source_created_at":self.source.converted_at,"source_horizon_height":state.horizon.height,"source_horizon_hash":state.horizon.hash,"source_horizon_time":state.horizon.time,"initial_covered_seconds":self.source.covered_seconds,"initial_coverage_shorter_than_retention":self.source.coverage_shorter_than_retention});
-        tx.execute(
-            "UPDATE dsa.identity SET origin=$1,tool_version=$2 WHERE id=1",
-            &[&origin, &VERSION],
-        )
-        .await?;
-        tx.batch_execute(
-            "UPDATE dsa.position SET serving=true,reason='serving',updated_at=now() WHERE id=1",
-        )
-        .await?;
+        load::publish_state(tx, state, &origin).await?;
         let commit_started = Instant::now();
+        self.commit_sent
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.transaction.commit().await?;
         self.destination.commit_seconds = commit_started.elapsed().as_secs_f64();
         self.destination.finish_seconds = finished.elapsed().as_secs_f64();
@@ -331,13 +295,9 @@ impl StagedConversion<'_> {
     }
 }
 
-async fn write_state(tx: &Transaction<'_>, state: &ServingState) -> Result<(), Error> {
-    tx.execute("UPDATE dsa.position SET horizon_height=$1::integer,horizon_hash=decode($2,'hex'),horizon_time=$3::text::timestamptz,target_height=$4::integer,target_hash=decode($5,'hex'),target_time=$6::text::timestamptz,tip_height=$7::integer,tip_hash=decode($8,'hex'),tip_time=$9::text::timestamptz,retention_seconds=$10,updated_at=now() WHERE id=1",&[&(state.horizon.height as i32),&state.horizon.hash,&state.horizon.time,&(state.target.height as i32),&state.target.hash,&state.target.time,&(state.tip.height as i32),&state.tip.hash,&state.tip.time,&state.retention_seconds]).await?;
-    Ok(())
-}
-
 async fn settings(source: &Transaction<'_>) -> Result<SourceSettings, Error> {
-    let row=source.query_one("SELECT current_setting('server_version_num')::integer,current_setting('work_mem'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout'),current_setting('default_transaction_read_only'),current_setting('transaction_read_only'),current_setting('transaction_isolation'),coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()),false)",&[]).await?;
+    let row=source.query_one("SELECT current_setting('server_version_num')::integer,current_setting('work_mem'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout'),current_setting('default_transaction_read_only'),current_setting('transaction_read_only'),current_setting('transaction_isolation'),coalesce((SELECT ssl \
+        FROM pg_stat_ssl WHERE pid=pg_backend_pid()),false)",&[]).await?;
     let settings = SourceSettings {
         server_version_num: row.get(0),
         work_mem: row.get(1),
@@ -363,12 +323,22 @@ async fn settings(source: &Transaction<'_>) -> Result<SourceSettings, Error> {
 }
 
 async fn validate_reader(source: &Transaction<'_>) -> Result<u32, Error> {
-    let row=source.query_one("SELECT current_user::text,r.rolcanlogin AND NOT (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls) AND r.oid<>d.datdba FROM pg_roles r CROSS JOIN pg_database d WHERE r.rolname=current_user AND d.datname=current_database()",&[]).await?;
+    let row=source.query_one("SELECT current_user::text,r.rolcanlogin AND NOT (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole \
+        OR r.rolreplication OR r.rolbypassrls) AND r.oid<>d.datdba FROM pg_roles r CROSS \
+        JOIN pg_database d WHERE r.rolname=current_user AND d.datname=current_database()",&[]).await?;
     if !row.get::<_, bool>(1) {
         return Err(Error::Refusal("invalid_source_reader_role"));
     }
     let role: String = row.get(0);
-    let gate=source.query_opt("SELECT p.oid,p.prosecdef AND p.provolatile='s' AND p.prorettype=16 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='chain' AND p.proname='gate' AND p.pronargs=0 AND p.prokind='f'",&[]).await?.ok_or(Error::Refusal("unsupported_legacy_schema"))?;
+    let gate = source
+        .query_opt(
+            "SELECT p.oid,p.prosecdef AND p.provolatile='s' AND p.prorettype=16 FROM pg_proc p \
+        JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='chain' AND p.proname='gate' \
+        AND p.pronargs=0 AND p.prokind='f'",
+            &[],
+        )
+        .await?
+        .ok_or(Error::Refusal("unsupported_legacy_schema"))?;
     if !gate.get::<_, bool>(1) {
         return Err(Error::Refusal("unsupported_legacy_schema"));
     }
@@ -427,7 +397,11 @@ pub(crate) fn columns(table: &str) -> Vec<(&'static str, &'static str, &'static 
 
 async fn validate_schema(source: &Transaction<'_>, gate: u32) -> Result<(), Error> {
     for table in NODE_RELATIONS {
-        let actual=source.query("SELECT a.attname::text,t.typname::text,n.nspname::text FROM pg_class c JOIN pg_namespace relation_schema ON relation_schema.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid JOIN pg_type t ON t.oid=a.atttypid JOIN pg_namespace n ON n.oid=t.typnamespace WHERE relation_schema.nspname='public' AND c.relname=$1 AND c.relkind='v' AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",&[&table]).await?;
+        let actual=source.query("SELECT a.attname::text,t.typname::text,n.nspname::text FROM pg_class c \
+            JOIN pg_namespace relation_schema ON relation_schema.oid=c.relnamespace \
+            JOIN pg_attribute a ON a.attrelid=c.oid JOIN pg_type t ON t.oid=a.atttypid \
+            JOIN pg_namespace n ON n.oid=t.typnamespace WHERE relation_schema.nspname='public' \
+            AND c.relname=$1 AND c.relkind='v' AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",&[&table]).await?;
         let expected = columns(table);
         if actual.len() != expected.len()
             || actual.iter().zip(expected).any(|(r, e)| {
@@ -440,7 +414,17 @@ async fn validate_schema(source: &Transaction<'_>, gate: u32) -> Result<(), Erro
         }
     }
     let tables = NODE_RELATIONS.to_vec();
-    let count:i64=source.query_one("SELECT count(DISTINCT r.ev_class) FROM pg_rewrite r JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid AND d.refclassid='pg_proc'::regclass AND d.refobjid=$1 JOIN pg_class c ON c.oid=r.ev_class JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=ANY($2::text[])",&[&gate,&tables]).await?.get(0);
+    let count: i64 = source
+        .query_one(
+            "SELECT count(DISTINCT r.ev_class) FROM pg_rewrite r \
+        JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid \
+        AND d.refclassid='pg_proc'::regclass AND d.refobjid=$1 JOIN pg_class c ON c.oid=r.ev_class \
+        JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' \
+        AND c.relname=ANY($2::text[])",
+            &[&gate, &tables],
+        )
+        .await?
+        .get(0);
     if count != 11 {
         return Err(Error::Refusal("unsupported_legacy_schema"));
     }
@@ -552,7 +536,11 @@ pub(crate) async fn network_evidence(
         })
         .map(|a| hex::decode(&a.policy).map_err(|_| Error::Refusal("invalid_keep_profile")))
         .collect::<Result<Vec<_>, _>>()?;
-    let positive: bool = source.query_one("SELECT EXISTS(SELECT 1 FROM public.multi_asset m JOIN public.ma_tx_out a ON a.ident=m.id JOIN public.tx_out o ON o.id=a.tx_out_id JOIN public.tx t ON t.id=o.tx_id WHERE m.policy=ANY($1::bytea[]) AND a.quantity>0 AND a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735 AND o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND t.id BETWEEN 0 AND $2::bigint*4096+4095)", &[&policies, &i64::from(tip)]).await?.get(0);
+    let positive: bool = source.query_one("SELECT EXISTS(SELECT 1 FROM public.multi_asset m JOIN public.ma_tx_out a ON a.ident=m.id \
+        JOIN public.tx_out o ON o.id=a.tx_out_id JOIN public.tx t ON t.id=o.tx_id \
+        WHERE m.policy=ANY($1::bytea[]) AND a.quantity>0 AND a.id BETWEEN 0 \
+        AND $2::bigint*68719476736+68719476735 AND o.id BETWEEN 0 AND $2::bigint*16777216+16777215 \
+        AND t.id BETWEEN 0 AND $2::bigint*4096+4095)", &[&policies, &i64::from(tip)]).await?.get(0);
     if !positive {
         return Err(Error::Refusal("source_network_ambiguous"));
     }
@@ -674,7 +662,8 @@ async fn source_report(
     }
     let horizon = header(source, horizon).await?;
     point_queries += 1;
-    let covered=source.query_one("SELECT extract(epoch FROM ($1::text::timestamptz-$2::text::timestamptz))::text,extract(epoch FROM ($1::text::timestamptz-$2::text::timestamptz))<$3::bigint,to_char(transaction_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",&[&target.time,&horizon.time,&options.retention_seconds]).await?;
+    let covered=source.query_one("SELECT extract(epoch FROM ($1::text::timestamptz-$2::text::timestamptz))::text,extract(epoch \
+        FROM ($1::text::timestamptz-$2::text::timestamptz))<$3::bigint,to_char(transaction_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",&[&target.time,&horizon.time,&options.retention_seconds]).await?;
     let selection = Selection::new(
         profile,
         Bounds {
@@ -747,7 +736,6 @@ async fn supply(
         .map(|u| (u.clone(), "0".to_owned()))
         .collect::<BTreeMap<_, _>>();
     let sql = include_str!("conversion_supply.sql");
-    let sql_sha256 = format!("{:x}", Sha256::digest(sql.as_bytes()));
     let started = Instant::now();
     // A LIMIT can otherwise sort an unbounded bitmap/heap scan under stale
     // statistics. Scope ordered-index paths to this project-owned operation;
@@ -764,15 +752,11 @@ async fn supply(
     let mut cost = SupplyCost::default();
     eprintln!(
         "{}",
-        json!({"event":"source_supply_started","operation":"convert","target":target,"page_rows":4096,"sql_sha256":sql_sha256,"planner_before":planner_before,"supply_planner":["off","off","on","on"]})
+        json!({"event":"source_supply_started","operation":"convert","target":target,"planner_before":planner_before})
     );
     loop {
         let previous = units.iter().map(|u| amounts[u].clone()).collect::<Vec<_>>();
         let page_started = Instant::now();
-        eprintln!(
-            "{}",
-            json!({"event":"source_supply_page_started","operation":"convert","page":cost.batches,"after_asset_id":after_id,"target":target,"sql_sha256":sql_sha256})
-        );
         let rows = source
             .query(
                 sql,
@@ -801,10 +785,6 @@ async fn supply(
         cost.batches += 1;
         cost.rows += count as u64;
         cost.longest_seconds = cost.longest_seconds.max(elapsed);
-        eprintln!(
-            "{}",
-            json!({"event":"source_supply_page_finished","operation":"convert","page":cost.batches-1,"after_asset_id":after_id,"last_asset_id":last,"rows":count,"elapsed_seconds":elapsed,"sql_sha256":sql_sha256})
-        );
         match last {
             Some(id) => after_id = id,
             None => break,
@@ -826,64 +806,12 @@ async fn supply(
     }
     eprintln!(
         "{}",
-        json!({"event":"source_supply_finished","operation":"convert","batches":cost.batches,"rows":cost.rows,"elapsed_seconds":started.elapsed().as_secs_f64(),"longest_page_seconds":cost.longest_seconds,"sql_sha256":sql_sha256,"planner_restored":planner_before})
+        json!({"event":"source_supply_finished","operation":"convert","batches":cost.batches,"rows":cost.rows,"elapsed_seconds":started.elapsed().as_secs_f64(),"longest_page_seconds":cost.longest_seconds,"planner_restored":planner_before})
     );
     Ok((amounts, cost))
 }
 
 impl Store {
-    /// Read-only refusal check. prepare_destination repeats its authoritative
-    /// checks under the writer lock after source preflight, closing the race.
-    async fn conversion_destination_preflight(&self, profile: &Profile) -> Result<(), Error> {
-        let identity: bool = self
-            .client
-            .query_one("SELECT to_regclass('dsa.identity') IS NOT NULL", &[])
-            .await?
-            .get(0);
-        if !identity {
-            let occupied: bool = self.client.query_one("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('public','information_schema')) OR EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public') OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public') OR EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public') OR EXISTS(SELECT 1 FROM pg_extension WHERE extname<>'plpgsql')", &[]).await?.get(0);
-            return if occupied {
-                Err(Error::Refusal("destination_not_empty"))
-            } else {
-                Ok(())
-            };
-        }
-        self.open(profile).await?;
-        let row = self.client.query_one("SELECT p.serving,i.origin->>'kind' FROM dsa.position p CROSS JOIN dsa.identity i WHERE p.id=1 AND i.id=1", &[]).await?;
-        if row.get::<_, bool>(0) {
-            return Err(Error::Refusal("destination_not_empty"));
-        }
-        let origin: Option<String> = row.get(1);
-        if origin.as_deref() == Some("restore_failed") {
-            return Err(Error::Refusal("destination_owned_by_failed_restore"));
-        }
-        if !matches!(origin.as_deref(), Some("empty" | "convert_failed")) {
-            return Err(Error::Refusal("destination_not_empty"));
-        }
-        let mut counts = NODE_RELATIONS
-            .iter()
-            .map(|t| format!("(SELECT count(*) FROM serve.{t})"))
-            .collect::<Vec<_>>();
-        counts.extend(
-            [
-                "dsa.consumed_before_horizon",
-                "dsa.supply",
-                "dsa.first_served",
-                "dsa.calls",
-            ]
-            .map(|t| format!("(SELECT count(*) FROM {t})")),
-        );
-        let occupied: i64 = self
-            .client
-            .query_one(&format!("SELECT {}", counts.join("+")), &[])
-            .await?
-            .get(0);
-        if occupied != 0 {
-            return Err(Error::Refusal("destination_not_empty"));
-        }
-        Ok(())
-    }
-
     /// The caller retains the source transaction for reference-answer capture.
     /// Capture and commit source reads before `StagedConversion::finish`, whose
     /// local keep/digest/index work uses only the verified private TEMP copy.
@@ -894,7 +822,9 @@ impl Store {
         options: &ConvertOptions,
     ) -> Result<StagedConversion<'a>, Error> {
         options.validate()?;
-        self.conversion_destination_preflight(profile).await?;
+        // Refuse an occupied destination before reading the source; the load
+        // checks it again under its locks.
+        self.destination(profile).await?;
         let mut report = source_report(source, profile, options).await?;
         let supply_started = Instant::now();
         let (amounts, supply_cost) = supply(source, profile, report.state.target.height).await?;
@@ -903,11 +833,7 @@ impl Store {
         report.supply_rows = supply_cost.rows;
         report.longest_supply_page_seconds = supply_cost.longest_seconds;
         let prepare_started = Instant::now();
-        self.prepare_destination(profile, "convert_failed").await?;
-        let mut destination = DestinationCost {
-            prepare_seconds: prepare_started.elapsed().as_secs_f64(),
-            ..Default::default()
-        };
+        self.prepare_load(profile, "convert_failed").await?;
         let selection = Selection::new(
             profile,
             Bounds {
@@ -916,40 +842,17 @@ impl Store {
                 tip: report.state.tip.height,
             },
         )?;
-        // Source/selection preflight precedes all destination changes. Reuse
-        // restore's conservative reader classification and closed-empty checks;
-        // an already granted reader must reach its gate during raw staging and
-        // local selection as well as publication. Retain matching public
-        // indexes in this mode, so node startup prerequisites also stay present.
-        let (isolated_bulk, reason) = crate::snapshot::restore_access(self.client()).await?;
-        eprintln!(
-            "{}",
-            json!({"event":"conversion_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"},"reason":reason})
-        );
-        let (_, locked) = crate::snapshot::restore_tables()?;
+        let commit_sent = self.cancellation.commit_sent.clone();
         let tx = self.writer_transaction().await?;
-        crate::snapshot::lock_empty_restore(&tx, &locked, isolated_bulk, "convert_failed").await?;
-        let indexes = if isolated_bulk {
-            include_str!("indexes.sql")
-                .lines()
-                .filter(|line| line.starts_with("CREATE"))
-                .collect()
-        } else {
-            crate::snapshot::restore_indexes(&tx).await?.missing
-        };
-        for line in include_str!("indexes.sql")
-            .lines()
-            .filter(|s| isolated_bulk && s.starts_with("CREATE"))
-        {
-            let name = line
-                .split("INDEX ")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .ok_or(Error::Refusal("invalid_index_catalogue"))?;
+        load::lock_empty(&tx, "ACCESS EXCLUSIVE", "convert_failed").await?;
+        for name in load::secondary_index_names() {
             tx.batch_execute(&format!("DROP INDEX IF EXISTS serve.{name}"))
                 .await?;
         }
-        destination.prepare_seconds = prepare_started.elapsed().as_secs_f64();
+        let destination = DestinationCost {
+            prepare_seconds: prepare_started.elapsed().as_secs_f64(),
+            ..Default::default()
+        };
         let raw = crate::conversion_stage::stage(source, &tx, &report.state, options).await?;
         report.raw_families = raw.costs.clone();
         report.staging_peak_bytes = raw.temporary_bytes;
@@ -962,7 +865,7 @@ impl Store {
             options: options.clone(),
             supply: amounts,
             destination,
-            indexes,
+            commit_sent,
         })
     }
 
@@ -973,13 +876,19 @@ impl Store {
         options: &ConvertOptions,
     ) -> Result<Conversion, Error> {
         let snapshot = source.snapshot().await?;
-        let stage = self.stage_conversion(profile, &snapshot, options).await?;
-        snapshot.commit().await?;
-        eprintln!(
-            "{}",
-            json!({"event":"conversion_source_snapshot_committed"})
-        );
-        let mut converted = stage.finish(profile).await?;
+        let result = async {
+            let staged = self.stage_conversion(profile, &snapshot, options).await?;
+            snapshot.commit().await?;
+            staged.finish(profile).await
+        }
+        .await;
+        let mut converted = match result {
+            Ok(converted) => converted,
+            Err(error) => {
+                self.release_writer().await;
+                return Err(error);
+            }
+        };
         if let Some(path) = &options.snapshot {
             converted.snapshot = Some(self.snapshot(profile, path).await.map_err(|error| {
                 Error::ConvertedSnapshot {
