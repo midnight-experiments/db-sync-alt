@@ -1,5 +1,8 @@
 name: a7-prototype-tools
 on:
+  push:
+    branches: ['validation/a7-whole-conversion']
+    paths: ['.github/workflows/a7-prototype-tools.yml']
   workflow_dispatch:
     inputs:
       product_pin:
@@ -9,7 +12,14 @@ on:
 permissions:
   contents: read
 jobs:
+  registration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Register manual tools workflow without building a candidate
+        run: python3 -c "print('Registration only; no product build, PostgreSQL or benchmark')"
   tools:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
