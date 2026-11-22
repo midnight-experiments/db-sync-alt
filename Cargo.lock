@@ -761,6 +761,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsa-testkit"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "dsa-chain",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pallas-addresses",
+ "pallas-crypto",
+ "pallas-primitives",
+ "pallas-traverse",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
