@@ -43,8 +43,12 @@
 //! Empty COPY tables are rechecked under relation/identity locks. Before a node
 //! reader has gate access, the ingest transaction truncates them, allowing
 //! minimal-WAL COPY when the server already uses that WAL mode. Once gate access
-//! is granted, compatible relation locks preserve prompt closed-reader errors:
-//! no TRUNCATE or index drop, matching indexes stay and missing ones are built.
+//! is granted, a prototype builds one private inherited child per stable served
+//! parent. Parent views/indexes/OIDs remain in place; no public binding DDL is
+//! used. Bulk commit stays closed, and final publication is a gate/state update.
+//! Direct parent INSERT/COPY is rejected; writers use the validated physical
+//! write route for ON CONFLICT and RETURNING. This new internal boundary still
+//! needs follower integration and performance qualification.
 //! No CASCADE, sequence reset or server-policy change occurs. Product reader
 //! grants share the writer lock, so they cannot race the isolated fast path.
 //! Caller statement/idle transaction timeouts remain in force; no timeout is
@@ -56,8 +60,12 @@
 //! checks exact sizes/hashes/trailing EOF, creates indexes, analyzes, initializes
 //! private allocation sequences above imported identity IDs, verifies closure,
 //! positional ranges, header continuity, supply, sparse markers and digest, then
-//! publishes state/gate in that same transaction. Any failure rolls back imported
-//! rows and leaves the committed failed-restore state closed and retryable.
+//! publishes state/gate atomically. Invalid inputs roll back imported rows. A
+//! verified private build may commit closed and resume publication without COPY,
+//! bound to destination/input/verified result; it is never treated as empty.
+//! Completed/serving destinations remain refused. Successful restore also
+//! requires a subsequent once-only retention anchor, protecting the initial
+//! cohort until settlement. Later heights retain their ordinary clocks.
 //!
 //! Sparse state stores the retained outpoint ID; presence means consumed before
 //! H, derived inside the same source snapshot. It stores no spending height. Its
@@ -81,6 +89,8 @@ use futures_util::{SinkExt, StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{GenericClient, IsolationLevel};
+
+mod cold;
 
 use crate::{
     DATABASE_FORMAT, Error, KEEP_RULE_VERSION, NODE_RELATIONS, Store,
@@ -116,7 +126,7 @@ pub(crate) async fn restore_access<C: GenericClient>(
 // default btree spelling, quoted `index` column and implicit encode argument
 // casts from our bytea domains / hex literal. Other casts remain significant.
 // Keep quoted contents intact: whitespace inside a literal is significant.
-fn index_shape(sql: &str) -> Vec<String> {
+pub(crate) fn index_shape(sql: &str) -> Vec<String> {
     let mut chars = sql.trim_end_matches(';').chars().peekable();
     let mut tokens = Vec::new();
     while let Some(ch) = chars.next() {
@@ -754,6 +764,10 @@ impl Store {
     }
 
     pub async fn restore(&mut self, profile: &Profile, path: &Path) -> Result<Verification, Error> {
+        if let Some(report) = cold::resume(self, profile, path).await? {
+            return Ok(report);
+        }
+
         let stage = RestoreStage::start("restore_prepare", "database");
         self.prepare_destination(profile, "restore_failed")
             .await
@@ -782,6 +796,10 @@ impl Store {
             "{}",
             serde_json::json!({"event":"restore_load_mode","mode":if isolated_bulk {"isolated_bulk"} else {"reader_compatible"},"reason":reason})
         );
+        if !isolated_bulk {
+            return cold::restore_preflighted(self, profile, file, description).await;
+        }
+        let input_binding = cold::input_hash(&mut file)?;
         let tx = self
             .writer_transaction()
             .await
@@ -997,6 +1015,7 @@ impl Store {
         }
         stage.finish();
         let stage = RestoreStage::start("restore_publish", "database");
+        cold::record_direct(&tx, &input_binding, &description, &verified).await?;
         tx.execute("INSERT INTO dsa.first_served SELECT id,transaction_timestamp() FROM serve.block WHERE id BETWEEN $1 AND $2",&[&i64::from(s.horizon.height),&i64::from(s.target.height)]).await.map_err(|error| stage.error(error))?;
         tx.execute(
             "UPDATE dsa.identity SET origin=$1,tool_version=$2 WHERE id=1",
@@ -1017,6 +1036,7 @@ impl Store {
         let stage = RestoreStage::start("restore_commit", "database");
         tx.commit().await.map_err(|error| stage.error(error))?;
         stage.finish();
+        cold::settle(self).await?;
         Ok(verified)
     }
 }

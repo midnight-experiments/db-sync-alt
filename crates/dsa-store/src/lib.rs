@@ -8,6 +8,7 @@ pub mod convert;
 pub mod keep;
 pub mod snapshot;
 pub mod source_capture;
+pub mod storage;
 pub mod verify;
 
 use std::{io::BufReader, path::Path, time::Duration};
@@ -325,6 +326,15 @@ impl Store {
         Ok(self.client.transaction().await?)
     }
 
+    /// Follower writes/pruning recover a committed restore's retention anchor
+    /// before using it. Restore/setup transactions keep their separate protocol.
+    pub async fn following_transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        let transaction = self.writer_transaction().await?;
+        transaction.query_one("SELECT dsa.gate()", &[]).await?;
+        storage::recover_retention_anchor(&transaction).await?;
+        Ok(transaction)
+    }
+
     pub async fn create(&mut self, profile: &Profile) -> Result<(), Error> {
         self.create_layout(profile, true).await
     }
@@ -412,10 +422,14 @@ impl Store {
 
     pub async fn status(&self, profile: &Profile) -> Result<Value, Error> {
         self.open(profile).await?;
-        Ok(self.client.query_one(
+        let mut status: Value=self.client.query_one(
             "SELECT jsonb_build_object('identity',(SELECT to_jsonb(i)-'id' FROM dsa.identity i WHERE id=1), \
              'position',(SELECT to_jsonb(p)-'id' FROM dsa.position p WHERE id=1))", &[]
-        ).await?.get(0))
+        ).await?.get(0);
+        if storage::has_journal(&self.client).await? {
+            status["restore"]=self.client.query_one("SELECT jsonb_build_object('protocol',protocol,'phase',phase,'storage_kind',storage_kind,'input_sha256',input_sha256,'initial_horizon',initial_horizon,'initial_target',initial_target,'retention_anchor_at',retention_anchor_at,'content_digest',verified->>'content_digest','state_digest',verified->>'state_digest') FROM dsa.restore_build WHERE id",&[]).await?.get(0);
+        }
+        Ok(status)
     }
 
     pub async fn grant_reader(&mut self, profile: &Profile, role: &str) -> Result<Value, Error> {

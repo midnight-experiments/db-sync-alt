@@ -87,6 +87,9 @@ pub(crate) async fn verify<C: GenericClient>(
     profile: &Profile,
     serving: bool,
 ) -> Result<Verification, Error> {
+    if crate::storage::has_journal(client).await? {
+        crate::storage::validate_routes(client).await?;
+    }
     if serving {
         client.query_one("SELECT dsa.gate()", &[]).await?;
     }
@@ -270,13 +273,7 @@ pub(crate) async fn verify<C: GenericClient>(
         if total as u64 != digest.rows {
             return Err(Error::Refusal("digest_join_lost_rows"));
         }
-        let size: i64 = client
-            .query_one(
-                "SELECT pg_total_relation_size($1::text::regclass)",
-                &[&format!("{schema}.{table}")],
-            )
-            .await?
-            .get(0);
+        let size = crate::storage::relation_bytes(client, &format!("{schema}.{table}")).await?;
         relation_bytes.insert(table.to_owned(), size);
         if table == MARKERS {
             protected = Some(digest);

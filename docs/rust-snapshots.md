@@ -1,5 +1,38 @@
 # Development Rust snapshots
 
+The reader-compatible cold-restore path in this branch is a prototype. It is not
+a qualified release or a claim to the three-minute limit. Stable served parents
+and their startup indexes stay available while one private child per family is
+loaded and independently verified. The verified build commits with the gate
+closed. Publication changes only identity/position/receipt rows; it performs no
+public-view or parent-table binding DDL. A stalled row update therefore leaves
+new node readers able to evaluate the old closed gate.
+
+`status` reports a destination/input-bound restore receipt. A `ready` build may
+retry the exact input, reverify its actual rows and finish without another COPY.
+A different input or destination binding is refused. Invalid input rolls back
+the build; completed or unrelated nonempty targets remain refused. No retired
+generation is created: original empty parents retain the stable interfaces and
+exactly one child holds each family's rows. A failed uncommitted build leaves no
+private objects; a verified durable build is retained for owned recovery.
+
+Restored heights in the initial horizon-to-target cohort are protected until a
+post-publication transaction sets their immutable retention anchor. A delayed
+publication never consumes retention during private build time. A lost settlement
+acknowledgement does not reset the anchor. Existing databases and later heights
+keep their ordinary per-height clocks; consumers must use
+`dsa_store::storage::first_served_at`. The anchor is conservative after first
+visibility, not an exact commit timestamp. Settlement counts in restore time.
+
+Internal insertion/COPY writers must resolve the single authoritative relation
+with `dsa_store::storage::write_relation`; direct insertion into the empty parent
+is rejected. PostgreSQL parent constraints do not enforce child uniqueness, and
+parent `ON CONFLICT` cannot arbitrate a child's index. `following_transaction`
+recovers an interrupted retention settlement before follow/prune work. The
+generated `restore_writer_probe` example exercises this actual API with
+RETURNING/ON CONFLICT and rolled-back tuples. Follower integration of these
+boundaries is still required and is not claimed by the prototype.
+
 Wire format1 carries keep-rule version2 and preserves the selected payloads
 and original pre-filter asset ordinals. Rule1 files and databases are refused;
 regenerate by converting a genuine legacy schema5 source. No real-network

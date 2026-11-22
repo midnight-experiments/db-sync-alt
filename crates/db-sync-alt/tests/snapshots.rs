@@ -1808,3 +1808,198 @@ async fn restore_conflicting_catalogue_objects_are_preserved_before_copy() -> Re
     source.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_private_ready_resume_and_stalled_gate_reader_contract() -> Result {
+    let f = fixture(281);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("private-ready.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader],
+    )
+    .await?;
+    let client = connect(&dest.config).await?;
+    let original = restore_catalogue(&client).await?;
+    let mut reader_config = dest.config.clone();
+    reader_config
+        .user(&dest.reader)
+        .options("-c default_transaction_read_only=on -c statement_timeout=200ms");
+    let reader = connect(&reader_config).await?;
+    let prepared = reader
+        .prepare("SELECT * FROM public.block ORDER BY block_no DESC LIMIT 1")
+        .await?;
+    let old = connect(&reader_config).await?;
+    old.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;DECLARE old_read NO SCROLL CURSOR FOR SELECT * FROM public.block").await?;
+    client.batch_execute("CREATE FUNCTION dsa.private_gate_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(881,1);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.private_gate_barrier() FROM PUBLIC;CREATE TRIGGER private_gate_barrier BEFORE UPDATE ON dsa.position FOR EACH ROW WHEN(NEW.serving AND NOT OLD.serving) EXECUTE FUNCTION dsa.private_gate_barrier();SELECT pg_advisory_lock(881,1)").await?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    command
+        .args([
+            "restore",
+            "--database",
+            &dest.dsn(),
+            "--network",
+            &f.profile.network,
+        ])
+        .args(file_args(&path))
+        .kill_on_drop(true);
+    let restore = tokio::spawn(async move { command.output().await });
+    wait_restore_barrier(&client, &dest.name, "UPDATE dsa.position SET serving=true%").await?;
+    assert_eq!(restore_catalogue(&client).await?, original);
+    let row=client.query_one("SELECT phase,retention_anchor_at IS NULL,(SELECT count(*) FROM serve.block)>0 FROM dsa.restore_build WHERE id",&[]).await?;
+    assert_eq!(row.get::<_, String>(0), "ready");
+    assert!(row.get::<_, bool>(1) && row.get::<_, bool>(2));
+    // More than the reader deadline, with the actual normal publication query
+    // still blocked: there is no view/table AX, so every new read sees55000.
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    closed_reader_queries(&reader).await?;
+    assert_eq!(
+        reader
+            .query(&prepared, &[])
+            .await
+            .unwrap_err()
+            .code()
+            .map(|c| c.code()),
+        Some("55000")
+    );
+    for name in [
+        "idx_block_block_no",
+        "idx_tx_block_id",
+        "idx_tx_out_tx_id",
+        "idx_tx_out_data_hash",
+        "idx_tx_out_address",
+        "idx_tx_in_tx_in_id",
+        "idx_tx_in_tx_out_id_tx_out_index",
+        "idx_multi_asset_policy_name",
+        "idx_multi_asset_policy_name_hex",
+        "idx_ma_tx_out_ident",
+        "idx_ma_tx_out_id_ident",
+    ] {
+        assert_eq!(
+            reader
+                .query("SELECT * FROM pg_indexes WHERE indexname=$1", &[&name])
+                .await?
+                .len(),
+            1
+        );
+    }
+    assert!(
+        dsa_store::storage::first_served_at(&client, i64::from(f.bounds.horizon))
+            .await?
+            .is_none()
+    );
+    let pid:i32=client.query_one("SELECT pid FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event='advisory' AND query LIKE 'UPDATE dsa.position SET serving=true%'",&[&dest.name]).await?.get(0);
+    assert!(
+        client
+            .query_one("SELECT pg_cancel_backend($1)", &[&pid])
+            .await?
+            .get::<_, bool>(0)
+    );
+    let failed = restore.await??;
+    assert!(!failed.status.success());
+    let until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)",
+            &[&pid],
+        )
+        .await?
+        .get::<_, bool>(0)
+    {
+        assert!(tokio::time::Instant::now() < until);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let ready = dest.cli("status", &f.profile.network, &[]).await?;
+    assert_eq!(ready["restore"]["phase"], "ready");
+    assert_eq!(ready["position"]["serving"], false);
+    let wrong = dir.path().join("other-valid-input.dsa");
+    std::fs::write(
+        &wrong,
+        rewrite_description(&std::fs::read(&path)?, |v| {
+            v["tool_version"] = json!("different-public-tool")
+        }),
+    )?;
+    let refused = dest
+        .cli_raw("restore", &f.profile.network, &file_args(&wrong))
+        .await?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("restore_input_binding_mismatch"));
+    assert_no_restore_copy(&refused);
+    assert_eq!(dest.cli("status", &f.profile.network, &[]).await?, ready);
+    old.batch_execute("ROLLBACK").await?;
+    drop(old);
+    client
+        .batch_execute("SELECT pg_advisory_unlock(881,1)")
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    let before_retry: String = client
+        .query_one("SELECT clock_timestamp()::text", &[])
+        .await?
+        .get(0);
+    let output = dest
+        .cli_raw("restore", &f.profile.network, &file_args(&path))
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_restore_copy(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("restore_resume_verified"));
+    let actual: Value = serde_json::from_slice(&output.stdout)?;
+    for key in [
+        "content_digest",
+        "state_digest",
+        "families",
+        "protected_state",
+        "state",
+        "supply",
+    ] {
+        assert_eq!(actual[key], description["verified"][key]);
+    }
+    let anchor=client.query_one("SELECT phase,retention_anchor_at::text,retention_anchor_at>=$1::text::timestamptz FROM dsa.restore_build WHERE id",&[&before_retry]).await?;
+    assert_eq!(anchor.get::<_, String>(0), "complete");
+    assert!(anchor.get::<_, bool>(2));
+    let clock = anchor.get::<_, String>(1);
+    let completed_retry = dest
+        .cli_raw("restore", &f.profile.network, &file_args(&path))
+        .await?;
+    assert!(!completed_retry.status.success());
+    assert!(String::from_utf8_lossy(&completed_retry.stderr).contains("destination_not_empty"));
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT retention_anchor_at::text FROM dsa.restore_build WHERE id",
+                &[]
+            )
+            .await?
+            .get::<_, String>(0),
+        clock
+    );
+    assert_eq!(restore_catalogue(&client).await?, original);
+    assert!(!reader.query(&prepared, &[]).await?.is_empty());
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader, "--check"],
+    )
+    .await?;
+    println!(
+        "{}",
+        json!({"normal_cli_private_ready_resume":true,"stalled_gate_reader_55000":true,"startup_catalogue_preserved":true,"old_prepared_readers":true,"wrong_input_no_mutation":true,"resume_without_copy":true,"post_publication_once_only_anchor":true,"all_six_fields_exact":true})
+    );
+    drop(reader);
+    drop(client);
+    source.cleanup().await?;
+    dest.cleanup().await?;
+    Ok(())
+}
