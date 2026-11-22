@@ -12,6 +12,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile = Profile::load(&network)?;
     let mut store = Store::connect(config, None).await?;
     store.open(&profile).await?;
+    if std::env::args().any(|arg| arg == "--follow-closed") {
+        let before = store.status(&profile).await?;
+        assert_eq!(before["position"]["serving"], false);
+        assert_eq!(before["restore"]["phase"], "published");
+        assert!(before["restore"]["retention_anchor_at"].is_null());
+        let error = match store.following_transaction().await {
+            Ok(tx) => {
+                tx.rollback().await?;
+                panic!("closed gate unexpectedly admitted a following transaction");
+            }
+            Err(error) => error.report(),
+        };
+        assert_eq!(error["sqlstate"], "55000");
+        let after = store.status(&profile).await?;
+        assert_eq!(before["position"], after["position"]);
+        assert_eq!(after["restore"]["phase"], "complete");
+        assert!(after["restore"]["retention_anchor_at"].is_string());
+        assert!(!store.settle_restored_retention(&profile).await?);
+        println!(
+            "{}",
+            json!({"passed":true,"actual_store_api":true,"following_refused_sqlstate":"55000","anchor_committed_before_gate_error":true,"gate_and_position_preserved":true,"restore":after.get("restore")})
+        );
+        return Ok(());
+    }
     if std::env::args().any(|arg| arg == "--settle-only") {
         let before = store.status(&profile).await?;
         let settled = store.settle_restored_retention(&profile).await?;

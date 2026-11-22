@@ -2210,7 +2210,14 @@ async fn restore_build_commit_reader_barrier_and_closed_gate_clock_recovery() ->
             .is_none()
     );
     let mut store = Store::connect(dest.config.clone(), None).await?;
-    assert!(store.settle_restored_retention(&f.profile).await?);
+    let following_error = match store.following_transaction().await {
+        Ok(tx) => {
+            tx.rollback().await?;
+            panic!("closed gate admitted a following transaction");
+        }
+        Err(error) => error.report(),
+    };
+    assert_eq!(following_error["sqlstate"], "55000");
     assert!(!store.settle_restored_retention(&f.profile).await?);
     let after = store.status(&f.profile).await?;
     assert_eq!(before["position"], after["position"]);
@@ -2227,7 +2234,7 @@ async fn restore_build_commit_reader_barrier_and_closed_gate_clock_recovery() ->
     assert!(inherited);
     println!(
         "{}",
-        json!({"normal_build_commit_barrier":true,"all_build_locks_held_readers_55000":true,"no_public_serve_ax":true,"inherited_stats":true,"published_null_anchor_term":true,"actual_owner_settlement_closed_gate":true,"gate_and_facts_preserved":true,"idempotent_clock_recovery":true})
+        json!({"normal_build_commit_barrier":true,"all_build_locks_held_readers_55000":true,"no_public_serve_ax":true,"inherited_stats":true,"published_null_anchor_term":true,"actual_following_entry_settles_before_closed_gate_error":true,"gate_and_facts_preserved":true,"idempotent_clock_recovery":true})
     );
     drop(store);
     drop(reader);
