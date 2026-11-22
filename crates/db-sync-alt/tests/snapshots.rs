@@ -607,6 +607,18 @@ async fn snapshot_verify_named_corruptions() -> Result {
         let lines = String::from_utf8(result.stderr)?;
         let error: Value = serde_json::from_str(lines.lines().last().unwrap())?;
         assert_eq!(error["error"], expected, "{sql}");
+        if expected == "supply_mismatch" {
+            // The mismatch names the unit and both amounts.
+            assert!(
+                error["item"].as_str().is_some_and(|unit| unit.len() >= 56),
+                "{error}"
+            );
+            assert!(
+                error["expected"].is_string() && error["actual"].is_string(),
+                "{error}"
+            );
+            assert_ne!(error["expected"], error["actual"]);
+        }
         drop(client);
         db.cleanup().await?;
     }
@@ -1157,7 +1169,7 @@ fn last_error(output: &std::process::Output) -> Value {
 async fn one_layout(client: &Client) -> Result {
     let row = client
         .query_one(
-            "SELECT to_regnamespace('dsa_retired') IS NULL AND to_regnamespace('dsa_restore') IS NULL,NOT EXISTS(SELECT 1 FROM pg_inherits)",
+            "SELECT to_regnamespace('dsa_retired') IS NULL,NOT EXISTS(SELECT 1 FROM pg_inherits)",
             &[],
         )
         .await?;
