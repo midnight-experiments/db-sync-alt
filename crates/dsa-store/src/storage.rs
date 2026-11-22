@@ -79,7 +79,7 @@ pub(crate) async fn validate_routes<C: GenericClient>(client: &C) -> Result<(), 
         .missing
         .is_empty()
     {
-        return Err(Error::Refusal("restore_public_index_missing"));
+        return Err(Error::Refusal("required_index_missing"));
     }
     let kind: String = client
         .query_one(
