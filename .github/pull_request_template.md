@@ -4,8 +4,8 @@ Describe the concrete problem and resulting behavior.
 
 ## Validation
 
-List the commands you ran (`python3 tools/dev.py …`, the source check) and their
-results. Say what was tested with synthetic data only.
+List the commands you ran (`cargo test`, the PostgreSQL tests, the source check)
+and their results. Say what was tested with synthetic data only.
 
 ## Compatibility
 

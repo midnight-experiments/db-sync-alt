@@ -1,6 +1,5 @@
 __pycache__/
 *.py[cod]
-.venv/
 .env
 .env.*
 !.env.example
@@ -9,8 +8,5 @@ state/
 backups/
 *.dump
 *.log
-coverage/
-build/
-*.egg-info/
 
 /target/

@@ -196,12 +196,12 @@ impl Database {
     pub(crate) async fn legacy(&self, f: &Fixture) -> Result {
         let client = connect(&self.config).await?;
         for ddl in [
-            include_str!("../../../../src/db_sync_alt/store/schema.sql"),
-            include_str!("../../../../src/db_sync_alt/store/schema_v2.sql"),
-            include_str!("../../../../src/db_sync_alt/store/schema_v3.sql"),
-            include_str!("../../../../src/db_sync_alt/store/schema_v3_after_load.sql"),
-            include_str!("../../../../src/db_sync_alt/store/schema_v4.sql"),
-            include_str!("../../../../src/db_sync_alt/store/schema_v5.sql"),
+            include_str!("../fixtures/legacy-schema/schema.sql"),
+            include_str!("../fixtures/legacy-schema/schema_v2.sql"),
+            include_str!("../fixtures/legacy-schema/schema_v3.sql"),
+            include_str!("../fixtures/legacy-schema/schema_v3_after_load.sql"),
+            include_str!("../fixtures/legacy-schema/schema_v4.sql"),
+            include_str!("../fixtures/legacy-schema/schema_v5.sql"),
         ] {
             client.batch_execute(ddl).await?;
         }

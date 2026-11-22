@@ -64,7 +64,7 @@ are refused.
 Preprod is built, followed, served and checked against cardano-db-sync end to
 end. A Mainnet database built from a real Mainnet cardano-db-sync 13.8.0.0 (up
 to block 14,160,853), upgraded and verified, is followed through Blockfrost with
-[relevance filtering](mainnet-relevance.md), and a Midnight node 2.1.101 reads
+relevance filtering, and a Midnight node 2.1.101 reads
 it over TLS; serving that node at the Mainnet chain tip is not tested. The
 Preview profile is checked by unit and integration tests on synthetic data only
 (for example a Preview build from block 0 with k = 432); no Preview database has
