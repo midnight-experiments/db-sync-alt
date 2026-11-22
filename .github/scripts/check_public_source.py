@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Check the complete public tree; report filenames/codes, never secret matches."""
 import argparse
+import gzip
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
@@ -21,9 +23,16 @@ PATTERNS = {
     'credential_url': re.compile(r'(?:postgres(?:ql)?|https?)://[^\s/:]+:[^\s/@]+@'),
     'private_host_identity': re.compile(r'\b(?:eddie|acedward)@(?:[^\s]+)'),
 }
-# No binary asset is admitted; add a reviewed path and SHA-256 here to admit one.
+# Binary assets require an exact path and SHA-256. Compressed JSON fixtures
+# additionally receive bounded expansion, member validation and text scans.
 APPROVED_PNG = {}
 PNG_SIGNATURE = bytes((137, 80, 78, 71, 13, 10, 26, 10))
+APPROVED_JSON_GZIP = {
+    'crates/dsa-provider/tests/fixtures/mainnet-corpus.json.gz':
+        '0195eee4b707ace0f3095902009ff66350288e5f7bf732b6450912377ead5f4f',
+    'crates/dsa-provider/tests/fixtures/preprod-corpus.json.gz':
+        '7111c2e00ccd86ec320a3e5fe36f49c581144e13de8c8acfc3eac7a970cfec8c',
+}
 
 FORBIDDEN_SUFFIXES = {'.dump','.db','.pem','.key','.log','.pyc','.pyo'}
 
@@ -43,6 +52,30 @@ REDACTION_FIXTURES = {
     # Upstream unit-test constant in the pinned (hash-checked) node source.
     'reference/node/src/main_chain_follower.rs': {'postgres://user:pass@localhost:5432/testdb'},
 }
+
+def recorded_fixture_text(raw):
+    if len(raw)>5*1024*1024:raise ValueError('compressed_fixture_limit')
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+        expanded=stream.read(64*1024*1024+1)
+    if len(expanded)>64*1024*1024:raise ValueError('expanded_fixture_limit')
+    bundle=json.loads(expanded)
+    if bundle['format']!='recorded-corpus-v1' or bundle['network'] not in {'mainnet','preprod'}:
+        raise ValueError('fixture_identity')
+    files=bundle['files'];hashes=bundle['sha256']
+    if not isinstance(files,dict) or not files or files.keys()!=hashes.keys():
+        raise ValueError('fixture_members')
+    for name,text in files.items():
+        parts=Path(name).parts
+        allowed=name in {'recording-plan.json','expected.json','origins.json'} or (
+            len(parts)==3 and parts[0]=='provider' and
+            parts[1] in {'headers','transactions','datums','metadata','outputs'} and
+            parts[2].endswith('.json'))
+        if not allowed or name!='/'.join(parts) or Path(name).is_absolute() or any(p in {'.','..'} for p in parts):
+            raise ValueError('fixture_member_path')
+        if not isinstance(text,str) or hashlib.sha256(text.encode()).hexdigest()!=hashes[name]:
+            raise ValueError('fixture_member_hash')
+        json.loads(text)
+    return '\n'.join(files.values())
 
 def check(root):
     errors=[]; hashes={}
@@ -65,8 +98,15 @@ def check(root):
             if hashes[str(rel)]!=APPROVED_PNG[str(rel)] or not b.startswith(PNG_SIGNATURE):
                 errors.append((str(rel),'unapproved_binary_asset'))
             continue
-        try:text=b.decode('utf-8')
-        except UnicodeDecodeError:errors.append((str(rel),'binary_file'));continue
+        if str(rel) in APPROVED_JSON_GZIP:
+            if hashes[str(rel)]!=APPROVED_JSON_GZIP[str(rel)]:
+                errors.append((str(rel),'unapproved_binary_asset'));continue
+            try:text=recorded_fixture_text(b)
+            except (OSError,EOFError,ValueError,TypeError,KeyError,AttributeError):
+                errors.append((str(rel),'invalid_recorded_fixture'));continue
+        else:
+            try:text=b.decode('utf-8')
+            except UnicodeDecodeError:errors.append((str(rel),'binary_file'));continue
         if '\x00' in text:errors.append((str(rel),'binary_file'));continue
         for label,regex in PATTERNS.items():
             scan_text=text

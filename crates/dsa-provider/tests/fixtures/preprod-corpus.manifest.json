@@ -1,0 +1,42 @@
+{
+  "format": "recorded-corpus-v1",
+  "network": "preprod",
+  "projection_blocks": [
+    4349638,
+    4349642,
+    5225025,
+    5380834,
+    5380847,
+    5384721
+  ],
+  "datum_support_blocks": [
+    4318350
+  ],
+  "files": 24,
+  "raw_bundle_bytes": 291696,
+  "compressed_bytes": 48596,
+  "compressed_sha256": "7111c2e00ccd86ec320a3e5fe36f49c581144e13de8c8acfc3eac7a970cfec8c",
+  "expected": {
+    "tx": 6,
+    "tx_out": 7,
+    "ma_tx_out": 7,
+    "tx_in": 8,
+    "tx_metadata": 0,
+    "mint": 4,
+    "datum": 6
+  },
+  "scope": "Public finalized ledger records and independently exported legacy schema5 rows. Projection blocks alone enter row and shape counts. Shared API replies carry qualified capture provenance. The complete local corpus retains the older bridge asset-row differences.",
+  "coverage": {
+    "decoded_transactions": 20,
+    "pallas_compared": 20,
+    "pallas_unavailable": 0,
+    "invalid_transactions": 0,
+    "byron_outputs": 0,
+    "pointer_outputs": 0,
+    "collateral_outputs_compared": 9,
+    "fallback_outputs_compared": 0,
+    "multi_input_transactions": 13,
+    "skipped_non_effective_collateral_outputs": 0,
+    "skipped_non_effective_ordinary_outputs": 0
+  }
+}

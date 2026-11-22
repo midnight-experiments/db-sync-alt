@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dsa-chain", "crates/dsa-store", "crates/db-sync-alt"]
+members = ["crates/dsa-chain", "crates/dsa-store", "crates/dsa-provider", "crates/dsa-service", "crates/db-sync-alt"]
 resolver = "3"
 
 [workspace.package]
@@ -13,7 +13,7 @@ repository = "https://github.com/midnight-experiments/db-sync-alt"
 dsa-chain = { path = "crates/dsa-chain" }
 dsa-store = { path = "crates/dsa-store" }
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "unbounded_depth"] }
 sha2 = "0.10"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
