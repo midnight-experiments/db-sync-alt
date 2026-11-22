@@ -1,0 +1,41 @@
+name: a7-prototype-tools
+on:
+  workflow_dispatch:
+    inputs:
+      product_pin:
+        description: 'Exact clean public prototype SHA after normal Rust CI is green'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate exact source pin
+        env:
+          PRODUCT_PIN: ${{inputs.product_pin}}
+        run: |
+          python3 - <<'PY'
+          import os,re
+          pin=os.environ['PRODUCT_PIN'];assert re.fullmatch('[0-9a-f]{40}',pin)
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{inputs.product_pin}}
+          path: product
+          persist-credentials: false
+      - name: Build normal CLI and actual Store API writer probe
+        env:
+          PRODUCT_PIN: ${{inputs.product_pin}}
+        run: python3 .github/qualification/build_prototype_tools.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a7-prototype-tools-${{github.run_id}}
+          path: ${{runner.temp}}/a7-prototype-tools
+          retention-days: 3
