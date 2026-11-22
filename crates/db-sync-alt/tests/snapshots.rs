@@ -2097,3 +2097,143 @@ async fn restore_refuses_unowned_private_objects_and_empty_inheritance() -> Resu
     source.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_build_commit_reader_barrier_and_closed_gate_clock_recovery() -> Result {
+    let f = fixture(283);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("build-commit.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader],
+    )
+    .await?;
+    let client = connect(&dest.config).await?;
+    let catalogue = restore_catalogue(&client).await?;
+    client.batch_execute("CREATE FUNCTION dsa.fixture_build_commit() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(882,1);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.fixture_build_commit() FROM PUBLIC;CREATE CONSTRAINT TRIGGER fixture_build_commit AFTER UPDATE ON dsa.position DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN(OLD.horizon_height IS NULL AND NEW.horizon_height IS NOT NULL AND NOT NEW.serving) EXECUTE FUNCTION dsa.fixture_build_commit();CREATE FUNCTION dsa.fixture_anchor() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(882,2);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.fixture_anchor() FROM PUBLIC;SELECT pg_advisory_lock(882,1);SELECT pg_advisory_lock(882,2)").await?;
+    let mut root = dest.config.clone();
+    let admin_user: String = dest
+        .admin
+        .query_one("SELECT current_user", &[])
+        .await?
+        .get(0);
+    root.user(&admin_user);
+    let admin = connect(&root).await?;
+    admin.batch_execute("CREATE FUNCTION dsa.fixture_anchor_install() RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$DECLARE c record;BEGIN FOR c IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP IF c.command_tag='CREATE TABLE' AND c.object_type='table' AND c.objid=to_regclass('dsa.restore_build') THEN EXECUTE 'CREATE TRIGGER fixture_anchor BEFORE UPDATE ON dsa.restore_build FOR EACH ROW WHEN(OLD.phase=''published'' AND NEW.phase=''complete'') EXECUTE FUNCTION dsa.fixture_anchor()';END IF;END LOOP;END$$;REVOKE ALL ON FUNCTION dsa.fixture_anchor_install() FROM PUBLIC;CREATE EVENT TRIGGER fixture_anchor_install ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION dsa.fixture_anchor_install()").await?;
+    let mut rc = dest.config.clone();
+    rc.user(&dest.reader)
+        .options("-c default_transaction_read_only=on -c statement_timeout=200ms");
+    let reader = connect(&rc).await?;
+    let prepared = reader
+        .prepare("SELECT * FROM public.block ORDER BY block_no DESC LIMIT 1")
+        .await?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    command
+        .args([
+            "restore",
+            "--database",
+            &dest.dsn(),
+            "--network",
+            &f.profile.network,
+        ])
+        .args(file_args(&path))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = command.spawn()?;
+    let process = child.id().ok_or("missing child")?;
+    let work = tokio::spawn(async move { child.wait_with_output().await });
+    wait_restore_barrier(&client, &dest.name, "COMMIT%").await?;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    closed_reader_queries(&reader).await?;
+    assert_eq!(
+        reader
+            .query(&prepared, &[])
+            .await
+            .unwrap_err()
+            .code()
+            .map(|x| x.code()),
+        Some("55000")
+    );
+    assert_eq!(restore_catalogue(&client).await?, catalogue);
+    let ax:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace WHERE l.mode='AccessExclusiveLock' AND l.granted AND n.nspname IN('serve','public'))",&[]).await?.get(0);
+    assert!(!ax);
+    assert_eq!(
+        reader
+            .query(
+                "SELECT * FROM pg_indexes WHERE indexname='idx_tx_out_address'",
+                &[]
+            )
+            .await?
+            .len(),
+        1
+    );
+    client
+        .batch_execute("SELECT pg_advisory_unlock(882,1)")
+        .await?;
+    wait_restore_barrier(
+        &client,
+        &dest.name,
+        "UPDATE dsa.restore_build SET retention_anchor_at=%",
+    )
+    .await?;
+    let row=client.query_one("SELECT phase,retention_anchor_at IS NULL,(SELECT serving FROM dsa.position) FROM dsa.restore_build WHERE id",&[]).await?;
+    assert_eq!(row.get::<_, String>(0), "published");
+    assert!(row.get::<_, bool>(1) && row.get::<_, bool>(2));
+    assert!(!reader.query(&prepared, &[]).await?.is_empty());
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &process.to_string()])
+            .status()
+            .await?
+            .success()
+    );
+    let output = work.await??;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("operation_interrupted"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while client.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt')",&[&dest.name]).await?.get::<_,bool>(0){assert!(tokio::time::Instant::now()<deadline);tokio::time::sleep(std::time::Duration::from_millis(10)).await;}
+    client.batch_execute("UPDATE dsa.position SET serving=false,reason='generated_post_publish_check';SELECT pg_advisory_unlock(882,2)").await?;
+    let before = dest.cli("status", &f.profile.network, &[]).await?;
+    assert!(
+        dsa_store::storage::first_served_at(&client, i64::from(f.bounds.horizon))
+            .await?
+            .is_none()
+    );
+    let mut store = Store::connect(dest.config.clone(), None).await?;
+    assert!(store.settle_restored_retention(&f.profile).await?);
+    assert!(!store.settle_restored_retention(&f.profile).await?);
+    let after = store.status(&f.profile).await?;
+    assert_eq!(before["position"], after["position"]);
+    assert_eq!(after["restore"]["phase"], "complete");
+    assert!(after["restore"]["retention_anchor_at"].is_string());
+    assert!(
+        dsa_store::storage::first_served_at(&client, i64::from(f.bounds.horizon))
+            .await?
+            .is_some()
+    );
+    closed_reader_queries(&reader).await?;
+    assert_eq!(rows(&source).await?, rows(&dest).await?);
+    let inherited:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_stats WHERE schemaname='serve' AND tablename='tx_out' AND inherited)",&[]).await?.get(0);
+    assert!(inherited);
+    println!(
+        "{}",
+        json!({"normal_build_commit_barrier":true,"all_build_locks_held_readers_55000":true,"no_public_serve_ax":true,"inherited_stats":true,"published_null_anchor_term":true,"actual_owner_settlement_closed_gate":true,"gate_and_facts_preserved":true,"idempotent_clock_recovery":true})
+    );
+    drop(store);
+    drop(reader);
+    drop(admin);
+    drop(client);
+    source.cleanup().await?;
+    dest.cleanup().await?;
+    Ok(())
+}

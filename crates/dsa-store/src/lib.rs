@@ -334,10 +334,34 @@ impl Store {
     /// Follower writes/pruning recover a committed restore's retention anchor
     /// before using it. Restore/setup transactions keep their separate protocol.
     pub async fn following_transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        // A closed gate after publication must not strand its protected cohort.
+        // Commit settlement separately before requiring the gate for writes.
+        self.settle_pending_retention().await?;
         let transaction = self.writer_transaction().await?;
         transaction.query_one("SELECT dsa.gate()", &[]).await?;
         storage::recover_retention_anchor(&transaction).await?;
         Ok(transaction)
+    }
+
+    /// Owner-only recovery of an already-published cohort, even if a later check
+    /// closed the gate. Never opens it, reloads rows or refreshes a settled clock.
+    pub async fn settle_restored_retention(&mut self, profile: &Profile) -> Result<bool, Error> {
+        self.open(profile).await?;
+        self.settle_pending_retention().await
+    }
+
+    async fn settle_pending_retention(&mut self) -> Result<bool, Error> {
+        if !storage::has_journal(&self.client).await? {
+            return Ok(false);
+        }
+        let pending:bool=self.client.query_one("SELECT phase='published' AND retention_anchor_at IS NULL FROM dsa.restore_build WHERE id",&[]).await?.get(0);
+        if !pending {
+            return Ok(false);
+        }
+        let transaction = self.writer_transaction().await?;
+        storage::recover_retention_anchor(&transaction).await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     pub async fn create(&mut self, profile: &Profile) -> Result<(), Error> {

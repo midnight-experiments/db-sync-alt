@@ -26,12 +26,26 @@ visibility, not an exact commit timestamp. Settlement counts in restore time.
 
 Internal insertion/COPY writers must resolve the single authoritative relation
 with `dsa_store::storage::write_relation`; direct insertion into the empty parent
-is rejected. PostgreSQL parent constraints do not enforce child uniqueness, and
+is rejected with `0A000` (distinct from a reader's closed-gate `55000`). Known
+earlier prototype guard bodies remain readable/resumable without rewriting them.
+PostgreSQL parent constraints do not enforce child uniqueness, and
 parent `ON CONFLICT` cannot arbitrate a child's index. `following_transaction`
 recovers an interrupted retention settlement before follow/prune work. The
 generated `restore_writer_probe` example exercises this actual API with
 RETURNING/ON CONFLICT and rolled-back tuples. Follower integration of these
 boundaries is still required and is not claimed by the prototype.
+
+Both children and the served inheritance parents are analyzed before build
+commit, so node joins receive inherited statistics. Resuming an older owned
+build repairs missing inherited statistics without another COPY. A future
+follower must maintain these parent statistics as child facts change.
+
+An owner may call `Store::settle_restored_retention` to finish a published
+cohort's pending clock even after a later check closed the gate. It preserves
+the gate and all data, and never republishes a READY build or refreshes a settled
+anchor. `following_transaction` performs pending settlement before its gate
+check, so a closed gate cannot permanently strand the clock. The generated API
+probe exposes this method with `--settle-only`; it is not a new operator CLI.
 
 Wire format1 carries keep-rule version2 and preserves the selected payloads
 and original pre-filter asset ordinals. Rule1 files and databases are refused;

@@ -194,6 +194,29 @@ pub(super) async fn resume(
     }
     let stage = RestoreStage::start("restore_resume_verify", "database");
     let tx = store.writer_transaction().await?;
+    // Owned READY layouts from the earlier prototype can lack inherited stats.
+    // Repair only missing nonempty-family stats without another payload load.
+    let kind: String = tx
+        .query_one("SELECT storage_kind FROM dsa.restore_build WHERE id", &[])
+        .await?
+        .get(0);
+    if kind == "inherited" {
+        for family in NODE_RELATIONS {
+            let have:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_stats WHERE schemaname='serve' AND tablename=$1 AND inherited)",&[&family]).await?.get(0);
+            if !have
+                && saved
+                    .families
+                    .get(family)
+                    .is_some_and(|digest| digest.rows > 0)
+            {
+                let analyze = RestoreStage::start("restore_inherited_analyze", family);
+                tx.batch_execute(&format!("ANALYZE serve.{family}"))
+                    .await
+                    .map_err(|error| analyze.error(error))?;
+                analyze.finish();
+            }
+        }
+    }
     let actual = verify::verify(&tx, profile, phase == "published").await?;
     if !verify::logical_equal(&saved, &actual) {
         return Err(Error::Refusal("snapshot_content_digest_mismatch"));
@@ -287,6 +310,13 @@ pub(super) async fn restore_preflighted(
             "ANALYZE dsa_restore.{family};ALTER TABLE dsa_restore.{family} INHERIT serve.{family}"
         ))
         .await?;
+        stage.finish();
+        // Per-child stats do not populate the parent's inherited join stats.
+        // ANALYZE's locks stay compatible with node AccessShare readers.
+        let stage = RestoreStage::start("restore_inherited_analyze", family);
+        tx.batch_execute(&format!("ANALYZE serve.{family}"))
+            .await
+            .map_err(|error| stage.error(error))?;
         stage.finish();
     }
     tx.batch_execute("ANALYZE dsa.consumed_before_horizon")

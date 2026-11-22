@@ -13,6 +13,10 @@ use crate::{Error, NODE_RELATIONS};
 
 pub(crate) const SCHEMA: &str = "dsa_restore";
 pub(crate) const PARENT_GUARD_BODY: &str =
+    "BEGIN RAISE EXCEPTION 'restore_write_route_required' USING ERRCODE='0A000';END";
+// Earlier isolated builds used the gate code for the same fail-closed guard.
+// Accept their stored layout without rewriting or reloading an owned build.
+pub(crate) const LEGACY_PARENT_GUARD_BODY: &str =
     "BEGIN RAISE EXCEPTION 'restore_write_route_required' USING ERRCODE='55000';END";
 
 pub(crate) async fn has_journal<C: GenericClient>(client: &C) -> Result<bool, Error> {
@@ -89,7 +93,7 @@ pub(crate) async fn validate_routes<C: GenericClient>(client: &C) -> Result<(), 
         .await?
         .get(0);
     if kind == "inherited" {
-        let guard:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang CROSS JOIN dsa.restore_build b WHERE b.id AND p.oid=to_regprocedure('dsa.restore_parent_insert_guard()') AND p.proowner=b.owner_oid AND p.prosrc=$1 AND NOT p.prosecdef AND NOT p.proretset AND p.pronargs=0 AND p.prorettype='trigger'::regtype AND l.lanname='plpgsql')",&[&PARENT_GUARD_BODY]).await?.get(0);
+        let guard:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang CROSS JOIN dsa.restore_build b WHERE b.id AND p.oid=to_regprocedure('dsa.restore_parent_insert_guard()') AND p.proowner=b.owner_oid AND p.prosrc=ANY($1::text[]) AND NOT p.prosecdef AND NOT p.proretset AND p.pronargs=0 AND p.prorettype='trigger'::regtype AND l.lanname='plpgsql')",&[&vec![PARENT_GUARD_BODY,LEGACY_PARENT_GUARD_BODY]]).await?.get(0);
         if !guard {
             return Err(Error::Refusal("restore_parent_guard_mismatch"));
         }
