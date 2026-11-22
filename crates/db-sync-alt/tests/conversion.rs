@@ -2,12 +2,12 @@
 #[path = "common/legacy.rs"]
 #[allow(dead_code)]
 mod common;
-use common::fixtures::selected;
-use common::{Database, connect, failure, file_args, fixture};
-use dsa_chain::{
-    keep::{Header, TABLES, keep},
-    profiles::Profile,
+use common::fixtures::{
+    model::{Header, keep},
+    selected,
 };
+use common::{Database, connect, failure, file_args, fixture};
+use dsa_chain::{keep::TABLES, profiles::Profile};
 use dsa_store::{
     Store,
     convert::{ConvertOptions, LegacySource},

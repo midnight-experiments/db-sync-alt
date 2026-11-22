@@ -1508,7 +1508,7 @@ async fn compare_more_than_five_hundred_pairs_and_quiet_event_classes() -> Resul
         f.chain
             .blocks
             .entry(i64::from(height))
-            .or_insert(dsa_chain::keep::Header {
+            .or_insert(common::fixtures::model::Header {
                 epoch: Some((height / 2) as i32),
                 slot: Some(i64::from(height) * 100 + 1),
             });

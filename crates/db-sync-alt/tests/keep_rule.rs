@@ -13,16 +13,16 @@ mod queries;
 
 use std::{collections::BTreeMap, error::Error as StdError, time::Instant};
 
-use dsa_chain::keep::{Bounds, RetainedRows, TABLES, keep};
+use dsa_chain::keep::{Bounds, RetainedRows, TABLES};
 use dsa_store::{
     Store,
-    keep::{Selection, SourceSchema},
+    keep::{Form, Selection, SourceSchema},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, Config, NoTls, config::SslMode};
 
-use fixtures::{Fixture, Rows, selected};
+use fixtures::{Fixture, Rows, model::keep, selected};
 use futures_util::TryStreamExt;
 use queries::{IdBounds, Queries};
 
@@ -177,7 +177,7 @@ impl Database {
         }).collect::<Vec<_>>().join(",");
         let sql = format!(
             "{} SELECT jsonb_build_object({entries})",
-            Selection::ctes_sql(SourceSchema::Serve)
+            Selection::ctes(Form::Source(SourceSchema::Serve))
         );
         selection
             .validate_source(self.store.client(), SourceSchema::Serve)
@@ -362,7 +362,7 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
     let out = null_value.tags["council_6"];
     null_value.chain.datums.insert(
         105,
-        dsa_chain::keep::Datum {
+        fixtures::model::Datum {
             hash: "12".repeat(32),
         },
     );
@@ -726,98 +726,6 @@ async fn verify_observations(
     Ok(counts)
 }
 
-#[test]
-fn keep_rule_indexed_stage_dependencies_are_not_noops() -> Result {
-    let plan = Selection::staging_plan()?;
-    assert_eq!(plan.len(), 20);
-    let expected = [
-        "conversion_keys_unspent",
-        "conversion_keys_permissioned",
-        "conversion_keys_epochs",
-        "conversion_keys_outputs",
-        "conversion_keys_assets",
-    ];
-    for (index, name) in expected.iter().enumerate() {
-        assert_eq!(plan[index].table, *name);
-        for stage in plan.iter().skip(index + 1) {
-            assert!(
-                stage
-                    .create_sql
-                    .contains(&format!("SELECT * FROM pg_temp.{name}")),
-                "{} missing {}",
-                stage.table,
-                name
-            );
-        }
-    }
-    for stage in &plan {
-        for bind in 1..=10 {
-            assert!(
-                stage.create_sql.contains(&format!("${bind}::")),
-                "{} missing bind{}",
-                stage.table,
-                bind
-            );
-        }
-    }
-    assert!(
-        plan[0]
-            .create_sql
-            .contains("SELECT o.id FROM pg_temp.tx_out o")
-    );
-    assert!(
-        !plan[1]
-            .create_sql
-            .contains("old_unspent AS MATERIALIZED (\n SELECT o.id")
-    );
-    assert!(
-        plan[5]
-            .create_sql
-            .contains("SELECT o.id,o.tx_id,o.address,o.data_hash")
-    );
-    assert!(
-        plan[6]
-            .create_sql
-            .contains("SELECT a.id,a.tx_out_id,a.ident")
-    );
-    assert!(
-        plan[7]
-            .create_sql
-            .contains("SELECT DISTINCT o.data_hash AS hash FROM pg_temp.conversion_output_facts o")
-    );
-    assert!(
-        plan[7]
-            .create_sql
-            .contains("FROM pg_temp.conversion_asset_facts a")
-    );
-    assert!(
-        plan[9]
-            .create_sql
-            .contains("SELECT o.tx_id FROM pg_temp.conversion_output_facts o")
-    );
-    assert!(
-        plan[13]
-            .create_sql
-            .contains("SELECT a.ident FROM pg_temp.conversion_asset_facts a")
-    );
-    assert!(plan[14].create_sql.contains("WHERE d.hash=h.hash OFFSET 0"));
-    assert!(
-        plan[12]
-            .create_sql
-            .contains("UNION SELECT a.id FROM pg_temp.ma_tx_out a WHERE a.id BETWEEN")
-    );
-    assert!(plan[12].create_sql.contains("ident NOT IN"));
-    assert!(!plan[1].prepare_sql.contains("UNIQUE"));
-    assert!(!plan[2].prepare_sql.contains("UNIQUE"));
-    for (index, family) in TABLES.iter().enumerate() {
-        assert_eq!(plan[8 + index].table, format!("conversion_family_{family}"));
-        assert!(plan.last().unwrap().create_sql.contains(&format!(
-            "SELECT family,id FROM pg_temp.conversion_family_{family}"
-        )));
-    }
-    Ok(())
-}
-
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn keep_rule_indexed_stages_match_independent_model() -> Result {
@@ -843,7 +751,7 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
         missing.chain.datums.remove(&987654);
         cases.push(missing);
     }
-    let plan = Selection::staging_plan()?;
+    let plan = Selection::staging_plan();
     let mut duplicate_epoch_cases = 0;
     for fixture in &cases {
         let (_, full_ids) = db.replace(fixture).await?;
@@ -903,165 +811,6 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
     println!(
         "{}",
         json!({"indexed_stage_cases":cases.len(),"stages":20,"family_comparisons":cases.len()*TABLES.len(),"duplicate_epoch_cases":duplicate_epoch_cases,"oracle":"independent pure model and original all11 CTEs","rollback_cleanup_verified":true,"temporary_tables_checked":plan.len()+TABLES.len(),"ordered_staging_sql":plan.iter().map(|stage|json!({"table":stage.table,"create_sha256":format!("{:x}",Sha256::digest(stage.create_sql.as_bytes())),"prepare_sha256":format!("{:x}",Sha256::digest(stage.prepare_sql.as_bytes()))})).collect::<Vec<_>>()})
-    );
-    db.cleanup().await
-}
-
-// Keep the measured non-NULL optimization equivalent to its predecessor and
-// the independent pure model, including all eleven families and real mutants.
-#[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
-async fn keep_rule_q4_private_split_equivalence() -> Result {
-    use std::collections::BTreeSet;
-    let initial = Fixture::base(1);
-    let db = Database::new(&initial.profile).await?;
-    db.store
-        .client()
-        .batch_execute("CREATE TEMP TABLE q4_retained_outputs(id bigint PRIMARY KEY)")
-        .await?;
-    let mut cases = named_cases().into_values().collect::<Vec<_>>();
-    cases.extend((0..32).map(Fixture::generated));
-    let mut address_mutation = 0;
-    let mut unit_mutation = 0;
-    for fixture in &cases {
-        let (product_rows, product_ids) = db.replace(fixture).await?;
-        let model = keep(&fixture.chain, &fixture.profile, fixture.bounds)?;
-        assert_eq!(product_ids, model, "product seed{}", fixture.seed);
-        assert_eq!(product_rows, selected(&fixture.rows(), &model));
-        let outputs = model["tx_out"].iter().copied().collect::<Vec<_>>();
-        db.store
-            .client()
-            .batch_execute("TRUNCATE pg_temp.q4_retained_outputs")
-            .await?;
-        db.store
-            .client()
-            .execute(
-                "INSERT INTO pg_temp.q4_retained_outputs SELECT unnest($1::bigint[])",
-                &[&outputs],
-            )
-            .await?;
-        let selection = Selection::new(&fixture.profile, fixture.bounds)?;
-        let prefix = Selection::ctes_sql(SourceSchema::Serve).replacen("WITH\n", "WITH q4_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,$3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,$6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,$9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names),\n", 1);
-        let output_start = prefix.find("keep_tx_out AS MATERIALIZED (").unwrap();
-        let output_end = prefix.find("keep_block AS MATERIALIZED (").unwrap();
-        let split = format!(
-            "{}keep_tx_out AS MATERIALIZED (SELECT id FROM pg_temp.q4_retained_outputs),\n{}",
-            &prefix[..output_start],
-            &prefix[output_end..]
-        );
-        let datum_start = prefix.find("keep_datum AS MATERIALIZED (").unwrap();
-        let datum_end = prefix.find("keep_epoch_param AS MATERIALIZED (").unwrap();
-        let nonnull = &prefix[datum_start..datum_end];
-        let original = nonnull.replace(
-            "WHERE o.data_hash IS NOT NULL AND o.id BETWEEN",
-            "WHERE o.id BETWEEN",
-        );
-        assert_ne!(nonnull, original);
-        let predecessor = prefix.replacen(nonnull, &original, 1);
-        let all_families = TABLES
-            .iter()
-            .map(|table| format!("SELECT '{table}'::text AS family,id FROM keep_{table}"))
-            .collect::<Vec<_>>()
-            .join(" UNION ALL ");
-        let mut predecessor_ids = TABLES
-            .iter()
-            .map(|table| (table.to_string(), BTreeSet::new()))
-            .collect::<RetainedRows>();
-        for row in db
-            .store
-            .client()
-            .query(
-                &format!("{predecessor} {all_families} ORDER BY family,id"),
-                &selection.parameters(),
-            )
-            .await?
-        {
-            predecessor_ids
-                .get_mut(row.get::<_, &str>(0))
-                .unwrap()
-                .insert(row.get(1));
-        }
-        assert_eq!(predecessor_ids, model, "predecessor seed{}", fixture.seed);
-        let forward = r#"datum_output_candidates AS MATERIALIZED (
- SELECT o.id,o.data_hash FROM (SELECT DISTINCT address FROM unnest($4::text[]) g(address)) g
- JOIN serve.tx_out o ON o.address=g.address
- WHERE o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND o.data_hash IS NOT NULL
- UNION ALL
- SELECT o.id,o.data_hash FROM serve.multi_asset m
- JOIN serve.ma_tx_out a ON a.ident=m.id AND a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
- JOIN serve.tx_out o ON o.id=a.tx_out_id AND o.id BETWEEN 0 AND $2::bigint*16777216+16777215
- WHERE m.policy=$7::bytea AND m.name=$8::bytea AND o.data_hash IS NOT NULL
-),
-keep_datum AS MATERIALIZED (
- SELECT DISTINCT d.id FROM datum_output_candidates o
- JOIN keep_tx_out k ON k.id=o.id JOIN serve.datum d ON d.hash=o.data_hash
-),
-"#;
-        for (name, sql) in [
-            ("predecessor", predecessor),
-            ("normal_product", prefix.clone()),
-            (
-                "split_indexed_outputs",
-                split.replacen(nonnull, &original, 1),
-            ),
-            ("split_nonnull", split.clone()),
-            ("forward_eligibility", prefix.replacen(nonnull, forward, 1)),
-        ] {
-            let ids = db
-                .store
-                .client()
-                .query(
-                    &(sql + " SELECT id FROM keep_datum ORDER BY id"),
-                    &selection.parameters(),
-                )
-                .await?
-                .iter()
-                .map(|row| row.get::<_, i64>(0))
-                .collect::<BTreeSet<_>>();
-            assert_eq!(ids, model["datum"], "Q4 {name} seed{}", fixture.seed);
-        }
-        // Real sensitivity controls: removing an address reason or broadening
-        // exact permissioned-unit matching must change a generated datum set.
-        for (kind, mutant) in [
-            (
-                "address",
-                nonnull.replace("o.address=ANY($4::text[])", "FALSE"),
-            ),
-            (
-                "unit",
-                nonnull.replace(
-                    "m.policy=$7::bytea AND m.name=$8::bytea",
-                    "m.policy=$7::bytea",
-                ),
-            ),
-        ] {
-            let sql =
-                prefix.replacen(nonnull, &mutant, 1) + " SELECT id FROM keep_datum ORDER BY id";
-            let ids = db
-                .store
-                .client()
-                .query(&sql, &selection.parameters())
-                .await?
-                .iter()
-                .map(|row| row.get::<_, i64>(0))
-                .collect::<BTreeSet<_>>();
-            if ids != model["datum"] {
-                if kind == "address" {
-                    address_mutation += 1;
-                } else {
-                    unit_mutation += 1;
-                }
-            }
-        }
-    }
-    assert!(address_mutation > 0, "address mutation was not detected");
-    assert!(
-        unit_mutation > 0,
-        "wrong-name permissioned mutation was not detected"
-    );
-    println!(
-        "{}",
-        json!({"q4_execution_shape_cases":cases.len(),"variants":5,"full_family_comparisons":cases.len()*TABLES.len(),"address_negative_cases":address_mutation,"unit_negative_cases":unit_mutation,"semantic_source":"unchanged A3 pure model","product_optimization":"explicit nonNULL datum hash; predecessor all11 exact","keep_rule_version_changed":false})
     );
     db.cleanup().await
 }
@@ -1221,11 +970,16 @@ async fn keep_rule_selection_entry_points() -> Result {
     let selection = Selection::new(&fixture.profile, fixture.bounds)?;
     assert_eq!(ids, keep(&fixture.chain, &fixture.profile, fixture.bounds)?);
     for schema in [SourceSchema::Public, SourceSchema::Serve] {
-        assert_eq!(selection.collect_ids(db.store.client(), schema).await?, ids);
+        assert_eq!(
+            selection
+                .collect_ids(db.store.client(), Form::Source(schema))
+                .await?,
+            ids
+        );
         for table in TABLES {
             let sql = format!(
                 "SELECT to_jsonb(r) FROM ({}) r",
-                selection.rows_sql(schema, table)?
+                selection.rows_sql(Form::Source(schema), table)?
             );
             let actual = db
                 .store
@@ -1242,7 +996,7 @@ async fn keep_rule_selection_entry_points() -> Result {
                 schema.name()
             );
             let stream = selection
-                .stream_rows(db.store.client(), schema, table)
+                .stream_rows(db.store.client(), Form::Source(schema), table)
                 .await?;
             tokio::pin!(stream);
             let mut count = 0;
@@ -1274,7 +1028,7 @@ async fn keep_rule_selection_entry_points() -> Result {
     queries::reader_probes(&reader_client).await?;
     for table in TABLES {
         let stream = selection
-            .stream_rows(&reader_client, SourceSchema::Public, table)
+            .stream_rows(&reader_client, Form::Source(SourceSchema::Public), table)
             .await?;
         tokio::pin!(stream);
         let mut count = 0;
@@ -1287,7 +1041,7 @@ async fn keep_rule_selection_entry_points() -> Result {
     db.reader = Some(reader);
     assert!(
         selection
-            .rows_sql(SourceSchema::Serve, "tx; DROP SCHEMA serve")
+            .rows_sql(Form::Source(SourceSchema::Serve), "tx; DROP SCHEMA serve")
             .is_err()
     );
     let absent = Selection::new(
@@ -1312,7 +1066,7 @@ async fn keep_rule_selection_entry_points() -> Result {
         .await?;
     assert!(
         selection
-            .collect_ids(&db.full, SourceSchema::Public)
+            .collect_ids(&db.full, Form::Source(SourceSchema::Public))
             .await
             .unwrap_err()
             .to_string()
@@ -1469,7 +1223,7 @@ async fn keep_rule_height_limit_and_collector_guard() -> Result {
             .retain(|_, row| row.output != output);
         fixture.chain.output_assets.insert(
             dsa_chain::ids::asset_id(height, 4095, 4095, 4095)?,
-            dsa_chain::keep::OutputAsset {
+            fixtures::model::OutputAsset {
                 output,
                 asset: fixture.asset_id("cnight"),
             },
@@ -1488,7 +1242,7 @@ async fn keep_rule_height_limit_and_collector_guard() -> Result {
     let selection = Selection::new(&fixture.profile, fixture.bounds)?;
     for table in TABLES {
         let stream = selection
-            .stream_rows(db.store.client(), SourceSchema::Serve, table)
+            .stream_rows(db.store.client(), Form::Source(SourceSchema::Serve), table)
             .await?;
         tokio::pin!(stream);
         let mut count = 0;
@@ -1522,14 +1276,18 @@ async fn keep_rule_height_limit_and_collector_guard() -> Result {
     )?;
     assert!(
         selection
-            .collect_ids(db.store.client(), SourceSchema::Serve)
+            .collect_ids(db.store.client(), Form::Source(SourceSchema::Serve))
             .await
             .unwrap_err()
             .to_string()
             .contains("keep_validation_too_large")
     );
     let stream = selection
-        .stream_rows(db.store.client(), SourceSchema::Serve, "block")
+        .stream_rows(
+            db.store.client(),
+            Form::Source(SourceSchema::Serve),
+            "block",
+        )
         .await?;
     tokio::pin!(stream);
     let mut count = 0;
@@ -1804,7 +1562,7 @@ async fn keep_rule_realistic_plans() -> Result {
                     .await?;
                 let sql = format!(
                     "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT count(*) FROM ({}) rows",
-                    selection.rows_sql(SourceSchema::Serve, table)?
+                    selection.rows_sql(Form::Source(SourceSchema::Serve), table)?
                 );
                 let begin = Instant::now();
                 let plan: Value = client

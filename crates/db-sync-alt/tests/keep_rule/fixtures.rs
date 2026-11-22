@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "model.rs"]
+pub mod model;
+
 use dsa_chain::{
     ids,
-    keep::{Bounds, Chain, Datum, Header, Input, Output, OutputAsset, Stake, Transaction},
+    keep::Bounds,
     profiles::{Asset, Profile},
 };
+use model::{Chain, Datum, Header, Input, Output, OutputAsset, Stake, Transaction};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 

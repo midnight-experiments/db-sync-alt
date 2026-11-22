@@ -13,7 +13,7 @@ use tokio_postgres::GenericClient;
 
 use crate::{
     Error, NODE_RELATIONS, Store, canonical,
-    keep::{Selection, SourceSchema},
+    keep::{Form, Selection, SourceSchema},
 };
 
 pub const MARKERS: &str = "consumed_before_horizon";
@@ -142,7 +142,7 @@ pub(crate) async fn verify<C: GenericClient>(
         .query_one(
             &format!(
                 "{} SELECT EXISTS(SELECT 1 FROM serve.ma_tx_out a WHERE NOT ({}))",
-                Selection::ctes_sql(SourceSchema::Serve),
+                Selection::ctes(Form::Source(SourceSchema::Serve)),
                 Selection::asset_predicate(SourceSchema::Serve, "a")
             ),
             &selection.parameters(),
@@ -182,7 +182,7 @@ pub(crate) async fn verify<C: GenericClient>(
     }
     let sql = format!(
         "{} SELECT EXISTS(SELECT 1 FROM serve.block b WHERE b.id<$1 AND NOT EXISTS(SELECT 1 FROM keep_block k WHERE k.id=b.id))",
-        Selection::ctes_sql(SourceSchema::Serve)
+        Selection::ctes(Form::Source(SourceSchema::Serve))
     );
     if client
         .query_one(&sql, &selection.parameters())

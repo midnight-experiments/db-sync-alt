@@ -3,11 +3,8 @@
 #[allow(dead_code)]
 pub(crate) mod fixtures;
 
-use dsa_chain::{
-    keep::{Header, TABLES},
-    profiles::Profile,
-};
-use fixtures::{Fixture, Rows};
+use dsa_chain::{keep::TABLES, profiles::Profile};
+use fixtures::{Fixture, Rows, model::Header};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,

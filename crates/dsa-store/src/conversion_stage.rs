@@ -417,7 +417,7 @@ pub(crate) async fn select(
         "{}",
         json!({"event":"conversion_local_selection_started","source_reads_required":false,"temporary_relation_bytes":raw.temporary_bytes})
     );
-    let plan = Selection::staging_plan()?;
+    let plan = Selection::staging_plan();
     let mut temporary_bytes = 0_i64;
     for stage in &plan {
         let began = Instant::now();

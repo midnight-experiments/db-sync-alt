@@ -4,11 +4,18 @@
 mod fixtures;
 
 use dsa_chain::{
-    keep::{Bounds, Header, TABLES, keep},
+    keep::{Bounds, TABLES},
     profiles::Profile,
 };
-use dsa_store::{Store, keep::Selection};
-use fixtures::{Fixture, Rows, selected};
+use dsa_store::{
+    Store,
+    keep::{Form, Selection},
+};
+use fixtures::{
+    Fixture, Rows,
+    model::{Header, keep},
+    selected,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -649,7 +656,7 @@ async fn snapshot_sparse_spent_state_survives_restore_and_horizon_advances() -> 
                 .query(
                     &format!(
                         "SELECT to_jsonb(t) FROM ({}) t",
-                        selection.pruned_rows_sql(table)?
+                        selection.rows_sql(Form::Pruned, table)?
                     ),
                     &selection.parameters(),
                 )
@@ -2242,5 +2249,608 @@ async fn restore_build_commit_reader_barrier_and_closed_gate_clock_recovery() ->
     drop(client);
     source.cleanup().await?;
     dest.cleanup().await?;
+    Ok(())
+}
+
+fn node_index_names() -> Vec<String> {
+    let mut names = include_str!("../../dsa-store/src/indexes.sql")
+        .lines()
+        .filter(|line| line.starts_with("CREATE"))
+        .map(|line| {
+            line.split("INDEX ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    names.extend(TABLES.iter().map(|table| format!("{table}_pkey")));
+    names
+}
+
+/// The node creates an index when `pg_indexes` does not hold exactly one row
+/// with its name, anywhere in the database.
+async fn one_index_row_per_name(client: &Client) -> Result {
+    let names = node_index_names();
+    for row in client
+        .query(
+            "SELECT n,(SELECT count(*) FROM pg_indexes WHERE indexname=n) FROM unnest($1::text[]) n",
+            &[&names],
+        )
+        .await?
+    {
+        assert_eq!(
+            row.get::<_, i64>(1),
+            1,
+            "pg_indexes rows for {}",
+            row.get::<_, String>(0)
+        );
+    }
+    Ok(())
+}
+
+fn latest_block_sql() -> String {
+    let catalogue: Value =
+        serde_json::from_str(include_str!("../../dsa-store/catalogue.json")).unwrap();
+    catalogue["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "get_latest_block_info" && entry["kind"] == "read")
+        .unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn closed_for_node(
+    reader: &Client,
+    literal: &str,
+    prepared: &tokio_postgres::Statement,
+) -> Result {
+    for table in TABLES {
+        let error = reader
+            .query(&format!("SELECT * FROM public.{table}"), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().map(|c| c.code()), Some("55000"), "{table}");
+    }
+    for error in [
+        reader.query(literal, &[]).await.unwrap_err(),
+        reader.query(prepared, &[]).await.unwrap_err(),
+    ] {
+        assert_eq!(error.code().map(|c| c.code()), Some("55000"));
+    }
+    Ok(())
+}
+
+async fn wait_until(client: &Client, sql: &str, what: &str) -> Result {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !client.query_one(sql, &[]).await?.get::<_, bool>(0) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {what}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+fn restore_command(db: &Database, network: &str, path: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    command
+        .args(["restore", "--database", &db.dsn(), "--network", network])
+        .args(file_args(path))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
+fn last_error(output: &std::process::Output) -> Value {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|value| value.get("error").is_some())
+        .unwrap_or(Value::Null)
+}
+
+async fn one_layout(client: &Client) -> Result {
+    let row = client
+        .query_one(
+            "SELECT to_regnamespace('dsa_retired') IS NULL AND to_regnamespace('dsa_restore') IS NULL,NOT EXISTS(SELECT 1 FROM pg_inherits)",
+            &[],
+        )
+        .await?;
+    assert!(row.get::<_, bool>(0), "a second storage schema exists");
+    assert!(row.get::<_, bool>(1), "inherited storage exists");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_publishes_by_view_switch_while_readers_see_55000() -> Result {
+    let f = fixture(301);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("switch.dsa");
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let dest = Database::new().await?;
+    dest.cli("create", &f.profile.network, &[]).await?;
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader],
+    )
+    .await?;
+    let owner = connect(&dest.config).await?;
+    // Holds the build transaction open at its commit, after every load step.
+    owner.batch_execute("CREATE FUNCTION dsa.test_build_barrier() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(901,1);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.test_build_barrier() FROM PUBLIC;CREATE CONSTRAINT TRIGGER test_build_barrier AFTER UPDATE ON dsa.position DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN(OLD.horizon_height IS NULL AND NEW.horizon_height IS NOT NULL AND NOT NEW.serving) EXECUTE FUNCTION dsa.test_build_barrier();SELECT pg_advisory_lock(901,1)").await?;
+    let mut reader_config = dest.config.clone();
+    reader_config
+        .user(&dest.reader)
+        .options("-c default_transaction_read_only=on -c statement_timeout=5s");
+    let reader = connect(&reader_config).await?;
+    let literal = latest_block_sql();
+    let prepared = reader.prepare(&literal).await?;
+    closed_for_node(&reader, &literal, &prepared).await?;
+    one_index_row_per_name(&reader).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let prober = {
+        let stop = stop.clone();
+        let config = reader_config.clone();
+        let literal = literal.clone();
+        tokio::spawn(async move {
+            let client = connect(&config).await?;
+            let (mut closed, mut serving) = (0_u64, 0_u64);
+            while !stop.load(Ordering::Relaxed) {
+                match client.query(&literal, &[]).await {
+                    Ok(rows) => {
+                        assert!(!rows.is_empty(), "empty answer during restore");
+                        serving += 1;
+                    }
+                    Err(error) => {
+                        assert_eq!(error.code().map(|c| c.code()), Some("55000"), "{error}");
+                        closed += 1;
+                    }
+                }
+                one_index_row_per_name(&client).await?;
+            }
+            Ok::<_, Box<dyn StdError + Send + Sync>>((closed, serving))
+        })
+    };
+    let started: String = owner
+        .query_one("SELECT clock_timestamp()::text", &[])
+        .await?
+        .get(0);
+    let mut child = restore_command(&dest, &f.profile.network, &path).spawn()?;
+    wait_until(&dest.admin, &format!("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname='{}' AND application_name='db-sync-alt' AND wait_event='advisory' AND query LIKE 'COMMIT%')", dest.name), "the build commit").await?;
+    closed_for_node(&reader, &literal, &prepared).await?;
+    one_index_row_per_name(&reader).await?;
+    // A reader in an open transaction that touched a view delays publication.
+    let holder = connect(&reader_config).await?;
+    holder
+        .batch_execute("BEGIN;DECLARE held CURSOR FOR SELECT * FROM public.block")
+        .await?;
+    owner
+        .batch_execute("SELECT pg_advisory_unlock(901,1)")
+        .await?;
+    wait_until(
+        &owner,
+        "SELECT to_regnamespace('dsa_retired') IS NOT NULL",
+        "the committed build",
+    )
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        child.try_wait()?.is_none(),
+        "publication did not wait for the reader's lock"
+    );
+    closed_for_node(&reader, &literal, &prepared).await?;
+    one_index_row_per_name(&reader).await?;
+    holder.batch_execute("COMMIT").await?;
+    let output = child.wait_with_output().await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    for key in [
+        "content_digest",
+        "state_digest",
+        "families",
+        "state",
+        "supply",
+    ] {
+        assert_eq!(report[key], description["verified"][key], "{key}");
+    }
+    assert!(!reader.query(&literal, &[]).await?.is_empty());
+    assert!(!reader.query(&prepared, &[]).await?.is_empty());
+    assert!(
+        holder
+            .query_one("SELECT count(*) FROM public.block", &[])
+            .await?
+            .get::<_, i64>(0)
+            > 0
+    );
+    stop.store(true, Ordering::Relaxed);
+    let (closed, serving) = prober.await??;
+    assert!(closed > 0 && serving > 0, "{closed}/{serving}");
+    one_layout(&owner).await?;
+    one_index_row_per_name(&owner).await?;
+    let fresh:bool=owner.query_one("SELECT count(*)=(SELECT target_height-horizon_height+1 FROM dsa.position) AND bool_and(first_served_at>=$1::text::timestamptz) FROM dsa.first_served",&[&started]).await?.get(0);
+    assert!(fresh, "first-served rows are not the publication time");
+    assert_eq!(rows(&source).await?, rows(&dest).await?);
+    drop((reader, holder, owner));
+    source.cleanup().await?;
+    dest.cleanup().await?;
+    Ok(())
+}
+
+async fn database_state(client: &Client) -> Result<Value> {
+    let mut state:Value=client.query_one("SELECT jsonb_build_object('namespaces',(SELECT jsonb_agg(nspname ORDER BY nspname) FROM pg_namespace WHERE nspname NOT LIKE 'pg\\_%' AND nspname<>'information_schema'),'relations',(SELECT coalesce(jsonb_agg(jsonb_build_array(n.nspname,c.relname,c.relkind,c.oid::bigint,pg_relation_filenode(c.oid)::bigint,c.relacl::text) ORDER BY n.nspname,c.relname),'[]') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname<>'information_schema'))",&[]).await?.get(0);
+    if client
+        .query_one("SELECT to_regclass('dsa.identity') IS NOT NULL", &[])
+        .await?
+        .get::<_, bool>(0)
+    {
+        state["identity"] = client
+            .query_one("SELECT to_jsonb(i) FROM dsa.identity i", &[])
+            .await?
+            .get(0);
+        state["position"] = client
+            .query_one("SELECT to_jsonb(p) FROM dsa.position p", &[])
+            .await?
+            .get(0);
+    }
+    Ok(state)
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restore_refusals_leave_database_unchanged_and_interrupted_publication_retries() -> Result {
+    let dir = tempfile::tempdir()?;
+    let mut sources = Vec::new();
+    let mut files = Vec::new();
+    for seed in [311, 313, 312] {
+        let f = fixture(seed);
+        let source = Database::new().await?;
+        populate(&source, &f).await?;
+        let path = dir.path().join(format!("seed{seed}.dsa"));
+        let description = source
+            .cli("snapshot", &f.profile.network, &file_args(&path))
+            .await?;
+        sources.push((f, source));
+        files.push((path, description));
+    }
+    let network = sources[0].0.profile.network.clone();
+    assert_eq!(sources[1].0.profile.network, network);
+    assert_ne!(sources[2].0.profile.network, network);
+    let good = files[0].0.clone();
+    let bytes = std::fs::read(&good)?;
+    let mut format = bytes.clone();
+    format[11] = 2;
+    let format_file = dir.path().join("format.dsa");
+    std::fs::write(&format_file, format)?;
+    let rule_file = dir.path().join("rule.dsa");
+    std::fs::write(
+        &rule_file,
+        rewrite_description(&bytes, |v| v["keep_rule_version"] = json!(1)),
+    )?;
+    let missing = dir.path().join("missing.dsa");
+    let zeros = "00".repeat(32);
+    let cases: [(Vec<&str>, &str); 5] = [
+        (file_args(&missing).to_vec(), "snapshot_io_error"),
+        (file_args(&files[2].0).to_vec(), "network_mismatch"),
+        (
+            file_args(&format_file).to_vec(),
+            "unsupported_snapshot_format",
+        ),
+        (file_args(&rule_file).to_vec(), "keep_rule_version_mismatch"),
+        (
+            [
+                file_args(&good).as_slice(),
+                &["--expect-content-digest", &zeros],
+            ]
+            .concat(),
+            "snapshot_content_digest_unexpected",
+        ),
+    ];
+    for created in [false, true] {
+        let dest = Database::new().await?;
+        if created {
+            dest.cli("create", &network, &[]).await?;
+            dest.cli("grant-reader", &network, &["--role", &dest.reader])
+                .await?;
+        }
+        let client = connect(&dest.config).await?;
+        let before = database_state(&client).await?;
+        for (args, expected) in &cases {
+            let output = dest.cli_raw("restore", &network, args).await?;
+            assert!(!output.status.success(), "accepted {expected}");
+            assert_eq!(last_error(&output)["error"], *expected, "{args:?}");
+            assert_eq!(
+                database_state(&client).await?,
+                before,
+                "{expected} changed the database"
+            );
+        }
+        let expected = files[0].1["verified"]["content_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let restored = dest
+            .cli(
+                "restore",
+                &network,
+                &[
+                    file_args(&good).as_slice(),
+                    &["--expect-content-digest", &expected],
+                ]
+                .concat(),
+            )
+            .await?;
+        assert_eq!(restored["content_digest"], json!(expected));
+        drop(client);
+        dest.cleanup().await?;
+    }
+    // Interrupted after the build commit and before publication.
+    for retry in [0, 1] {
+        let dest = Database::new().await?;
+        dest.cli("create", &network, &[]).await?;
+        dest.cli("grant-reader", &network, &["--role", &dest.reader])
+            .await?;
+        let owner = connect(&dest.config).await?;
+        let mut reader_config = dest.config.clone();
+        reader_config.user(&dest.reader);
+        let holder = connect(&reader_config).await?;
+        holder
+            .batch_execute("BEGIN;DECLARE held CURSOR FOR SELECT * FROM public.block")
+            .await?;
+        let child = restore_command(&dest, &network, &good).spawn()?;
+        let pid = child.id().ok_or("restore exited")?.to_string();
+        wait_until(
+            &owner,
+            "SELECT to_regnamespace('dsa_retired') IS NOT NULL",
+            "the committed build",
+        )
+        .await?;
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .await?
+                .success()
+        );
+        let output = child.wait_with_output().await?;
+        assert!(!output.status.success());
+        let report = last_error(&output);
+        assert_eq!(report["error"], "operation_interrupted", "{report}");
+        assert_eq!(report["published"], false, "{report}");
+        holder.batch_execute("COMMIT").await?;
+        let reader = connect(&reader_config).await?;
+        assert_eq!(
+            reader
+                .query("SELECT * FROM public.block", &[])
+                .await
+                .unwrap_err()
+                .code()
+                .map(|c| c.code()),
+            Some("55000")
+        );
+        assert!(
+            owner
+                .query_one("SELECT to_regnamespace('dsa_retired') IS NOT NULL", &[])
+                .await?
+                .get::<_, bool>(0)
+        );
+        let (file, description) = &files[retry];
+        let restored = dest.cli("restore", &network, &file_args(file)).await?;
+        for key in [
+            "content_digest",
+            "state_digest",
+            "families",
+            "state",
+            "supply",
+        ] {
+            assert_eq!(restored[key], description["verified"][key], "{key}");
+        }
+        one_layout(&owner).await?;
+        one_index_row_per_name(&owner).await?;
+        assert!(
+            !reader
+                .query("SELECT * FROM public.block", &[])
+                .await?
+                .is_empty()
+        );
+        assert_eq!(rows(&sources[retry].1).await?, rows(&dest).await?);
+        drop((reader, holder, owner));
+        dest.cleanup().await?;
+    }
+    for (_, source) in sources {
+        source.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn restored_database_survives_rename_and_owner_change() -> Result {
+    let f = fixture(321);
+    let dir = tempfile::tempdir()?;
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let path = dir.path().join("rename.dsa");
+    let description = source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let mut dest = Database::new().await?;
+    dest.cli("restore", &f.profile.network, &file_args(&path))
+        .await?;
+    let renamed = format!("{}_renamed", dest.name);
+    dest.admin
+        .batch_execute(&format!("ALTER DATABASE {} RENAME TO {renamed}", dest.name))
+        .await?;
+    dest.name = renamed.clone();
+    dest.config.dbname(&renamed);
+    let digest = &description["verified"]["content_digest"];
+    assert_eq!(
+        dest.cli("verify", &f.profile.network, &[]).await?["content_digest"],
+        *digest
+    );
+    let after_rename = dir.path().join("after-rename.dsa");
+    let snapshot = dest
+        .cli("snapshot", &f.profile.network, &file_args(&after_rename))
+        .await?;
+    assert_eq!(snapshot["verified"]["content_digest"], *digest);
+    let new_owner = format!("{}_next", dest.owner);
+    dest.admin.batch_execute(&format!("CREATE ROLE {new_owner} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS")).await?;
+    let admin_user: String = dest
+        .admin
+        .query_one("SELECT current_user", &[])
+        .await?
+        .get(0);
+    let mut inside = dest.config.clone();
+    inside.user(&admin_user);
+    connect(&inside)
+        .await?
+        .batch_execute(&format!(
+            "REASSIGN OWNED BY {} TO {new_owner};ALTER DATABASE {renamed} OWNER TO {new_owner}",
+            dest.owner
+        ))
+        .await?;
+    let old_owner = std::mem::replace(&mut dest.owner, new_owner.clone());
+    dest.config.user(&new_owner);
+    assert_eq!(
+        dest.cli("verify", &f.profile.network, &[]).await?["content_digest"],
+        *digest
+    );
+    let after_owner = dir.path().join("after-owner.dsa");
+    let snapshot = dest
+        .cli("snapshot", &f.profile.network, &file_args(&after_owner))
+        .await?;
+    assert_eq!(snapshot["verified"]["content_digest"], *digest);
+    dest.cli(
+        "grant-reader",
+        &f.profile.network,
+        &["--role", &dest.reader, "--check"],
+    )
+    .await?;
+    let copy = Database::new().await?;
+    let restored = copy
+        .cli("restore", &f.profile.network, &file_args(&after_owner))
+        .await?;
+    assert_eq!(restored["content_digest"], *digest);
+    copy.cleanup().await?;
+    dest.cleanup().await?;
+    source
+        .admin
+        .batch_execute(&format!("DROP ROLE {old_owner}"))
+        .await?;
+    source.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn verify_refuses_rows_outside_the_keep_rule_and_missing_coverage() -> Result {
+    let mut f = fixture(331);
+    f.bounds.horizon = 6;
+    let dir = tempfile::tempdir()?;
+    let source = Database::new().await?;
+    populate(&source, &f).await?;
+    let path = dir.path().join("exact.dsa");
+    source
+        .cli("snapshot", &f.profile.network, &file_args(&path))
+        .await?;
+    let client = connect(&source.config).await?;
+    let old_tx: i64 = client
+        .query_one(
+            "SELECT min(id) FROM serve.tx WHERE block_id<(SELECT horizon_height FROM dsa.position)",
+            &[],
+        )
+        .await?
+        .get(0);
+    let marked = client
+        .query_one("SELECT o.tx_id,o.index::integer FROM dsa.consumed_before_horizon c JOIN serve.tx_out o ON o.id=c.tx_out_id ORDER BY c.tx_out_id LIMIT 1", &[])
+        .await?;
+    let (marked_tx, marked_index): (i64, i32) = (marked.get(0), marked.get(1));
+    let pool: i64 = client
+        .query_one("SELECT min(id) FROM serve.pool_hash", &[])
+        .await?
+        .get(0);
+    let epoch: i32 = client
+        .query_one(
+            "SELECT epoch_no-3 FROM serve.block WHERE id=(SELECT horizon_height FROM dsa.position)",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(epoch >= 0);
+    drop(client);
+    let block = old_tx / 4096;
+    let cases = [
+        (
+            format!("INSERT INTO serve.tx VALUES({block}*4096+4000,decode(repeat('5a',32),'hex'),{block},4000,true)"),
+            "row_outside_keep_rule",
+            Some("tx"),
+        ),
+        (
+            format!("INSERT INTO serve.tx_out VALUES({old_tx}*4096+4000,{old_tx},4000,'generated_old_spent',1,NULL,NULL);INSERT INTO dsa.consumed_before_horizon VALUES({old_tx}*4096+4000)"),
+            "row_outside_keep_rule",
+            Some("tx_out"),
+        ),
+        (
+            format!("INSERT INTO serve.tx_in VALUES({old_tx}*4096+4000,{old_tx},{marked_tx},{marked_index})"),
+            "row_outside_keep_rule",
+            Some("tx_in"),
+        ),
+        (
+            format!("INSERT INTO serve.tx_metadata VALUES({old_tx},6500973,{old_tx},'{{}}')"),
+            "row_outside_keep_rule",
+            Some("tx_metadata"),
+        ),
+        (
+            format!("INSERT INTO serve.epoch_param VALUES({epoch},decode(repeat('5b',32),'hex'),16384)"),
+            "row_outside_keep_rule",
+            Some("epoch_param"),
+        ),
+        (
+            format!("INSERT INTO serve.epoch_stake VALUES(987654,{pool},1,{epoch})"),
+            "row_outside_keep_rule",
+            Some("epoch_stake"),
+        ),
+        (
+            "DELETE FROM dsa.first_served WHERE height=(SELECT horizon_height FROM dsa.position)".to_owned(),
+            "first_served_incomplete",
+            None,
+        ),
+        (
+            "DELETE FROM serve.epoch_param WHERE epoch_no=(SELECT epoch_no FROM serve.block WHERE id=(SELECT target_height FROM dsa.position))".to_owned(),
+            "epoch_param_missing",
+            None,
+        ),
+    ];
+    for (sql, expected, family) in cases {
+        let db = Database::new().await?;
+        db.cli("restore", &f.profile.network, &file_args(&path))
+            .await?;
+        db.cli("verify", &f.profile.network, &[]).await?;
+        let client = connect(&db.config).await?;
+        client.batch_execute(&sql).await?;
+        let result = db.cli_raw("verify", &f.profile.network, &[]).await?;
+        assert!(!result.status.success(), "{expected}: {sql}");
+        let error = last_error(&result);
+        assert_eq!(error["error"], expected, "{sql}");
+        if let Some(family) = family {
+            assert_eq!(error["family"], family, "{sql}");
+        }
+        drop(client);
+        db.cleanup().await?;
+    }
+    source.cleanup().await?;
     Ok(())
 }
