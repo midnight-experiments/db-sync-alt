@@ -1,5 +1,7 @@
 [workspace]
-members = ["crates/dsa-chain", "crates/dsa-store", "crates/dsa-provider", "crates/dsa-service", "crates/db-sync-alt", "crates/dsa-testkit"]
+members = ["crates/dsa-chain", "crates/dsa-store", "crates/dsa-provider", "crates/dsa-service", "crates/db-sync-alt", "crates/dsa-testkit", "tools/corpus"]
+# The corpus tools are built only on request (`-p dsa-corpus-tools` or `--workspace`).
+default-members = ["crates/dsa-chain", "crates/dsa-store", "crates/dsa-provider", "crates/dsa-service", "crates/db-sync-alt", "crates/dsa-testkit"]
 resolver = "3"
 
 [workspace.package]

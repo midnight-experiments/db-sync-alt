@@ -1,6 +1,6 @@
 //! Replay the public ledger subset against its independently exported SQL rows.
 
-#[path = "../examples/support/corpus.rs"]
+#[path = "support/corpus.rs"]
 mod corpus;
 
 use std::{

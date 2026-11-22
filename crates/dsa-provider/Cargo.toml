@@ -27,7 +27,6 @@ webpki-roots = "1"
 
 [dev-dependencies]
 bytes = "1"
-clap.workspace = true
 dsa-testkit = { path = "../dsa-testkit" }
 flate2 = "1"
 futures-util = "0.3"

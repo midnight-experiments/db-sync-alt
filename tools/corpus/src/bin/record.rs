@@ -16,9 +16,9 @@ use dsa_chain::{
     block::{DatumAvailability, Outcome, Selection, SupplementRequest, Supplements, process_block},
     profiles::Profile,
 };
-#[path = "support/origins.rs"]
+#[path = "../../../../crates/dsa-provider/tests/support/origins.rs"]
 mod origins;
-#[path = "support/recorded.rs"]
+#[path = "../../../../crates/dsa-provider/tests/support/recorded.rs"]
 mod recorded;
 use dsa_provider::{
     Config, Provider,

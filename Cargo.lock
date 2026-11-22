@@ -703,13 +703,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsa-corpus-tools"
+version = "0.5.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "dsa-chain",
+ "dsa-provider",
+ "hex",
+ "pallas-primitives",
+ "pallas-traverse",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "dsa-provider"
 version = "0.5.0"
 dependencies = [
  "bech32 0.11.1",
  "bytes",
  "chrono",
- "clap",
  "dsa-chain",
  "dsa-testkit",
  "flate2",

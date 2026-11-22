@@ -673,11 +673,14 @@ mod tests {
                 }
             );
         }
+        let mut credential = Url::parse("https://example.invalid").unwrap();
+        credential.set_username("example-user").unwrap();
+        credential.set_password(Some("example-password")).unwrap();
         for url in [
             "http://example.invalid/api/v0",
             "https://example.invalid/?key=secret",
             "https://example.invalid/#fragment",
-            "https://user:password@example.invalid/",
+            credential.as_str(),
         ] {
             assert_eq!(
                 Config::new(url, "/missing-key")

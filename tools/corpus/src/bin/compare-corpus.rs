@@ -1,5 +1,5 @@
 //! Offline comparison of finalized provider recordings and restored SQL rows.
-#[path = "support/corpus.rs"]
+#[path = "../../../../crates/dsa-provider/tests/support/corpus.rs"]
 mod corpus;
 fn main() {
     let mut args = std::env::args().skip(1);

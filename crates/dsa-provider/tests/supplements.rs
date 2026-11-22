@@ -147,7 +147,7 @@ fn an_invalid_transaction_resolves_only_its_return_at_the_body_output_count() {
     );
 }
 
-#[path = "../examples/support/recorded.rs"]
+#[path = "support/recorded.rs"]
 mod recorded;
 
 #[test]
