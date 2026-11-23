@@ -1,0 +1,78 @@
+{
+  "format": 1,
+  "network": "mainnet",
+  "node_release": "2.1.101",
+  "cardano": {
+    "security_parameter": 2160,
+    "active_slots_coefficient": 0.05,
+    "block_stability_margin": 30,
+    "first_epoch_number": 208,
+    "first_epoch_timestamp_millis": 1596059091000,
+    "epoch_duration_millis": 432000000,
+    "first_slot_number": 4492800,
+    "slot_duration_millis": 1000
+  },
+  "start": {
+    "block_number": 13164005,
+    "block_hash": "fa1ef4f32aa53504f24f59503604f687d15e0314d1446a29c6900d54785cd5b8",
+    "block_timestamp_millis": 1773614285000,
+    "tx_index_in_block": 1
+  },
+  "addresses": {
+    "council": "addr1wxg3mm3436f57r4r9t6cqdvxe0hwjusayz4ed8ulmlenttqj62ul2",
+    "ics": "addr1wyczfpxfnf5hvp36mrn655ye4k2cwluvlez6phx8jx46k6s2ttdaq",
+    "mapping": "addr1w9e7ft4rrdd4rkdseguxr9hudfxyytm5ckh2qy0yhz7lfeg9lvhq7",
+    "reserve": "addr1w950c5zxn5fhwlauvpy3ssk287q0qlwz6e2zc4gaj62vaxsy3s9p0",
+    "technical_committee": "addr1w8umlgsw6cfkxpdk2jekzwa7rjdx7tc937mpahhyn00430s074k8y"
+  },
+  "assets": {
+    "auth": {
+      "policy": "73e4aea31b5b51d9b0ca386196fc6a4c422f74c5aea011e4b8bdf4e5",
+      "name": ""
+    },
+    "bridge": {
+      "policy": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa",
+      "name": "4e49474854"
+    },
+    "cnight": {
+      "policy": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa",
+      "name": "4e49474854"
+    },
+    "council": {
+      "policy": "911dee358e934f0ea32af5803586cbeee9721d20ab969f9fdff335ac",
+      "name": ""
+    },
+    "ics": {
+      "policy": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa",
+      "name": "4e49474854"
+    },
+    "permissioned_candidates": {
+      "policy": "2c322542e32817f26a75bc49eaaf3ce831b62dafe4040e2f296e339a",
+      "name": ""
+    },
+    "reserve": {
+      "policy": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa",
+      "name": "4e49474854"
+    },
+    "technical_committee": {
+      "policy": "f9bfa20ed6136305b654b3613bbe1c9a6f2f058fb61edee49bdf58be",
+      "name": ""
+    }
+  },
+  "provenance": {
+    "repository": "https://github.com/midnightntwrk/midnight-node",
+    "commit": "86774edf8cc76345a5c3a4221f3fe80c094b1c33",
+    "files": {
+      "res/cfg/default.toml": "8448e0dd2aa72753326fbdd0e4378b794ae73b6096ecd68002cf02cacee889f4",
+      "res/cfg/mainnet.toml": "5146a4118855ddf2661c5be0274a7f0c53878e70b1906fc29971ac76b9306357",
+      "res/mainnet/chain-spec-raw.json": "bd81ad4571575f29309d8a10aefb731b6ea6dc3f6b9df7d2d3e3aca94df45e81",
+      "res/mainnet/chain-spec.json": "70a502a928cfc1e101c980bd9a696595e4c32030a2e4aff713974f81a9fed334",
+      "res/mainnet/cnight-config.json": "524a46fae87388aa2b80a299225b46d75df7f4dc8ef08a90a81a0f32dabb4746",
+      "res/mainnet/federated-authority-config.json": "5a07fdb45b88e126303c0bde229c4a93168358fee1ec75528dd4acaa02987084",
+      "res/mainnet/ics-config.json": "79628e039cc73228b21efa598842b262ecc24faf0befa3050881e7bd8b538535",
+      "res/mainnet/pc-chain-config.json": "8a3ed6d0a06273b8381cf1b576f4b63c1d98c5f3bc656cb832ceaadfcfa357b8",
+      "res/mainnet/permissioned-candidates-config.json": "581fbf3de1becd2d357ed371cf714901ba5bbffd95c9f01e83cd60cfd82664cb",
+      "res/mainnet/reserve-config.json": "2f787af5de123065d8f1a7fab78141c28161d2df7334d9a67c7d474de115b44e"
+    }
+  }
+}

@@ -1,7 +1,19 @@
 name: source-and-tests
 on:
   push:
+    paths-ignore:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - '.github/workflows/rust.yml'
   pull_request:
+    paths-ignore:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - '.github/workflows/rust.yml'
 permissions:
   contents: read
 jobs:

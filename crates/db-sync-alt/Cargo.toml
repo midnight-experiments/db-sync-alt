@@ -1,0 +1,31 @@
+[package]
+name = "db-sync-alt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+dsa-chain.workspace = true
+dsa-provider = { path = "../dsa-provider" }
+dsa-service = { path = "../dsa-service" }
+dsa-store.workspace = true
+tokio = { workspace = true, features = ["sync", "net"] }
+tokio-postgres.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dsa-testkit = { path = "../dsa-testkit" }
+tokio = { workspace = true, features = ["process", "time", "io-util", "net"] }
+sha2.workspace = true
+hex = "0.4"
+futures-util = "0.3"
+tempfile = "3"
+
+chrono.workspace = true
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "bigdecimal"] }

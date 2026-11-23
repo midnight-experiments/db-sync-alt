@@ -43,7 +43,7 @@ packages = [
 "db_sync_alt.service" = ["service.example.json"]
 "db_sync_alt.store" = ["*.sql"]
 "db_sync_alt.profiles" = ["**/*.json", "**/*.md"]
-"db_sync_alt.reference" = ["**/*.rs", "*.json"]
+"db_sync_alt.reference" = ["**/*.rs", "*.json", "**/*.json"]
 
 [tool.ruff]
 target-version = "py311"

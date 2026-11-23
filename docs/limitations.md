@@ -34,6 +34,13 @@
   not read registrations
   ([registered candidates](connect-a-node.md#registered-candidates)). Serving
   them as cardano-db-sync does is future work.
+- **No genesis subcommands of the node.** `generate-ics-genesis`,
+  `generate-reserve-genesis`, `generate-genesis-config`,
+  `verify-cardano-tip-finalized` and the `verify-*-auth-script` commands read
+  headers and unspent outputs at a reference block. Below the horizon a pruned
+  database answers them incompletely and without an error. Run them against a
+  cardano-db-sync database; `db-sync-alt status` lists the statements under
+  `unsupported_node_statements`.
 - **Bridge data from the coverage start only.** The token bridge's metadata is
   stored forward only, from the first update acquired from Blockfrost after the
   newest update without it (a cardano-db-sync bootstrap or catch-up, or an

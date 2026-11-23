@@ -1,0 +1,25 @@
+[package]
+name = "dsa-corpus-tools"
+description = "Record provider answers for the replay corpus and compare a recording with exported rows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+dsa-chain.workspace = true
+dsa-provider = { path = "../../crates/dsa-provider" }
+hex = "0.4"
+pallas-primitives = "=0.33.0"
+pallas-traverse = "=0.33.0"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

@@ -1,0 +1,15 @@
+{
+  "origin": "https://github.com/midnight-experiments/db-sync-alt",
+  "commit": "4d7cba2eee66b081c644fa8e2150025baf46a54f",
+  "sources": [
+    {
+      "path": "tests/fixtures/data/blockfrost/block-cbor.json",
+      "sha256": "1e65f4d1dad0ded0d7a1c5d6d9b71718f22a8e3395fd314feb14555d49e39f86"
+    },
+    {
+      "path": "tests/fixtures/data/blockfrost/nonpreferred-block-5357253.json",
+      "sha256": "e6d0639d31ee72ae96c7100a09981e4600c1c4c6c5fc59e2be78c258733063f8"
+    }
+  ],
+  "description": "Existing recorded finalized Blockfrost transaction answers. No constructed ledger transactions."
+}

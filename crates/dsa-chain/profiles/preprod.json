@@ -1,0 +1,78 @@
+{
+  "format": 1,
+  "network": "preprod",
+  "node_release": "2.1.101",
+  "cardano": {
+    "security_parameter": 2160,
+    "active_slots_coefficient": 0.05,
+    "block_stability_margin": 30,
+    "first_epoch_number": 4,
+    "first_epoch_timestamp_millis": 1655769600000,
+    "epoch_duration_millis": 432000000,
+    "first_slot_number": 86400,
+    "slot_duration_millis": 1000
+  },
+  "start": {
+    "block_number": 4500197,
+    "block_hash": "121c92dde3aa55b2b85e5ebd9b6cf9d1f42ad51848584ef6e2fc553f535e2e94",
+    "block_timestamp_millis": 1773277903000,
+    "tx_index_in_block": 4
+  },
+  "addresses": {
+    "council": "addr_test1wz76eeh439esrzt00h4m7kecd45e0ez43sfrw7lrajeze6qamp2sp",
+    "ics": "addr_test1wpr4mvu8h2fzs23c06waldlc6t7jjlumvcz9qqzl8mfh25qw9zcjz",
+    "mapping": "addr_test1wplxjzranravtp574s2wz00md7vz9rzpucu252je68u9a8qzjheng",
+    "reserve": "addr_test1wraevj382xaeeww85mg5whg75j3evzpq5re33zpkgagzgfsgag5wv",
+    "technical_committee": "addr_test1wp3fqhht7q4kqz5vtadn607p0kh0c7kask5javqyzk96uac8ua2lc"
+  },
+  "assets": {
+    "auth": {
+      "policy": "7e69087d98fac5869eac14e13dfb6f98228c41e638aa2a59d1f85e9c",
+      "name": ""
+    },
+    "bridge": {
+      "policy": "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1",
+      "name": "4e49474854"
+    },
+    "cnight": {
+      "policy": "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1",
+      "name": ""
+    },
+    "council": {
+      "policy": "bdace6f5897301896f7debbf5b386d6997e4558c12377be3ecb22ce8",
+      "name": ""
+    },
+    "ics": {
+      "policy": "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1",
+      "name": ""
+    },
+    "permissioned_candidates": {
+      "policy": "d962fc619efb2b904e5a8443838500ef2145452af117ab8f9cc3f97f",
+      "name": ""
+    },
+    "reserve": {
+      "policy": "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1",
+      "name": ""
+    },
+    "technical_committee": {
+      "policy": "62905eebf02b600a8c5f5b3d3fc17daefc7add85a92eb004158bae77",
+      "name": ""
+    }
+  },
+  "provenance": {
+    "repository": "https://github.com/midnightntwrk/midnight-node",
+    "commit": "86774edf8cc76345a5c3a4221f3fe80c094b1c33",
+    "files": {
+      "res/cfg/default.toml": "8448e0dd2aa72753326fbdd0e4378b794ae73b6096ecd68002cf02cacee889f4",
+      "res/cfg/preprod.toml": "e5be5410ca678003de97540ed4b9b3acb6ae91cebcf66eba4bbd8caec18412cd",
+      "res/preprod/chain-spec-raw.json": "fe96d5070ab4b624f114087482a373c3c210310449c1253bcc0261822f941560",
+      "res/preprod/chain-spec.json": "fc54e340c2d7355f67bd4aca6864e40292ee30fc12b34f1d297a54ae09a22c52",
+      "res/preprod/cnight-config.json": "668c86265597144b81d38be12d4c5fbcebc9c2178b5ccc0e526d688ef629b1d4",
+      "res/preprod/federated-authority-config.json": "ce95ffea90a49c5495bc04611ec2634f6ee778ac9d1fa341de4fffbf984eb87c",
+      "res/preprod/ics-config.json": "2eabf6f8dbb62a386b9e21595253694b243d4cbcd44d43c2c98606b049117666",
+      "res/preprod/pc-chain-config.json": "e7fc9469c2d4415fd6a8bbe41ece0dfde34d19045e60ccd51e9462775bae6c64",
+      "res/preprod/permissioned-candidates-config.json": "fa0ffbfe50ba9cb190d7fc10685f031213081daed7e1574e4febe3f1c34010ee",
+      "res/preprod/reserve-config.json": "27a53a53c10f9ef2ab09739a890c12f6bfd3dfb5f2efe1f0f2f596474bbe0984"
+    }
+  }
+}
