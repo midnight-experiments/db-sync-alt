@@ -455,7 +455,9 @@ impl Service {
         error
     }
 
-    /// The first start on an empty database: restore `--snapshot`.
+    /// The first start on an empty database, or after an interrupted
+    /// restore: restore `--snapshot`. The file is needed only here; a missing
+    /// or unreadable one refuses the start and names the flag.
     async fn restore(&self, store: &mut Store) -> Result<Value, Error> {
         let Some(restore) = &self.settings.restore else {
             return Err(Error::Refusal {
@@ -463,6 +465,17 @@ impl Service {
                 detail: json!({"database": "empty", "flag": "--snapshot"}),
             });
         };
+        let unreadable = match std::fs::File::open(&restore.file).and_then(|file| file.metadata()) {
+            Ok(metadata) if metadata.is_file() => None,
+            Ok(_) => Some("not_a_file".to_owned()),
+            Err(error) => Some(format!("{:?}", error.kind())),
+        };
+        if let Some(kind) = unreadable {
+            return Err(Error::Refusal {
+                code: "snapshot_file_unreadable",
+                detail: json!({"flag": "--snapshot", "kind": kind}),
+            });
+        }
         let description = dsa_store::snapshot::describe(&restore.file, &self.profile)?;
         let in_file = description.verified.state.retention_seconds;
         if let Some(retention) = self.settings.retention

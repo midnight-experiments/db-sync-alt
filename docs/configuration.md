@@ -70,7 +70,7 @@ server on the same host; `--tls-root-cert` is then refused.
 | --- | --- | --- | --- |
 | `--listen` | `DSA_LISTEN` | `0.0.0.0:18080` | Address and port of `/health` and `/status`. |
 | `--reader` | `DSA_READER` | required | The Midnight node's PostgreSQL login. It is granted the node's rights at every start and checked ([PostgreSQL](postgresql.md#the-reader-login)). |
-| `--snapshot` | `DSA_SNAPSHOT` | none | A snapshot file to restore when the database is empty. Read only on an empty database; the file must be readable at every start while the flag is set. |
+| `--snapshot` | `DSA_SNAPSHOT` | none | A snapshot file to restore when the database is empty, or when an interrupted restore left its build. Read only then: on a serving database the file need not exist, so the flag may stay set after the first start. A missing or unreadable file when a restore is needed ends `run` with exit status 1 (`snapshot_file_unreadable`). |
 | `--expect-content-digest` | `DSA_EXPECT_CONTENT_DIGEST` | none | Refuse the `--snapshot` file unless its content digest is this one (64 lowercase hexadecimal characters). Only with `--snapshot`. |
 | `--retention-seconds` | `DSA_RETENTION_SECONDS` | the stored value | Seconds an event stays after it is first served, at least 86,400. A value that differs from the stored one is refused unless `--change-retention` is given. |
 | `--change-retention` | `DSA_CHANGE_RETENTION` | off | Store `--retention-seconds` when it differs from the stored value ([operations](operations.md#change-the-retention)). Only with `--retention-seconds`. |

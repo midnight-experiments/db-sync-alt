@@ -119,9 +119,12 @@ docker compose -f deploy/compose.yaml --env-file deploy/compose.env up -d
 curl -s http://127.0.0.1:18080/status
 ```
 
-Once the service serves, remove the two lines from `compose.env`: the file is
-read only on an empty database, but must stay readable while `DSA_SNAPSHOT` is
-set.
+The two lines may stay in `compose.env`: the file is read only when a restore
+is needed, and a start on a serving database does not need it. The snapshot
+directory is also the directory of the daily files, and every file of the
+network's daily name pattern in it belongs to the rotation, the release file
+included: it is removed once `DSA_SNAPSHOT_KEEP` (default 3) newer daily files
+exist. Keep a copy elsewhere if you want to keep it.
 
 ### 5. Connect a Midnight node
 
@@ -162,7 +165,11 @@ stops only the service; PostgreSQL keeps serving the node the last update.
 `down` stops both and keeps the database volume and the snapshot files.
 
 The daily snapshot files in `DSA_SNAPSHOT_HOST_DIR` are the database's backups:
-copy them off the host. To restore one, see
+copy them off the host. Every file of the network's daily name pattern in that
+directory belongs to the rotation, a release file put there for the first
+start included: the newest `DSA_SNAPSHOT_KEEP` stay, older ones are removed.
+The first-start lines `DSA_SNAPSHOT` and `DSA_EXPECT_CONTENT_DIGEST` may stay
+set. To restore one, see
 [a closed gate](../docs/operations.md#a-closed-gate).
 
 To upgrade, set `DSA_IMAGE` to the new version and run `up -d` again.

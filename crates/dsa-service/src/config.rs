@@ -1,7 +1,9 @@
 //! The service's own settings. Every value is checked before anything
 //! connects, and a refusal names the flag that carries the value. There is
 //! no configuration file: values come from flags or their `DSA_`
-//! environment variables, and secrets only ever as file paths.
+//! environment variables, and secrets only ever as file paths. The
+//! `--snapshot` file is not opened here: it is read only when a restore is
+//! needed, so a start on a serving database does not need it.
 
 use std::{
     net::SocketAddr,
@@ -110,11 +112,6 @@ impl Settings {
             .map_err(|_| invalid("invalid_listen_address", "--listen"))?;
         if input.reader.is_empty() || input.reader.len() > 63 || input.reader.contains('\0') {
             return Err(invalid("invalid_reader_role", "--reader"));
-        }
-        if let Some(file) = &input.snapshot
-            && !(file.is_file() && std::fs::File::open(file).is_ok())
-        {
-            return Err(invalid("invalid_snapshot_file", "--snapshot"));
         }
         if let Some(digest) = &input.expect_content_digest {
             if input.snapshot.is_none() {
@@ -244,19 +241,6 @@ mod tests {
                 "--reader",
             ),
             (
-                Box::new(|i| i.snapshot = Some("/nonexistent/file.snapshot".into())),
-                "invalid_snapshot_file",
-                "--snapshot",
-            ),
-            (
-                Box::new({
-                    let dir = dir.path().to_owned();
-                    move |i| i.snapshot = Some(dir.clone())
-                }),
-                "invalid_snapshot_file",
-                "--snapshot",
-            ),
-            (
                 Box::new({
                     let digest = digest.clone();
                     move |i| i.expect_content_digest = Some(digest.clone())
@@ -338,6 +322,17 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    /// The snapshot file is needed only for a restore: the check does not
+    /// open it.
+    #[test]
+    fn a_missing_snapshot_file_passes_the_check() {
+        let mut value = input();
+        value.snapshot = Some("/nonexistent/file.snapshot".into());
+        value.expect_content_digest = Some("a".repeat(64));
+        let restore = Settings::check(value).unwrap().restore.unwrap();
+        assert_eq!(restore.file, PathBuf::from("/nonexistent/file.snapshot"));
     }
 
     #[test]

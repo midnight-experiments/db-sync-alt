@@ -1029,6 +1029,69 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
     p.cleanup().await
 }
 
+/// The `--snapshot` file is read only when a restore is needed: a start on a
+/// serving database whose file the daily rotation removed follows without a
+/// word about it; on an empty database the missing file refuses the start
+/// with exit status 1 and an error that names the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_missing_snapshot_file_matters_only_for_a_restore() -> Result {
+    let p = Preprod::new(87, 1, 0, false).await?;
+    let k = p.k();
+    let fake = p.fake(p.t0 + k).await;
+    let missing = p.dir.path().join("rotated-away.snapshot");
+    let extra = vec![
+        "--snapshot".to_owned(),
+        missing.to_string_lossy().into_owned(),
+        "--expect-content-digest".to_owned(),
+        p.digest.clone(),
+    ];
+    let child = Child::start(
+        &run_arguments(&p.converted, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let address = child.address().await;
+    let (mut bodies, mut states) = (Vec::new(), std::collections::BTreeSet::new());
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| document["state"] == "following",
+    )
+    .await;
+    child.signal("TERM");
+    let (code, _, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    assert!(
+        !lines.iter().any(|line| line.contains("snapshot_file")),
+        "{lines:?}"
+    );
+    assert!(
+        bodies.iter().all(|body| !body.contains("snapshot_file")),
+        "a word about the file in /status"
+    );
+    let empty = Database::new().await?;
+    let child = Child::start(
+        &run_arguments(&empty, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let (code, _, lines) = tokio::time::timeout(Duration::from_secs(60), child.finish())
+        .await
+        .expect("the service ends");
+    assert_eq!(code, Some(1), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("\"error\":\"snapshot_file_unreadable\"")
+                && line.contains("\"flag\":\"--snapshot\"")
+        }),
+        "{lines:?}"
+    );
+    empty.cleanup().await?;
+    p.cleanup().await
+}
+
 /// Runs a one-shot command of the binary on `database` with no `DSA_`
 /// variable; its output.
 async fn command(database: &Database, arguments: &[&str]) -> Result<std::process::Output> {

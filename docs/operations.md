@@ -309,8 +309,16 @@ With `--snapshot-dir`, the service writes a snapshot file every day at
 `<network>-<target height>-<first 12 digits of the content digest>.snapshot`,
 written under a temporary name and then published. The newest
 `--snapshot-keep` files of the network are kept; older ones and leftovers of an
-interrupted write are removed. A failed write is tried again after 10 minutes
-without touching the older files. The last file is in `integrity.snapshot`.
+interrupted write are removed. Every file of that name pattern for the network
+in `--snapshot-dir` belongs to the rotation, also one the service did not
+write, such as a release file put there for the first start: it is removed
+once `--snapshot-keep` newer files exist. Keep a copy elsewhere of any file you
+want to keep. A failed write is tried again after 10 minutes without touching
+the older files. The last file is in `integrity.snapshot`.
+
+The `--snapshot` and `--expect-content-digest` of the first start may stay
+set: the file is read only when a restore is needed, so a start on a serving
+database does not need it, also after the rotation removed it.
 
 These files are the backups of a pruned database: a database cannot be rebuilt
 from the provider's history at a practical cost. Copy them off the host.

@@ -29,7 +29,6 @@ exit status.
 | `invalid_provider_configuration` | A provider value is out of range, or the key or certificate file cannot be read. | Check `--requests-per-second` (at most 10), `--max-in-flight` and the files. |
 | `invalid_listen_address` | `--listen` is not an address and port. | For example `0.0.0.0:18080`. |
 | `invalid_reader_role` | `--reader` is empty or too long. | |
-| `invalid_snapshot_file` | The `--snapshot` file cannot be read. | It must be readable at every start while the flag is set; remove the flag once the database serves. |
 | `expect_content_digest_requires_snapshot` | `--expect-content-digest` without `--snapshot`. | |
 | `invalid_content_digest` | The digest is not 64 lowercase hexadecimal characters. | |
 | `invalid_retention` | `--retention-seconds` below 86,400. | |
@@ -40,8 +39,9 @@ exit status.
 | `invalid_database_fatal_after` | `--database-fatal-after-seconds` below 60. | |
 | `overall_timeout_not_supported` | `run` was given `--overall-timeout-seconds` or `DSA_OVERALL_TIMEOUT_SECONDS`. | Remove it: the service runs until it is stopped. |
 
-An empty `DSA_` variable is a value: `DSA_SNAPSHOT=` is refused as
-`invalid_snapshot_file`. Leave unused variables out.
+An empty `DSA_` variable is a value: the command-line parser refuses
+`DSA_SNAPSHOT=` because `--snapshot` needs a value, and `DSA_MAX_IN_FLIGHT=` as
+not a number. Leave unused variables out.
 
 ## Connecting to PostgreSQL
 
@@ -75,9 +75,12 @@ connection, is starting or stopping, or has too many connections.
 | `stored_headers_incomplete` | The headers between the target and the tip are not all stored. | Run `verify`; restore a snapshot file into a new database. |
 
 `run` also refuses an empty database without `--snapshot`
-(`snapshot_required`), a `--retention-seconds` that differs from the stored
-one (`retention_mismatch`, [change the retention](operations.md#change-the-retention)),
-and a `--listen` address that is in use (`listen_address_unavailable`).
+(`snapshot_required`), a `--snapshot` file that is missing or unreadable when a
+restore is needed (`snapshot_file_unreadable`, with the flag and the kind of
+failure; the file is not read when the database serves), a
+`--retention-seconds` that differs from the stored one (`retention_mismatch`,
+[change the retention](operations.md#change-the-retention)), and a `--listen`
+address that is in use (`listen_address_unavailable`).
 
 ## The reader login
 

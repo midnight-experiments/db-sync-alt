@@ -73,7 +73,11 @@ or `integrity.snapshot` of the database that wrote it), not from the file
 itself.
 
 `run --snapshot FILE --expect-content-digest DIGEST` does the same on its first
-start. A restore:
+start. The file is read only when a restore is needed, so the two flags may
+stay set after the first start, also when the file is gone. When the file lies
+in `--snapshot-dir` under the daily name pattern of the network, it belongs to
+the daily rotation and is removed once `--snapshot-keep` newer files exist
+([operations](operations.md#daily-snapshot-files)). A restore:
 
 1. Opens the file and checks it before the database changes: the description,
    the format, the network, the profile hash, the keep-rule version, the node

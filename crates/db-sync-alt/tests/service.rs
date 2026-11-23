@@ -904,7 +904,9 @@ async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
 /// The daily snapshot file on an injected clock: a start after the
 /// time of day, a day without a run, a failed write tried again without
 /// losing the older files, the keep count; the recorded digest equals the
-/// one `verify` computes.
+/// one `verify` computes. A file of the network's name pattern that the
+/// service did not write, such as a release file put there for the first
+/// start, belongs to the rotation.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Result {
@@ -932,6 +934,8 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
     for name in &foreign {
         std::fs::write(dir.path().join(name), b"not ours")?;
     }
+    let release = format!("{network}-1-0123456789ab.snapshot");
+    std::fs::write(dir.path().join(&release), b"a release file")?;
     let stale = dir.path().join(format!(".{network}-snapshot-left"));
     std::fs::create_dir(&stale)?;
     std::fs::write(stale.join("snapshot"), b"partial")?;
@@ -971,6 +975,11 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
     );
     assert_eq!(std::fs::metadata(dir.path().join(&a.file))?.len(), a.bytes);
     assert!(!stale.exists(), "a stale temporary directory stays");
+    assert_eq!(
+        ours(dir.path()),
+        BTreeSet::from([release.clone(), a.file.clone()]),
+        "the release file is the second newest"
+    );
     let view = writer.service_view(&profile, None).await.map_err(named)?;
     assert_eq!(view.upkeep.snapshot.as_ref().unwrap().record, a);
     let document = status::compose(Some(&view), None, &status::Settings::new(&network), now);
@@ -990,6 +999,11 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
         .await
         .map_err(named)?;
     last = Some(now);
+    assert_eq!(
+        ours(dir.path()),
+        BTreeSet::from([a.file.clone(), b.file.clone()]),
+        "the release file is removed with the third newest"
+    );
     // A day without a run: one file at the next look.
     let plan = advance(&setup.g, &setup.follower, 2, None);
     setup.step(&plan).await?;
