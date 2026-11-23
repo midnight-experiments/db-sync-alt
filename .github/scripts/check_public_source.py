@@ -12,9 +12,8 @@ import subprocess
 
 ROOT_FILES = {'README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md',
               'SECURITY.md','CHANGELOG.md','CODE_OF_CONDUCT.md','.gitignore','.dockerignore',
-              'pyproject.toml','requirements.lock','.env.example',
-              'Cargo.toml','Cargo.lock','rust-toolchain.toml'}
-ROOT_DIRS = {'src','tests','profiles','reference','deploy','tools','docs','.github','crates'}
+              '.env.example','Cargo.toml','Cargo.lock','rust-toolchain.toml'}
+ROOT_DIRS = {'profiles','reference','deploy','tools','docs','.github','crates'}
 PATTERNS = {
     'personal_absolute_path': re.compile(r'/(?:home|Users|media)/[A-Za-z0-9_.-]+/'),
     'private_key': re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'),
@@ -42,13 +41,6 @@ NODE_CONNECTION_EXAMPLE = 'postgresql://db_sync_alt_reader:<password>@<host>:543
 REDACTION_FIXTURES = {
     'README.md': {NODE_CONNECTION_EXAMPLE},
     'docs/connect-a-node.md': {NODE_CONNECTION_EXAMPLE},
-    'tests/unit/test_cli_run.py': {'postgres://urluser:urlpassword@127.0.0.1:5432/test',
-                                      'postgres://u:p@127.0.0.1/test'},
-    'tests/unit/test_sync_diagnostics.py': {'postgres://user:secret@private/key'},
-    'tests/unit/test_service.py': {'postgres://alice:do-not-print@private-secret-directory'},
-    'tests/fixtures/service.py': {'postgres://username:secret@private-directory'},
-    'tests/unit/test_health.py': {'postgres://alice:password@private.example/secret-directory',
-                              'postgres://alice:secret@hostname/private-directory'},
     # Upstream unit-test constant in the pinned (hash-checked) node source.
     'reference/node/src/main_chain_follower.rs': {'postgres://user:pass@localhost:5432/testdb'},
 }

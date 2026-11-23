@@ -88,4 +88,4 @@
   the database; there is no pruning yet ([costs](costs.md#disk)).
 - **What the tests cover.** The test suite uses synthetic data and disposable
   PostgreSQL; it does not run a live Blockfrost key, a real Midnight node, a
-  long soak or host reboots ([development](development.md)).
+  long soak or host reboots.

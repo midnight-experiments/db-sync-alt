@@ -287,9 +287,9 @@ from a private file; see [costs](docs/costs.md).
 
 ## More
 
-[Architecture](docs/architecture.md) · [Glossary](docs/glossary.md) ·
+[Glossary](docs/glossary.md) ·
 [Networks](docs/networks.md) · [Operations](docs/operations.md) · [Backup and recovery](docs/recovery.md) ·
-[Development](docs/development.md) · [Contributing](CONTRIBUTING.md) ·
+[Contributing](CONTRIBUTING.md) ·
 [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
 
 Licensed under [Apache-2.0](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md)

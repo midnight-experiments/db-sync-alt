@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for helping. Start with [architecture](docs/architecture.md) and
-[development](docs/development.md); everything runs in Docker.
+Thanks for helping. db-sync-alt is a Rust workspace (`crates/`); build and test
+it in a container with the toolchain pinned in `rust-toolchain.toml`.
 
 1. Open an issue first for anything larger than a small fix: describe the
    problem, the expected behavior and, if you can, a reproduction with synthetic
@@ -9,13 +9,18 @@ Thanks for helping. Start with [architecture](docs/architecture.md) and
 2. Keep changes small and reviewable. Keep the boundaries explicit: what is
    published, how provider requests are counted, what the reader role can read.
    Never weaken a check to make a test pass.
-3. Add tests for changed behavior in the lane that fits it (`tests/unit`,
-   `tests/integration`, `tests/e2e`; see [development](docs/development.md)).
-   A skipped test fails its lane.
-4. Run the checks:
+3. Add tests for changed behavior next to the code in the crate that changes
+   (`crates/*/tests`). Tests that need PostgreSQL 17 are marked `#[ignore]` and
+   read a disposable server's connection settings from `DSA_TEST_DATABASE`;
+   never point it at a real database.
+4. Run the checks that CI runs (`.github/workflows/ci.yml`):
 
    ```sh
-   python3 tools/dev.py all
+   cargo fmt --all -- --check
+   cargo clippy --locked --workspace --all-targets -- -D warnings
+   cargo test --locked --workspace
+   DSA_TEST_DATABASE='host=<test server> user=postgres dbname=dsa_test' \
+     cargo test --locked --workspace -- --ignored
    python3 .github/scripts/check_public_source.py
    ```
 

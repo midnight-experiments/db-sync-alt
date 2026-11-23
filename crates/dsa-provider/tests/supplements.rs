@@ -11,16 +11,12 @@ struct Record {
 
 #[test]
 fn real_output_fallback_preserves_body_coordinates_value_and_collateral_role() {
-    let record: Record = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/data/blockfrost/collateral-omission-cbor.json"
-    ))
-    .unwrap();
+    let record: Record =
+        serde_json::from_str(include_str!("fixtures/collateral-omission-cbor.json")).unwrap();
     let raw = hex::decode(record.cbor).unwrap();
     let tx = transaction::decode(&raw, &record.tx_hash).unwrap();
-    let reply: TransactionOutputs = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/data/blockfrost/collateral-omission-utxos.json"
-    ))
-    .unwrap();
+    let reply: TransactionOutputs =
+        serde_json::from_str(include_str!("fixtures/collateral-omission-utxos.json")).unwrap();
     let resolved = resolve_outputs(&tx, &reply).unwrap();
     assert_eq!(resolved.len(), tx.outputs().len());
     for (index, output) in tx.outputs().iter().enumerate() {

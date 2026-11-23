@@ -88,8 +88,7 @@ Blockfrost answers HTTP 402, which ends the day at once (`quota_exhausted`).
 Each update is sized to its blocks: it takes as many blocks as fit three
 quarters of its budget at one request per transaction (two with relevance
 filtering), and at least one. With relevance filtering the update then holds
-only the blocks whose content fits its key limit
-([relevance filtering](mainnet-relevance.md#enable-and-observe)).
+only the blocks whose content fits its key limit.
 An update that still uses up its budget waits for the next UTC day
 (`request_budget_exhausted`) and then continues where it stopped, under a new
 job record that carries the earlier count. All

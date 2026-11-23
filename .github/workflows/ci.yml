@@ -1,61 +1,108 @@
-name: source-and-tests
+name: ci
 on:
   push:
-    paths-ignore:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - '.github/workflows/rust.yml'
   pull_request:
-    paths-ignore:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
-      - '.github/workflows/rust.yml'
 permissions:
   contents: read
+env:
+  # Size limits of the release binary and of the container image.
+  BINARY_MAX_BYTES: 30000000
+  IMAGE_MAX_BYTES: 50000000
 jobs:
-  source:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Check public source and pinned provenance
-        run: python3 .github/scripts/check_public_source.py
-      - name: Lint (ruff)
-        run: python3 tools/dev.py lint
-  unit:
-    runs-on: ubuntu-latest
+  check:
+    name: source, format, lint, tests
+    runs-on: ubuntu-24.04
+    container: rust:1.100.0-bookworm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Unit tests (no database, no network)
-        run: python3 tools/dev.py unit
+      - name: Use the pinned toolchain
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rustup show active-toolchain
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
+      - run: python3 .github/scripts/check_public_source.py
+      - run: python3 .github/scripts/test_public_source.py
+      - run: python3 .github/scripts/test_reference_source.py
+      - run: python3 .github/scripts/third_party_notices.py --check
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - name: Check generated profiles against the node sources
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/midnightntwrk/midnight-node.git "$RUNNER_TEMP/midnight-node"
+          git -C "$RUNNER_TEMP/midnight-node" checkout 86774edf8cc76345a5c3a4221f3fe80c094b1c33
+          cargo run --locked -p dsa-chain --example generate_profiles -- --node-source "$RUNNER_TEMP/midnight-node" --check
+          python3 .github/scripts/check_reference_source.py --node-source "$RUNNER_TEMP/midnight-node"
+
   integration:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Integration tests with PostgreSQL 17 (shard ${{ matrix.shard }} of 8; density isolated)
-        run: python3 tools/dev.py integration --shard ${{ matrix.shard }}/8
-  e2e:
-    runs-on: ubuntu-latest
+    name: PostgreSQL 17 integration tests
+    runs-on: ubuntu-24.04
+    container: rust:1.100.0-bookworm
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: dsa_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Compose smoke of the built image
-        run: python3 tools/dev.py e2e
+      - name: Use the pinned toolchain
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rustup show active-toolchain
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rust-target" >> "$GITHUB_ENV"
+      - name: PostgreSQL integration tests
+        env:
+          DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
+          # Deterministic CI sample; the full proof defaults to 10,000 cases
+          # when DSA_KEEP_CASES is unset in the on-demand test invocation.
+          DSA_KEEP_CASES: 64
+        run: cargo test --locked --workspace -- --ignored --nocapture --skip keep_rule_realistic_plans --skip convert_scaled_source_cost --skip compare_cli_tls_reader_files_and_certificate_identity
+
+  release-binary:
+    name: release binary (Ubuntu 24.04, glibc 2.39)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+          rustup show active-toolchain
+      - run: cargo build --release --locked -p db-sync-alt
+      - name: Size and version
+        run: |
+          size=$(stat -c %s target/release/db-sync-alt)
+          echo "db-sync-alt: $size bytes (at most $BINARY_MAX_BYTES)"
+          target/release/db-sync-alt --version
+          test "$size" -le "$BINARY_MAX_BYTES"
+
+  image:
+    name: container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: docker build -f deploy/Dockerfile -t db-sync-alt:ci .
+      - name: Size and version
+        run: |
+          size=$(docker image inspect --format '{{.Size}}' db-sync-alt:ci)
+          echo "db-sync-alt:ci: $size bytes (at most $IMAGE_MAX_BYTES)"
+          docker run --rm db-sync-alt:ci --version
+          test "$size" -le "$IMAGE_MAX_BYTES"
