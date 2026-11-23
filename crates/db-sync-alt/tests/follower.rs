@@ -497,12 +497,17 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
 /// (`chain`); afterwards the chain answers.
 fn scripted_target(height: u32, script: &[&'static str]) -> Hook {
     let path = format!("/api/v0/blocks/{height}");
-    let next = std::sync::Mutex::new(script.to_vec().into_iter());
+    let next = std::sync::Mutex::new(
+        script
+            .iter()
+            .copied()
+            .collect::<std::collections::VecDeque<_>>(),
+    );
     Arc::new(move |requested, chain: &mut Chain, _| {
         if requested != path {
             return None;
         }
-        match next.lock().unwrap().next()? {
+        match next.lock().unwrap().pop_front()? {
             "missing" => Some(Behavior::status(404)),
             "other" => {
                 let mut header = chain.at(height)?.header();
