@@ -4,7 +4,7 @@
 //! latest block as the pool endpoints define "current", and accepted only
 //! when its sum equals the epoch's active stake.
 
-use std::{collections::BTreeMap, future::Future};
+use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use dsa_provider::{
     Kind, Provider,
@@ -14,7 +14,10 @@ use dsa_store::follow::EpochParamRow;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::follow::Requests;
+use crate::{
+    follow::Requests,
+    retry::{Stop, Time, pause_until},
+};
 
 /// Pools retired at the epoch two before the one read, or later, can still
 /// hold stake in it: an epoch's distribution is the snapshot taken one epoch
@@ -26,6 +29,58 @@ pub const MAX_POOLS: usize = 100_000;
 const MAX_PAGES: u32 = 10_000;
 /// Rows of a full page.
 const PAGE_ROWS: usize = 100;
+/// Attempts of one request of a stake read that fails in transport.
+pub const REQUEST_ATTEMPTS: u32 = 5;
+
+/// How the requests of a stake read wait: the follower's clock and its stop.
+#[derive(Clone)]
+pub struct Waits {
+    pub time: Arc<dyn Time>,
+    pub stop: Stop,
+}
+
+/// The provider, the request counts and the waits of one stake read.
+struct Read<'a> {
+    provider: &'a Provider,
+    requests: &'a Requests,
+    waits: &'a Waits,
+}
+
+impl Read<'_> {
+    /// One request. A transport failure, a timeout or a 5xx is sent again
+    /// after the wait the client names, up to `REQUEST_ATTEMPTS` times; a
+    /// refusal with its own resume time (402, 418, 429) is waited out and
+    /// sent again without counting. Any other error ends the read, so that
+    /// one failed request does not cost the whole read.
+    async fn send<T, F, R>(&self, family: &'static str, mut request: F) -> Result<T, StakeError>
+    where
+        F: FnMut() -> R,
+        R: Future<Output = Result<T, dsa_provider::Error>>,
+    {
+        let mut failures = 0;
+        loop {
+            self.requests.count(family);
+            let error = match request().await {
+                Ok(answer) => return Ok(answer),
+                Err(error) => error,
+            };
+            let until = match error.kind {
+                Kind::Wait { until } => until,
+                Kind::Retry { until } if error.transport() => {
+                    failures += 1;
+                    if failures >= REQUEST_ATTEMPTS {
+                        return Err(error.into());
+                    }
+                    until
+                }
+                _ => return Err(error.into()),
+            };
+            if !pause_until(&*self.waits.time, &self.waits.stop, until).await {
+                return Err(StakeError::Stopped);
+            }
+        }
+    }
+}
 
 /// The parameters of `epoch`; `None` until the provider knows its nonce.
 pub async fn parameters(
@@ -108,6 +163,9 @@ pub enum StakeError {
     /// A limit of the read: the code names it.
     #[error("{0}")]
     Invalid(&'static str),
+    /// The stop came during a wait.
+    #[error("stop_requested")]
+    Stopped,
 }
 
 impl From<dsa_provider::Error> for StakeError {
@@ -127,6 +185,7 @@ impl StakeError {
             Self::InvalidPoolId { .. } => "provider_invalid_pool_id",
             Self::InvalidRow { .. } => "provider_invalid_stake_row",
             Self::Invalid(code) => code,
+            Self::Stopped => "stop_requested",
         }
     }
 
@@ -154,7 +213,7 @@ impl StakeError {
     pub fn refusal(&self) -> bool {
         match self {
             Self::Provider(error) => !error.transport() && matches!(error.kind, Kind::Retry { .. }),
-            Self::Changed => false,
+            Self::Changed | Self::Stopped => false,
             _ => true,
         }
     }
@@ -185,7 +244,7 @@ fn pool_hash(pool: &PoolId) -> Result<String, StakeError> {
 async fn every_page<T, F, R>(mut fetch: F) -> Result<Vec<T>, StakeError>
 where
     F: FnMut(Page) -> R,
-    R: Future<Output = Result<Vec<T>, dsa_provider::Error>>,
+    R: Future<Output = Result<Vec<T>, StakeError>>,
 {
     let mut rows = Vec::new();
     let mut page = Page::first();
@@ -207,17 +266,14 @@ where
 }
 
 /// Pools retired at `epoch - RETIRED_WINDOW` or later, newest first.
-async fn retired(
-    provider: &Provider,
-    requests: &Requests,
-    epoch: u32,
-) -> Result<Vec<PoolId>, StakeError> {
+async fn retired(read: &Read<'_>, epoch: u32) -> Result<Vec<PoolId>, StakeError> {
     let floor = epoch.saturating_sub(RETIRED_WINDOW);
     let mut pools = Vec::new();
     let mut page = Page::first();
     for _ in 0..MAX_PAGES {
-        requests.count("pools");
-        let rows = provider.retired_pools(page).await?;
+        let rows = read
+            .send("pools", || read.provider.retired_pools(page))
+            .await?;
         for row in &rows {
             if row.epoch < floor {
                 return Ok(pools);
@@ -256,15 +312,18 @@ fn add(
 pub async fn current_stake(
     provider: &Provider,
     requests: &Requests,
+    waits: &Waits,
     epoch: u32,
     stake_prefix: &str,
 ) -> Result<BTreeMap<String, u64>, StakeError> {
+    let read = Read {
+        provider,
+        requests,
+        waits,
+    };
     let mut pools = BTreeMap::new();
-    let extended = every_page(|page| {
-        requests.count("pools");
-        provider.extended_pools(page)
-    })
-    .await?;
+    let extended =
+        every_page(|page| read.send("pools", move || provider.extended_pools(page))).await?;
     for row in extended {
         add(
             &mut pools,
@@ -273,14 +332,13 @@ pub async fn current_stake(
             "pools/extended",
         )?;
     }
-    for pool in retired(provider, requests, epoch).await? {
+    for pool in retired(&read, epoch).await? {
         if pools.contains_key(&pool_hash(&pool)?) {
             // Retired, then registered again.
             continue;
         }
-        requests.count("pools");
-        let row = provider
-            .pool(&pool)
+        let row = read
+            .send("pools", || provider.pool(&pool))
             .await?
             .ok_or_else(|| StakeError::InvalidRow {
                 pool: pool.to_string(),
@@ -291,8 +349,9 @@ pub async fn current_stake(
     let mut stake = BTreeMap::new();
     for (key, (pool, amount)) in pools {
         if amount == 0 {
-            requests.count("epochs");
-            let listing = provider.epoch_pool_stake(epoch, &pool).await?;
+            let listing = read
+                .send("epochs", || provider.epoch_pool_stake(epoch, &pool))
+                .await?;
             let Some(first) = listing.first() else {
                 continue;
             };
@@ -317,14 +376,16 @@ pub async fn current_stake(
 pub async fn historical_stake(
     provider: &Provider,
     requests: &Requests,
+    waits: &Waits,
     epoch: u32,
 ) -> Result<BTreeMap<String, u64>, StakeError> {
+    let read = Read {
+        provider,
+        requests,
+        waits,
+    };
     let mut candidates = BTreeMap::new();
-    let registered = every_page(|page| {
-        requests.count("pools");
-        provider.pools(page)
-    })
-    .await?;
+    let registered = every_page(|page| read.send("pools", move || provider.pools(page))).await?;
     for pool in registered {
         let id = pool.to_string();
         if candidates.insert(pool_hash(&pool)?, pool).is_some() {
@@ -334,7 +395,7 @@ pub async fn historical_stake(
             });
         }
     }
-    for pool in retired(provider, requests, epoch).await? {
+    for pool in retired(&read, epoch).await? {
         candidates.entry(pool_hash(&pool)?).or_insert(pool);
     }
     if candidates.len() > MAX_POOLS {
@@ -345,8 +406,9 @@ pub async fn historical_stake(
         let mut page = Page::first();
         let mut done = false;
         for _ in 0..MAX_PAGES {
-            requests.count("pools");
-            let rows = provider.pool_history(&pool, page).await?;
+            let rows = read
+                .send("pools", || provider.pool_history(&pool, page))
+                .await?;
             done = rows.len() < PAGE_ROWS;
             for row in &rows {
                 if row.epoch == epoch && (row.active_stake.0 > 0 || row.delegators_count >= 1) {
@@ -377,11 +439,19 @@ pub async fn historical_stake(
 pub async fn read_stake(
     provider: &Provider,
     requests: &Requests,
+    waits: &Waits,
     epoch: u32,
     network: &str,
 ) -> Result<Distribution, StakeError> {
-    requests.count("epochs");
-    let summary = provider.epoch(epoch).await?.ok_or(StakeError::NotReady)?;
+    let read = Read {
+        provider,
+        requests,
+        waits,
+    };
+    let summary = read
+        .send("epochs", || provider.epoch(epoch))
+        .await?
+        .ok_or(StakeError::NotReady)?;
     let total = summary
         .active_stake
         .map(|stake| stake.0)
@@ -389,8 +459,10 @@ pub async fn read_stake(
     if total == 0 {
         return Err(StakeError::Invalid("provider_empty_epoch"));
     }
-    requests.count("headers");
-    let current = provider.latest_block().await?.epoch;
+    let current = read
+        .send("headers", || provider.latest_block())
+        .await?
+        .epoch;
     if current < epoch {
         return Err(StakeError::NotReady);
     }
@@ -400,11 +472,17 @@ pub async fn read_stake(
         Method::History
     };
     let pools = match method {
-        Method::Current => current_stake(provider, requests, epoch, stake_prefix(network)).await?,
-        Method::History => historical_stake(provider, requests, epoch).await?,
+        Method::Current => {
+            current_stake(provider, requests, waits, epoch, stake_prefix(network)).await?
+        }
+        Method::History => historical_stake(provider, requests, waits, epoch).await?,
     };
-    requests.count("headers");
-    if provider.latest_block().await?.epoch != current {
+    if read
+        .send("headers", || provider.latest_block())
+        .await?
+        .epoch
+        != current
+    {
         return Err(StakeError::Changed);
     }
     let sum: u128 = pools.values().map(|amount| u128::from(*amount)).sum();

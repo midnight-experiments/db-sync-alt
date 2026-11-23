@@ -44,9 +44,12 @@ then holds stake of amount zero) and is skipped otherwise. A distribution is
 stored only when its sum equals the epoch's active stake from `/epochs/{n}`
 and the latest block's epoch did not move during the read.
 
-A read that fails is tried again for that epoch only: after a transport
-failure in 1, 2, 4, 8 and 16 seconds and then every 30 seconds; after a
-refusal of the answers (a sum that does not match, a pool listed twice, an
+Within a read, a request that fails in transport (a timeout, a dropped
+connection, a 5xx) is sent again after the wait the client names, up to 5
+times, and a 402, 418 or 429 is waited out until the time it names; one failed
+request does not cost the whole read. A read that fails is tried again for
+that epoch only: after a transport failure in 1, 2, 4, 8 and 16 seconds and
+then every 30 seconds; after a refusal of the answers (a sum that does not match, a pool listed twice, an
 invalid row) in 1, 2, 4, 8, 16, 30, 60 and 300 seconds and then every 600
 seconds. Meanwhile the newer epochs are read, so one epoch that cannot be read
 does not hold back the others. `/status` shows the last failure in
