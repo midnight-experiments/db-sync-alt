@@ -839,7 +839,9 @@ async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
     assert!(ratio <= 1.3, "{evidence}");
     assert_eq!(supply_checks, days * 4);
     assert_eq!(index_looks, days * 24.min(steps_per_day));
-    assert_eq!(files, days);
+    // One file per day at 03:00, and one more at the first look when it
+    // comes before 03:00: no file was written since the day before's 03:00.
+    assert_eq!(files, days + u32::from(step_seconds < 3 * 3600));
     assert_eq!(kept, 2);
     drop((
         follower,

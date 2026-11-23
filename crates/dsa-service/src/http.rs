@@ -313,7 +313,7 @@ mod tests {
         for url in [
             "https://127.0.0.1/health",
             "http://",
-            "http://user:secret@host/health",
+            "http://user@host/health",
             "http://host:0/health",
             "http://host:99999/health",
             "http://host:port/health",
