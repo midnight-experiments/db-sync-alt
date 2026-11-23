@@ -108,6 +108,23 @@ def troubleshooting_errors(root):
     if not codes:return [(TROUBLESHOOTING,'no_codes')]
     return [(TROUBLESHOOTING,'unknown_code:'+code) for code in codes if code not in known]
 
+# The images CI runs in are the ones the image build and Compose use, so that
+# an update proposed for deploy/ fails CI until the workflow follows.
+CI_WORKFLOW='.github/workflows/ci.yml'
+
+def workflow_image_errors(root):
+    files=[root/CI_WORKFLOW,root/'deploy/Dockerfile',root/'deploy/compose.yaml']
+    if not all(path.exists() for path in files):return []
+    ci,dockerfile,compose=(path.read_text() for path in files)
+    pairs={
+        'rust':(re.findall(r'^\s*container:\s*(rust:\S+)\s*$',ci,re.M),
+                re.findall(r'^FROM\s+(rust:\S+)',dockerfile,re.M)),
+        'postgres':(re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',ci,re.M),
+                    re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',compose,re.M)),
+    }
+    return [(CI_WORKFLOW,'workflow_image_differs:'+name) for name,(used,pinned) in pairs.items()
+            if not used or not pinned or set(used)!=set(pinned) or '@sha256:' not in used[0]]
+
 def check(root):
     errors=[]; hashes={}
     tracked=set()
@@ -161,6 +178,7 @@ def check(root):
                         destination.read_text(errors='replace')):
                     errors.append((str(rel),'broken_anchor:'+link))
     errors+=troubleshooting_errors(root)
+    errors+=workflow_image_errors(root)
     try:
         profiles=sorted(p.parent for p in (root/'profiles').glob('*/source-manifest.json'))
         if not profiles:raise ValueError('no_profiles')

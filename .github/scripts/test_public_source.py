@@ -117,4 +117,25 @@ class ProcessReferenceChecks(unittest.TestCase):
         for text in passed:
             self.assertEqual(self.errors(text),[],text)
 
+class WorkflowImageChecks(unittest.TestCase):
+    def errors(self,ci,dockerfile,compose):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name,text in [(checker.CI_WORKFLOW,ci),('deploy/Dockerfile',dockerfile),
+                              ('deploy/compose.yaml',compose)]:
+                (root/name).parent.mkdir(parents=True,exist_ok=True);(root/name).write_text(text)
+            errors,_=checker.check(root)
+        return sorted(code for name,code in errors if name==checker.CI_WORKFLOW)
+
+    def test_the_workflow_runs_in_the_pinned_images(self):
+        rust='rust:1@sha256:'+'a'*64;postgres='postgres:17@sha256:'+'b'*64
+        ci=f'jobs:\n  check:\n    container: {rust}\n    services:\n      postgres:\n        image: {postgres}\n'
+        dockerfile=f'FROM {rust} AS build\n'
+        compose=f'services:\n  postgres:\n    image: {postgres}\n'
+        self.assertEqual(self.errors(ci,dockerfile,compose),[])
+        self.assertEqual(self.errors(ci.replace(rust,'rust:1'),dockerfile,compose),
+                         ['workflow_image_differs:rust'])
+        self.assertEqual(self.errors(ci,dockerfile,compose.replace('b'*64,'c'*64)),
+                         ['workflow_image_differs:postgres'])
+
 if __name__=='__main__':unittest.main()
