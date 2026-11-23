@@ -6,22 +6,21 @@ What db-sync-alt 0.5.0 works with. Anything else is refused or unsupported.
 | --- | --- | --- |
 | Midnight node | 2.1.101 | The SQL catalogue is extracted from the node's sources at tag `node-2.1.101` (commit `86774edf8cc76345a5c3a4221f3fe80c094b1c33`), kept unchanged under `reference/`. The keep rule (version 2) is derived from these queries. Another release works only if it sends the same queries and reads the same addresses and assets. |
 | PostgreSQL | 17 | Provided by you ([PostgreSQL](postgresql.md)). Every connection checks the major version; another one is refused (`postgresql_17_required`). The node connects over TLS only. |
-| PostgreSQL client tools | none | Restore, snapshot and conversion need no `psql`, `pg_dump` or `pg_restore`. |
+| PostgreSQL client tools | none | Restore and snapshot need no `psql`, `pg_dump` or `pg_restore`. |
 | Cardano networks | Mainnet, Preprod | `--network mainnet` or `--network preprod`. Other names are refused (`unsupported_network`). |
 | Provider | Blockfrost API v0 of the network | One key file. See [provider](provider.md). |
 | Operating system | Linux x86-64 with glibc 2.39 or newer | The release binary is built on Ubuntu 24.04. The image is based on Debian 12 (distroless) and runs as user 65532. |
-| Source for `convert` | A serving 0.4.x database (schema 5), read through its reader login | See [upgrade](upgrade.md). |
 | Database format | 1 | Stored in the database (`identity.database_format`); another format is refused (`unsupported_database_format`). |
 | Snapshot file format | 1 | Another format is refused (`unsupported_snapshot_format`). |
 
 ## What the release checks cover
 
 - Queries: every statement of the node's query catalogue returns the same rows
-  from a 0.5.0 database as from the 0.4.9 database at the same block
-  ([comparison](comparison.md)).
+  from a 0.5.0 database as from a full-history database of the same chain at
+  the same block ([comparison](comparison.md)).
 - Following: the follower ran on real Preprod and Mainnet blocks, and on
-  Preprod its database had the content digest of a conversion of a 0.4.9
-  database at the same blocks ([provider](provider.md#catching-up)).
+  Preprod its database had the content digest of a database built from the
+  full history at the same blocks ([provider](provider.md#catching-up)).
 - A Midnight node running against a 0.5.0 database is not part of these
   checks. Before a node depends on a new database, run the connection check of
   [connect a node](connect-a-node.md) and watch the node follow.

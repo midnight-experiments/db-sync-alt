@@ -85,6 +85,42 @@ class DocumentationChecks(unittest.TestCase):
                          ['unknown_code:invented_code'])
         self.assertEqual(self.errors({**source,checker.TROUBLESHOOTING:'No table.\n'}),['no_codes'])
 
+class HistoryChecks(unittest.TestCase):
+    def errors(self,files):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name,text in files.items():
+                (root/name).parent.mkdir(parents=True,exist_ok=True);(root/name).write_text(text)
+            errors,_=checker.check(root)
+        return sorted((name,code) for name,code in errors if ':line ' in code)
+
+    def test_prose_names_no_earlier_version_upgrade_or_comparison_with_before(self):
+        for name,text,code in [
+                ('docs/a.md','Intro.\nRequires 0.4.9 first.\n','earlier_version:line 2'),
+                ('README.md','Convert a 0.4.x database.\n','earlier_version:line 1'),
+                ('SECURITY.md','Tag v0.3.0.\n','earlier_version:line 1'),
+                ('deploy/README.md','To upgrade, set the image.\n','upgrade:line 1'),
+                ('deploy/compose.yaml','# Upgrading needs a stop.\n','upgrade:line 1'),
+                ('crates/x/tests/fixtures/README.md','Data for the migration test.\n','migration:line 1'),
+                ('CONTRIBUTING.md','Unlike the previous release, it needs a key.\n','earlier_release:line 1'),
+                ('profiles/x/README.md','Used by the Python implementation.\n','python_implementation:line 1'),
+                ('CHANGELOG.md','**Breaking.** A new format.\n','breaking_release:line 1'),
+                ('docs/b.md','The quota field is gone.\n','compared_with_before:line 1'),
+                ('NOTICE','The service no longer reads a file.\n','compared_with_before:line 1'),
+                ('.github/pull_request_template.md','Give the upgrade path.\n','upgrade:line 1')]:
+            self.assertEqual(self.errors({name:text}),[(name,code)],(name,text))
+
+    def test_numbers_and_files_that_are_not_versions_of_db_sync_alt_pass(self):
+        page=('Listen on 0.0.0.0:18080 or 127.0.0.1; 0.19 s and 0.4 s; version=0.5.0;\n'
+              'node 2.1.101, glibc 2.39, Compose 2.24.4, TLSv1.2, 10.4.1.\n'
+              'Mark breaking changes clearly. Earlier blocks are pruned.\n')
+        self.assertEqual(self.errors({'docs/a.md':page,'README.md':page,'deploy/compose.yaml':page}),[])
+        # Crate versions in the generated notices, pinned upstream files and the
+        # license texts are not prose of this repository.
+        self.assertEqual(self.errors({'THIRD_PARTY_NOTICES.md':'| hex | 0.4.3 |\n',
+                                      'reference/node/README.md':'Upgrade from 0.4.1.\n',
+                                      'docs/licenses/x-LICENSE':'upgrade 0.1.0\n'}),[])
+
 class ProcessReferenceChecks(unittest.TestCase):
     def errors(self,text,name='crates/x/tests/a.rs'):
         with tempfile.TemporaryDirectory() as directory:

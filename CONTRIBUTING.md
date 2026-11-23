@@ -70,9 +70,10 @@ python3 .github/scripts/third_party_notices.py --check
 ```
 
 `check_public_source.py` checks that the tree holds no private path, key or
-credential, that pinned upstream files keep their hashes, and that every
-relative link in the Markdown files and every code in
-`docs/troubleshooting.md` resolves. When `Cargo.lock` changes, run
+credential, that pinned upstream files keep their hashes, that every relative
+link in the Markdown files and every code in `docs/troubleshooting.md`
+resolves, and that no prose file names a version before 0.5.0, an update path
+or a comparison with before. When `Cargo.lock` changes, run
 `python3 .github/scripts/third_party_notices.py` in the container to write
 `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY_LICENSES.txt` again.
 
@@ -82,8 +83,15 @@ The documentation describes the software as it is. Tests keep parts of it
 equal to the code: `crates/db-sync-alt/tests/documentation.rs` compares
 `docs/configuration.md` with the `--help` of every command, the exit statuses
 of `docs/operations.md` with the binary's, and the `/status` fields and
-`/health` reason codes with the status document. A change that adds a flag, a
-field or a code fails these tests until the page says what it means.
+`/health` reason codes with the status document. They also check that no page
+and no `--help` names a hidden command or flag, a version before 0.5.0 or an
+update path. A change that adds a flag, a field or a code fails these tests until
+the page says what it means.
+
+The binary has two commands outside the documented interface, `follow` and
+`convert` (with the `compare` flag `--a-capture`, which reads the answers
+`convert` captures), used in development and maintenance: `--help` does not
+list them and the pages do not describe them.
 
 ## Changes
 

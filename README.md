@@ -12,7 +12,7 @@ last 7 days (the retention, counted from when this database first served them),
 the Cardano outputs of Midnight's addresses and assets that are still unspent,
 and a few governance records and epoch values. Everything older is deleted as
 the chain advances, so the database stays small: 194 MB on Mainnet right after
-a restore ([measured](docs/snapshots.md#restore)).
+a restore ([measured](#requirements)).
 
 > This whole project is vibe coded. If you use it for a real application that
 > manages any real money, that money will likely be lost. This project is for
@@ -33,7 +33,7 @@ flowchart LR
   queries fail with SQLSTATE 55000 instead of returning empty answers.
 - **Keeps serving.** The node reads the last update while db-sync-alt is
   stopped or restarting.
-- **One binary.** No Python, no PostgreSQL client tools, no configuration file.
+- **One binary.** No PostgreSQL client tools, no configuration file.
 
 ## Requirements
 
@@ -41,13 +41,24 @@ flowchart LR
 - PostgreSQL 17 with TLS, which you provide: a dedicated database, an owner
   login and a reader login for the node ([PostgreSQL](docs/postgresql.md)).
 - A Blockfrost key for the network, in a file.
-- A snapshot file of the network to start from, or a 0.4.x database to convert
-  ([upgrade](docs/upgrade.md)).
-- Disk: right after a restore the database held 194 MB on Mainnet and 18 MB
-  on Preprod, and the snapshot files are 32.9 MB and 1.5 MB
-  ([measured](docs/snapshots.md)). Memory: the follower peaked at 42,064 KiB
-  resident while catching up 43,919 Preprod blocks
-  ([measured](docs/provider.md#catching-up)).
+- A snapshot file of the network to start from.
+
+Measured on 2026-11-23 with release builds on an x86-64 Linux host,
+PostgreSQL 17 in a container:
+
+| Measured | Mainnet | Preprod |
+| --- | --- | --- |
+| Memory of the service, resident | 26 MB at the tip; peak 42 MB catching up 75,000 blocks | 15 MB at the tip; peak 17 MB |
+| [Database](docs/postgresql.md#size-and-connections) | 194 MB after restoring a 7-day window; 376 MB holding 25 days of blocks, before its first pruning | 18 MB after a restore; 20 MB after following for three hours |
+| [Snapshot file](docs/snapshots.md#what-a-file-contains) | 32.9 MB for a 7-day window; 44.1 MB for 24 days | 1.5 to 1.6 MB |
+| [Restore](docs/snapshots.md#restore); [writing a file](docs/snapshots.md#write-a-file) | 19.9 s; 13.0 s for 24 days | 0.5 to 0.7 s; 0.4 s |
+| [Supply check](docs/operations.md#supply-check) | 1.1 s (247,986 unspent outputs) | — |
+| [Provider requests](docs/provider.md#catching-up) | 0.92 a block catching up | 0.80 a block catching up; 319 an hour at the tip, about 7,700 a day |
+| [Compose](deploy/README.md#postgresql-settings), two minutes after a first start | — | service container 4.8 MiB, PostgreSQL container 67 MiB |
+
+The binary is 9.1 MB and the image 33 MB ([deployment](deploy/README.md#the-image)).
+In a test, a restart of the service reached `following` in 0.19 s on a 185 MB
+database ([operations](docs/operations.md#start)).
 
 ## Install
 
@@ -122,20 +133,13 @@ Midnight node 2.1.101 connects only over TLS. The reader login can read the
 node's eleven views and nothing else. Details and checks:
 [connect a node](docs/connect-a-node.md).
 
-## Upgrade from 0.4.x
-
-`db-sync-alt convert` builds a new 0.5.0 database from a serving 0.4.x
-database, which it only reads and which stays as it was. Verify it, start
-`run` on it, and point the node at it: [upgrade](docs/upgrade.md). This is a
-breaking release ([changelog](CHANGELOG.md)).
-
 ## Documentation
 
 - [Configuration](docs/configuration.md): every flag and variable.
 - [Operations](docs/operations.md): states, `/health`, `/status`, logs, exit
   statuses, upkeep, the retention, a closed gate.
 - [Snapshot files](docs/snapshots.md): restore, write, verify.
-- [Upgrade from 0.4.x](docs/upgrade.md) and [comparison](docs/comparison.md).
+- [Comparison](docs/comparison.md): the node's queries against two databases.
 - [Provider](docs/provider.md): requests, pace, refusals, measured costs.
 - [PostgreSQL](docs/postgresql.md) and [connect a node](docs/connect-a-node.md).
 - [Compatibility](docs/compatibility.md) and [limitations](docs/limitations.md).

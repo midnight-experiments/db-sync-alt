@@ -60,11 +60,11 @@ connection, is starting or stopping, or has too many connections.
 | `tls_error` | Another TLS failure, for example a server without TLS. | Turn TLS on ([PostgreSQL](postgresql.md#tls)) or use `sslmode=disable` for a local server. |
 | `postgresql_17_required` | The server is not PostgreSQL 17. | |
 | `invalid_owner_role` | The login does not own the database, or has superuser or other role attributes. | [PostgreSQL](postgresql.md#the-database-and-its-logins). |
-| `writer_busy` | Another session holds the writer lock: a running service, a restore or a conversion, or the session of a db-sync-alt process that is gone, whose host lost power or whose network to the server was cut. `run` waits for the lock, at start and when its writer reconnects, with the state `waiting` and the reason `writer_busy`, and ends with exit status 1 after 120 seconds; the other commands refuse at once. | Stop the other process, or wait for it. A session left by a process that is gone ends by itself within about a minute; to end it at once, see below. |
+| `writer_busy` | Another session holds the writer lock: a running service or a restore, or the session of a db-sync-alt process that has died, whose host lost power or whose network to the server was cut. `run` waits for the lock, at start and when its writer reconnects, with the state `waiting` and the reason `writer_busy`, and ends with exit status 1 after 120 seconds; the other commands refuse at once. | Stop the other process, or wait for it. A session left by a process that has died ends by itself within about a minute; to end it at once, see below. |
 
 Every session of db-sync-alt sets the server-side TCP keepalive
 (`tcp_keepalives_idle` 30 seconds, `tcp_keepalives_interval` 10 seconds,
-`tcp_keepalives_count` 3), so the server notices a client that is gone within
+`tcp_keepalives_count` 3), so the server notices a client that has died within
 about a minute and ends its session, which releases the writer lock. To find
 the session that holds the lock, and its client, run as the owner login or a
 superuser in the database:
@@ -83,11 +83,11 @@ If no db-sync-alt process runs on that client any more, end the session with
 
 | Code | Cause | What to do |
 | --- | --- | --- |
-| `unsupported_database_format` | The database is not a db-sync-alt 0.5.0 database: for example a 0.4.x database. | Give the right database; a 0.4.x database is the source of [`convert`](upgrade.md). |
+| `unsupported_database_format` | The database is not a db-sync-alt database of this format. | Give the right database. |
 | `network_mismatch` | The database belongs to another network. | Check `--network` and `--database`. |
 | `profile_hash_mismatch` | The database was made with another profile. | Restore a file made by this release into a new database. |
 | `keep_rule_version_mismatch` | The database was made with another keep rule. | As above. |
-| `destination_not_empty` | `restore`, `convert` or `create` was given a database that holds data. | Use an empty database. |
+| `destination_not_empty` | `restore` or `create` was given a database that holds data. | Use an empty database. |
 | `database_not_serving` | The gate is closed, or the database never served. | See `position.reason` in `db-sync-alt status`; for a closed gate, [restore a snapshot file](operations.md#a-closed-gate). |
 | `stored_headers_incomplete` | The headers between the target and the tip are not all stored. | Run `verify`; restore a snapshot file into a new database. |
 
@@ -206,20 +206,6 @@ file into a new database. The faults include:
 | `unspent_count_mismatch` | The count of unspent outputs at a profile address differs from a recount. |
 | `header_gap` | A header between the horizon and the tip is missing. |
 | `missing_supply` | A fixed-supply asset has no recorded supply. |
-
-## `convert`
-
-| Code | Cause | What to do |
-| --- | --- | --- |
-| `source_not_serving` | The 0.4.x database does not serve: it answered SQLSTATE 55000. | Let the 0.4.x service publish, then convert. |
-| `invalid_source_reader_role` | The source login is not exactly the 0.4.x reader. | Use the 0.4.x reader login. |
-| `unsupported_legacy_schema` | The source is not a 0.4.x schema-5 database. | Upgrade the 0.4.x database with 0.4.x first. |
-| `source_network_ambiguous` | The source holds nothing that proves its network. | |
-| `horizon_before_source_history` | `--horizon-block` is older than the source's history. | Choose a later horizon. |
-| `horizon_above_source_target` | `--horizon-block` is above the source's target. | |
-| `source_statement_timeout` | A source statement reached its limit. | Raise `--source-statement-timeout-seconds`. |
-| `source_read_failed` | A source read failed; the report has the server's message. | |
-| `conversion_completed_snapshot_failed` | The database was converted and serves; only the snapshot file failed. | Run `snapshot` with a new path; do not convert again. |
 
 ## `compare`
 

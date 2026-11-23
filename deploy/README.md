@@ -8,7 +8,8 @@ certificates and time-zone data), without a shell, a package manager or
 PostgreSQL client tools. It runs as user 65532. Its
 entry point is `/usr/local/bin/db-sync-alt` and its default command is `run`;
 `/var/lib/db-sync-alt/snapshots` belongs to user 65532 for the daily snapshot
-files. The license texts are in `/usr/share/doc/db-sync-alt`. `Dockerfile`
+files. The license texts are in `/usr/share/doc/db-sync-alt`. The image is
+33 MB (33,199,302 bytes) and its binary 9.1 MB (9,054,520 bytes). `Dockerfile`
 builds it from the repository root:
 
 ```sh
@@ -145,8 +146,11 @@ The node connects to host `postgres`, port 5432, database `db_sync_alt`, user
 ### PostgreSQL settings
 
 `compose.yaml` passes these settings to the server. The database is small: it
-measured 194 MB on Mainnet right after a restore
-([snapshots](../docs/snapshots.md#restore)).
+measured 194 MB on Mainnet right after a restore and 376 MB while holding 25
+days of blocks before its first pruning
+([PostgreSQL](../docs/postgresql.md#size-and-connections)). On Preprod, two
+minutes after a first start, the service container used 4.8 MiB of memory and
+the PostgreSQL container 67 MiB (2026-11-23).
 
 | Setting | Value | Why |
 | --- | --- | --- |
@@ -164,7 +168,7 @@ idle-in-transaction timeouts of 60 seconds, `search_path` `public` and
 read-only transactions. db-sync-alt grants it the node's views at every start,
 and refuses a reader that can do more.
 
-### Stop, back up and upgrade
+### Stop and back up
 
 `docker compose -f deploy/compose.yaml --env-file deploy/compose.env stop db-sync-alt`
 stops only the service; PostgreSQL keeps serving the node the last update.
@@ -176,8 +180,6 @@ directory belongs to the rotation, a release file put there for the first
 start included: the newest `DSA_SNAPSHOT_KEEP` stay, older ones are removed.
 The first-start lines `DSA_SNAPSHOT` and `DSA_EXPECT_CONTENT_DIGEST` may stay
 set. To restore one, see [a closed gate under Compose](#a-closed-gate-under-compose).
-
-To upgrade, set `DSA_IMAGE` to the new version and run `up -d` again.
 
 ### A closed gate under Compose
 

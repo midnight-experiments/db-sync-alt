@@ -12,9 +12,7 @@ practical cost.
   day and keeps the newest few ([operations](operations.md#daily-snapshot-files)).
 - **The releases.** One file per network is attached to each release, with its
   content digest in the release notes.
-- **`db-sync-alt snapshot`** on any serving database, and
-  **`db-sync-alt convert --snapshot`** when a 0.4.x database is converted
-  ([upgrade](upgrade.md)).
+- **`db-sync-alt snapshot`** on any serving database.
 
 Anyone with a database of the same network can check a file: restore it and
 compare its content digest with the digest of their own database at the same
@@ -32,8 +30,8 @@ The description holds:
 - the network, the profile hash, the keep-rule version (2), the node release
   (`2.1.101`), the database format (1) and the version of db-sync-alt that
   wrote it;
-- the origin of the data: a conversion, a restore or a followed database, with
-  the target and tip of the source;
+- the origin of the data, with the target and tip of the database it came
+  from;
 - the horizon, target and tip, each with height, hash and time, and the
   retention;
 - a digest per table, the content digest, the state digest, and the recorded
@@ -46,17 +44,17 @@ in the file: a restore counts every block of the window as first served at the
 restore.
 
 The content digest covers what the node can read, by natural key, never by row
-ID. A file from a conversion, a file from a followed database and a restore of
-either give the same content digest at the same horizon, target and tip. The
+ID. A file from a followed database and a restore of that file give the same
+content digest at the same horizon, target and tip. The
 state digest covers the outputs spent before the horizon.
 
-Measured sizes, from conversions of the real databases with a pre-release
-build:
+Measured sizes of real files (2026-11-23, release builds):
 
-| File | Horizon | Target | Size |
-| --- | ---: | ---: | ---: |
-| Mainnet, converted 2026-11-21 | 14,130,822 | 14,160,893 | 32,877,530 bytes |
-| Preprod, converted 2026-11-22 | 5,414,627 | 5,441,843 | 1,516,541 bytes |
+| File | Size |
+| --- | ---: |
+| Mainnet, a 7-day window | 32.9 MB |
+| Mainnet, 24 days of blocks | 44.1 MB |
+| Preprod, a 7-day window | 1.5 to 1.6 MB |
 
 ## Restore
 
@@ -74,7 +72,7 @@ itself.
 
 `run --snapshot FILE --expect-content-digest DIGEST` does the same on its first
 start. The file is read only when a restore is needed, so the two flags may
-stay set after the first start, also when the file is gone. When the file lies
+stay set after the first start, also when the file has been removed. When the file lies
 in `--snapshot-dir` under the daily name pattern of the network, it belongs to
 the daily rotation and is removed once `--snapshot-keep` newer files exist
 ([operations](operations.md#daily-snapshot-files)). A restore:
@@ -85,7 +83,7 @@ the daily rotation and is removed once `--snapshot-keep` newer files exist
    every section's SHA-256. A wrong path or a file of another network, format
    or rule version leaves the database as it was.
 2. Takes the writer lock. The database must be blank (the layout is created)
-   or hold the empty layout that a failed restore or conversion leaves. A
+   or hold the empty layout that a failed restore leaves. A
    database that serves, holds a row, or has an object of its own in schema
    `serve` is refused unchanged (`destination_not_empty`).
 3. Builds the tables in one transaction: loads every section, re-hashing the
@@ -107,14 +105,17 @@ reports `"published": false` before its publishing commit was sent and
 `"outcome": "unknown"` after: run `status` and `verify` to see which state it
 reached.
 
-Measured restores, with the content digest equal to the recorded one each
-time. PostgreSQL 17 ran in a container with 4 CPUs, 4 GiB and NVMe writes
-capped at 48 MiB/s, on a 16-core x86-64 Linux host:
+Measured restores (2026-11-23, release builds), with the content digest equal
+to the recorded one each time. PostgreSQL 17 ran in a container with 4 CPUs,
+4 GiB and NVMe writes capped at 48 MiB/s, on a 16-core x86-64 Linux host:
 
-| File | Build | Date | Restore | Database after the restore |
-| --- | --- | --- | ---: | ---: |
-| Mainnet, target 14,160,893 | release, pre-release commit | 2026-11-23 | 19.9 s | 194 MB |
-| Preprod, target 5,397,924 | release, pre-release commit | 2026-11-23 | 0.70 s | 18 MB |
+| File | Restore |
+| --- | ---: |
+| Mainnet, a 7-day window, target 14,160,893 | 19.9 s |
+| Preprod, a 7-day window | 0.5 to 0.7 s |
+
+The database sizes after a restore are in
+[PostgreSQL](postgresql.md#size-and-connections).
 
 After a restore the database follows from the file's target: a file that is a
 day old costs a day of catching up ([provider](provider.md#catching-up)).
@@ -136,6 +137,9 @@ and removes its temporary files on any error. If the file was published but its
 directory could not be synced, the report is
 `snapshot_published_durability_uncertain` with `"published": true`: the file
 exists; do not write over it.
+
+Measured on 2026-11-23 with release builds: writing the Mainnet file of 24 days
+(44.1 MB) took 13.0 s, a Preprod file 0.4 s.
 
 ## Verify
 

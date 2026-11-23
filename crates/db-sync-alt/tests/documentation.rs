@@ -585,3 +585,256 @@ fn the_operations_page_explains_every_health_reason_and_status_field() {
         errors.join("\n")
     );
 }
+
+/// Commands the binary has outside its documented interface, for development
+/// and maintenance: `--help` does not list them and no page names them.
+const HIDDEN_COMMANDS: &[&str] = &["convert", "follow"];
+/// Flags of listed commands that `--help` does not show, with their command.
+const HIDDEN_FLAGS: &[(&str, &str)] = &[("compare", "--a-capture")];
+
+/// The pages that document the interface: the README, `docs/`, the
+/// deployment README, the changelog and the security policy.
+fn pages() -> Vec<(String, String)> {
+    let mut names: Vec<String> = std::fs::read_dir(root().join("docs"))
+        .expect("docs/")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .filter(|name| name.ends_with(".md"))
+        .map(|name| format!("docs/{name}"))
+        .collect();
+    names.sort();
+    names.extend(
+        [
+            "README.md",
+            "deploy/README.md",
+            "CHANGELOG.md",
+            "SECURITY.md",
+        ]
+        .map(str::to_owned),
+    );
+    names
+        .into_iter()
+        .map(|name| {
+            let text = read(&name);
+            (name, text)
+        })
+        .collect()
+}
+
+/// The `--help` of the binary and of every command it lists, by name.
+fn visible_helps() -> Vec<(String, String)> {
+    let top = help(None).expect("db-sync-alt --help");
+    let mut helps = vec![("db-sync-alt --help".to_owned(), top.clone())];
+    for command in listed_commands(&top) {
+        let text = help(Some(&command)).expect("a listed command has --help");
+        helps.push((format!("db-sync-alt {command} --help"), text));
+    }
+    helps
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// The positions where `needle` occurs in `text` as a whole name: not inside a
+/// longer name on either side.
+fn whole(text: &str, needle: &str) -> Vec<usize> {
+    text.match_indices(needle)
+        .filter(|(at, _)| {
+            let before = text[..*at].chars().next_back();
+            let after = text[at + needle.len()..].chars().next();
+            !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char)
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Whether `text` names the command `name`: in a code span of its own or at
+/// the start of one, after `db-sync-alt`, or followed by a flag or a colon.
+fn names_command(text: &str, name: &str) -> bool {
+    text.contains(&format!("`{name}`"))
+        || text.contains(&format!("`{name} "))
+        || !whole(text, &format!("db-sync-alt {name}")).is_empty()
+        || whole(text, name).into_iter().any(|at| {
+            let rest = &text[at + name.len()..];
+            rest.starts_with(" --") || rest.starts_with(':')
+        })
+}
+
+/// The long flags of a `--help`, without `--help` and `--version`.
+fn flag_names(text: &str) -> BTreeSet<String> {
+    help_flags(text).into_keys().collect()
+}
+
+#[test]
+fn hidden_commands_and_flags_are_hidden_and_no_page_names_them() {
+    // The list is complete: every `hide = true` of the command line is in it.
+    let mut declared = 0;
+    for entry in std::fs::read_dir(root().join("crates/db-sync-alt/src")).expect("src/") {
+        let path = entry.expect("an entry").path();
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            declared += std::fs::read_to_string(&path)
+                .expect("a source file")
+                .matches("hide = true")
+                .count();
+        }
+    }
+    let mut errors = Vec::new();
+    if declared != HIDDEN_COMMANDS.len() + HIDDEN_FLAGS.len() {
+        errors.push(format!(
+            "crates/db-sync-alt/src has {declared} `hide = true`, this test lists {}",
+            HIDDEN_COMMANDS.len() + HIDDEN_FLAGS.len()
+        ));
+    }
+    let top = help(None).expect("db-sync-alt --help");
+    let listed = listed_commands(&top);
+    let mut visible_flags = BTreeSet::new();
+    for command in &listed {
+        visible_flags.extend(flag_names(
+            &help(Some(command)).expect("a listed command has --help"),
+        ));
+    }
+    let mut hidden_flags: BTreeSet<String> = BTreeSet::new();
+    for command in HIDDEN_COMMANDS {
+        if listed.iter().any(|name| name == command) {
+            errors.push(format!("`{command}` is listed by db-sync-alt --help"));
+        }
+        match help(Some(command)) {
+            Some(text) => hidden_flags.extend(flag_names(&text)),
+            None => errors.push(format!("`{command} --help` does not work")),
+        }
+    }
+    let mut hidden_flags: BTreeSet<String> =
+        hidden_flags.difference(&visible_flags).cloned().collect();
+    for (command, flag) in HIDDEN_FLAGS {
+        let text = help(Some(command)).expect("a listed command has --help");
+        if flag_names(&text).contains(*flag) {
+            errors.push(format!("`{command}` {flag} is shown by --help"));
+        }
+        let accepted = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+            .args([command, flag, "value", "--help"])
+            .output()
+            .expect("the binary runs")
+            .status
+            .success();
+        if !accepted {
+            errors.push(format!("`{command}` does not accept {flag}"));
+        }
+        hidden_flags.insert((*flag).to_owned());
+    }
+    // The flags of `convert` that no listed command has, with `--a-capture`
+    // and `follow --stop-at-target`: fewer means a hidden command's flags
+    // became visible.
+    if hidden_flags.len() < 10 {
+        errors.push(format!("only these flags are hidden: {hidden_flags:?}"));
+    }
+    for (name, text) in pages().into_iter().chain(visible_helps()) {
+        for command in HIDDEN_COMMANDS {
+            if names_command(&text, command) {
+                errors.push(format!("{name} names the hidden command `{command}`"));
+            }
+        }
+        for flag in &hidden_flags {
+            if !whole(&text, flag).is_empty() {
+                errors.push(format!("{name} names the hidden flag {flag}"));
+            }
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// An earlier db-sync-alt version in `text` (0.1.x to 0.4.x, also with a `v`),
+/// not part of a longer number or address such as `0.0.0.0:18080`.
+fn earlier_version(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for (start, _) in text.match_indices('0') {
+        let at = if start > 0 && bytes[start - 1] == b'v' {
+            start - 1
+        } else {
+            start
+        };
+        let before = text[..at].chars().next_back();
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '.' || c == '_') {
+            continue;
+        }
+        let rest = &bytes[start..];
+        if rest.len() < 5 || rest[1] != b'.' || !(b'0'..=b'4').contains(&rest[2]) || rest[3] != b'.'
+        {
+            continue;
+        }
+        let last = if rest[4] == b'x' {
+            5
+        } else {
+            4 + rest[4..].iter().take_while(|b| b.is_ascii_digit()).count()
+        };
+        if last == 4 {
+            continue;
+        }
+        let after = &rest[last..];
+        let longer = after
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            || (after.first() == Some(&b'.') && after.get(1).is_some_and(u8::is_ascii_digit));
+        if !longer {
+            return Some(text[at..start + last].to_owned());
+        }
+    }
+    None
+}
+
+/// Words that describe a change from an earlier version instead of the
+/// software as it is.
+const HISTORY_WORDS: &[&str] = &[
+    "upgrade",
+    "upgrading",
+    "migrate",
+    "migration",
+    "no longer",
+    "is gone",
+    "are gone",
+    "earlier version",
+    "earlier release",
+    "previous version",
+    "previous release",
+];
+
+/// `.github/scripts/check_public_source.py` applies the same rule to every
+/// prose file of the repository; this test applies it to what the binary
+/// prints.
+#[test]
+fn no_help_text_names_an_earlier_version_or_an_upgrade() {
+    let mut errors = Vec::new();
+    for (name, text) in visible_helps() {
+        if let Some(version) = earlier_version(&text) {
+            errors.push(format!("{name}: {version}"));
+        }
+        let lower = text.to_lowercase();
+        for word in HISTORY_WORDS {
+            if !whole(&lower, word).is_empty() {
+                errors.push(format!("{name}: {word:?}"));
+            }
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+#[test]
+fn the_version_rule_finds_earlier_versions_and_nothing_else() {
+    for (text, found) in [
+        ("from 0.4.x on", Some("0.4.x")),
+        ("tag v0.4.9.", Some("v0.4.9")),
+        ("0.1.1", Some("0.1.1")),
+        ("listen on 0.0.0.0:18080", None),
+        ("127.0.0.1", None),
+        ("took 0.19 s and 0.4 s", None),
+        ("version 0.5.0", None),
+        ("node 2.1.101, 10.4.1", None),
+    ] {
+        assert_eq!(earlier_version(text).as_deref(), found, "{text}");
+    }
+}

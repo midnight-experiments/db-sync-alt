@@ -17,7 +17,6 @@ passwords, private configuration or database dumps.
 | Version | Supported |
 | --- | --- |
 | 0.5.x | yes |
-| 0.4.x and earlier | no |
 
 db-sync-alt is experimental; fixes go into the latest version.
 
