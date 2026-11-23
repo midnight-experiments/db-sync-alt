@@ -1,55 +1,117 @@
+# db-sync-alt with its own PostgreSQL 17 server. Settings come from an env file
+# (start from compose.env.example), secrets from files in DSA_SECRETS_DIR.
+# See README.md in this directory.
 services:
   postgres:
     image: postgres:17.11-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea5649807491a0545b5eeeb8f0b8bb11857a5
-    restart: "no"
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/db-sync-alt/start.sh"]
+    command:
+      - postgres
+      # TLS: Midnight node 2.1.101 connects over TLS only; db-sync-alt verifies
+      # the certificate against DSA_TLS_ROOT_CERT and the host name `postgres`.
+      - --ssl=on
+      - --ssl_cert_file=/run/db-sync-alt/server.crt
+      - --ssl_key_file=/run/db-sync-alt/server.key
+      - --ssl_min_protocol_version=TLSv1.2
+      - --password_encryption=scram-sha-256
+      # Memory: the whole database is smaller than 0.5 GB, so the defaults of a
+      # small server suffice and the server stays under 0.5 GiB.
+      - --shared_buffers=128MB
+      - --effective_cache_size=256MB
+      - --work_mem=4MB
+      - --maintenance_work_mem=64MB
+      # Connections: up to 32 from the node's pools, a few for db-sync-alt and
+      # its serving check, and the superuser's reserve.
+      - --max_connections=60
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?private compose.env required}
+      POSTGRES_PASSWORD_FILE: /run/db-sync-alt/postgres.password
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
-    volumes: ["database:/var/lib/postgresql/data"]
-    # midnight-node connects on the node network as the reader login; nothing is published on the host.
+    secrets:
+      - {source: postgres_password, target: postgres.password}
+      - {source: owner_password, target: owner.password}
+      - {source: reader_password, target: reader.password}
+      - {source: postgres_server_certificate, target: server.crt}
+      - {source: postgres_server_key, target: server.key}
+    volumes:
+      - database:/var/lib/postgresql/data
+      - ./postgres/start.sh:/opt/db-sync-alt/start.sh:ro
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/10-db-sync-alt.sh:ro
+    tmpfs: ["/run/db-sync-alt:rw,noexec,nosuid,size=1m"]
+    shm_size: 128mb
+    # midnight-node connects on the node network as the reader login; nothing
+    # is published on the host.
     networks: [backend, node]
     healthcheck:
-      # Over TCP: while the image initialises a new data directory it runs a temporary
-      # server on the Unix socket only, which would report ready before the real one.
+      # Over TCP: while the image initialises a new data directory it runs a
+      # temporary server on the Unix socket only.
       test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
       interval: 2s
       timeout: 2s
       retries: 30
-  service: &application
-    image: ${APP_IMAGE:-db-sync-alt:local}
-    command: [db-sync-alt, service, --config, /run/db-sync-alt/service.json]
-    restart: "no"
-    user: "${APP_UID:?}:${APP_GID:?}"
+
+  db-sync-alt:
+    image: ${DSA_IMAGE:?set DSA_IMAGE in the env file}
+    command: [run]
+    restart: unless-stopped
+    # The owner of the files in DSA_SECRETS_DIR and DSA_SNAPSHOT_HOST_DIR.
+    user: "${DSA_UID:?set DSA_UID in the env file}:${DSA_GID:?set DSA_GID in the env file}"
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    tmpfs: ["/tmp:rw,noexec,nosuid,size=67108864"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
     environment:
-      PGSERVICEFILE: /run/db-sync-alt/pg_service.conf
-      PGPASSFILE: /run/db-sync-alt/pgpass
-      DBSYNC_PROVIDER_KEY_FILE: /run/db-sync-alt/provider.key
-      DBSYNC_PROVIDER_STATE: /var/lib/db-sync-alt
+      DSA_NETWORK: ${DSA_NETWORK:?set DSA_NETWORK (mainnet or preprod) in the env file}
+      DSA_DATABASE: host=postgres port=5432 dbname=db_sync_alt user=db_sync_alt_owner
+      DSA_PASSWORD_FILE: /run/secrets/owner.password
+      DSA_TLS_ROOT_CERT: /run/secrets/root-ca.crt
+      DSA_READER: db_sync_alt_reader
+      DSA_PROVIDER_KEY_FILE: /run/secrets/provider.key
+      DSA_LISTEN: 0.0.0.0:18080
+      DSA_SNAPSHOT_DIR: /var/lib/db-sync-alt/snapshots
+      # Passed on only when set in the env file.
+      DSA_SNAPSHOT:
+      DSA_EXPECT_CONTENT_DIGEST:
+      DSA_RETENTION_SECONDS:
+      DSA_CHANGE_RETENTION:
+      DSA_SNAPSHOT_KEEP:
+      DSA_SNAPSHOT_AT:
+      DSA_PROVIDER_URL:
+      DSA_REQUESTS_PER_SECOND:
+      DSA_MAX_IN_FLIGHT:
+      DSA_POLL_INTERVAL_SECONDS:
+      DSA_PRUNE_INTERVAL_SECONDS:
+      DSA_HEALTH_MAX_LAG_BLOCKS:
+      DSA_DATABASE_FATAL_AFTER_SECONDS:
+    secrets:
+      - {source: owner_password, target: owner.password}
+      - {source: provider_key, target: provider.key}
+      - {source: postgres_ca, target: root-ca.crt}
     volumes:
-      - ${PRIVATE_DIR:?private configuration required}/service:/run/db-sync-alt:ro
-      - ${PRIVATE_DIR}/accounting:/var/lib/db-sync-alt:rw
+      - ${DSA_SNAPSHOT_HOST_DIR:?set DSA_SNAPSHOT_HOST_DIR in the env file}:/var/lib/db-sync-alt/snapshots
     networks: [backend, frontend]
     depends_on:
       postgres: {condition: service_healthy}
     ports:
-      - "127.0.0.1:${HTTP_PORT:-18080}:18080"
+      - "127.0.0.1:${DSA_HTTP_PORT:-18080}:18080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/db-sync-alt", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     stop_grace_period: 15s
-  bootstrap:
-    <<: *application
-    command: [db-sync-alt, compose, provision]
-    profiles: [tools]
-    environment:
-      PGSERVICEFILE: /run/db-sync-alt-operator/pg_service.conf
-      PGPASSFILE: /run/db-sync-alt-operator/pgpass
-    volumes:
-      - ${PRIVATE_DIR:?private configuration required}/operator:/run/db-sync-alt-operator:ro
-    networks: [backend]
-    ports: []
+
+secrets:
+  postgres_password: {file: "${DSA_SECRETS_DIR:?set DSA_SECRETS_DIR in the env file}/postgres.password"}
+  owner_password: {file: "${DSA_SECRETS_DIR}/owner.password"}
+  reader_password: {file: "${DSA_SECRETS_DIR}/reader.password"}
+  provider_key: {file: "${DSA_SECRETS_DIR}/provider.key"}
+  postgres_ca: {file: "${DSA_SECRETS_DIR}/root-ca.crt"}
+  postgres_server_certificate: {file: "${DSA_SECRETS_DIR}/server.crt"}
+  postgres_server_key: {file: "${DSA_SECRETS_DIR}/server.key"}
+
 networks:
   backend: {internal: true}
   frontend: {}
@@ -57,5 +119,6 @@ networks:
   # or `networks: {db-sync-alt: {external: true, name: <project>_node}}` in the node's Compose file).
   # Internal: PostgreSQL gets no route out through it.
   node: {internal: true}
+
 volumes:
   database: {}
