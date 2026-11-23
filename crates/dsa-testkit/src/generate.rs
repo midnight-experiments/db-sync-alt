@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    chain::Block,
+    chain::{Block, Chain, Pools},
     tx::{
         self, Built, Output, Tx, enterprise_address, hash, int_datum, large_datum, pointer_address,
         recipient_metadatum,
@@ -78,6 +78,47 @@ pub struct Generated {
 }
 
 impl Generated {
+    /// The same chain with every datum known from its first block on: what a
+    /// provider that already holds the whole chain answers.
+    pub fn known_from_start(&self) -> Self {
+        let first = self.blocks.first().map_or(0, |block| block.height);
+        Self {
+            blocks: self.blocks.clone(),
+            datums: self
+                .datums
+                .iter()
+                .map(|(hash, (_, bytes))| (hash.clone(), (first, bytes.clone())))
+                .collect(),
+            metadata: self.metadata.clone(),
+            epochs: self.epochs.clone(),
+            stake: self.stake.clone(),
+            counts: self.counts.clone(),
+        }
+    }
+
+    /// Gives every `length` consecutive blocks one epoch, starting at the
+    /// first block's epoch; each new epoch takes the parameters and stake of
+    /// the old epoch of its first block. Hashes do not depend on epochs.
+    pub fn lengthen_epochs(&mut self, length: u32) {
+        let Some(first) = self.blocks.first().map(|block| (block.height, block.epoch)) else {
+            return;
+        };
+        let mut epochs = BTreeMap::new();
+        let mut stake = BTreeMap::new();
+        for block in &mut self.blocks {
+            let epoch = first.1 + (block.height - first.0) / length.max(1);
+            epochs
+                .entry(epoch)
+                .or_insert_with(|| self.epochs[&block.epoch].clone());
+            stake
+                .entry(epoch)
+                .or_insert_with(|| self.stake[&block.epoch].clone());
+            block.epoch = epoch;
+        }
+        self.epochs = epochs;
+        self.stake = stake;
+    }
+
     /// The datum the provider returns while the block at `height` is read.
     pub fn datum(&self, hash: &str, height: u32) -> Option<&[u8]> {
         self.datums
@@ -888,4 +929,35 @@ pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
 /// The hex Blake2b-256 of a datum's bytes, as an output's datum hash.
 pub fn datum_hash(bytes: &[u8]) -> String {
     tx::hash(bytes)
+}
+
+impl Chain {
+    /// The provider's view of a generated chain: its blocks, every datum,
+    /// the bridge metadata, the parameters of every epoch, and the stake of
+    /// every epoch with all of its pools registered.
+    pub fn from_generated(g: &Generated, stake_prefix: &str) -> Self {
+        let mut chain = Self::from_blocks(g.blocks.clone());
+        chain.datums = g
+            .datums
+            .iter()
+            .map(|(hash, (_, bytes))| (hash.clone(), bytes.clone()))
+            .collect();
+        chain.metadata = g.metadata.clone();
+        chain.parameters = g.epochs.clone();
+        let stake: BTreeMap<u32, BTreeMap<String, u64>> = g
+            .stake
+            .iter()
+            .map(|(epoch, pools)| (*epoch, pools.iter().cloned().collect()))
+            .collect();
+        chain.pools = Pools {
+            registered: stake
+                .values()
+                .flat_map(|pools| pools.keys().cloned())
+                .collect(),
+            stake,
+            stake_prefix: stake_prefix.to_owned(),
+            ..Pools::default()
+        };
+        chain
+    }
 }

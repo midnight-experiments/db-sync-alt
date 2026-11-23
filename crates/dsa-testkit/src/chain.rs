@@ -1,9 +1,11 @@
 //! A scripted chain served the way the provider serves it: headers, the next
-//! headers after a block, and transaction CBOR in pages of exactly 100. The
-//! chain can fork at the tip, contradict a final block and inject faults.
+//! headers after a block, transaction CBOR in pages of exactly 100, datums,
+//! bridge metadata, transaction outputs, epoch parameters, epochs, pools,
+//! pool history and each epoch's stake listing. The chain can fork at the
+//! tip, contradict a final block and inject faults.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -61,12 +63,63 @@ pub struct Fault {
     pub times: usize,
 }
 
+/// The stake model behind the pool endpoints. The provider's "current"
+/// epoch is the epoch of the chain's latest block.
+#[derive(Clone, Debug, Default)]
+pub struct Pools {
+    /// Epoch -> pool (28-byte hash, hexadecimal) -> active stake. A listed
+    /// pool holds stake rows in that epoch.
+    pub stake: BTreeMap<u32, BTreeMap<String, u64>>,
+    /// Pools registered now: `/pools` and `/pools/extended`.
+    pub registered: BTreeSet<String>,
+    /// Pool -> the epoch it retired in: `/pools/retired`.
+    pub retired: BTreeMap<String, u32>,
+    /// Epochs whose `/epochs/{n}` reports this active stake instead of the
+    /// sum of their distribution.
+    pub reported_total: BTreeMap<u32, u64>,
+    /// The prefix of the stake addresses in `/epochs/{n}/stakes/{pool}`.
+    pub stake_prefix: String,
+}
+
+/// The Bech32 pool ID of a 28-byte pool hash in hexadecimal.
+pub fn pool_id(hash: &str) -> String {
+    let bytes = hex::decode(hash).expect("pool hash");
+    bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("pool").expect("hrp"), &bytes)
+        .expect("pool id")
+}
+
+fn pool_hash(id: &str) -> Option<String> {
+    let (hrp, bytes) = bech32::decode(id).ok()?;
+    (hrp.as_str() == "pool" && bytes.len() == 28).then(|| hex::encode(bytes))
+}
+
+/// One page of 100 of `rows`.
+fn paged(rows: Vec<Value>, page: usize) -> Value {
+    Value::Array(
+        rows.into_iter()
+            .skip(page.saturating_sub(1) * PAGE)
+            .take(PAGE)
+            .collect(),
+    )
+}
+
 #[derive(Clone, Default)]
 pub struct Chain {
     blocks: Vec<Block>,
     routes: BTreeMap<String, Value>,
     faults: Vec<Fault>,
     salt: u64,
+    /// Datum bytes by hash: `/scripts/datum/{hash}/cbor`.
+    pub datums: BTreeMap<String, Vec<u8>>,
+    /// Transaction -> the raw JSON of its bridge metadatum (label 6500973);
+    /// `None` and absent transactions have no metadata.
+    pub metadata: BTreeMap<String, Option<String>>,
+    /// Transaction -> its `/txs/{hash}/utxos` answer.
+    pub outputs: BTreeMap<String, Value>,
+    /// Epoch -> (nonce, max_tx_size): `/epochs/{n}/parameters`; an absent
+    /// epoch is not known yet.
+    pub parameters: BTreeMap<u32, (String, u32)>,
+    pub pools: Pools,
 }
 
 /// A distinct ordinary transaction, for filling blocks.
@@ -132,6 +185,154 @@ impl Chain {
 
     pub fn tip(&self) -> Option<&Block> {
         self.blocks.last()
+    }
+
+    /// The served blocks, to replace or extend while the server runs.
+    pub fn blocks_mut(&mut self) -> &mut Vec<Block> {
+        &mut self.blocks
+    }
+
+    /// The epoch the pool endpoints call current: the latest block's.
+    pub fn current_epoch(&self) -> u32 {
+        self.tip().map_or(0, |tip| tip.epoch)
+    }
+
+    fn pool_stake(&self, epoch: u32, pool: &str) -> Option<u64> {
+        self.pools
+            .stake
+            .get(&epoch)
+            .and_then(|pools| pools.get(pool))
+            .copied()
+    }
+
+    fn pool_row(&self, pool: &str) -> Value {
+        let stake = self
+            .pool_stake(self.current_epoch(), pool)
+            .unwrap_or_default()
+            .to_string();
+        json!({
+            "pool_id": pool_id(pool), "hex": pool, "vrf_key": "0".repeat(64), "blocks_minted": 0,
+            "blocks_epoch": 0, "live_stake": stake, "live_size": 0.0, "live_saturation": 0.0,
+            "live_delegators": 1, "active_stake": stake, "active_size": 0.0,
+            "declared_pledge": "0", "live_pledge": "0", "margin_cost": 0.0, "fixed_cost": "340000000",
+            "reward_account": "stake1synthetic", "owners": [], "registration": [], "retirement": []
+        })
+    }
+
+    /// Answers the provider's datum, metadata, output, epoch and pool
+    /// endpoints; `None` for another path.
+    fn answer_data(&self, parts: &[&str], page: usize) -> Option<Behavior> {
+        let missing = || Behavior::status(404);
+        let pools = &self.pools;
+        let answer = match parts {
+            ["scripts", "datum", hash, "cbor"] => self.datums.get(*hash).map_or_else(missing, |bytes| {
+                Behavior::json(json!({"cbor": hex::encode(bytes)}))
+            }),
+            ["txs", hash, "metadata"] => match self.metadata.get(*hash) {
+                Some(Some(raw)) => Behavior::raw(format!(
+                    "[{{\"label\":\"6500973\",\"json_metadata\":{raw}}}]"
+                )),
+                _ => Behavior::json(json!([])),
+            },
+            ["txs", hash, "utxos"] => self
+                .outputs
+                .get(*hash)
+                .map_or_else(missing, |answer| Behavior::json(answer.clone())),
+            ["epochs", epoch, "parameters"] => epoch
+                .parse::<u32>()
+                .ok()
+                .and_then(|epoch| self.parameters.get(&epoch).map(|value| (epoch, value)))
+                .map_or_else(missing, |(epoch, (nonce, size))| {
+                    Behavior::json(json!({
+                        "epoch": epoch, "min_fee_a": 44, "min_fee_b": 155381, "max_block_size": 90112,
+                        "max_tx_size": size, "max_block_header_size": 1100, "key_deposit": "2000000",
+                        "pool_deposit": "500000000", "nonce": nonce, "protocol_major_ver": 10,
+                        "protocol_minor_ver": 0, "coins_per_utxo_size": "4310"
+                    }))
+                }),
+            ["epochs", epoch] => match epoch.parse::<u32>() {
+                Ok(epoch) if epoch <= self.current_epoch() => {
+                    let sum = pools
+                        .stake
+                        .get(&epoch)
+                        .map(|stake| stake.values().sum::<u64>());
+                    let total = pools.reported_total.get(&epoch).copied().or(sum);
+                    Behavior::json(json!({
+                        "epoch": epoch, "start_time": 1_596_059_091, "end_time": 1_596_491_091,
+                        "first_block_time": 1_596_059_091, "last_block_time": 1_596_491_091,
+                        "block_count": 0, "tx_count": 0, "output": "0", "fees": "0",
+                        "active_stake": total.map(|total| total.to_string())
+                    }))
+                }
+                _ => missing(),
+            },
+            ["epochs", epoch, "stakes", pool] => {
+                let held = epoch
+                    .parse::<u32>()
+                    .ok()
+                    .zip(pool_hash(pool))
+                    .and_then(|(epoch, pool)| self.pool_stake(epoch, &pool));
+                Behavior::json(match held {
+                    Some(amount) if page == 1 => json!([{
+                        "stake_address": format!("{}synthetic", pools.stake_prefix),
+                        "amount": amount.to_string()
+                    }]),
+                    _ => json!([]),
+                })
+            }
+            ["pools"] => Behavior::json(paged(
+                pools
+                    .registered
+                    .iter()
+                    .map(|pool| json!(pool_id(pool)))
+                    .collect(),
+                page,
+            )),
+            ["pools", "extended"] => Behavior::json(paged(
+                pools
+                    .registered
+                    .iter()
+                    .map(|pool| self.pool_row(pool))
+                    .collect(),
+                page,
+            )),
+            ["pools", "retired"] => {
+                let mut retired = pools.retired.iter().collect::<Vec<_>>();
+                retired.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                Behavior::json(paged(
+                    retired
+                        .into_iter()
+                        .map(|(pool, epoch)| json!({"pool_id": pool_id(pool), "epoch": epoch}))
+                        .collect(),
+                    page,
+                ))
+            }
+            ["pools", id] => match pool_hash(id) {
+                Some(pool) if pools.registered.contains(&pool) || pools.retired.contains_key(&pool) => {
+                    Behavior::json(self.pool_row(&pool))
+                }
+                _ => missing(),
+            },
+            ["pools", id, "history"] => match pool_hash(id) {
+                Some(pool) => Behavior::json(paged(
+                    pools
+                        .stake
+                        .iter()
+                        .rev()
+                        .filter_map(|(epoch, stake)| {
+                            stake.get(&pool).map(|amount| {
+                                json!({"epoch": epoch, "blocks": 0, "active_stake": amount.to_string(),
+                                    "active_size": 0.0, "delegators_count": 1, "rewards": "0", "fees": "0"})
+                            })
+                        })
+                        .collect(),
+                    page,
+                )),
+                None => missing(),
+            },
+            _ => return None,
+        };
+        Some(answer)
     }
 
     pub fn blocks(&self) -> &[Block] {
@@ -235,7 +436,7 @@ impl Chain {
             ["blocks", id, "txs", "cbor"] => self
                 .by_hash(id)
                 .map_or_else(missing, |block| Behavior::json(block.page(page))),
-            _ => missing(),
+            _ => self.answer_data(&parts, page).unwrap_or_else(missing),
         }
     }
 
