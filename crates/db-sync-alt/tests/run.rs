@@ -985,11 +985,13 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     let database = &p.converted;
     let ended = |code: Option<i32>, lines: &[String], status: i32, error: &str| {
         assert_eq!(code, Some(status), "{error}: {lines:?}");
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains(&format!("\"error\":\"{error}\""))),
-            "{error}: {lines:?}"
+        let named = lines
+            .iter()
+            .find(|line| line.contains(&format!("\"error\":\"{error}\"")))
+            .unwrap_or_else(|| panic!("{error}: {lines:?}"));
+        println!(
+            "{}",
+            json!({"event":"fatal_case","exit":status,"error":error,"line":named})
         );
     };
     let quick = |arguments: Vec<String>, environment: Vec<(&'static str, String)>| async move {
@@ -1012,8 +1014,19 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     let down_address = down.address().await;
     let failing = p.fake(p.t0 + k + 5).await;
     failing.set_hook(Some(Arc::new(|_, _, _| Some(Behavior::status(503)))));
-    let mut failing_arguments = run_arguments(database, "preprod", &failing, &[]);
-    failing_arguments.extend(["--database-fatal-after-seconds".to_owned(), "60".to_owned()]);
+    // On a database of its own, restored at its first start: it holds the
+    // writer lock while it waits.
+    let other = Database::new().await?;
+    let mut failing_arguments = run_arguments(&other, "preprod", &failing, &[]);
+    failing_arguments.extend(
+        [
+            "--database-fatal-after-seconds",
+            "60",
+            "--snapshot",
+            &p.file(),
+        ]
+        .map(str::to_owned),
+    );
     let lasting_started = Instant::now();
     let unavailable = Child::start(&failing_arguments, &key_environment(&failing));
 
@@ -1052,11 +1065,13 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     );
     let mut environment = key_environment(&fake);
     environment.push(("DSA_MAX_IN_FLIGHT", String::new()));
-    let (code, lines) = quick(
-        run_arguments(database, "preprod", &fake, &[])[..10].to_vec(),
-        environment,
-    )
-    .await;
+    let mut without = run_arguments(database, "preprod", &fake, &[]);
+    let at = without
+        .iter()
+        .position(|item| item == "--max-in-flight")
+        .unwrap();
+    without.drain(at..at + 2);
+    let (code, lines) = quick(without, environment).await;
     assert_eq!(code, Some(2), "{lines:?}");
     assert!(
         lines.iter().any(|line| line.contains("--max-in-flight")),
@@ -1135,7 +1150,9 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     drop(holder);
 
     // A reader that can read more than the node's relations.
-    let admin = &database.admin;
+    let mut root: tokio_postgres::Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
+    root.dbname(&database.name);
+    let admin = common::connect(&root).await?;
     admin
         .batch_execute(&format!(
             "GRANT SELECT ON dsa.position TO {}",
@@ -1194,5 +1211,6 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
         "{}",
         json!({"event":"fatal_conditions","lasting_seconds":lasted})
     );
+    other.cleanup().await?;
     p.cleanup().await
 }
