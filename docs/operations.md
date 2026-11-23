@@ -18,8 +18,13 @@ At start the service:
    `waiting` with reason `database_unreachable`; it retries after 1, 2, 4, 8 and
    16 seconds and then every 30 seconds, and ends with exit status 75 once the
    database has stayed unreachable for `--database-fatal-after-seconds`.
-4. Takes the [writer lock](glossary.md#database). A second process that writes
-   to the same database is refused (`writer_busy`).
+4. Takes the [writer lock](glossary.md#database). While another session holds
+   it, the state is `waiting` with reason `writer_busy`, retried with backoff;
+   after 120 seconds the service ends with exit status 1 (`writer_busy`). The
+   same holds when the writer reconnects later. Every session sets the
+   server-side TCP keepalive, so the session of a process that is gone ends
+   within about a minute and frees the lock
+   ([troubleshooting](troubleshooting.md#connecting-to-postgresql)).
 5. On an empty database, restores the `--snapshot` file (state `restoring`).
    Without `--snapshot` an empty database is refused (`snapshot_required`).
    What an interrupted restore left (its build, not yet published) is
@@ -54,6 +59,7 @@ Reasons of `waiting`:
 | --- | --- |
 | `database_connecting` | The service is connecting to PostgreSQL. |
 | `database_unreachable` | PostgreSQL cannot be reached; retried with backoff. |
+| `writer_busy` | Another session holds the writer lock; retried with backoff for up to 120 seconds, then the service ends with exit status 1. |
 | `quota_exhausted` | The provider answered 402: the key's daily allowance is spent. Waited out until 00:02 UTC of the next day ([provider](provider.md#refusals-and-outages)). |
 | `provider_rate_limited` | The provider answered 429. Waited out for the time the provider names. |
 | `provider_banned` | The provider answered 418. Waited out for the time the provider names, 1 to 24 hours. |
@@ -209,7 +215,8 @@ output carries only a command's result.
   and `snapshot_file`, each end with its `outcome` and `seconds`.
 - While catching up, one `update` line at most every 10 seconds; each line
   carries the update's report.
-- Conditions: `database_unreachable` and `database_reachable`,
+- Conditions: `database_unreachable` and `database_reachable`, `writer_busy`
+  and `writer_lock_taken`,
   `follower_retry` with the error and the time of the next attempt,
   `follower_state` on a change of state, `gate_closed` with the check's report,
   `retention_changed`, `status_read_failed` and `status_read_recovered`,

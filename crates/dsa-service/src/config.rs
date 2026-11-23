@@ -19,6 +19,10 @@ pub const MIN_RETENTION_SECONDS: i64 = 86_400;
 /// The shortest time a database may stay unreachable before the service
 /// ends.
 pub const MIN_DATABASE_FATAL_AFTER_SECONDS: u64 = 60;
+/// How long the service waits for the writer lock that another session
+/// holds, at start and on a reconnect, before it refuses to run: a session of
+/// a process that is gone keeps the lock until the server ends it.
+pub const WRITER_BUSY_AFTER_SECONDS: u64 = 120;
 
 /// The values as given, before they are checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +73,8 @@ pub struct Settings {
     pub snapshots: Option<Snapshots>,
     pub health_max_lag_blocks: u32,
     pub database_fatal_after: Duration,
+    /// See [`WRITER_BUSY_AFTER_SECONDS`].
+    pub writer_busy_after: Duration,
 }
 
 /// A refused value: the error code and the flag that carries the value.
@@ -170,6 +176,7 @@ impl Settings {
             }),
             health_max_lag_blocks: input.health_max_lag_blocks,
             database_fatal_after: Duration::from_secs(input.database_fatal_after_seconds),
+            writer_busy_after: Duration::from_secs(WRITER_BUSY_AFTER_SECONDS),
         })
     }
 

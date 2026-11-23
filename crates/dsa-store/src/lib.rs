@@ -467,6 +467,14 @@ impl Store {
         if !(170000..180000).contains(&version) {
             return Err(Error::Refusal("postgresql_17_required"));
         }
+        // The server notices a client that is gone within about a minute and
+        // ends its session, with the locks the session holds.
+        store
+            .client
+            .batch_execute(
+                "SET tcp_keepalives_idle=30;SET tcp_keepalives_interval=10;SET tcp_keepalives_count=3",
+            )
+            .await?;
         Ok(store)
     }
 

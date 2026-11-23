@@ -64,6 +64,9 @@ pub struct Settings {
     /// `fatal_after`. Otherwise it is retried without end and named in the
     /// state.
     pub refused_answers_end_the_run: bool,
+    /// How long a reconnect waits for the writer lock that another session
+    /// holds before the run ends with `writer_busy`; `None` ends it at once.
+    pub writer_busy_after: Option<Duration>,
     /// Make no block above this height final, complete the stake of the
     /// epochs up to it and return once the stored target equals it.
     pub stop_at_target: Option<u32>,
@@ -78,6 +81,7 @@ impl Default for Settings {
             max_in_flight: 4,
             fatal_after: Duration::from_secs(1_800),
             refused_answers_end_the_run: true,
+            writer_busy_after: None,
             stop_at_target: None,
         }
     }
@@ -305,6 +309,9 @@ enum Condition {
     Temporary,
     /// An answer the follower refuses.
     Answer,
+    /// Another session holds the writer lock at a reconnect: retried, and
+    /// ends the run once it has lasted `writer_busy_after`.
+    WriterBusy,
 }
 
 /// The SQLSTATE of a store error, if the server gave one.
@@ -685,6 +692,12 @@ impl<'a> Follower<'a> {
                 Kind::Retry { until } if provider.transport() => (Condition::Temporary, until),
                 Kind::Retry { until } => (Condition::Answer, until),
             },
+            Error::Store(dsa_store::Error::Refusal("writer_busy"))
+                if self.settings.writer_busy_after.is_some() =>
+            {
+                self.store = None;
+                (Condition::WriterBusy, now)
+            }
             Error::Store(store) => match retried(store) {
                 Some(reconnect) => {
                     if reconnect {
@@ -703,16 +716,34 @@ impl<'a> Follower<'a> {
             self.backoff.reset();
             self.condition = Some(condition);
         }
-        let until = not_before.max(now + self.backoff.failed(now).as_secs());
+        let mut until = not_before.max(now + self.backoff.failed(now).as_secs());
         let lasted = self.backoff.lasted(now);
-        let ends = condition == Condition::Temporary || self.settings.refused_answers_end_the_run;
-        if ends && lasted > self.settings.fatal_after.as_secs() {
-            return Err(self
-                .fatal(Error::Lasting {
+        let limit = match condition {
+            Condition::Temporary => Some(self.settings.fatal_after),
+            Condition::Answer => self
+                .settings
+                .refused_answers_end_the_run
+                .then_some(self.settings.fatal_after),
+            Condition::WriterBusy => self.settings.writer_busy_after,
+        };
+        if let (Condition::WriterBusy, Some(limit)) = (condition, limit) {
+            // The last attempt falls within the wait.
+            until = until.min(now + limit.as_secs().saturating_sub(lasted));
+        }
+        if limit.is_some_and(|limit| lasted > limit.as_secs()) {
+            // A writer lock held too long is refused as at start, not as a
+            // temporary condition.
+            let ending = match condition {
+                Condition::WriterBusy => Error::Refusal {
+                    code: "writer_busy",
+                    detail: json!({"lasted_seconds": lasted}),
+                },
+                _ => Error::Lasting {
                     seconds: lasted,
                     error: Box::new(error),
-                })
-                .await);
+                },
+            };
+            return Err(self.fatal(ending).await);
         }
         let report = error.report();
         eprintln!(

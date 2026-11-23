@@ -117,6 +117,20 @@ impl World {
         tokio::sync::watch::Sender<bool>,
         JoinHandle<std::result::Result<Report, follow::Error>>,
     ) {
+        self.run_with(fatal_after, config::WRITER_BUSY_AFTER_SECONDS)
+            .await
+    }
+
+    /// [`World::run`] with the time the writer lock is waited for.
+    async fn run_with(
+        &self,
+        fatal_after: u64,
+        writer_busy_after: u64,
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        JoinHandle<std::result::Result<Report, follow::Error>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let config = self.proxy.config(&self.start.database.config);
@@ -137,6 +151,7 @@ impl World {
                 snapshots: None,
                 health_max_lag_blocks: 9,
                 database_fatal_after: Duration::from_secs(fatal_after),
+                writer_busy_after: Duration::from_secs(writer_busy_after),
             },
             follower: follow::Settings::default(),
             index_policy: IndexPolicy::default(),
@@ -462,6 +477,113 @@ async fn an_answer_the_client_refuses_never_ends_the_service() -> Result {
         .expect("the service ends")?
         .map_err(|error| error.report().to_string())?;
     assert_eq!(report.stopped, "stop_requested");
+    world.start.cleanup().await
+}
+
+/// A session that holds the writer lock, as the session of a process that is
+/// gone does until the server ends it, keeps the service waiting with
+/// `writer_busy`, at start and on a reconnect. Once the server ends that
+/// session the service takes the lock and follows, without an exit; a lock
+/// held longer than the wait refuses the start. Every session of the store
+/// sets the server-side keepalive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_held_writer_lock_is_waited_for_and_taken_once_free() -> Result {
+    let world = World::new(59, 80).await?;
+    let mut samples = Vec::new();
+    let mut height = world.start.target + K;
+    world.serve(height);
+    let admin = &world.start.database.admin;
+    let config = world.start.database.config.clone();
+    let hold = || async {
+        let mut holder = Store::connect(config.clone(), None).await?;
+        holder.lock_writer().await.map_err(named)?;
+        let pid: i32 = holder
+            .client()
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((holder, pid))
+    };
+    let (holder, pid) = hold().await?;
+    for (name, value) in [
+        ("tcp_keepalives_idle", "30"),
+        ("tcp_keepalives_interval", "10"),
+        ("tcp_keepalives_count", "3"),
+    ] {
+        let set: String = holder
+            .client()
+            .query_one(&format!("SHOW {name}"), &[])
+            .await?
+            .get(0);
+        assert_eq!(set, value, "{name}");
+    }
+    // At start.
+    let (address, stopper, task) = world.run_with(600, 3_600).await;
+    status_until(address, &mut samples, "writer busy at start", |document| {
+        document["state_reason"] == "writer_busy" && waiting_with_its_end(document)
+    })
+    .await;
+    admin
+        .execute("SELECT pg_terminate_backend($1)", &[&pid])
+        .await?;
+    drop(holder);
+    status_until(
+        address,
+        &mut samples,
+        "following once the lock is free",
+        target_at(height),
+    )
+    .await;
+    // On a reconnect: the service's sessions end, and another session takes
+    // the lock before it is back.
+    world.proxy.refuse();
+    let (holder, pid) = hold().await?;
+    world.proxy.accept();
+    height += 3;
+    world.serve(height);
+    status_until(
+        address,
+        &mut samples,
+        "writer busy on a reconnect",
+        |document| document["state_reason"] == "writer_busy" && waiting_with_its_end(document),
+    )
+    .await;
+    admin
+        .execute("SELECT pg_terminate_backend($1)", &[&pid])
+        .await?;
+    drop(holder);
+    status_until(
+        address,
+        &mut samples,
+        "following after the reconnect",
+        target_at(height),
+    )
+    .await;
+    assert!(!task.is_finished(), "the service ended");
+    stopper.send(true)?;
+    let report = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.stopped, "stop_requested");
+    // A lock held for longer than the wait refuses the start.
+    let (holder, _) = hold().await?;
+    let (_address, _stopper, task) = world.run_with(600, 120).await;
+    let error = tokio::time::timeout(Duration::from_secs(60), task)
+        .await
+        .expect("the service ends")?
+        .unwrap_err();
+    let report = error.report();
+    assert_eq!(report["error"], "writer_busy", "{report}");
+    assert!(
+        report["detail"]["lasted_seconds"]
+            .as_u64()
+            .is_some_and(|seconds| seconds > 120),
+        "{report}"
+    );
+    println!("{}", json!({"event":"writer_busy","refused":report}));
+    drop(holder);
     world.start.cleanup().await
 }
 
@@ -1369,6 +1491,26 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     );
     let lasting_started = Instant::now();
     let unavailable = Child::start(&failing_arguments, &key_environment(&failing));
+    // A second writer: another session holds the writer lock of a database
+    // of its own for longer than the 120 seconds the service waits for it.
+    let busy = Database::new().await?;
+    let mut holder = Store::connect(busy.config.clone(), None).await?;
+    holder.lock_writer().await.map_err(named)?;
+    let second = Child::start(
+        &run_arguments(&busy, "preprod", &fake, &[]),
+        &key_environment(&fake),
+    );
+    let second_address = second.address().await;
+    let (mut second_bodies, mut second_states) = (Vec::new(), std::collections::BTreeSet::new());
+    child_status_until(
+        &second,
+        second_address,
+        &mut second_bodies,
+        &mut second_states,
+        Duration::from_secs(30),
+        |document| document["state"] == "waiting" && document["state_reason"] == "writer_busy",
+    )
+    .await;
 
     let mut bodies = Vec::new();
     let mut states = std::collections::BTreeSet::new();
@@ -1478,17 +1620,6 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     .await;
     ended(code, &lines, 1, "network_mismatch");
 
-    // A second writer.
-    let mut holder = Store::connect(database.config.clone(), None).await?;
-    holder.lock_writer().await.map_err(named)?;
-    let (code, lines) = quick(
-        run_arguments(database, "preprod", &fake, &[]),
-        key_environment(&fake),
-    )
-    .await;
-    ended(code, &lines, 1, "writer_busy");
-    drop(holder);
-
     // A reader that can read more than the node's relations.
     let mut root: tokio_postgres::Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
     root.dbname(&database.name);
@@ -1535,6 +1666,16 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     )
     .await;
     ended(code, &lines, 1, "database_not_serving");
+
+    // The second writer waited with `writer_busy`, then was refused.
+    let (code, _, lines) = tokio::time::timeout(Duration::from_secs(240), second.finish())
+        .await
+        .expect("the second writer ends");
+    ended(code, &lines, 1, "writer_busy");
+    let waited = lasting_started.elapsed().as_secs_f64();
+    assert!(waited >= 120.0, "{waited}");
+    drop(holder);
+    busy.cleanup().await?;
 
     // The two conditions that lasted.
     let (code, _, lines) = tokio::time::timeout(Duration::from_secs(120), down.finish())

@@ -308,10 +308,11 @@ impl Service {
             .send_replace(Some(phase(&self.provider, state, reason, wait_until)));
     }
 
-    /// Prepares the database, retrying while it cannot be reached; a
-    /// condition that lasts longer than `database_fatal_after` ends the
-    /// service.
+    /// Prepares the database, retrying while it cannot be reached and while
+    /// another session holds the writer lock; a condition that lasts longer
+    /// than its stated time ends the service.
     async fn start(&self, backoff: &mut Backoff) -> Result<Prepared, Error> {
+        let mut busy = Backoff::default();
         loop {
             match self.prepare().await {
                 Ok(prepared) => {
@@ -322,13 +323,53 @@ impl Service {
                                 "lasted_seconds":backoff.lasted(self.now())})
                         );
                     }
+                    if busy.failures() > 0 {
+                        eprintln!(
+                            "{}",
+                            json!({"event":"writer_lock_taken","failures":busy.failures(),
+                                "lasted_seconds":busy.lasted(self.now())})
+                        );
+                    }
                     return Ok(prepared);
                 }
                 Err(Error::Store(error)) if error.temporary() => {
                     self.unreachable(backoff, Error::Store(error)).await?;
                 }
+                Err(Error::Store(dsa_store::Error::Refusal("writer_busy"))) => {
+                    self.writer_busy(&mut busy).await?;
+                }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    /// Waits after another session was found holding the writer lock, or
+    /// refuses the start once it has held it for `writer_busy_after`: a
+    /// session whose process is gone keeps the lock until the server ends it.
+    async fn writer_busy(&self, busy: &mut Backoff) -> Result<(), Error> {
+        let now = self.now();
+        let wait = busy.failed(now).as_secs();
+        let lasted = busy.lasted(now);
+        let limit = self.settings.writer_busy_after.as_secs();
+        if lasted >= limit {
+            return Err(Error::Refusal {
+                code: "writer_busy",
+                detail: json!({"lasted_seconds": lasted}),
+            });
+        }
+        // The last attempt falls within the wait.
+        let wait = wait.min(limit - lasted);
+        if busy.failures() == 1 {
+            eprintln!(
+                "{}",
+                json!({"event":"writer_busy","refused_after_seconds":self.settings.writer_busy_after.as_secs()})
+            );
+        }
+        self.show(State::Waiting, "writer_busy", Some(now + wait));
+        if pause_until(&*self.time, &self.stop, now + wait).await {
+            Ok(())
+        } else {
+            Err(Error::Stopped)
         }
     }
 
@@ -888,6 +929,7 @@ pub async fn run(context: Context) -> Result<Report, Error> {
     let mut follower_settings = follower;
     follower_settings.fatal_after = settings.database_fatal_after;
     follower_settings.refused_answers_end_the_run = false;
+    follower_settings.writer_busy_after = Some(settings.writer_busy_after);
     let mut backoff = Backoff::default();
     let mut restored = None;
     let mut upkeep_started = false;
