@@ -1135,7 +1135,9 @@ struct Context {
 impl Context {
     fn scan_rows(&self, s: &Statement) -> i32 {
         if matches!(s.name.as_str(), "get_asset_creates" | "get_asset_spends") {
-            self.options.asset_page_rows.unwrap_or(self.options.page_rows)
+            self.options
+                .asset_page_rows
+                .unwrap_or(self.options.page_rows)
         } else {
             self.options.page_rows
         }
