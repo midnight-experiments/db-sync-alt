@@ -69,20 +69,75 @@ impl Operation {
     }
 }
 
+/// A handle of one database session the wrapper may cancel.
+trait Handle {
+    fn closed(&self) -> bool;
+    fn commit_sent(&self) -> bool;
+}
+
+impl Handle for Cancellation {
+    fn closed(&self) -> bool {
+        Cancellation::closed(self)
+    }
+    fn commit_sent(&self) -> bool {
+        Cancellation::commit_sent(self)
+    }
+}
+
+/// The handles of the live sessions. A handle whose connection has closed
+/// is dropped when the next one is added, so a command that reconnects
+/// keeps one handle per live connection; whether one of them sent a commit
+/// that publishes is kept.
+struct Registry<H> {
+    handles: Vec<H>,
+    commit_sent: bool,
+}
+
+impl<H> Default for Registry<H> {
+    fn default() -> Self {
+        Self {
+            handles: Vec::new(),
+            commit_sent: false,
+        }
+    }
+}
+
+impl<H: Handle + Clone> Registry<H> {
+    fn add(&mut self, handle: H) {
+        let (closed, live): (Vec<H>, Vec<H>) = self.handles.drain(..).partition(H::closed);
+        self.commit_sent |= closed.iter().any(H::commit_sent);
+        self.handles = live;
+        self.handles.push(handle);
+    }
+
+    fn commit_sent(&self) -> bool {
+        self.commit_sent || self.handles.iter().any(H::commit_sent)
+    }
+
+    fn live(&self) -> Vec<H> {
+        self.handles
+            .iter()
+            .filter(|handle| !handle.closed())
+            .cloned()
+            .collect()
+    }
+}
+
 /// What a running command shares with the wrapper: its database sessions, to
 /// cancel when it is stopped or fails, and the stop request.
 #[derive(Clone)]
 pub(crate) struct Session {
-    cancellations: Arc<Mutex<Vec<Cancellation>>>,
+    cancellations: Arc<Mutex<Registry<Cancellation>>>,
     stop: watch::Receiver<bool>,
 }
 
 impl Session {
+    /// Registers a new connection; the handles of closed ones go.
     pub(crate) fn watch(&self, cancellation: Cancellation) {
         self.cancellations
             .lock()
             .expect("cancellation registry")
-            .push(cancellation);
+            .add(cancellation);
     }
 
     /// Whether a commit that publishes was sent.
@@ -90,8 +145,7 @@ impl Session {
         self.cancellations
             .lock()
             .expect("cancellation registry")
-            .iter()
-            .any(Cancellation::commit_sent)
+            .commit_sent()
     }
 
     /// Resolves when the command is asked to stop.
@@ -106,7 +160,7 @@ impl Session {
             .cancellations
             .lock()
             .expect("cancellation registry")
-            .clone();
+            .live();
         let mut pending = tokio::task::JoinSet::new();
         for (index, handle) in handles.into_iter().enumerate() {
             pending.spawn(async move {
@@ -353,6 +407,56 @@ mod tests {
         let report = result.unwrap_err().report();
         assert_eq!(report["published"], false);
         assert_eq!(report["error"], "operation_deadline_exceeded");
+    }
+
+    #[derive(Clone)]
+    struct Fake {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        commit_sent: bool,
+    }
+
+    impl Handle for Fake {
+        fn closed(&self) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn commit_sent(&self) -> bool {
+            self.commit_sent
+        }
+    }
+
+    fn fake(commit_sent: bool) -> Fake {
+        Fake {
+            closed: Arc::default(),
+            commit_sent,
+        }
+    }
+
+    /// A command whose connection drops and reconnects a thousand times keeps
+    /// one handle per live connection, and a commit sent on a connection that
+    /// closed since is still known.
+    #[test]
+    fn a_reconnect_replaces_the_handle_of_the_closed_connection() {
+        let mut registry = Registry::default();
+        let status = fake(false);
+        registry.add(status.clone());
+        let mut writer = fake(true);
+        registry.add(writer.clone());
+        for _ in 0..1_000 {
+            writer
+                .closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            writer = fake(false);
+            registry.add(writer.clone());
+            assert_eq!(registry.handles.len(), 2);
+        }
+        assert!(registry.commit_sent(), "the first writer sent a commit");
+        assert_eq!(registry.live().len(), 2);
+        status
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(registry.live().len(), 1, "a closed one is not cancelled");
+        registry.add(fake(false));
+        assert_eq!(registry.handles.len(), 2);
     }
 
     #[test]

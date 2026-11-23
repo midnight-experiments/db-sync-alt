@@ -347,12 +347,14 @@ pub struct Store {
     probe: std::sync::Mutex<follow::Probe>,
 }
 /// Cancels this backend's statement using the same TLS validation, and tells
-/// whether the store sent the commit that publishes a load.
+/// whether the store sent the commit that publishes a load and whether its
+/// connection has closed.
 #[derive(Clone)]
 pub struct Cancellation {
     token: tokio_postgres::CancelToken,
     tls: MakeRustlsConnect,
     commit_sent: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
 }
 impl Cancellation {
     pub async fn cancel(&self) -> Result<(), Error> {
@@ -361,12 +363,18 @@ impl Cancellation {
     pub fn commit_sent(&self) -> bool {
         self.commit_sent.load(Ordering::SeqCst)
     }
+    /// The connection ended or its store was dropped: nothing is left to
+    /// cancel.
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for Store {
     fn drop(&mut self) {
         // Closing the socket also releases this session's advisory lock.
         self.connection.abort();
+        self.cancellation.closed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -421,7 +429,9 @@ impl Store {
             token: client.cancel_token(),
             tls,
             commit_sent: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
         };
+        let closed = Arc::clone(&cancellation.closed);
         let connection = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 eprintln!(
@@ -429,6 +439,7 @@ impl Store {
                     json!({"event":"postgres_connection_failed","diagnostic":postgres_report(&error)})
                 );
             }
+            closed.store(true, Ordering::SeqCst);
         });
         let store = Self {
             client,
