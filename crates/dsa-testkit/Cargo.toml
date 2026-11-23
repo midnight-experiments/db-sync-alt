@@ -20,7 +20,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 pallas-addresses = "=0.33.0"
-pallas-crypto = "=0.33.0"
+pallas-crypto = "=1.4.0"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 serde_json.workspace = true
