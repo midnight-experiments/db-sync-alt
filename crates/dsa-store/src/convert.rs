@@ -279,7 +279,7 @@ impl StagedConversion<'_> {
         };
         verify::same(&selected, &verified, "conversion_source_digest_mismatch")?;
         let origin = json!({"kind":"converted","source_kind":"legacy_schema5","source_network":self.source.network,"source_target_height":state.target.height,"source_target_hash":state.target.hash,"source_target_time":state.target.time,"source_tip_height":state.tip.height,"source_tip_hash":state.tip.hash,"source_tip_time":state.tip.time,"source_created_at":self.source.converted_at,"source_horizon_height":state.horizon.height,"source_horizon_hash":state.horizon.hash,"source_horizon_time":state.horizon.time,"initial_covered_seconds":self.source.covered_seconds,"initial_coverage_shorter_than_retention":self.source.coverage_shorter_than_retention});
-        load::publish_state(tx, state, &origin).await?;
+        load::publish_state(tx, profile, state, &origin).await?;
         let commit_started = Instant::now();
         self.commit_sent
             .store(true, std::sync::atomic::Ordering::SeqCst);

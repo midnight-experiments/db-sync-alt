@@ -5,6 +5,7 @@ pub mod catalogue;
 pub mod compare;
 mod conversion_stage;
 pub mod convert;
+pub mod follow;
 pub mod horizon;
 pub mod keep;
 mod load;
@@ -309,7 +310,7 @@ fn cause_in_chain(error: &(dyn std::error::Error + 'static)) -> Option<&'static 
     None
 }
 
-fn postgres_report(error: &tokio_postgres::Error) -> Value {
+pub(crate) fn postgres_report(error: &tokio_postgres::Error) -> Value {
     let mut report =
         json!({"error":"database_error","sqlstate":error.code().map(|code|code.code())});
     if let Some(server) = error.as_db_error() {
@@ -341,6 +342,7 @@ pub struct Store {
     connection: JoinHandle<()>,
     writer_locked: bool,
     cancellation: Cancellation,
+    probe: std::sync::Mutex<follow::Probe>,
 }
 /// Cancels this backend's statement using the same TLS validation, and tells
 /// whether the store sent the commit that publishes a load.
@@ -431,6 +433,7 @@ impl Store {
             connection,
             writer_locked: false,
             cancellation,
+            probe: Default::default(),
         };
         let version: i32 = store
             .client
@@ -545,12 +548,16 @@ impl Store {
         Ok(())
     }
 
+    /// The identity, the position and the follower's state rows: the service
+    /// state, the unspent outputs per profile address, the first observations
+    /// (their answers by size only) and the calls of the last eight UTC days.
     pub async fn status(&self, profile: &Profile) -> Result<Value, Error> {
         self.open(profile).await?;
-        Ok(self.client.query_one(
-            "SELECT jsonb_build_object('identity',(SELECT to_jsonb(i)-'id' FROM dsa.identity i WHERE id=1), \
-             'position',(SELECT to_jsonb(p)-'id' FROM dsa.position p WHERE id=1))", &[]
-        ).await?.get(0))
+        Ok(self
+            .client
+            .query_one(include_str!("status.sql"), &[])
+            .await?
+            .get(0))
     }
 
     pub async fn grant_reader(&mut self, profile: &Profile, role: &str) -> Result<Value, Error> {

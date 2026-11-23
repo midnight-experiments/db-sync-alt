@@ -584,6 +584,7 @@ dependencies = [
  "clap",
  "dsa-chain",
  "dsa-store",
+ "dsa-testkit",
  "futures-util",
  "hex",
  "jsonschema",

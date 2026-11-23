@@ -18,6 +18,7 @@ tokio-postgres.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+dsa-testkit = { path = "../dsa-testkit" }
 tokio = { workspace = true, features = ["process", "time", "io-util", "net"] }
 sha2.workspace = true
 hex = "0.4"

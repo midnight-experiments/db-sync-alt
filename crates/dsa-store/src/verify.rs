@@ -266,6 +266,9 @@ pub(crate) async fn verify<C: GenericClient>(
     }
     check_indexes(client).await?;
     let supply = check_supply(client, profile).await?;
+    if checks.gate {
+        check_unspent(client, profile).await?;
+    }
     if checks.exact {
         check_exact(client, &selection, h, t).await?;
     }
@@ -380,6 +383,31 @@ async fn check_supply<C: GenericClient>(
         return Err(Error::Refusal("missing_supply"));
     }
     Ok(supply)
+}
+
+/// The recorded unspent outputs at each profile address equal a recount. A
+/// load writes them at publication, so only a serving store has them.
+async fn check_unspent<C: GenericClient>(client: &C, profile: &Profile) -> Result<(), Error> {
+    let sql = format!(
+        "WITH counted(address,outputs) AS ({}) SELECT coalesce(c.address,u.address),u.outputs::text,c.outputs::text
+         FROM counted c FULL JOIN dsa.unspent u ON u.address=c.address
+         WHERE u.outputs IS DISTINCT FROM c.outputs ORDER BY 1 LIMIT 1",
+        crate::follow::UNSPENT_COUNTS
+    );
+    let addresses = crate::follow::profile_addresses(profile);
+    if let Some(row) = client.query_opt(&sql, &[&addresses]).await? {
+        let text = |index: usize| {
+            row.get::<_, Option<String>>(index)
+                .unwrap_or_else(|| "none".to_owned())
+        };
+        return Err(Error::Mismatch {
+            error: "unspent_count_mismatch",
+            item: row.get(0),
+            expected: text(1),
+            actual: text(2),
+        });
+    }
+    Ok(())
 }
 
 /// Nothing lies outside the pruned form of the keep rule, every height H…T
