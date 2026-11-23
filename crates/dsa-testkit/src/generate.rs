@@ -755,8 +755,9 @@ impl Generator<'_> {
 }
 
 /// Generates a chain. Heights run from `first_height`; every block has an
-/// epoch (6 to 12 blocks each) and a slot; the first two blocks hold a mint
-/// and a spend of it.
+/// epoch (6 to 12 blocks each) and a slot. The first block mints tokens and a
+/// governance record (on test networks only the governance policies tell the
+/// network apart), the second spends a minted output.
 pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
     let mut g = Generator {
         roles,
@@ -817,7 +818,8 @@ pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
             quiet = 3 + g.random.below(8);
         }
         let count = match offset {
-            0 | 1 => 1,
+            0 => 2,
+            1 => 1,
             _ if g.random.chance(7) => 0,
             _ => 1 + g.random.below(settings.transactions as u64) as usize,
         };
@@ -828,10 +830,11 @@ pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
             g.counts.quiet_blocks += 1;
         }
         let mut transactions = Vec::new();
-        for _ in 0..count {
+        for index in 0..count {
             let fee = 170_000 + g.unique();
             let mut draft = Draft::new(fee);
             match offset {
+                0 if index == 1 => g.governance(&mut draft),
                 0 => g.fund(&mut draft),
                 1 => g.transfer(&mut draft),
                 _ if quiet > 0 => match g.random.below(5) {
