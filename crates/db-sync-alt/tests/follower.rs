@@ -492,6 +492,130 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
     start.cleanup().await
 }
 
+/// A provider that answers the block at `height` by `script`, in order: a
+/// missing block (`missing`), another hash (`other`) or the chain's own
+/// (`chain`); afterwards the chain answers.
+fn scripted_target(height: u32, script: &[&'static str]) -> Hook {
+    let path = format!("/api/v0/blocks/{height}");
+    let next = std::sync::Mutex::new(script.to_vec().into_iter());
+    Arc::new(move |requested, chain: &mut Chain, _| {
+        if requested != path {
+            return None;
+        }
+        match next.lock().unwrap().next()? {
+            "missing" => Some(Behavior::status(404)),
+            "other" => {
+                let mut header = chain.at(height)?.header();
+                header["hash"] = json!("ab".repeat(32));
+                Some(Behavior::json(header))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// A missing answer for the target's height is not a contradiction: one or
+/// two of them, one followed by the stored hash, or another hash followed by
+/// a missing answer, are retried and following goes on with the gate open.
+/// Only another hash on both reads, a minute apart, closes the gate, also
+/// after a missing answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_missing_target_is_retried_and_only_another_hash_twice_closes_the_gate() -> Result {
+    let mut start = Start::new(43, 80, 20).await?;
+    let mut target = start.target;
+    // The stored tip leaves the provider's chain, so the fork point is
+    // searched from the target.
+    fn branched(g: &generate::Generated, target: u32) -> Vec<Block> {
+        let mut blocks = served(g, target + K + 1);
+        let keep = blocks.len() - 2;
+        let other = generate::branch(&blocks[keep..], u64::from(target));
+        blocks.truncate(keep);
+        blocks.extend(other);
+        blocks
+    }
+    for script in [
+        &["missing"][..],
+        &["missing", "missing"],
+        &["missing", "chain"],
+        &["other", "missing"],
+    ] {
+        let fake = Fake::with_chain(
+            Chain::from_generated(
+                &start.g,
+                dsa_service::epoch::stake_prefix(&start.profile.network),
+            ),
+            Some(scripted_target(target, script)),
+        )
+        .await;
+        fake.serve(branched(&start.g, target));
+        let report = follow_to(
+            &start.profile,
+            &fake,
+            &start.database.config,
+            until(target + 1),
+        )
+        .await
+        .map_err(|error| format!("{script:?}: {}", error.report()))?;
+        assert_eq!(report.position.target.height, target + 1, "{script:?}");
+        let state = start
+            .store()
+            .await?
+            .follow_state(&start.profile)
+            .await
+            .map_err(named)?;
+        assert!(state.serving, "{script:?}: {}", state.reason);
+        // Each missing answer was a retried step: the target was read once
+        // more than the script's missing answers.
+        let reads = times_of(&fake, &format!("/api/v0/blocks/{target}"));
+        let missing = script.iter().filter(|answer| **answer == "missing").count();
+        assert!(reads.len() > missing, "{script:?}: {reads:?}");
+        target += 1;
+        start.check(&format!("{script:?}")).await?;
+    }
+    // A missing answer, then another hash on two reads a minute apart.
+    let fake = Fake::with_chain(
+        Chain::from_generated(
+            &start.g,
+            dsa_service::epoch::stake_prefix(&start.profile.network),
+        ),
+        Some(scripted_target(target, &["missing", "other", "other"])),
+    )
+    .await;
+    fake.serve(branched(&start.g, target));
+    let error = follow_to(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        until(target + 1),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            follow::Error::Check {
+                code: "canonical_conflict",
+                ..
+            }
+        ),
+        "{}",
+        error.report()
+    );
+    let reads = times_of(&fake, &format!("/api/v0/blocks/{target}"));
+    assert_eq!(reads.len(), 3, "{reads:?}");
+    assert!(reads[2] - reads[1] >= 60, "{reads:?}");
+    let state = start
+        .store()
+        .await?
+        .follow_state(&start.profile)
+        .await
+        .map_err(named)?;
+    assert!(!state.serving);
+    assert_eq!(state.reason, "canonical_conflict");
+    start.cleanup().await
+}
+
 /// Test 3: answers that contradict themselves or the chain and every fault
 /// of the fake provider write nothing; the loop retries and continues. A
 /// spent allowance is waited out until the next UTC day without an exit.

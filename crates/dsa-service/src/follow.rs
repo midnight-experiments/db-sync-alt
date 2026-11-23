@@ -1024,20 +1024,29 @@ impl<'a> Follower<'a> {
 
     /// The highest stored height at or above the target whose hash the
     /// provider still returns. The target itself must be on the provider's
-    /// chain: a contradiction is read again after a minute, and a second one
-    /// closes the gate.
+    /// chain: another hash is read again after a minute, and another hash on
+    /// both reads closes the gate. A missing answer at the target's height,
+    /// while the provider's head is not below the stored tip, is an answer
+    /// that contradicts the chain: nothing is written and the step is tried
+    /// again.
     async fn find_fork(&mut self) -> Result<u32, Error> {
         let target = self.stored.target.clone();
-        let first = self.hash_at(target.height).await?;
-        if first.as_deref() != Some(target.hash.as_str()) {
+        let missing = || {
+            Error::answer(
+                "provider_target_missing",
+                json!({"height":target.height,"stored":target.hash}),
+            )
+        };
+        let first = self.hash_at(target.height).await?.ok_or_else(missing)?;
+        if first != target.hash {
             let until = self.now() + RECHECK.as_secs();
             self.set_state(State::Waiting, "target_contradicted", Some(until), None)
                 .await;
             if !pause_until(&*self.time, &self.stop, until).await {
                 return Err(Error::Stopped);
             }
-            let second = self.hash_at(target.height).await?;
-            if second.as_deref() != Some(target.hash.as_str()) {
+            let second = self.hash_at(target.height).await?.ok_or_else(missing)?;
+            if second != target.hash {
                 return Err(Error::Check {
                     code: "canonical_conflict",
                     detail: json!({"height":target.height,"stored":target.hash,"provider":[first,second]}),
