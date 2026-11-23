@@ -450,3 +450,46 @@ fn recorded_mainnet_subset_matches_sql_and_real_invalid_byron_ordinals() {
     }
     println!("public_mainnet_row_witnesses {measured}");
 }
+
+/// The recorded transactions the follower's ledger-content tests embed are
+/// members of this corpus, byte for byte.
+#[test]
+fn recorded_transactions_of_the_follower_tests_are_corpus_members() {
+    let (scratch, _) = replay("mainnet");
+    let fixture: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../db-sync-alt/tests/fixtures/recorded-transactions.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture["source"],
+        "crates/dsa-provider/tests/fixtures/mainnet-corpus.json.gz"
+    );
+    for (member, sha256) in fixture["members"].as_object().unwrap() {
+        let content = std::fs::read(scratch.path().join(member)).unwrap();
+        assert_eq!(
+            &format!("{:x}", Sha256::digest(&content)),
+            sha256.as_str().unwrap()
+        );
+    }
+    let transactions = fixture["transactions"].as_array().unwrap();
+    assert_eq!(transactions.len(), 5);
+    for transaction in transactions {
+        let block = transaction["block"].as_u64().unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(
+                scratch
+                    .path()
+                    .join(format!("provider/transactions/{block}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let row = &rows[transaction["position"].as_u64().unwrap() as usize];
+        assert_eq!(row["tx_hash"], transaction["tx_hash"]);
+        assert_eq!(row["cbor"], transaction["cbor"]);
+    }
+}
