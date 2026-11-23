@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 clap.workspace = true
 dsa-chain.workspace = true
+dsa-provider = { path = "../dsa-provider" }
+dsa-service = { path = "../dsa-service" }
 dsa-store.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tokio-postgres.workspace = true

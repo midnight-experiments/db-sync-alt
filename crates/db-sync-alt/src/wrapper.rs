@@ -95,13 +95,6 @@ impl Session {
     }
 
     /// Resolves when the command is asked to stop.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only long-running commands watch the stop request"
-        )
-    )]
     pub(crate) async fn stopping(&self) {
         let mut stop = self.stop.clone();
         let _ = stop.wait_for(|stop| *stop).await;

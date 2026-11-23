@@ -583,6 +583,8 @@ dependencies = [
  "chrono",
  "clap",
  "dsa-chain",
+ "dsa-provider",
+ "dsa-service",
  "dsa-store",
  "dsa-testkit",
  "futures-util",
@@ -793,6 +795,7 @@ dependencies = [
 name = "dsa-testkit"
 version = "0.5.0"
 dependencies = [
+ "bech32 0.11.1",
  "bytes",
  "dsa-chain",
  "futures-util",

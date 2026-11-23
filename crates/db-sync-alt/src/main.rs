@@ -1,6 +1,7 @@
 //! The command line: argument parsing and checking, and the dispatch of each
 //! command to the store through the wrapper of `wrapper.rs`.
 
+mod follow_arguments;
 mod wrapper;
 
 use std::{
@@ -176,6 +177,20 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Follow the provider's chain into a serving database.
+    #[command(hide = true)]
+    Follow {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[command(flatten)]
+        provider: follow_arguments::ProviderArguments,
+        #[command(flatten)]
+        follower: follow_arguments::FollowerArguments,
+        /// Stop once the stored target is this height, after the stake of
+        /// the epochs up to it is stored.
+        #[arg(long)]
+        stop_at_target: Option<u32>,
+    },
 }
 
 impl Command {
@@ -187,7 +202,8 @@ impl Command {
             | Self::Snapshot { database, .. }
             | Self::Restore { database, .. }
             | Self::Convert { database, .. }
-            | Self::GrantReader { database, .. } => Some(database),
+            | Self::GrantReader { database, .. }
+            | Self::Follow { database, .. } => Some(database),
             Self::Profile { .. } | Self::Compare(_) => None,
         }
     }
@@ -341,6 +357,12 @@ fn prepare(command: Command) -> Result<(Operation, Job), Usage> {
             ))
         }
         Command::Compare(args) => compare(args),
+        Command::Follow {
+            database,
+            provider,
+            follower,
+            stop_at_target,
+        } => follow_arguments::command(database, provider, follower, stop_at_target),
         command => database_command(command),
     }
 }
@@ -424,7 +446,9 @@ fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
         Command::Convert { .. } => ("convert", Changes, deadline.or(Some(3600))),
         Command::GrantReader { check: true, .. } => ("grant-reader", Checks, deadline),
         Command::GrantReader { .. } => ("grant-reader", Changes, deadline),
-        Command::Profile { .. } | Command::Compare(_) => unreachable!("not a database command"),
+        Command::Profile { .. } | Command::Compare(_) | Command::Follow { .. } => {
+            unreachable!("not a database command")
+        }
     };
     let source = match &command {
         Command::Convert {
@@ -565,7 +589,9 @@ async fn execute(
             role, check: true, ..
         } => store.check_reader(&profile, role).await,
         Command::GrantReader { role, .. } => store.grant_reader(&profile, role).await,
-        Command::Profile { .. } | Command::Compare(_) => unreachable!("not a database command"),
+        Command::Profile { .. } | Command::Compare(_) | Command::Follow { .. } => {
+            unreachable!("not a database command")
+        }
     }
 }
 
