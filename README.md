@@ -49,7 +49,7 @@ PostgreSQL 17 in a container:
 | Memory of the service, resident | 26 MB at the tip; peak 42 MB catching up 75,000 blocks | 15 MB at the tip; peak 17 MB |
 | [Database](docs/postgresql.md#size-and-connections) | 194 MB after restoring a 7-day window; 376 MB holding 25 days of blocks, before its first pruning | 18 MB after a restore; 20 MB after following for three hours |
 | [Snapshot file](docs/snapshots.md#what-a-file-contains) | 32.9 MB for a 7-day window; 44.1 MB for 24 days | 1.5 to 1.6 MB |
-| [Restore](docs/snapshots.md#restore); [writing a file](docs/snapshots.md#write-a-file) | 19.9 s; 13.0 s | 0.5 to 0.7 s; 0.4 s |
+| [Restore](docs/snapshots.md#restore); [writing a file](docs/snapshots.md#write-a-file) | 19.9 s; 13.0 s for 24 days | 0.5 to 0.7 s; 0.4 s |
 | [Supply check](docs/operations.md#supply-check) | 1.1 s (247,986 unspent outputs) | — |
 | [Provider requests](docs/provider.md#catching-up) | 0.92 a block catching up | 0.80 a block catching up; 233 an hour at the tip, about 5,600 a day |
 | [Compose](deploy/README.md#postgresql-settings), two minutes after a first start | — | service container 4.8 MiB, PostgreSQL container 67 MiB |
