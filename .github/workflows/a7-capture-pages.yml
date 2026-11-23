@@ -18,11 +18,11 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           rustup show active-toolchain
           cargo fmt --all
-          git diff -- crates/dsa-store/examples/a7_capture_pages.rs > format.patch
+          git diff -- crates/dsa-store/examples/a7_capture_pages.rs > "$RUNNER_TEMP/format.patch"
       - uses: actions/upload-artifact@v4
         with:
           name: native-capture-format-patch
-          path: format.patch
+          path: ${{ runner.temp }}/format.patch
           retention-days: 3
       - name: Require committed formatter output
         run: git diff --exit-code
@@ -34,18 +34,18 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked -p dsa-store --example a7_capture_pages
           CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --locked --release -p dsa-store --example a7_capture_pages
-          mkdir -p tool
-          cp "$CARGO_TARGET_DIR/release/examples/a7_capture_pages" tool/
-          tool/a7_capture_pages --self-test > tool/self-test.json
-          rustc -Vv > tool/rustc.txt
-          ldd tool/a7_capture_pages > tool/ldd.txt
-          git rev-parse HEAD > tool/source-head.txt
-          git status --porcelain > tool/source-status.txt
-          sha256sum crates/dsa-store/src/compare.rs > tool/native-path.sha256
-          cd tool
+          mkdir -p "$RUNNER_TEMP/tool"
+          cp "$CARGO_TARGET_DIR/release/examples/a7_capture_pages" "$RUNNER_TEMP/tool/"
+          "$RUNNER_TEMP/tool/a7_capture_pages" --self-test > "$RUNNER_TEMP/tool/self-test.json"
+          rustc -Vv > "$RUNNER_TEMP/tool/rustc.txt"
+          ldd "$RUNNER_TEMP/tool/a7_capture_pages" > "$RUNNER_TEMP/tool/ldd.txt"
+          git rev-parse HEAD > "$RUNNER_TEMP/tool/source-head.txt"
+          git status --porcelain > "$RUNNER_TEMP/tool/source-status.txt"
+          sha256sum crates/dsa-store/src/compare.rs > "$RUNNER_TEMP/tool/native-path.sha256"
+          cd "$RUNNER_TEMP/tool"
           sha256sum a7_capture_pages self-test.json rustc.txt ldd.txt source-head.txt source-status.txt native-path.sha256 > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: a7-native-capture-pages
-          path: tool
+          path: ${{ runner.temp }}/tool
           retention-days: 3
