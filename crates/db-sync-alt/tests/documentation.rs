@@ -295,6 +295,56 @@ fn the_configuration_page_states_every_flag_of_every_command() {
     );
 }
 
+/// `run` with `arguments` and `environment` and no other `DSA_` variable: its
+/// exit status and standard error.
+fn run_refusal(arguments: &[&str], environment: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    process.args([
+        "run",
+        "--database",
+        "host=127.0.0.1 port=1 user=nobody dbname=nowhere sslmode=disable",
+        "--network",
+        "preprod",
+        "--provider-key-file",
+        "/nonexistent/key",
+        "--reader",
+        "reader",
+    ]);
+    process.args(arguments);
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DSA_")) {
+        process.env_remove(name);
+    }
+    process.envs(environment.iter().copied());
+    let output = process.output().expect("the binary runs");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn run_refuses_the_overall_timeout_as_the_page_says() {
+    let page = read("docs/configuration.md");
+    let sections = sections(&page, "## ");
+    let run = plain(&section(&sections, "`run`").text);
+    assert!(
+        run.contains("It refuses --overall-timeout-seconds and DSA_OVERALL_TIMEOUT_SECONDS with exit status 2"),
+        "## `run` in docs/configuration.md: {run}"
+    );
+    let refused = r#"{"error":"overall_timeout_not_supported","flag":"--overall-timeout-seconds"}"#;
+    for (arguments, environment) in [
+        (&["--overall-timeout-seconds", "60"][..], &[][..]),
+        (&[][..], &[("DSA_OVERALL_TIMEOUT_SECONDS", "60")][..]),
+    ] {
+        let (code, stderr) = run_refusal(arguments, environment);
+        assert_eq!(code, Some(2), "{arguments:?} {environment:?}: {stderr}");
+        assert!(
+            stderr.lines().any(|line| line == refused),
+            "{arguments:?} {environment:?}: {stderr}"
+        );
+    }
+}
+
 /// The statuses of an `Exit status:` block of `--help`, with single spaces.
 fn printed_statuses(help: &str) -> BTreeMap<u8, String> {
     let mut statuses: BTreeMap<u8, String> = BTreeMap::new();

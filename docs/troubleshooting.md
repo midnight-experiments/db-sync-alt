@@ -38,6 +38,7 @@ exit status.
 | `invalid_snapshot_keep` | `--snapshot-keep` is 0. | |
 | `invalid_snapshot_at` | `--snapshot-at` is not `HH:MM`. | |
 | `invalid_database_fatal_after` | `--database-fatal-after-seconds` below 60. | |
+| `overall_timeout_not_supported` | `run` was given `--overall-timeout-seconds` or `DSA_OVERALL_TIMEOUT_SECONDS`. | Remove it: the service runs until it is stopped. |
 
 An empty `DSA_` variable is a value: `DSA_SNAPSHOT=` is refused as
 `invalid_snapshot_file`. Leave unused variables out.

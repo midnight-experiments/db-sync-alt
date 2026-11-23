@@ -31,7 +31,7 @@ command: each flag, its variable and its default.
 | `--tls-root-cert` | `DSA_TLS_ROOT_CERT` | none | PEM certificates of the authorities that signed the server's certificate. With it, the connection uses TLS and checks the certificate and the host name in `--database`. |
 | `--statement-timeout-seconds` | `DSA_STATEMENT_TIMEOUT_SECONDS` | PostgreSQL's setting | `statement_timeout` of this connection, 1 to 86,400 seconds. |
 | `--idle-transaction-timeout-seconds` | `DSA_IDLE_TRANSACTION_TIMEOUT_SECONDS` | PostgreSQL's setting | `idle_in_transaction_session_timeout` of this connection, 1 to 86,400 seconds. |
-| `--overall-timeout-seconds` | `DSA_OVERALL_TIMEOUT_SECONDS` | none; `convert`: 3600 | Stop the command after this many seconds, 1 to 86,400. |
+| `--overall-timeout-seconds` | `DSA_OVERALL_TIMEOUT_SECONDS` | none; `convert`: 3600 | Stop the command after this many seconds, 1 to 86,400. `run` refuses it, also as the variable, with exit status 2: the service runs until it is stopped. |
 
 TLS: without `--tls-root-cert` the connection still requires TLS and checks
 the server's certificate against the public certificate authorities. Put
@@ -85,7 +85,9 @@ server on the same host; `--tls-root-cert` is then refused.
 The service ([operations](operations.md)). It takes the
 [database flags](#database-flags), the [provider flags](#provider-flags), the
 [follower flags](#follower-flags) and the [service flags](#service-flags), and
-no others.
+no others. It refuses `--overall-timeout-seconds` and
+`DSA_OVERALL_TIMEOUT_SECONDS` with exit status 2
+(`overall_timeout_not_supported`): the service runs until it is stopped.
 
 ## `create`
 
