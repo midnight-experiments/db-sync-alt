@@ -5,7 +5,7 @@
 //! memory, stop, the status after a stop). DSA_RUN_CATCH_UP_BLOCKS sets the
 //! blocks of the catch-up (default 300) and DSA_RUN_LARGE_BLOCKS the size of
 //! the Mainnet-size store of the restart (default 30 filled block ranges of
-//! 100 transactions; 1,500 is about 300,000 outputs).
+//! 100 transactions; 2,000 is about 300,000 outputs).
 
 #[path = "follower/support.rs"]
 #[allow(dead_code)]
@@ -987,6 +987,7 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
         assert_eq!(code, Some(status), "{error}: {lines:?}");
         let named = lines
             .iter()
+            .rev()
             .find(|line| line.contains(&format!("\"error\":\"{error}\"")))
             .unwrap_or_else(|| panic!("{error}: {lines:?}"));
         println!(
