@@ -106,6 +106,14 @@ pub enum Error {
         elapsed_seconds: f64,
         error: tokio_postgres::Error,
     },
+    /// A failure named by the layer above the store, reported as it named
+    /// it; `temporary` when the same command may succeed later.
+    #[error("{}", reported_code(report))]
+    Reported { report: Value, temporary: bool },
+}
+
+fn reported_code(report: &Value) -> &str {
+    report["error"].as_str().unwrap_or("service_error")
 }
 
 impl Error {
@@ -185,6 +193,7 @@ impl Error {
                 expected,
                 actual,
             } => json!({"error":error,"item":item,"expected":expected,"actual":actual}),
+            Self::Reported { report, .. } => report.clone(),
             _ => json!({"error": self.to_string()}),
         }
     }
@@ -202,6 +211,7 @@ impl Error {
             Self::ComparisonSource { error, .. } | Self::InFamily { error, .. } => {
                 error.temporary()
             }
+            Self::Reported { temporary, .. } => *temporary,
             _ => false,
         }
     }
@@ -347,12 +357,14 @@ pub struct Store {
     probe: std::sync::Mutex<follow::Probe>,
 }
 /// Cancels this backend's statement using the same TLS validation, and tells
-/// whether the store sent the commit that publishes a load.
+/// whether the store sent the commit that publishes a load and whether its
+/// connection has closed.
 #[derive(Clone)]
 pub struct Cancellation {
     token: tokio_postgres::CancelToken,
     tls: MakeRustlsConnect,
     commit_sent: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
 }
 impl Cancellation {
     pub async fn cancel(&self) -> Result<(), Error> {
@@ -360,6 +372,13 @@ impl Cancellation {
     }
     pub fn commit_sent(&self) -> bool {
         self.commit_sent.load(Ordering::SeqCst)
+    }
+    /// The connection ended on its own (the server closed it or it broke):
+    /// its backend runs nothing that could be cancelled. A store that is
+    /// dropped is not closed in this sense: its backend may still be running
+    /// a statement.
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -421,7 +440,9 @@ impl Store {
             token: client.cancel_token(),
             tls,
             commit_sent: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
         };
+        let closed = Arc::clone(&cancellation.closed);
         let connection = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 eprintln!(
@@ -429,6 +450,7 @@ impl Store {
                     json!({"event":"postgres_connection_failed","diagnostic":postgres_report(&error)})
                 );
             }
+            closed.store(true, Ordering::SeqCst);
         });
         let store = Self {
             client,
@@ -468,7 +490,7 @@ impl Store {
     /// It stays held until this Store closes, including between transactions.
     /// A writer that just ended may still be rolling back on the server, so a
     /// held lock is retried for a few seconds before `writer_busy`.
-    pub(crate) async fn lock_writer(&mut self) -> Result<(), Error> {
+    pub async fn lock_writer(&mut self) -> Result<(), Error> {
         validate_owner(&self.client).await?;
         let mut attempts = 0;
         while !self.writer_locked {
@@ -578,6 +600,24 @@ impl Store {
     pub async fn check_reader(&self, profile: &Profile, role: &str) -> Result<Value, Error> {
         self.open(profile).await?;
         verify_reader(&self.client, role).await
+    }
+
+    /// Stores a new retention, at least 24 hours, under the writer lock. The
+    /// horizon follows it at its next advance.
+    pub async fn set_retention(&mut self, profile: &Profile, seconds: i64) -> Result<(), Error> {
+        if seconds < 86_400 {
+            return Err(Error::Refusal("retention_below_minimum"));
+        }
+        self.open(profile).await?;
+        let transaction = self.writer_transaction().await?;
+        transaction
+            .execute(
+                "UPDATE dsa.position SET retention_seconds=$1,updated_at=clock_timestamp() WHERE id=1",
+                &[&seconds],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 }
 

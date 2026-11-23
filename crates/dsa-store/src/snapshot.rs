@@ -247,6 +247,13 @@ pub(crate) fn preflight(file: &mut File, description: &Description) -> Result<()
     Ok(())
 }
 
+/// The description of the snapshot file at `path`, checked against
+/// `profile` (format, network, profile hash, rule version), without reading
+/// its sections.
+pub fn describe(path: &Path, profile: &Profile) -> Result<Description, Error> {
+    read_description(&mut File::open(path)?, profile)
+}
+
 pub(crate) fn read_description(file: &mut File, profile: &Profile) -> Result<Description, Error> {
     let mut magic = [0; 8];
     file.read_exact(&mut magic)?;

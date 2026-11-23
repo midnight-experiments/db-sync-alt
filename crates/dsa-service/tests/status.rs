@@ -67,13 +67,13 @@ fn serving_view() -> DatabaseView {
             serving: true,
             reason: "serving".to_owned(),
             target_height: Some(i64::from(target.height)),
-            target_hash: Some(format!("\\x{}", target.hash)),
+            target_hash: Some(target.hash.clone()),
             target_time: Some("2026-11-18T00:00:00+00:00".to_owned()),
             tip_height: Some(i64::from(tip.height)),
-            tip_hash: Some(format!("\\x{}", tip.hash)),
+            tip_hash: Some(tip.hash.clone()),
             tip_time: Some("2026-11-18T11:59:30+00:00".to_owned()),
             horizon_height: Some(i64::from(horizon.height)),
-            horizon_hash: Some(format!("\\x{}", horizon.hash)),
+            horizon_hash: Some(horizon.hash.clone()),
             horizon_time: Some("2026-11-11T07:20:00+00:00".to_owned()),
             retention_seconds: 604_800,
             updated_at: "2026-11-18T11:59:50.000000+00:00".to_owned(),
@@ -294,6 +294,25 @@ fn document(status: &Status) -> Value {
     serde_json::to_value(status).unwrap()
 }
 
+/// The JSON pointers of the string values that start with `\x`, the bytea
+/// text of PostgreSQL: every hash of the document is plain hexadecimal.
+fn bytea_text(value: &Value, at: &str, found: &mut Vec<String>) {
+    match value {
+        Value::String(text) if text.starts_with("\\x") => found.push(at.to_owned()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                bytea_text(item, &format!("{at}/{index}"), found);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, item) in fields {
+                bytea_text(item, &format!("{at}/{key}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn every_state_has_its_golden_document() {
     let update = std::env::var("DSA_UPDATE_GOLDEN").is_ok_and(|value| value == "1");
@@ -304,6 +323,9 @@ fn every_state_has_its_golden_document() {
             std::fs::write(&path, serde_json::to_string_pretty(&actual).unwrap() + "\n").unwrap();
             continue;
         }
+        let mut bytea = Vec::new();
+        bytea_text(&actual, "", &mut bytea);
+        assert!(bytea.is_empty(), "{name}: bytea text at {bytea:?}");
         let expected: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
             .unwrap_or_else(|error| panic!("{name}: {error}"));
         assert_eq!(
@@ -504,7 +526,9 @@ fn health_is_200_only_when_every_condition_holds() {
     let mut unchecked = serving_view();
     unchecked.reader_check = None;
     let mut old_view = serving_view();
-    old_view.observed_at = now() - 61;
+    old_view.observed_at = now() - 121;
+    let mut recent_view = serving_view();
+    recent_view.observed_at = now() - 120;
     let catching_up = FollowerView {
         state: State::CatchingUp,
         ..following()
@@ -555,6 +579,7 @@ fn health_is_200_only_when_every_condition_holds() {
             following(),
             vec!["database_observation_stale"],
         ),
+        ("database view 120 s old", recent_view, following(), vec![]),
     ];
     for (name, view, follower, expected) in cases {
         let status = compose(Some(&view), Some(&follower), &settings(), NOW);

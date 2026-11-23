@@ -69,20 +69,101 @@ impl Operation {
     }
 }
 
+/// A handle of one database session the wrapper may cancel.
+trait Handle {
+    fn closed(&self) -> bool;
+    fn commit_sent(&self) -> bool;
+}
+
+impl Handle for Cancellation {
+    fn closed(&self) -> bool {
+        Cancellation::closed(self)
+    }
+    fn commit_sent(&self) -> bool {
+        Cancellation::commit_sent(self)
+    }
+}
+
+/// The handles of a command's sessions. A connection registered under a
+/// role (the writer, the status read, the upkeep) replaces the earlier one of
+/// that role, so a command that reconnects keeps one handle per live
+/// connection. Other connections are kept until the server has ended them,
+/// because the backend of a dropped connection may still run a statement
+/// that a stop must cancel. Whether any of them sent a commit that publishes
+/// is kept.
+struct Registry<H> {
+    roles: std::collections::BTreeMap<&'static str, H>,
+    others: Vec<H>,
+    commit_sent: bool,
+}
+
+impl<H> Default for Registry<H> {
+    fn default() -> Self {
+        Self {
+            roles: std::collections::BTreeMap::new(),
+            others: Vec::new(),
+            commit_sent: false,
+        }
+    }
+}
+
+impl<H: Handle + Clone> Registry<H> {
+    fn add(&mut self, handle: H) {
+        let (closed, live): (Vec<H>, Vec<H>) = self.others.drain(..).partition(H::closed);
+        self.commit_sent |= closed.iter().any(H::commit_sent);
+        self.others = live;
+        self.others.push(handle);
+    }
+
+    fn replace(&mut self, role: &'static str, handle: H) {
+        if let Some(earlier) = self.roles.insert(role, handle) {
+            self.commit_sent |= earlier.commit_sent();
+        }
+    }
+
+    fn commit_sent(&self) -> bool {
+        self.commit_sent || self.roles.values().chain(&self.others).any(H::commit_sent)
+    }
+
+    fn live(&self) -> Vec<H> {
+        self.roles
+            .values()
+            .chain(&self.others)
+            .filter(|handle| !handle.closed())
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.roles.len() + self.others.len()
+    }
+}
+
 /// What a running command shares with the wrapper: its database sessions, to
 /// cancel when it is stopped or fails, and the stop request.
 #[derive(Clone)]
 pub(crate) struct Session {
-    cancellations: Arc<Mutex<Vec<Cancellation>>>,
+    cancellations: Arc<Mutex<Registry<Cancellation>>>,
     stop: watch::Receiver<bool>,
 }
 
 impl Session {
+    /// Registers a new connection; the handles of connections the server
+    /// ended go.
     pub(crate) fn watch(&self, cancellation: Cancellation) {
         self.cancellations
             .lock()
             .expect("cancellation registry")
-            .push(cancellation);
+            .add(cancellation);
+    }
+
+    /// Registers the connection of `role`, replacing the earlier one.
+    pub(crate) fn watch_as(&self, role: &'static str, cancellation: Cancellation) {
+        self.cancellations
+            .lock()
+            .expect("cancellation registry")
+            .replace(role, cancellation);
     }
 
     /// Whether a commit that publishes was sent.
@@ -90,8 +171,7 @@ impl Session {
         self.cancellations
             .lock()
             .expect("cancellation registry")
-            .iter()
-            .any(Cancellation::commit_sent)
+            .commit_sent()
     }
 
     /// Resolves when the command is asked to stop.
@@ -106,7 +186,7 @@ impl Session {
             .cancellations
             .lock()
             .expect("cancellation registry")
-            .clone();
+            .live();
         let mut pending = tokio::task::JoinSet::new();
         for (index, handle) in handles.into_iter().enumerate() {
             pending.spawn(async move {
@@ -353,6 +433,65 @@ mod tests {
         let report = result.unwrap_err().report();
         assert_eq!(report["published"], false);
         assert_eq!(report["error"], "operation_deadline_exceeded");
+    }
+
+    #[derive(Clone)]
+    struct Fake {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+        commit_sent: bool,
+    }
+
+    impl Handle for Fake {
+        fn closed(&self) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn commit_sent(&self) -> bool {
+            self.commit_sent
+        }
+    }
+
+    fn fake(commit_sent: bool) -> Fake {
+        Fake {
+            closed: Arc::default(),
+            commit_sent,
+        }
+    }
+
+    /// A service whose writer reconnects a thousand times keeps one handle
+    /// for it; a connection the server ended goes when the next one is
+    /// registered; a dropped one that may still run a statement stays; a
+    /// commit sent on a replaced or ended connection is still known.
+    #[test]
+    fn a_reconnect_replaces_the_handle_of_its_role() {
+        let mut registry = Registry::default();
+        registry.replace("status", fake(false));
+        let mut writer = fake(true);
+        registry.replace("writer", writer.clone());
+        for _ in 0..1_000 {
+            writer
+                .closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            writer = fake(false);
+            registry.replace("writer", writer.clone());
+            assert_eq!(registry.len(), 2);
+        }
+        assert!(registry.commit_sent(), "the first writer sent a commit");
+        // Other connections: one the server ended goes, a dropped one stays.
+        let ended = fake(false);
+        registry.add(ended.clone());
+        let dropped = fake(false);
+        registry.add(dropped.clone());
+        assert_eq!(registry.len(), 4);
+        ended
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(registry.live().len(), 3, "an ended one is not cancelled");
+        registry.add(fake(false));
+        assert_eq!(
+            registry.len(),
+            4,
+            "the ended one went, the dropped one stayed"
+        );
     }
 
     #[test]

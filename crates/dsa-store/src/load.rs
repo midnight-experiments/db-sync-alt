@@ -110,6 +110,17 @@ impl Layout {
 }
 
 impl Store {
+    /// Whether a restore may load this database: it is blank, holds the
+    /// closed layout without a row, or the build of an interrupted restore.
+    /// A database that serves or holds anything else is not loadable.
+    pub async fn loadable(&self, profile: &Profile) -> Result<bool, Error> {
+        match self.destination(profile).await {
+            Ok(_) => Ok(true),
+            Err(Error::Refusal("destination_not_empty")) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Classifies the destination without changing it. Anything that serves,
     /// holds a row or an object of its own is refused.
     pub(crate) async fn destination(&self, profile: &Profile) -> Result<Destination, Error> {

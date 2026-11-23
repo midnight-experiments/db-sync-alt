@@ -180,7 +180,9 @@ pub(crate) fn command(
                             root: destination.root.clone(),
                         };
                         let (database, session) = (Arc::clone(&database), session.clone());
-                        Box::pin(async move { open(connection, &database, &session).await })
+                        Box::pin(async move {
+                            open(connection, &database, &session, Some("writer")).await
+                        })
                     })
                 };
                 let (stopper, stop) = Stop::new();

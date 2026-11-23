@@ -54,7 +54,7 @@
   },
   "generated_at": 1795003200,
   "health": {
-    "database_observation_max_age_seconds": 60,
+    "database_observation_max_age_seconds": 120,
     "max_lag_blocks": 9,
     "provider_observation_max_age_seconds": 120
   },
@@ -141,16 +141,16 @@
   "node_release": "2.1.101",
   "poll_error_code": null,
   "position": {
-    "horizon_hash": "\\x3333333333333333333333333333333333333333333333333333333333333333",
+    "horizon_hash": "3333333333333333333333333333333333333333333333333333333333333333",
     "horizon_height": 14177840,
     "horizon_time": "2026-11-11T07:20:00+00:00",
     "reason": "serving",
     "retention_seconds": 604800,
     "serving": true,
-    "target_hash": "\\x2222222222222222222222222222222222222222222222222222222222222222",
+    "target_hash": "2222222222222222222222222222222222222222222222222222222222222222",
     "target_height": 14207840,
     "target_time": "2026-11-18T00:00:00+00:00",
-    "tip_hash": "\\x1111111111111111111111111111111111111111111111111111111111111111",
+    "tip_hash": "1111111111111111111111111111111111111111111111111111111111111111",
     "tip_height": 14210000,
     "tip_time": "2026-11-18T11:59:30+00:00",
     "updated_at": "2026-11-18T11:59:50.000000+00:00"
