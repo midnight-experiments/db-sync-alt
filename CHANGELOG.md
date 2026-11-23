@@ -1,17 +1,77 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
-- Documentation only. midnight-node 2.1.101 connects to its db-sync database
-  only over TLS and ignores `ALLOW_NON_SSL`: the docs give tested steps to turn
-  TLS on, for any PostgreSQL server and for the Compose deployment's bundled
-  one, and `SSL_ROOT_CERT` for the node. The network status describes the
-  Mainnet database built from a real Mainnet cardano-db-sync and followed
-  through Blockfrost. The README and the costs page give the Blockfrost costs
-  measured at the Preprod tip and for a catch-up from the published snapshot,
-  date the memory and disk measurement, and say when `provider_concurrency` and
-  `provider_max_requests_per_hour` apply. The operations page counts eleven
-  reader relations.
+**Breaking.** 0.5.0 is a new implementation in Rust with a new database
+format. It does not open a 0.4.x database, reads no configuration file or
+state directory, and its database keeps a retention window instead of the full
+history. Upgrade path ([upgrade](docs/upgrade.md)):
+
+1. With 0.4.x, take a backup and check that it restores; keep the 0.4.x
+   service running.
+2. Create an empty PostgreSQL 17 database and run `db-sync-alt convert` with
+   the 0.4.x database, read through its reader login, as the source. The 0.4.x
+   database stays as it was.
+3. Run `db-sync-alt verify` and `db-sync-alt grant-reader` on the new
+   database, and optionally `db-sync-alt compare` against the answers
+   `convert --capture-source` saved.
+4. Start `db-sync-alt run` on the new database, wait until `/health` answers
+   200, and point the node's connection string at it.
+5. Stop the 0.4.x service. Its database is the way back until you remove it.
+
+What changes for an operator:
+
+- **Install.** One binary for Linux x86-64 with glibc 2.39 or newer, or the
+  image `ghcr.io/midnight-experiments/db-sync-alt`. No Python, no virtual
+  environment, no `pg_dump` or `pg_restore`. The release archive and the image
+  carry the license texts of every crate in the binary.
+- **Configuration.** Flags, each also readable from a `DSA_` variable; secrets
+  only as file paths. Every value is checked before anything connects; an
+  invalid one ends the command with exit status 2 and names the flag
+  ([configuration](docs/configuration.md)).
+- **A database that prunes itself.** It keeps the events of the retention
+  (default 7 days after this database first served them, at least 24 hours),
+  the unspent outputs of the profile's addresses and assets, the governance
+  records and the epoch values the node reads, and deletes the rest. A
+  different `--retention-seconds` is refused unless `--change-retention` is
+  given. Measured right after a restore: 194 MB on Mainnet, 18 MB on Preprod
+  ([snapshots](docs/snapshots.md#restore)).
+- **Snapshot files** replace backups: `snapshot`, `restore` and `run
+  --snapshot` with `--expect-content-digest`. A file holds a whole database and
+  its content digest; a restore needs no client tools and leaves the node
+  getting SQLSTATE 55000 until it publishes. With `--snapshot-dir` the service
+  writes one file a day and keeps the newest `--snapshot-keep`.
+- **Following.** Each final block is read once, as transaction CBOR whose
+  hashes are checked; spends are matched to held outputs without a request.
+  Asset conservation in every transaction and a supply check every 6 hours
+  close the gate when they fail (`asset_conservation`, `supply_mismatch`), as
+  does a provider that contradicts a final block (`canonical_conflict`). An
+  update and its pruning are one transaction.
+- **Provider.** No built-in daily ceiling: a 402 is waited out until the next
+  UTC day, 418 and 429 until the time the provider names. Requests per second
+  (default 8) and in flight (default 4) are flags. `/status` shows the calls of
+  each UTC day for a week ([provider](docs/provider.md)).
+- **Service.** `/health` and `/status` stay on port 18080, now on
+  `0.0.0.0:18080` by default (`--listen`). Temporary conditions are retried;
+  a database or transport failure that lasts longer than
+  `--database-fatal-after-seconds` (default 1,800) ends the service with exit
+  status 75. `db-sync-alt health` is the container health check.
+- **`/status`.** `healthy`, `reason_codes`, `serving`, `sync`, `error_code`,
+  `poll_error_code`, `served_target`, `provider_head`, `lag`,
+  `freshness.provider_observation_age_seconds` and `service_version` keep their
+  meaning; `quota`, `relevance` and the `sync` value `checkpointing` are gone;
+  the other fields are new ([operations](docs/operations.md#status)).
+- **Commands.** `run`, `restore`, `snapshot`, `verify`, `status`, `convert`,
+  `compare`, `grant-reader`, `create`, `profile` and `health`. `acquire`,
+  `backup` and `upgrade` are gone, and with them the build from an operator's
+  cardano-db-sync, the integrity checkpoints and the node-configuration and
+  bridge-checkpoint reports.
+- **Networks.** Mainnet and Preprod, with profiles generated from Midnight
+  node 2.1.101. Preview is not supported.
+- **Limitations.** Queries about history older than the window, the
+  registered-candidate results of the node's operator RPCs and CLI, and the
+  node's genesis subcommands are not supported; stake distributions exist for
+  recent epochs only ([limitations](docs/limitations.md)).
 
 ## 0.4.9
 
