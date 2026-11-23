@@ -21,7 +21,7 @@ LABEL org.opencontainers.image.title="db-sync-alt" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /out/usr/local/bin/db-sync-alt /usr/local/bin/db-sync-alt
 COPY --from=build --chown=65532:65532 /out/var/lib/db-sync-alt /var/lib/db-sync-alt
-COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/doc/db-sync-alt/
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.txt /usr/share/doc/db-sync-alt/
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/db-sync-alt"]
 CMD ["run"]

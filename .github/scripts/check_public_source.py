@@ -10,7 +10,7 @@ import re
 import sys
 import subprocess
 
-ROOT_FILES = {'README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md',
+ROOT_FILES = {'README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','THIRD_PARTY_LICENSES.txt','CONTRIBUTING.md',
               'SECURITY.md','CHANGELOG.md','CODE_OF_CONDUCT.md','.gitignore','.dockerignore',
               '.env.example','Cargo.toml','Cargo.lock','rust-toolchain.toml'}
 ROOT_DIRS = {'profiles','reference','deploy','tools','docs','.github','crates'}

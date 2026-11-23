@@ -1,7 +1,10 @@
 db-sync-alt
 
-This distribution contains unchanged reference files and public network
-configuration from midnight-node, including its vendored Partner Chains
-component, at commit 3acfd2edecdcd91373b6a506933f4c14ad3f0308.
-Original source notices are preserved. See THIRD_PARTY_NOTICES.md for provenance
-and copies of the applicable Apache License, Version 2.0.
+This distribution contains unchanged reference files, SQL statements and
+public network configuration from midnight-node, including its vendored
+Partner Chains component, at commit 86774edf8cc76345a5c3a4221f3fe80c094b1c33
+(tag node-2.1.101), and the network configuration files of earlier
+midnight-node releases under profiles/. Original source notices are preserved.
+See THIRD_PARTY_NOTICES.md for provenance and copies of the applicable Apache
+License, Version 2.0, and THIRD_PARTY_LICENSES.txt for the licenses of the
+crates the binary is built from.

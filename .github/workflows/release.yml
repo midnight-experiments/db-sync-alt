@@ -41,7 +41,7 @@ jobs:
         run: |
           name="db-sync-alt-$VERSION-linux-x86_64"
           mkdir -p "dist/$name"
-          cp target/release/db-sync-alt LICENSE NOTICE THIRD_PARTY_NOTICES.md "dist/$name/"
+          cp target/release/db-sync-alt LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.txt "dist/$name/"
           tar -C dist --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > SHA256SUMS && cat SHA256SUMS)
       - name: Image
