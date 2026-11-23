@@ -42,6 +42,24 @@ impl Block {
         })
     }
 
+    /// The block after `previous` holding `transactions`, in the same epoch
+    /// and twenty slots later.
+    pub fn after(previous: &Block, transactions: Vec<Built>) -> Self {
+        let mut seed = format!("after {} {}", previous.hash, previous.height + 1).into_bytes();
+        for tx in &transactions {
+            seed.extend(tx.hash.as_bytes());
+        }
+        Self {
+            hash: hash(&seed),
+            height: previous.height + 1,
+            slot: previous.slot + 20,
+            epoch: previous.epoch,
+            time: previous.time + 20,
+            previous: Some(previous.hash.clone()),
+            transactions,
+        }
+    }
+
     /// One page of `/blocks/{hash}/txs/cbor`.
     pub fn page(&self, page: usize) -> Value {
         Value::Array(

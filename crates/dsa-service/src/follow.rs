@@ -237,7 +237,9 @@ pub(crate) async fn guarded<T>(
 
 /// Opens a new connection to the store, registered for cancellation by the
 /// caller.
-pub type Connect = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Store, dsa_store::Error>>>>>;
+pub type Connect = Box<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<Store, dsa_store::Error>> + Send>> + Send + Sync,
+>;
 
 /// The loop's outside world.
 pub struct Context<'a> {

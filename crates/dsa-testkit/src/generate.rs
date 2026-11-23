@@ -152,6 +152,22 @@ pub fn alternative(block: &Block, salt: u64, transactions: usize) -> Block {
     }
 }
 
+/// Another branch over consecutive `blocks`: the same heights, epochs and
+/// slots, other hashes and transactions, linked to the block before the
+/// first one.
+pub fn branch(blocks: &[Block], salt: u64) -> Vec<Block> {
+    let mut previous = blocks.first().and_then(|block| block.previous.clone());
+    blocks
+        .iter()
+        .map(|block| {
+            let mut other =
+                alternative(block, salt, ((salt + u64::from(block.height)) % 3) as usize);
+            other.previous = previous.replace(other.hash.clone());
+            other
+        })
+        .collect()
+}
+
 struct Random(u64);
 impl Random {
     fn next(&mut self) -> u64 {

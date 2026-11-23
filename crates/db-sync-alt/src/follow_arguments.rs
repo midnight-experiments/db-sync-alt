@@ -2,7 +2,7 @@
 //! and the hidden `follow` command. Every flag is also read from `DSA_` plus
 //! its name in upper case with underscores; a flag on the command line wins.
 
-use std::{path::PathBuf, rc::Rc, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Args;
 use dsa_service::{
@@ -167,7 +167,7 @@ pub(crate) fn command(
     settings.stop_at_target = stop_at_target;
     let mut operation = Operation::new("follow", Effect::Changes, database.overall_timeout_seconds);
     operation.grace = Duration::from_secs(5);
-    let database = Rc::new(database);
+    let database = Arc::new(database);
     Ok((
         operation,
         Box::new(move |session: Session| {
@@ -179,7 +179,7 @@ pub(crate) fn command(
                             config: destination.config.clone(),
                             root: destination.root.clone(),
                         };
-                        let (database, session) = (Rc::clone(&database), session.clone());
+                        let (database, session) = (Arc::clone(&database), session.clone());
                         Box::pin(async move { open(connection, &database, &session).await })
                     })
                 };
