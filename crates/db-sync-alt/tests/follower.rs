@@ -1101,7 +1101,7 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     let hook: Hook = {
         let polled = polled.clone();
         Arc::new(move |path, chain: &mut Chain, _| {
-            if path.contains("/next") && polled.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+            if path.contains("/next") && polled.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
                 let height = chain.tip().map_or(0, |tip| tip.height) + 1;
                 if height <= last
                     && let Some(block) = canonical.iter().find(|block| block.height == height)
