@@ -299,9 +299,27 @@ pub(crate) async fn write_position(
     transaction: &Transaction<'_>,
     state: &ServingState,
 ) -> Result<(), Error> {
-    transaction.execute("UPDATE dsa.position \
-        SET horizon_height=$1::integer,horizon_hash=decode($2,'hex'),horizon_time=$3::text::timestamptz,target_height=$4::integer,target_hash=decode($5,'hex'),target_time=$6::text::timestamptz,tip_height=$7::integer,tip_hash=decode($8,'hex'),tip_time=$9::text::timestamptz,retention_seconds=$10,updated_at=now() \
-        WHERE id=1",&[&(state.horizon.height as i32),&state.horizon.hash,&state.horizon.time,&(state.target.height as i32),&state.target.hash,&state.target.time,&(state.tip.height as i32),&state.tip.hash,&state.tip.time,&state.retention_seconds]).await?;
+    let s = state;
+    transaction
+        .execute(
+            "UPDATE dsa.position SET horizon_height=$1::integer,horizon_hash=decode($2,'hex'),
+             horizon_time=$3::text::timestamptz,target_height=$4::integer,target_hash=decode($5,'hex'),
+             target_time=$6::text::timestamptz,tip_height=$7::integer,tip_hash=decode($8,'hex'),
+             tip_time=$9::text::timestamptz,retention_seconds=$10,updated_at=now() WHERE id=1",
+            &[
+                &(s.horizon.height as i32),
+                &s.horizon.hash,
+                &s.horizon.time,
+                &(s.target.height as i32),
+                &s.target.hash,
+                &s.target.time,
+                &(s.tip.height as i32),
+                &s.tip.hash,
+                &s.tip.time,
+                &s.retention_seconds,
+            ],
+        )
+        .await?;
     Ok(())
 }
 

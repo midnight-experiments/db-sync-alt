@@ -296,8 +296,16 @@ impl StagedConversion<'_> {
 }
 
 async fn settings(source: &Transaction<'_>) -> Result<SourceSettings, Error> {
-    let row=source.query_one("SELECT current_setting('server_version_num')::integer,current_setting('work_mem'),current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout'),current_setting('default_transaction_read_only'),current_setting('transaction_read_only'),current_setting('transaction_isolation'),coalesce((SELECT ssl \
-        FROM pg_stat_ssl WHERE pid=pg_backend_pid()),false)",&[]).await?;
+    let row = source
+        .query_one(
+            "SELECT current_setting('server_version_num')::integer,current_setting('work_mem'),
+             current_setting('statement_timeout'),current_setting('idle_in_transaction_session_timeout'),
+             current_setting('default_transaction_read_only'),current_setting('transaction_read_only'),
+             current_setting('transaction_isolation'),
+             coalesce((SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()),false)",
+            &[],
+        )
+        .await?;
     let settings = SourceSettings {
         server_version_num: row.get(0),
         work_mem: row.get(1),

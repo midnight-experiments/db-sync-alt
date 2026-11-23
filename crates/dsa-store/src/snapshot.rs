@@ -121,8 +121,17 @@ impl Provenance {
         profile: &Profile,
         verified: &Verification,
     ) -> Result<Self, Error> {
-        let row=client.query_one("SELECT origin->>'kind',origin->>'source_kind',origin->>'source_network',origin->>'source_target_height',origin->>'source_target_hash',origin->>'source_target_time',origin->>'source_tip_height',origin->>'source_tip_hash',origin->>'source_tip_time',coalesce(origin->>'source_created_at',to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')),origin->>'snapshot_content_digest',origin->>'snapshot_state_digest' \
-            FROM dsa.identity WHERE id=1",&[]).await?;
+        let row = client
+            .query_one(
+                "SELECT origin->>'kind',origin->>'source_kind',origin->>'source_network',
+                 origin->>'source_target_height',origin->>'source_target_hash',origin->>'source_target_time',
+                 origin->>'source_tip_height',origin->>'source_tip_hash',origin->>'source_tip_time',
+                 coalesce(origin->>'source_created_at',to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')),
+                 origin->>'snapshot_content_digest',origin->>'snapshot_state_digest'
+                 FROM dsa.identity WHERE id=1",
+                &[],
+            )
+            .await?;
         let text = |index: usize, default: &str| {
             row.get::<_, Option<String>>(index)
                 .unwrap_or_else(|| default.to_owned())
