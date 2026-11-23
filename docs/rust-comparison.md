@@ -52,18 +52,33 @@ with the SQL's outer ordering preserved. Unordered results use multisets,
 including duplicate multiplicities. Only the two internal bounds helpers may
 report valid differing IDs as information; unsupported registered-candidate observations use a separate coverage label. Their before/after anchors and
 related output/asset/input bounds are verified independently at each database.
-The actual `resolve_ident` lookup IDs are exact. `--verify-unbounded` additionally
-checks event answers with bounds 0..i64::MAX; use this on generated scratch data
-or under an explicit source-access budget. It adds reads.
+The actual `resolve_ident` lookup IDs are exact. Database B always repeats every
+event query with bounds 0..i64::MAX and requires the same events; an event case
+that differs is listed in `unbounded_differences_b` and the comparison does not
+match. `--a-verify-unbounded` runs the same check on A; it reads A's whole event
+history, so use it on scratch data or under an explicit source-access budget.
+
+`get_highest_block`, `get_epoch_for_block_hash` and `get_block_info_for_tx_hash`
+are also probed at every position pair: the range of the pair's cursor and
+reference headers, the reference header's hash, and the newest transaction of
+the pair (or the verified absent hash when the pair holds none).
+
+The result columns of every query (name and PostgreSQL type, in order) are
+compared as well, because the node decodes each column by type: a value of
+another type with the same text fails the comparison and is listed in
+`column_differences`.
 
 JSON stdout includes the pinned catalogue, selected units, positions, settings,
 query counts, actual per-query/unit row-hit coverage, both destination-order
-and unbounded-check flags, and the first differing rows for every mismatch.
+and unbounded-check flags, and every differing row: for an ordered answer each
+position whose rows differ, for an unordered answer each row present on one side
+only. At most `--max-differing-rows` rows (default 1,000) are reported per query;
+`differing_rows` counts them all and `rows_truncated` says when the list is cut.
 Acceptance requires destination B's chain-order check. Source A remains
 unscanned globally. A pruned asset table may have leading/interior ordinal gaps;
-order verification does not infer dense rank from filtered facts. First-row
-previews are capped at 4,096 characters, with full-row SHA256 and an explicit
-truncation flag. Whole rows are still compared exactly. Exit 0 means supported-query parity, 2 means a supported answer mismatch and 1 means a refusal or query failure.
+order verification does not infer dense rank from filtered facts. Row previews
+are capped at 4,096 characters, with full-row SHA256 and an explicit truncation
+flag. Whole rows are still compared exactly. Exit 0 means supported-query parity, 2 means a supported answer mismatch and 1 means a refusal or query failure.
 Rule 1 pruned stores and mismatched rule declarations/identity are refused.
 Genuine legacy schema 5 readers remain supported. Preprod's empty-name cNIGHT
 and named NIGHT bridge unit are reported separately.
@@ -123,3 +138,7 @@ registered candidates requires full address coverage under a new keep-rule versi
 Capture files of observation format 2 are also read: their omitted candidate
 input metadata is recovered only for its known initial and epoch call sites.
 Their raw rows and checksums are unchanged; the report states the coverage.
+A capture records its probe plan and the result columns of its queries. A file
+written without them has probe plan 0: B then runs that plan, without the
+per-pair probes, and `columns_compared` is false because A's column types are
+unknown.

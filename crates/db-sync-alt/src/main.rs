@@ -70,9 +70,13 @@ struct CompareArguments {
     statement_timeout_seconds: Option<u32>,
     #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
     idle_transaction_timeout_seconds: Option<u32>,
-    /// Scratch verification: repeat events with bounds0..i64::MAX.
+    /// Also repeat side A's event queries with bounds 0..i64::MAX (side B always
+    /// does). This reads A's whole event history.
     #[arg(long)]
-    verify_unbounded: bool,
+    a_verify_unbounded: bool,
+    /// Differing rows reported per query.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+    max_differing_rows: u32,
     #[arg(long)]
     candidate_address: Option<String>,
     #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
@@ -587,7 +591,8 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
         let tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
         let mut options = Options {
             check_chain_order: true,
-            verify_unbounded: args.verify_unbounded,
+            verify_unbounded: true,
+            probe_plan: left.probe_plan,
             missing_policy: Some(hex_bytes(&left.missing_policy, 28)?),
             missing_tx_hash: Some(hex_bytes(&left.missing_tx_hash, 32)?),
             candidate_address: left.candidate_address.clone(),
@@ -602,7 +607,11 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
         tx.commit()
             .await
             .map_err(|e| wrap("b", Error::Postgres(e)))?;
-        return Ok(serde_json::to_value(compare(&left, &right)?)?);
+        return Ok(serde_json::to_value(compare(
+            &left,
+            &right,
+            args.max_differing_rows as usize,
+        )?)?);
     }
     let mut a = Reader::connect(
         config(
@@ -670,7 +679,7 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
             .map_err(|e| wrap("a", e))?
     };
     let mut options = Options {
-        verify_unbounded: args.verify_unbounded,
+        verify_unbounded: args.a_verify_unbounded,
         missing_policy: Some(missing_policy),
         missing_tx_hash: Some(missing_tx_hash),
         ..Default::default()
@@ -680,6 +689,7 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
     }
     let mut right_options = options.clone();
     right_options.check_chain_order = true;
+    right_options.verify_unbounded = true;
     // Both snapshots pin the same absence probe. Execute independently so one
     // idle snapshot cannot expire merely while the other endpoint is captured.
     let left_read = async {
@@ -702,7 +712,7 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
         Ok::<_, Error>(value)
     };
     let (left, right) = tokio::try_join!(left_read, right_read)?;
-    let report = compare(&left, &right)?;
+    let report = compare(&left, &right, args.max_differing_rows as usize)?;
     eprintln!(
         "{}",
         json!({"operation":"compare","event":"finished","matched":report.matched,"differing_cases":report.supported_difference_count,"unsupported_differences":report.unsupported_difference_count,"helper_id_differences":report.helper_id_differences})

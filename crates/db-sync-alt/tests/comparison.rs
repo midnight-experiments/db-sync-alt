@@ -138,7 +138,7 @@ async fn cli(
             "auto",
             "--horizon-block",
             "6",
-            "--verify-unbounded",
+            "--a-verify-unbounded",
         ])
         .args(extra)
         .output()
@@ -202,7 +202,7 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
         )
         .await?;
         tb.commit().await?;
-        let report = compare::compare(&left, &right)?;
+        let report = compare::compare(&left, &right, compare::MAX_DIFFERING_ROWS)?;
         assert!(report.matched, "{}", serde_json::to_string(&report)?);
         assert_eq!(report.probe_rows.len(), 58);
         assert!(!report.chain_order_checked_a);
@@ -211,7 +211,7 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
         let mut unchecked = right.clone();
         unchecked.chain_order_checked = false;
         assert!(matches!(
-            compare::compare(&left, &unchecked),
+            compare::compare(&left, &unchecked, compare::MAX_DIFFERING_ROWS),
             Err(dsa_store::Error::Refusal(
                 "comparison_destination_order_not_checked"
             ))
@@ -224,7 +224,7 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
         let mut wrong_context = right.clone();
         wrong_context.missing_policy = "fe".repeat(28);
         assert!(matches!(
-            compare::compare(&left, &wrong_context),
+            compare::compare(&left, &wrong_context, compare::MAX_DIFFERING_ROWS),
             Err(dsa_store::Error::Refusal(
                 "comparison_capture_context_mismatch"
             ))
@@ -384,12 +384,13 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
         &positions,
         &Options {
             check_chain_order: true,
+            verify_unbounded: true,
             ..options
         },
     )
     .await?;
     tx.commit().await?;
-    let compared = compare::compare(&left, &right)?;
+    let compared = compare::compare(&left, &right, compare::MAX_DIFFERING_ROWS)?;
     assert!(compared.matched);
     let old_latest = left
         .cases
@@ -447,11 +448,11 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
         })
         .unwrap();
     assert_eq!(
-        observed_header_hash(latest_difference["a"].as_str().unwrap())?,
+        observed_header_hash(latest_difference["rows"][0]["a"].as_str().unwrap())?,
         "cd".repeat(32)
     );
     assert_eq!(
-        observed_header_hash(latest_difference["b"].as_str().unwrap())?,
+        observed_header_hash(latest_difference["rows"][0]["b"].as_str().unwrap())?,
         anchors["tip"]["hash"].as_str().unwrap()
     );
     println!(
@@ -642,7 +643,7 @@ async fn compare_refuses_rule_one_and_declared_stored_mismatch_even_empty() -> R
     let original = good.keep_rule_version;
     good.keep_rule_version = 1;
     assert!(matches!(
-        compare::compare(&good, &good),
+        compare::compare(&good, &good, compare::MAX_DIFFERING_ROWS),
         Err(dsa_store::Error::Refusal("comparison_keep_rule_mismatch"))
     ));
     good.keep_rule_version = original;
@@ -1154,7 +1155,7 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
             "mainnet",
             "--positions",
             "auto",
-            "--verify-unbounded",
+            "--a-verify-unbounded",
         ])
         .output()
         .await?;
@@ -1203,11 +1204,11 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
         .unwrap();
     assert_eq!(latest_difference["informational"], false);
     assert_eq!(
-        observed_header_hash(latest_difference["a"].as_str().unwrap())?,
+        observed_header_hash(latest_difference["rows"][0]["a"].as_str().unwrap())?,
         "cd".repeat(32)
     );
     assert_eq!(
-        observed_header_hash(latest_difference["b"].as_str().unwrap())?,
+        observed_header_hash(latest_difference["rows"][0]["b"].as_str().unwrap())?,
         converted["source"]["state"]["tip"]["hash"]
             .as_str()
             .unwrap()
@@ -2052,7 +2053,7 @@ async fn compare_q19_compatible_b683_observation_without_reconversion() -> Resul
             file.to_str().unwrap(),
             "--b",
             &target.dsn(true),
-            "--verify-unbounded",
+            "--a-verify-unbounded",
         ]);
         c
     };
@@ -2082,7 +2083,7 @@ async fn compare_q19_compatible_b683_observation_without_reconversion() -> Resul
     let mut future = legacy.clone();
     future.node_commit = "00".repeat(20);
     assert!(matches!(
-        compare::compare(&future, &future),
+        compare::compare(&future, &future, compare::MAX_DIFFERING_ROWS),
         Err(dsa_store::Error::Refusal(
             "comparison_node_coverage_contract"
         ))
@@ -2091,6 +2092,135 @@ async fn compare_q19_compatible_b683_observation_without_reconversion() -> Resul
         "{}",
         json!({"event":"q19_capture_compatibility","actual_b683_binary":actual_old.is_some(),"format":2,"file_unchanged":true,"new_exit":compared.status.code()})
     );
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+const BASE_CAPTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/source-capture-format-2.json"
+);
+
+/// The fixture was written by `convert --capture-source` for fixture 345
+/// before captures recorded probe plans and result columns. It still loads,
+/// and the comparison it passed still passes.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_reads_a_capture_without_probe_plan_or_columns() -> Result {
+    let profile = Profile::load("mainnet")?;
+    let recorded = dsa_store::source_capture::read(std::path::Path::new(BASE_CAPTURE), &profile)?;
+    assert_eq!(recorded.probe_plan, 0);
+    assert!(recorded.columns.is_empty());
+    let mut f = fixture(345);
+    f.reindex_ordinals();
+    let source = Database::new().await?;
+    source.legacy(&f).await?;
+    let target = Database::new().await?;
+    target
+        .cli(
+            "convert",
+            "mainnet",
+            &["--source", &source.dsn(true), "--horizon-block", "6"],
+        )
+        .await?;
+    target
+        .cli("grant-reader", "mainnet", &["--role", &target.reader])
+        .await?;
+    let output = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "compare",
+            "--a-capture",
+            BASE_CAPTURE,
+            "--b",
+            &target.dsn(true),
+            "--network",
+            "mainnet",
+        ])
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["matched"], true);
+    assert_eq!(report["probe_plan"], 0);
+    assert_eq!(report["columns_compared"], false);
+    assert_eq!(report["unbounded_checked_b"], true);
+    assert_eq!(report["compared_cases"], recorded.cases.len());
+    // A fresh comparison of the same databases runs the current plan and
+    // compares column types too.
+    let fresh = cli(&source, &target, &profile, &[]).await?;
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    let fresh: Value = serde_json::from_slice(&fresh.stdout)?;
+    assert_eq!(fresh["matched"], true);
+    assert_eq!(fresh["probe_plan"], compare::PROBE_PLAN);
+    assert_eq!(fresh["columns_compared"], true);
+    let pairs = fresh["positions"]["pairs"].as_array().unwrap().len();
+    for query in [
+        "get_highest_block",
+        "get_epoch_for_block_hash",
+        "get_block_info_for_tx_hash",
+    ] {
+        let cases = fresh["coverage_b"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| id.starts_with(&format!("{query}:")))
+            .unwrap()
+            .1["cases"]
+            .as_u64()
+            .unwrap() as usize;
+        assert!(cases >= pairs, "{query} probed at every pair");
+    }
+    source.cleanup().await?;
+    target.cleanup().await?;
+    Ok(())
+}
+
+/// The node decodes result columns by type; equal values of another type
+/// must fail the comparison.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn compare_fails_on_a_type_only_difference() -> Result {
+    let (source, target, f) = setup(351).await?;
+    connect(&target.config)
+        .await?
+        .batch_execute(&format!(
+            "DROP VIEW public.block;
+             CREATE VIEW public.block AS
+                 SELECT id, hash, epoch_no::bigint AS epoch_no, slot_no, block_no, time, tx_count
+                 FROM serve.block WHERE dsa.gate();
+             REVOKE ALL ON public.block FROM PUBLIC;
+             GRANT SELECT ON public.block TO {}",
+            target.reader
+        ))
+        .await?;
+    let output = cli(&source, &target, &f.profile, &[]).await?;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["matched"], false);
+    assert_eq!(report["supported_difference_count"], 0);
+    let differences = report["column_differences"].as_array().unwrap();
+    assert!(differences.iter().any(|d| {
+        d["query"]
+            .as_str()
+            .unwrap()
+            .starts_with("get_epoch_for_block_hash:")
+            && d["b"][0]["type"] == "int8"
+            && d["a"][0]["type"] != "int8"
+    }));
     source.cleanup().await?;
     target.cleanup().await?;
     Ok(())
