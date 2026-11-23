@@ -126,6 +126,7 @@ address that is in use (`listen_address_unavailable`).
 | Code | Cause | What to do |
 | --- | --- | --- |
 | `provider_key_rejected` | The provider answered 401 or 403: the key is wrong, revoked, or for another network. The service stops. | Fix the key file. |
+| `provider_network_mismatch` | The provider's `/genesis` names another network's magic (`expected_magic` and `received_magic` in the detail): `--provider-url` points at a provider of another network. Checked when the follower starts and again before a contradiction of a final block would close the gate. The service stops with exit status 1; the gate is not touched and no update is written. | Fix `--provider-url`. |
 | `quota_exhausted` | 402: the key's daily allowance is spent. Waited out until the next UTC day. | Nothing; a larger plan if it repeats ([provider](provider.md#refusals-and-outages)). |
 | `provider_rate_limited` | 429. Waited out. | Lower `--requests-per-second` if another program shares the key. |
 | `provider_banned` | 418. Waited out, 1 to 24 hours. | Check what else uses the key. |

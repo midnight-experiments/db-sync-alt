@@ -14,7 +14,10 @@ use std::{
 };
 
 use chrono::{DateTime, Days, NaiveDateTime};
-use dsa_chain::{block::Selection, profiles::Profile};
+use dsa_chain::{
+    block::Selection,
+    profiles::{Profile, network_magic},
+};
 use dsa_provider::{
     Kind, Provider, Refusal,
     pages::PAGE_SIZE,
@@ -481,6 +484,8 @@ struct Follower<'a> {
     /// The condition the current failures belong to.
     condition: Option<Condition>,
     between: Option<Box<dyn Between + 'a>>,
+    /// The provider's `/genesis` named the profile's network.
+    network_checked: bool,
 }
 
 impl<'a> Follower<'a> {
@@ -537,6 +542,7 @@ impl<'a> Follower<'a> {
             backoff: Backoff::default(),
             condition: None,
             between: None,
+            network_checked: false,
             time,
         };
         follower
@@ -965,8 +971,34 @@ impl<'a> Follower<'a> {
             .map(|header| header.hash.to_string()))
     }
 
-    /// One iteration: poll, then at most one update.
+    /// The provider serves the profile's network: its `/genesis` names the
+    /// network's magic. A provider of another network contradicts the stored
+    /// chain without anything being wrong with it, so the run ends with
+    /// `provider_network_mismatch` and the gate untouched. A `/genesis` that
+    /// cannot be read is retried as any other request.
+    async fn check_network(&mut self) -> Result<(), Error> {
+        let Some(expected) = network_magic(&self.profile.network) else {
+            return Ok(());
+        };
+        self.requests.count("genesis");
+        let genesis = guarded(&self.stop, self.provider.genesis()).await?;
+        if genesis.network_magic != expected {
+            return Err(Error::Refusal {
+                code: "provider_network_mismatch",
+                detail: json!({"network":self.profile.network,"expected_magic":expected,
+                    "received_magic":genesis.network_magic}),
+            });
+        }
+        Ok(())
+    }
+
+    /// One iteration: poll, then at most one update. The first one checks
+    /// the provider's network.
     async fn step(&mut self) -> Result<Outcome, Error> {
+        if !self.network_checked {
+            self.check_network().await?;
+            self.network_checked = true;
+        }
         self.connect_if_needed().await?;
         if self.provider_tip.is_none() {
             self.latest().await?;
@@ -1219,6 +1251,9 @@ impl<'a> Follower<'a> {
             }
             let second = self.hash_at(target.height).await?.ok_or_else(missing)?;
             if second != target.hash {
+                // Only a provider of this network can contradict a final
+                // block.
+                self.check_network().await?;
                 return Err(Error::Check {
                     code: "canonical_conflict",
                     detail: json!({"height":target.height,"stored":target.hash,"provider":[first,second]}),

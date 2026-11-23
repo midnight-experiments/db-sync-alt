@@ -15,6 +15,7 @@ a request.
 
 | Request | When |
 | --- | --- |
+| `/genesis` | Once when the follower starts, and again before a contradiction of the stored target would close the gate (`canonical_conflict`). Its `network_magic` must be the network's: 764824073 for Mainnet, 1 for Preprod. Another ends the service with `provider_network_mismatch` and exit status 1, and leaves the gate open; a provider of another network contradicts the stored chain without anything being wrong with it. |
 | `/blocks/{stored tip hash}/next` | Every poll at the tip, every `--poll-interval-seconds` (default 20): one request when nothing changed. While behind: the headers to fetch, 100 a page. |
 | `/blocks/latest` | Only when a page of headers is full, after a "not found", and for the first status. |
 | `/blocks/{height}` | After a fork at the tip, to find the highest stored block the provider still has: a binary search, at most 12 requests for k = 2,160. Also to read the target again when the provider contradicts it. |

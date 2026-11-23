@@ -461,6 +461,9 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
     let times = times_of(&twice, &format!("/api/v0/blocks/{target}"));
     assert_eq!(times.len(), 2, "{times:?}");
     assert!(times[1] - times[0] >= 60, "{times:?}");
+    // The provider's network was read at the start and before the gate
+    // closed.
+    assert_eq!(twice.requests("/genesis"), 2);
     let state = start
         .store()
         .await?
@@ -489,6 +492,121 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
         service,
         ("stopped".to_owned(), "canonical_conflict".to_owned())
     );
+    start.cleanup().await
+}
+
+/// A `/genesis` of the network with this magic.
+fn genesis(magic: u32) -> Behavior {
+    Behavior::json(json!({
+        "active_slots_coefficient": 0.05, "update_quorum": 5,
+        "max_lovelace_supply": "45000000000000000", "network_magic": magic,
+        "epoch_length": 432000, "system_start": 1654041600,
+        "slots_per_kes_period": 129600, "slot_length": 1,
+        "max_kes_evolutions": 62, "security_param": 2160
+    }))
+}
+
+/// A provider of another network ends the run with
+/// `provider_network_mismatch` and leaves the gate open and the stored
+/// position as it was: found at the start, before any other request, and
+/// found before a contradiction of the target would close the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_provider_of_another_network_never_closes_the_gate() -> Result {
+    let start = Start::new(29, 80, 20).await?;
+    let target = start.target;
+    let (expected, other) = if start.profile.network == "mainnet" {
+        (764_824_073, 1)
+    } else {
+        (1, 764_824_073)
+    };
+    let unchanged = |state: &dsa_store::follow::FollowState, context: &str| {
+        assert!(state.serving, "{context}: {}", state.reason);
+        assert_eq!(state.target.height, target, "{context}");
+    };
+    let refused = |error: follow::Error, context: &str| {
+        let report = error.report();
+        assert!(
+            matches!(
+                error,
+                follow::Error::Refusal {
+                    code: "provider_network_mismatch",
+                    ..
+                }
+            ),
+            "{context}: {report}"
+        );
+        assert_eq!(report["detail"]["expected_magic"], expected, "{report}");
+        assert_eq!(report["detail"]["received_magic"], other, "{report}");
+    };
+    // At the start.
+    let fake = Fake::start(&start.g, &start.profile).await;
+    fake.chain.lock().unwrap().network_magic = Some(other);
+    fake.serve(served(&start.g, target + K + 5));
+    let error = follow_to(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        until(target + 1),
+    )
+    .await
+    .unwrap_err();
+    refused(error, "at the start");
+    assert_eq!(fake.paths(), vec!["/api/v0/genesis".to_owned()]);
+    let state = start
+        .store()
+        .await?
+        .follow_state(&start.profile)
+        .await
+        .map_err(named)?;
+    unchanged(&state, "at the start");
+    // At the moment of a conflict: the right network at the start, another
+    // one once the target is contradicted twice.
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let conflict = contradiction(target, false);
+    let hook: Hook = {
+        let reads = reads.clone();
+        Arc::new(move |path, chain: &mut Chain, now| {
+            if path == "/api/v0/genesis" {
+                let first = reads.fetch_add(1, Ordering::SeqCst) == 0;
+                return (!first).then(|| genesis(other));
+            }
+            conflict(path, chain, now)
+        })
+    };
+    let fake = Fake::with_chain(
+        Chain::from_generated(
+            &start.g,
+            dsa_service::epoch::stake_prefix(&start.profile.network),
+        ),
+        Some(hook),
+    )
+    .await;
+    let mut blocks = served(&start.g, target + K + 1);
+    let keep = blocks.len() - 2;
+    let branch = generate::branch(&blocks[keep..], 77);
+    blocks.truncate(keep);
+    blocks.extend(branch);
+    fake.serve(blocks);
+    let error = follow_to(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        until(target + 1),
+    )
+    .await
+    .unwrap_err();
+    refused(error, "at the conflict");
+    let times = times_of(&fake, &format!("/api/v0/blocks/{target}"));
+    assert_eq!(times.len(), 2, "the target was read twice: {times:?}");
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    let state = start
+        .store()
+        .await?
+        .follow_state(&start.profile)
+        .await
+        .map_err(named)?;
+    unchanged(&state, "at the conflict");
     start.cleanup().await
 }
 

@@ -357,7 +357,7 @@ and `state_reason` and `last_error` name the check:
 
 | Check | What it found |
 | --- | --- |
-| `canonical_conflict` | The provider contradicted the stored target twice, 60 seconds apart: a final block the database serves is not on the provider's chain. |
+| `canonical_conflict` | The provider contradicted the stored target twice, 60 seconds apart: a final block the database serves is not on the provider's chain. Before the gate closes, the provider's `/genesis` is read again: a provider of another network ends the service with `provider_network_mismatch` instead, and the gate stays open. |
 | `asset_conservation` | In a transaction of a new block, the inputs the database holds plus the mint do not equal the outputs for a profile asset: the database misses an output. The report names the transaction and the unit. |
 | `supply_mismatch` | The unspent amount of a fixed-supply asset differs from the recorded supply. The report names the unit and both amounts. |
 

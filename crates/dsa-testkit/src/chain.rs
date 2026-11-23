@@ -138,6 +138,8 @@ pub struct Chain {
     /// epoch is not known yet.
     pub parameters: BTreeMap<u32, (String, u32)>,
     pub pools: Pools,
+    /// The network magic `/genesis` names; without one it answers 404.
+    pub network_magic: Option<u32>,
 }
 
 /// A distinct ordinary transaction, for filling blocks.
@@ -428,6 +430,15 @@ impl Chain {
         let parts: Vec<_> = route.trim_start_matches('/').split('/').collect();
         let missing = || Behavior::status(404);
         match parts.as_slice() {
+            ["genesis"] => self.network_magic.map_or_else(missing, |magic| {
+                Behavior::json(json!({
+                    "active_slots_coefficient": 0.05, "update_quorum": 5,
+                    "max_lovelace_supply": "45000000000000000", "network_magic": magic,
+                    "epoch_length": 432000, "system_start": 1654041600,
+                    "slots_per_kes_period": 129600, "slot_length": 1,
+                    "max_kes_evolutions": 62, "security_param": 2160
+                }))
+            }),
             ["blocks", "latest"] => self
                 .tip()
                 .map_or_else(missing, |tip| Behavior::json(tip.header())),

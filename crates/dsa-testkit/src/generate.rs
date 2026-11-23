@@ -974,6 +974,12 @@ impl Chain {
             stake_prefix: stake_prefix.to_owned(),
             ..Pools::default()
         };
+        // The network of the stake addresses: Mainnet's or Preprod's magic.
+        chain.network_magic = Some(if stake_prefix == "stake1" {
+            764_824_073
+        } else {
+            1
+        });
         chain
     }
 }
