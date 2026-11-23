@@ -521,8 +521,18 @@ async fn status_prints_identity_position_and_capabilities_without_writing() -> R
     );
     let after = store.service_view(&profile, None).await?;
     assert_eq!(
-        (&after.identity, &after.position, &after.service_state, &after.upkeep),
-        (&before.identity, &before.position, &before.service_state, &before.upkeep),
+        (
+            &after.identity,
+            &after.position,
+            &after.service_state,
+            &after.upkeep
+        ),
+        (
+            &before.identity,
+            &before.position,
+            &before.service_state,
+            &before.upkeep
+        ),
         "status writes nothing"
     );
     store.grant_reader(&profile, &db.reader).await?;
