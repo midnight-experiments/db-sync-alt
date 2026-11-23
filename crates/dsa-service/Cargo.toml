@@ -10,7 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-bech32 = "0.11"
+bech32 = "0.12"
 chrono.workspace = true
 dsa-chain.workspace = true
 dsa-provider = { path = "../dsa-provider" }

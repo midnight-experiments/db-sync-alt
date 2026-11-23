@@ -182,9 +182,9 @@ checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
 
 [[package]]
 name = "bech32"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
 
 [[package]]
 name = "bigdecimal"
@@ -636,7 +636,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 name = "dsa-chain"
 version = "0.5.0"
 dependencies = [
- "bech32 0.11.1",
+ "bech32 0.12.0",
  "clap",
  "dsa-testkit",
  "hex",
@@ -675,7 +675,7 @@ dependencies = [
 name = "dsa-provider"
 version = "0.5.0"
 dependencies = [
- "bech32 0.11.1",
+ "bech32 0.12.0",
  "bytes",
  "chrono",
  "dsa-chain",
@@ -702,7 +702,7 @@ dependencies = [
 name = "dsa-service"
 version = "0.5.0"
 dependencies = [
- "bech32 0.11.1",
+ "bech32 0.12.0",
  "chrono",
  "dsa-chain",
  "dsa-provider",
@@ -744,7 +744,7 @@ dependencies = [
 name = "dsa-testkit"
 version = "0.5.0"
 dependencies = [
- "bech32 0.11.1",
+ "bech32 0.12.0",
  "bytes",
  "dsa-chain",
  "futures-util",
@@ -785,7 +785,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2181,7 +2181,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2246,7 +2246,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2822,7 +2822,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3426,7 +3426,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
