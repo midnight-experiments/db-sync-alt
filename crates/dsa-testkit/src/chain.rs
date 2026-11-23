@@ -95,6 +95,14 @@ impl Chain {
         chain
     }
 
+    /// A chain of given blocks, such as a generated one.
+    pub fn from_blocks(blocks: Vec<Block>) -> Self {
+        Self {
+            blocks,
+            ..Self::default()
+        }
+    }
+
     fn push_at(&mut self, height: u32, transactions: Vec<Built>) {
         let previous = self.blocks.last().map(|block| block.hash.clone());
         let slot = u64::from(height) * 20;

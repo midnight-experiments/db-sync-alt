@@ -74,7 +74,7 @@ impl Store {
         snapshot::preflight(&mut file, &description)?;
         self.prepare_load(profile, "restore_failed").await?;
         let verified = self.build(profile, &mut file, &description).await?;
-        self.publish(&description, &verified).await?;
+        self.publish(profile, &description, &verified).await?;
         Ok(verified)
     }
 
@@ -117,6 +117,7 @@ impl Store {
 
     async fn publish(
         &mut self,
+        profile: &Profile,
         description: &Description,
         verified: &Verification,
     ) -> Result<(), Error> {
@@ -155,7 +156,7 @@ impl Store {
             transaction
                 .batch_execute(&format!("DROP TABLE {retired};DROP SCHEMA {RETIRED}"))
                 .await?;
-            load::publish_state(&transaction, &verified.state, &origin).await?;
+            load::publish_state(&transaction, profile, &verified.state, &origin).await?;
             commit_sent.store(true, Ordering::SeqCst);
             transaction.commit().await?;
             return Ok(());

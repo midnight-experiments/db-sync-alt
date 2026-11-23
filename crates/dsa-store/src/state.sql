@@ -50,6 +50,34 @@ CREATE SEQUENCE dsa.multi_asset_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.datum_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.pool_hash_id_seq MINVALUE 1;
 CREATE SEQUENCE dsa.epoch_stake_id_seq MINVALUE 1;
+-- The follower's state, outside the snapshot file and both digests: the
+-- service's state with its last update and last error (one row, written at
+-- publication), the unspent outputs at each profile address, and the first
+-- stored observation of each rare shape with the provider answers that hold it.
+CREATE TABLE dsa.service_state (
+ id smallint PRIMARY KEY CHECK(id=1),
+ state text NOT NULL,
+ reason text NOT NULL,
+ detail jsonb NOT NULL DEFAULT '{}'::jsonb,
+ last_update jsonb,
+ last_error jsonb,
+ updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE dsa.unspent (
+ address text PRIMARY KEY,
+ outputs bigint NOT NULL CHECK(outputs>=0)
+);
+CREATE TABLE dsa.first_observation (
+ shape text PRIMARY KEY,
+ block_height public.word31type NOT NULL,
+ transaction_hash public.hash32type,
+ output_index public.txindex,
+ datum_hash public.hash32type,
+ raw_datum_bytes integer CHECK(raw_datum_bytes>=0),
+ sources text[] NOT NULL,
+ answers bytea[] NOT NULL CHECK(cardinality(answers)=cardinality(sources)),
+ observed_at timestamptz NOT NULL DEFAULT now()
+);
 REVOKE ALL ON ALL TABLES IN SCHEMA dsa FROM PUBLIC;
 CREATE FUNCTION dsa.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path=pg_catalog,dsa AS $$

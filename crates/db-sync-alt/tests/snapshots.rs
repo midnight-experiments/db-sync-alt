@@ -157,6 +157,32 @@ fn markers(f: &Fixture, kept: &Rows, h: u32) -> BTreeSet<i64> {
         .collect()
 }
 
+/// The unspent outputs at each profile address, as a publication records them:
+/// no kept spend names them and they are not recorded as spent before H.
+fn unspent(f: &Fixture, kept: &Rows, markers: &BTreeSet<i64>) -> (Vec<String>, Vec<i64>) {
+    let spent = kept["tx_in"]
+        .iter()
+        .map(|row| (row["tx_out_id"].as_i64(), row["tx_out_index"].as_i64()))
+        .collect::<BTreeSet<_>>();
+    f.profile
+        .addresses
+        .values()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|address| {
+            let outputs = kept["tx_out"]
+                .iter()
+                .filter(|row| {
+                    row["address"].as_str() == Some(address.as_str())
+                        && !spent.contains(&(row["tx_id"].as_i64(), row["index"].as_i64()))
+                        && !markers.contains(&row["id"].as_i64().unwrap())
+                })
+                .count() as i64;
+            (address.clone(), outputs)
+        })
+        .unzip()
+}
+
 async fn position(client: &Client, b: Bounds) -> Result {
     client.execute("UPDATE dsa.position SET horizon_height=$1::integer,horizon_hash=(SELECT hash FROM serve.block WHERE id=$1::bigint),horizon_time=(SELECT time AT TIME ZONE 'UTC' FROM serve.block WHERE id=$1::bigint),target_height=$2::integer,target_hash=(SELECT hash FROM serve.block WHERE id=$2::bigint),target_time=(SELECT time AT TIME ZONE 'UTC' FROM serve.block WHERE id=$2::bigint),tip_height=$3::integer,tip_hash=(SELECT hash FROM serve.block WHERE id=$3::bigint),tip_time=(SELECT time AT TIME ZONE 'UTC' FROM serve.block WHERE id=$3::bigint),serving=true,reason='generated',updated_at=now() WHERE id=1",&[&(b.horizon as i32),&(b.target as i32),&(b.tip as i32)]).await?;
     Ok(())
@@ -167,11 +193,19 @@ async fn populate(db: &Database, f: &Fixture) -> Result<Rows> {
     let client = connect(&db.config).await?;
     let kept = selected(&f.rows(), &keep(&f.chain, &f.profile, f.bounds)?);
     load(&client, &kept).await?;
-    for id in markers(f, &kept, f.bounds.horizon) {
+    let markers = markers(f, &kept, f.bounds.horizon);
+    for id in &markers {
         client
-            .execute("INSERT INTO dsa.consumed_before_horizon VALUES($1)", &[&id])
+            .execute("INSERT INTO dsa.consumed_before_horizon VALUES($1)", &[id])
             .await?;
     }
+    let (addresses, outputs) = unspent(f, &kept, &markers);
+    client
+        .execute(
+            "INSERT INTO dsa.unspent SELECT * FROM unnest($1::text[],$2::bigint[])",
+            &[&addresses, &outputs],
+        )
+        .await?;
     for unit in f
         .profile
         .assets

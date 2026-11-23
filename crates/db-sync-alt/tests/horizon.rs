@@ -80,7 +80,7 @@ impl Scratch {
             .join(",");
         self.client
             .batch_execute(&format!(
-                "TRUNCATE {tables},dsa.consumed_before_horizon,dsa.supply,dsa.first_served"
+                "TRUNCATE {tables},dsa.consumed_before_horizon,dsa.supply,dsa.first_served,dsa.unspent"
             ))
             .await?;
         self.client
@@ -96,11 +96,18 @@ impl Scratch {
                 &[&serde_json::to_value(&kept)?],
             )
             .await?;
-        let markers = markers(f, &kept, horizon).into_iter().collect::<Vec<_>>();
+        let markers = markers(f, &kept, horizon);
         self.client
             .execute(
                 "INSERT INTO dsa.consumed_before_horizon SELECT unnest($1::bigint[])",
-                &[&markers],
+                &[&markers.iter().collect::<Vec<_>>()],
+            )
+            .await?;
+        let (addresses, outputs) = unspent(f, &kept, &markers);
+        self.client
+            .execute(
+                "INSERT INTO dsa.unspent SELECT * FROM unnest($1::text[],$2::bigint[])",
+                &[&addresses, &outputs],
             )
             .await?;
         let target = i64::from(f.bounds.target);
@@ -172,6 +179,32 @@ impl Scratch {
             .await?;
         Ok(())
     }
+}
+
+/// The unspent outputs at each profile address, as a publication records them:
+/// no kept spend names them and they are not recorded as spent before H.
+fn unspent(f: &Fixture, kept: &Rows, markers: &BTreeSet<i64>) -> (Vec<String>, Vec<i64>) {
+    let spent = kept["tx_in"]
+        .iter()
+        .map(|row| (row["tx_out_id"].as_i64(), row["tx_out_index"].as_i64()))
+        .collect::<BTreeSet<_>>();
+    f.profile
+        .addresses
+        .values()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|address| {
+            let outputs = kept["tx_out"]
+                .iter()
+                .filter(|row| {
+                    row["address"].as_str() == Some(address.as_str())
+                        && !spent.contains(&(row["tx_id"].as_i64(), row["index"].as_i64()))
+                        && !markers.contains(&row["id"].as_i64().unwrap())
+                })
+                .count() as i64;
+            (address.clone(), outputs)
+        })
+        .unzip()
 }
 
 /// Kept outputs whose spend lies before `horizon`.

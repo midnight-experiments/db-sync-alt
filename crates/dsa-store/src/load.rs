@@ -22,7 +22,8 @@ pub(crate) fn served_tables_ddl() -> &'static str {
 /// A restore builds new tables in `serve` and keeps the empty ones the public
 /// views read in this schema until it publishes.
 pub(crate) const RETIRED: &str = "dsa_retired";
-const STATE_TABLES: &str = "dsa.supply,dsa.consumed_before_horizon,dsa.first_served,dsa.calls";
+const STATE_TABLES: &str = "dsa.supply,dsa.consumed_before_horizon,dsa.first_served,dsa.calls,\
+    dsa.service_state,dsa.unspent,dsa.first_observation";
 const LOAD_KINDS: [&str; 2] = ["restore_failed", "convert_failed"];
 
 /// What a database holds before a load.
@@ -357,9 +358,11 @@ pub(crate) async fn analyze_and_sequences(transaction: &Transaction<'_>) -> Resu
 }
 
 /// The last step of every load: one first-served time for each height H…T,
-/// the origin, and the open gate.
+/// the origin, the follower's state rows (the service state and the unspent
+/// outputs at each profile address), and the open gate.
 pub(crate) async fn publish_state(
     transaction: &Transaction<'_>,
+    profile: &Profile,
     state: &ServingState,
     origin: &Value,
 ) -> Result<(), Error> {
@@ -367,6 +370,22 @@ pub(crate) async fn publish_state(
         .execute(
             "INSERT INTO dsa.first_served SELECT b.id,n.at FROM serve.block b CROSS JOIN (SELECT clock_timestamp() AS at) n WHERE b.id BETWEEN $1 AND $2",
             &[&i64::from(state.horizon.height), &i64::from(state.target.height)],
+        )
+        .await?;
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO dsa.unspent(address,outputs) {}",
+                crate::follow::UNSPENT_COUNTS
+            ),
+            &[&crate::follow::profile_addresses(profile)],
+        )
+        .await?;
+    transaction
+        .execute(
+            "INSERT INTO dsa.service_state(id,state,reason,updated_at)
+             VALUES(1,'published',coalesce($1::jsonb->>'kind','published'),clock_timestamp())",
+            &[origin],
         )
         .await?;
     transaction
