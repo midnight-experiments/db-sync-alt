@@ -822,6 +822,80 @@ impl Store {
     }
 }
 
+/// The epochs whose stake distribution the window keeps: from `first` (the
+/// horizon's epoch minus two) on; `newest` is the newest one stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StakeWindow {
+    pub first: u32,
+    pub newest: Option<u32>,
+}
+
+impl Store {
+    /// The stored call counts per UTC day from `since` on.
+    pub async fn calls(&self, since: NaiveDate) -> Result<Vec<(NaiveDate, i64)>, Error> {
+        Ok(self
+            .client
+            .query(
+                "SELECT day,requests FROM dsa.calls WHERE day>=$1 ORDER BY day",
+                &[&since],
+            )
+            .await?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Stores call counts outside an update: for each day the larger of the
+    /// stored and the given count stays.
+    pub async fn record_calls(&mut self, calls: &[(NaiveDate, i64)]) -> Result<(), Error> {
+        if calls.iter().any(|(_, count)| *count < 0) {
+            return Err(Error::Refusal("update_calls_negative"));
+        }
+        let (days, requests): (Vec<NaiveDate>, Vec<i64>) = calls.iter().copied().unzip();
+        self.lock_writer().await?;
+        self.client
+            .execute(UPSERT_CALLS, &[&days, &requests])
+            .await?;
+        Ok(())
+    }
+
+    /// Which of `epochs` have stored parameters.
+    pub async fn stored_epoch_params(&self, epochs: &[u32]) -> Result<BTreeSet<u32>, Error> {
+        let wanted = epochs
+            .iter()
+            .map(|epoch| i32::try_from(*epoch).map_err(|_| Error::Refusal("invalid_epoch")))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.client
+            .query(
+                "SELECT epoch_no::bigint FROM serve.epoch_param WHERE epoch_no=ANY($1::integer[])",
+                &[&wanted],
+            )
+            .await?
+            .iter()
+            .map(|row| height_of(row.get(0)))
+            .collect()
+    }
+
+    /// The epochs the window keeps stake for and the newest one stored.
+    pub async fn stake_window(&self) -> Result<StakeWindow, Error> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT (SELECT b.epoch_no::bigint FROM dsa.position p JOIN serve.block b ON b.id=p.horizon_height WHERE p.id=1),
+                 (SELECT max(epoch_no)::bigint FROM serve.epoch_stake)",
+                &[],
+            )
+            .await?;
+        let horizon: i64 = row
+            .get::<_, Option<i64>>(0)
+            .ok_or(Error::Refusal("missing_horizon_epoch"))?;
+        Ok(StakeWindow {
+            first: height_of(horizon.saturating_sub(2).max(0))?,
+            newest: row.get::<_, Option<i64>>(1).map(height_of).transpose()?,
+        })
+    }
+}
+
 fn lock(probe: &std::sync::Mutex<Probe>) -> std::sync::MutexGuard<'_, Probe> {
     probe
         .lock()
