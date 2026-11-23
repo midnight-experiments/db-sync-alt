@@ -1,99 +1,115 @@
-//! All SQL literals are extracted at build time from pinned node 2.1.101 files.
-//! The committed inventory also includes DDL and non-emitted bridge components;
-//! readers execute only complete SELECTs and the assembled enabled bridge query.
-#[allow(dead_code)]
-#[path = "../codegen/catalogue.rs"]
-mod extraction;
-pub use extraction::{Catalogue, Source, Statement};
-pub const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/node-catalogue.json"));
-pub fn catalogue() -> Catalogue {
-    serde_json::from_str(GENERATED).expect("built catalogue")
+//! The SQL of the pinned node, as committed in `catalogue.json` and
+//! `bridge.json`, and the node SQL the catalogue does not hold, listed with
+//! its reason in `sql-outside-catalogue.json`. The test `tests/catalogue.rs`
+//! extracts all three from the vendored node sources and requires the
+//! committed files to equal the extraction.
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, sync::LazyLock};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Source {
+    pub file: String,
+    pub line: usize,
+    pub function: String,
 }
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn committed_catalogue_matches_extraction() {
-        let generated: serde_json::Value = serde_json::from_str(super::GENERATED).unwrap();
-        let committed: serde_json::Value =
-            serde_json::from_str(include_str!("../catalogue.json")).unwrap();
-        assert_eq!(generated, committed);
-        assert_eq!(
-            super::catalogue()
-                .entries
-                .iter()
-                .filter(|e| e.kind == "read")
-                .count(),
-            29
-        );
-    }
-    #[test]
-    fn scanner_skips_comments() {
-        let values = super::extraction::literals(
-            "// \"no\"\n/* \"no\" /* nested */ */ r##\"SELECT \"yes\"\"##",
-        )
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect::<Vec<_>>();
-        assert_eq!(values, vec!["SELECT \"yes\"".to_owned()]);
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Statement {
+    pub id: String,
+    pub name: String,
+    pub sql: String,
+    pub sha256: String,
+    pub kind: String,
+    pub group: String,
+    pub parameters: Vec<String>,
+    pub sources: Vec<Source>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Catalogue {
+    pub node_commit: String,
+    pub files: BTreeMap<String, String>,
+    pub entries: Vec<Statement>,
+    pub candidate_addresses: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Checkpoint {
-    Block(i32),
-    Tx(i32, i32),
-    ReserveTransfer(i32, i32),
+/// The node's bridge statement for enabled inputs, a block checkpoint and no
+/// row limit, assembled from its QueryBuilder template. `{}` marks the block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Bridge {
+    pub source: Source,
+    pub sql: String,
 }
-/// Exact enabled-input QueryBuilder assembly of the node source. Interpolation accepts only typed integers and closed arm names.
-pub fn bridge_sql(checkpoint: Checkpoint, limit: Option<u32>) -> String {
-    use std::collections::BTreeMap;
-    let source = include_str!(
-        "../../../reference/partner-chains/toolkit/data-sources/db-sync/src/db_model.rs"
-    );
-    let body = source.split_once("fn get_bridge_txs(").unwrap().1;
-    let literal = |s: &str| extraction::literals(s).into_iter().next().unwrap().1;
-    let mut substitutions = BTreeMap::new();
-    for name in ["bridge_inputs_subquery", "reserve_inputs_subquery"] {
-        let block = body
-            .split_once(&format!("let {name} = match tx_in_configuration"))
-            .unwrap()
-            .1;
-        substitutions.insert(
-            name,
-            literal(block.split_once("TxInConfiguration::Enabled =>").unwrap().1),
-        );
-    }
-    for name in ["bridge_outputs_subquery", "reserve_outputs_subquery"] {
-        substitutions.insert(
-            name,
-            literal(body.split_once(&format!("let {name} =")).unwrap().1),
-        );
-    }
-    let (arm, values) = match checkpoint {
-        Checkpoint::Block(n) => ("ResolvedBridgeDataCheckpoint::Block", vec![n]),
-        Checkpoint::Tx(n, i) => ("ResolvedBridgeDataCheckpoint::Tx {", vec![n, i]),
-        Checkpoint::ReserveTransfer(n, i) => (
-            "ResolvedBridgeDataCheckpoint::TxReserveTransfer",
-            vec![n, i],
-        ),
-    };
-    let mut predicate = literal(body.split_once(arm).unwrap().1);
-    for n in values {
-        predicate = predicate.replacen("{}", &n.to_string(), 1);
-    }
-    substitutions.insert("checkpoint_limit", predicate);
-    substitutions.insert(
-        "max_rows",
-        limit.map_or_else(|| "null".to_owned(), |n| n.to_string()),
-    );
-    let mut sql = literal(
-        body.split_once("let mut query_builder = QueryBuilder::new")
-            .unwrap()
-            .1,
-    );
-    for (name, value) in substitutions {
-        sql = sql.replace(&format!("{{{name}}}"), &value);
-    }
-    assert!(!sql.contains(['{', '}']));
-    sql
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Class {
+    /// A vendored template assembled into a compared statement.
+    Assembled,
+    /// Issued on the node's db-sync connection by a subcommand that a pruned
+    /// database answers incompletely.
+    Unsupported,
+    /// Issued against a database that is not cardano-db-sync.
+    OtherDatabase,
+}
+
+/// One SQL literal of the node sources that the catalogue does not hold.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Outside {
+    pub file: String,
+    pub line: usize,
+    pub sha256: String,
+    pub class: Class,
+    pub subcommands: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutsideCatalogue {
+    pub node_commit: String,
+    pub statements: Vec<Outside>,
+}
+
+/// The committed catalogue text. Source captures record its SHA-256.
+pub const TEXT: &str = include_str!("../catalogue.json");
+pub const BRIDGE_TEXT: &str = include_str!("../bridge.json");
+pub const OUTSIDE_TEXT: &str = include_str!("../sql-outside-catalogue.json");
+
+static CATALOGUE: LazyLock<Catalogue> =
+    LazyLock::new(|| serde_json::from_str(TEXT).expect("committed catalogue"));
+static BRIDGE: LazyLock<Bridge> =
+    LazyLock::new(|| serde_json::from_str(BRIDGE_TEXT).expect("committed bridge statement"));
+static OUTSIDE: LazyLock<OutsideCatalogue> =
+    LazyLock::new(|| serde_json::from_str(OUTSIDE_TEXT).expect("committed outside list"));
+
+pub fn catalogue() -> &'static Catalogue {
+    &CATALOGUE
+}
+
+pub fn sha256() -> String {
+    format!("{:x}", Sha256::digest(TEXT))
+}
+
+pub fn bridge() -> &'static Bridge {
+    &BRIDGE
+}
+
+/// The bridge statement with its checkpoint block; the integer is the only
+/// value inserted into the text, as in the node.
+pub fn bridge_sql(block: i32) -> String {
+    BRIDGE.sql.replacen("{}", &block.to_string(), 1)
+}
+
+pub fn outside() -> &'static OutsideCatalogue {
+    &OUTSIDE
+}
+
+/// The node statements a pruned database answers incompletely, with the node
+/// subcommands that issue them.
+pub fn unsupported() -> impl Iterator<Item = &'static Outside> {
+    OUTSIDE
+        .statements
+        .iter()
+        .filter(|statement| statement.class == Class::Unsupported)
 }

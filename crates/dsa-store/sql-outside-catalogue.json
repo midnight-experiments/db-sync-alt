@@ -1,0 +1,166 @@
+{
+  "node_commit": "86774edf8cc76345a5c3a4221f3fe80c094b1c33",
+  "statements": [
+    {
+      "file": "partner-chains/toolkit/data-sources/db-sync/src/db_model.rs",
+      "line": 854,
+      "sha256": "f83454995e749821abca18d588040c72982dd69b7a8438598dda52ec7cb4856c",
+      "class": "assembled",
+      "subcommands": [],
+      "reason": "The QueryBuilder template of get_bridge_txs. Its enabled-input form with a block checkpoint is assembled from this template and the catalogued components into bridge.json, and compared."
+    },
+    {
+      "file": "node/src/command.rs",
+      "line": 1154,
+      "sha256": "aa03a10525c70b8f9783cbdf63886cddcd262fc7e4912b9df167f6d005db1edd",
+      "class": "unsupported",
+      "subcommands": [
+        "verify-cardano-tip-finalized"
+      ],
+      "reason": "The newest stored header. The subcommand also reads the header of an arbitrary Cardano block by its hash, which a pruned database does not hold below the horizon."
+    },
+    {
+      "file": "node/src/genesis/creation/ics_genesis.rs",
+      "line": 62,
+      "sha256": "580ca78c4698cb0c06ae7ea811ddbf6bba8f59e40acddbff50b1dc293a3afb9a",
+      "class": "unsupported",
+      "subcommands": [
+        "generate-ics-genesis"
+      ],
+      "reason": "The header of the reference block by its hash. A pruned database holds no header below the horizon."
+    },
+    {
+      "file": "node/src/genesis/creation/ics_genesis.rs",
+      "line": 93,
+      "sha256": "5cc44f140f6f95b681e41801c3cadd20c3765152c40c9b778cf5f041b75b8764",
+      "class": "unsupported",
+      "subcommands": [
+        "generate-ics-genesis"
+      ],
+      "reason": "The unspent outputs at the ICS address at the reference block. Outputs created and spent before the horizon are not stored, so the set is incomplete without an error."
+    },
+    {
+      "file": "node/src/genesis/creation/reserve_genesis.rs",
+      "line": 58,
+      "sha256": "580ca78c4698cb0c06ae7ea811ddbf6bba8f59e40acddbff50b1dc293a3afb9a",
+      "class": "unsupported",
+      "subcommands": [
+        "generate-reserve-genesis",
+        "generate-genesis-config"
+      ],
+      "reason": "The header of the reference block by its hash. A pruned database holds no header below the horizon."
+    },
+    {
+      "file": "node/src/genesis/creation/reserve_genesis.rs",
+      "line": 83,
+      "sha256": "5cc44f140f6f95b681e41801c3cadd20c3765152c40c9b778cf5f041b75b8764",
+      "class": "unsupported",
+      "subcommands": [
+        "generate-reserve-genesis",
+        "generate-genesis-config"
+      ],
+      "reason": "The unspent outputs at the reserve address at the reference block. Outputs created and spent before the horizon are not stored, so the set is incomplete without an error."
+    },
+    {
+      "file": "node/src/genesis/verification/verify_auth_script_common.rs",
+      "line": 126,
+      "sha256": "c160d2dc16f302e6bcd86aa0dc6348c5842a0eab7b98cb74d9dd8c3e6d496cd6",
+      "class": "unsupported",
+      "subcommands": [
+        "verify-auth-script",
+        "verify-federated-authority-auth-script",
+        "verify-ics-auth-script",
+        "verify-permissioned-candidates-auth-script",
+        "verify-reserve-auth-script"
+      ],
+      "reason": "The governance output and its datum at a reference block. An output spent before the horizon is not stored."
+    },
+    {
+      "file": "node/src/genesis/verification/verify_auth_script_common.rs",
+      "line": 203,
+      "sha256": "a28fab3c9f04711c1621ef4b5d316c655bd075910e4bffe1a365bb71e650df9b",
+      "class": "unsupported",
+      "subcommands": [
+        "verify-cardano-tip-finalized",
+        "verify-auth-script",
+        "verify-federated-authority-auth-script",
+        "verify-ics-auth-script",
+        "verify-permissioned-candidates-auth-script",
+        "verify-reserve-auth-script"
+      ],
+      "reason": "The block number of a Cardano block by its hash. A pruned database holds no header below the horizon."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 62,
+      "sha256": "aff67eb8c8f252a34828f6ae46747dbd2ad3f497a88416269e1286375717badb",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 68,
+      "sha256": "50d06e4139b606aa5998b6fcebaff6effb664dfe531be7bab7ad70f378989630",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 82,
+      "sha256": "f0600a36001f81f60acbf4beb2628b19072c3fc36bf432ceaba0d6a9d0445235",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 113,
+      "sha256": "a6a6c0023eae22c5ca085d9bb4b5f0007e73cd7e98fe48a875ac27ba7ec25ceb",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 145,
+      "sha256": "e73243da569c0486287159b28228d3c97bfd3b79a43e4efca424459a8c2725fc",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 170,
+      "sha256": "3fb5aae6a9c02e97f5fba4d12186d91772bda3cdfca6125e985711066616940e",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 204,
+      "sha256": "2041e76bf19c834b518f7266241ab22718b013753570b48c3bd34d6e04b34c91",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 224,
+      "sha256": "4660cf343b2743fcc3826f676fe492f672724cee8bf63cab4534d587b59de1e3",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    },
+    {
+      "file": "util/toolkit/src/fetcher/fetch_storage/postgres_backend.rs",
+      "line": 242,
+      "sha256": "b86451d7e8af4c1bdfe9d6072dea016af3d676903e7858b6a9ea836391ec2b70",
+      "class": "other_database",
+      "subcommands": [],
+      "reason": "The toolkit's own block-data cache database, not the cardano-db-sync connection."
+    }
+  ]
+}

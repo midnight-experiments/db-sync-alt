@@ -159,7 +159,7 @@ pub fn read(path: &Path, profile: &Profile) -> Result<Capture, Error> {
         return Err(Error::Refusal("comparison_capture_context_mismatch"));
     }
     if capture.node_commit != catalogue::catalogue().node_commit
-        || capture.catalogue_sha256 != format!("{:x}", Sha256::digest(catalogue::GENERATED))
+        || capture.catalogue_sha256 != catalogue::sha256()
     {
         return Err(Error::Refusal("comparison_capture_catalogue_mismatch"));
     }

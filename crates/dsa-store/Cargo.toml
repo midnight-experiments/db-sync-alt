@@ -27,8 +27,3 @@ bytes = "1"
 futures-util = "0.3"
 tempfile = "3"
 zstd = "0.13"
-
-[build-dependencies]
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true

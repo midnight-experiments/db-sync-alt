@@ -15,7 +15,7 @@
 //! duplicate-preserving multisets. No tie exemption changes an ordered result.
 use crate::{
     Error, NODE_RELATIONS, Store,
-    catalogue::{self, Checkpoint, Statement},
+    catalogue::{self, Statement},
 };
 use chrono::NaiveDateTime;
 use dsa_chain::profiles::{AssetRole, Profile};
@@ -1508,7 +1508,7 @@ pub async fn capture(
             candidate_address: effective.candidate_address.clone(),
             transaction_hit_available: false,
             node_commit: cat.node_commit.clone(),
-            catalogue_sha256: hash(catalogue::GENERATED),
+            catalogue_sha256: catalogue::sha256(),
             profile_hash: profile.hash()?,
             network: profile.network.clone(),
             positions: positions.clone(),
@@ -1940,7 +1940,7 @@ pub async fn capture(
             .collect::<BTreeMap<_, _>>();
         for (unit, role) in bridge_units {
             let a = profile.assets.get(role);
-            let sql = catalogue::bridge_sql(Checkpoint::Block(pair.cursor.block as i32 - 1), None);
+            let sql = catalogue::bridge_sql(pair.cursor.block as i32 - 1);
             let statement = Statement {
                 id: "get_bridge_txs:enabled".to_owned(),
                 name: "get_bridge_txs".to_owned(),
@@ -2034,9 +2034,7 @@ fn candidate_input(capture: &Capture, case: &Case) -> Option<CandidateInput> {
         return None;
     }
     let cat = catalogue::catalogue();
-    if capture.node_commit != cat.node_commit
-        || capture.catalogue_sha256 != hash(catalogue::GENERATED)
-    {
+    if capture.node_commit != cat.node_commit || capture.catalogue_sha256 != catalogue::sha256() {
         return None;
     }
     if !cat
@@ -2113,9 +2111,9 @@ pub fn compare(a: &Capture, b: &Capture) -> Result<Report, Error> {
     }
     let helpers = catalogue::catalogue()
         .entries
-        .into_iter()
+        .iter()
         .filter(|e| e.name == "get_low_bounds" || e.name == "get_high_bounds")
-        .map(|e| e.id)
+        .map(|e| e.id.clone())
         .collect::<BTreeSet<_>>();
     let mut differences = Vec::new();
     let mut unsupported_observations = Vec::new();
@@ -2268,7 +2266,7 @@ mod tests {
             candidate_address: input.address.clone(),
             transaction_hit_available: false,
             node_commit: cat.node_commit.clone(),
-            catalogue_sha256: hash(catalogue::GENERATED),
+            catalogue_sha256: catalogue::sha256(),
             profile_hash: "fixture".to_owned(),
             network: "mainnet".to_owned(),
             positions: Positions {

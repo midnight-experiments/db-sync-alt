@@ -1,9 +1,22 @@
 # Compare the node's database answers
 
 `db-sync-alt compare --network mainnet --a '<reader DSN>' --b '<reader DSN>' --positions auto --horizon-block H`
-compares the complete pinned Midnight 2.1.101 SELECT catalogue. Both connections
-must have the exact public reader grant. The command executes no index creation,
-DDL or source writes. Missing startup indexes fail the comparison.
+compares the SELECT catalogue of the pinned Midnight 2.1.101 node sources. Both
+connections must have the exact public reader grant. The command executes no
+index creation, DDL or source writes. Missing startup indexes fail the comparison.
+
+The catalogue (`crates/dsa-store/catalogue.json`) and the assembled bridge
+statement (`crates/dsa-store/bridge.json`) are extracted from the vendored node
+files under `reference/`; a test requires both files to equal a fresh extraction.
+Every SQL-looking string literal of a vendored file is either catalogued or
+listed in `crates/dsa-store/sql-outside-catalogue.json` with its reason, and the
+reference check of the CI workflow requires the same of every other node source
+file. That list names the seven statements of the node's genesis subcommands
+(`generate-ics-genesis`, `generate-reserve-genesis`, `generate-genesis-config`,
+`verify-cardano-tip-finalized` and the five `verify-*-auth-script` commands).
+They read headers and unspent outputs at an arbitrary reference block, which a
+pruned database answers incompletely without an error, so these subcommands are
+unsupported; `db-sync-alt status` prints them under `unsupported_node_statements`.
 
 TLS verifies the server identity by default. Use `--a-tls-root-cert` and
 `--b-tls-root-cert` for custom roots and `--a-password-file` and

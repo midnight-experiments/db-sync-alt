@@ -507,6 +507,13 @@ async fn status_prints_identity_position_and_capabilities_without_writing() -> R
         first["capabilities"],
         serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?
     );
+    let unsupported = first["unsupported_node_statements"].as_array().unwrap();
+    assert_eq!(unsupported.len(), 7);
+    assert!(
+        unsupported.iter().all(
+            |s| s["class"] == "unsupported" && !s["subcommands"].as_array().unwrap().is_empty()
+        )
+    );
     assert_eq!(
         store.status(&profile).await?,
         before,

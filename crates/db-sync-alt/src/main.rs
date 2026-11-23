@@ -365,6 +365,8 @@ async fn database_command(
             let mut value = store.status(profile).await?;
             value["capabilities"] =
                 serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?;
+            value["unsupported_node_statements"] =
+                serde_json::to_value(dsa_store::catalogue::unsupported().collect::<Vec<_>>())?;
             Ok(value)
         }
         Command::Verify { .. } => Ok(serde_json::to_value(store.verify(profile).await?)?),
