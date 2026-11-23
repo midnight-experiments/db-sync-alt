@@ -20,7 +20,11 @@ use dsa_store::{
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::follow::ProviderTip;
+use crate::follow::{ProviderTip, StakeMissing};
+
+/// `/status` warns while the target's epoch has had no stored stake for this
+/// long at the tip (seconds).
+pub const STAKE_MISSING_WARNING_SECONDS: u64 = 600;
 
 /// `/health` fails when the provider's head block is older than this
 /// (seconds): Cardano makes a block every 20 seconds on average.
@@ -100,6 +104,8 @@ pub struct FollowerView {
     pub last_refusal: Option<Refusal>,
     pub blocks_remaining: Option<u64>,
     pub blocks_per_hour: Option<f64>,
+    pub stake_failure: Option<Value>,
+    pub stake_missing: Option<StakeMissing>,
 }
 
 impl From<&crate::follow::Progress> for FollowerView {
@@ -114,6 +120,8 @@ impl From<&crate::follow::Progress> for FollowerView {
             last_refusal: progress.last_refusal.clone(),
             blocks_remaining: progress.blocks_remaining,
             blocks_per_hour: progress.blocks_per_hour,
+            stake_failure: progress.stake_failure.clone(),
+            stake_missing: progress.stake_missing,
         }
     }
 }
@@ -208,11 +216,13 @@ pub struct Provider {
     pub last_refusal: Option<Refusal>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Epochs {
     pub current_epoch: Option<u32>,
     pub newest_parameters_epoch: Option<u32>,
     pub newest_stake_epoch: Option<u32>,
+    /// The last failed stake read, until its epoch's stake is stored.
+    pub stake_failure: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -539,6 +549,11 @@ pub fn compose(
     if database.is_some_and(|view| !view.tls_available) {
         warnings.push("database_tls_unavailable".to_owned());
     }
+    if let Some(missing) = follower.and_then(|follower| follower.stake_missing)
+        && now.saturating_sub(missing.since) > STAKE_MISSING_WARNING_SECONDS
+    {
+        warnings.push(format!("stake_missing:{}", missing.epoch));
+    }
     let mut status = Status {
         service_version: dsa_chain::VERSION,
         network: settings.network.clone(),
@@ -592,6 +607,7 @@ pub fn compose(
             current_epoch: database.and_then(|view| view.current_epoch),
             newest_parameters_epoch: database.and_then(|view| view.newest_parameters_epoch),
             newest_stake_epoch: database.and_then(|view| view.newest_stake_epoch),
+            stake_failure: follower.and_then(|follower| follower.stake_failure.clone()),
         },
         integrity: Integrity {
             unspent_outputs: supply_check

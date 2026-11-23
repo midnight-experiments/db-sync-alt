@@ -986,6 +986,100 @@ async fn epoch_parameters_come_first_and_stake_never_delays_an_update() -> Resul
     start.cleanup().await
 }
 
+/// An ended epoch whose stake cannot sum to its active stake is retried at
+/// growing waits for that epoch (1, 2, 4, 8, 16, 30, 60, 300, then 600
+/// seconds), while the next epoch's stake is read and stored; the last
+/// failure names the epoch and both numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
+    let start = Start::new(37, 100, 15).await?;
+    let g = start.g.known_from_start();
+    let end = 100;
+    let boundaries = (start.target + 1..=end - K)
+        .filter(|height| g.block(*height).unwrap().epoch != g.block(height - 1).unwrap().epoch)
+        .collect::<Vec<_>>();
+    assert!(boundaries.len() >= 2, "{boundaries:?}");
+    let refused = g.block(boundaries[0]).unwrap().epoch;
+    let next = g.block(boundaries[1]).unwrap().epoch;
+    let fake = Fake::start(&g, &start.profile).await;
+    fake.chain
+        .lock()
+        .unwrap()
+        .pools
+        .reported_total
+        .insert(refused, 1);
+    fake.serve(served(&g, end));
+    let (stopper, stop) = Stop::new();
+    let (progress, mut view) = watch::channel(Progress::default());
+    let run = follow::follow(context(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        Settings::default(),
+        stop,
+        progress,
+    ));
+    let stored = |config: tokio_postgres::Config| async move {
+        let epochs: Vec<i32> = common::connect(&config)
+            .await?
+            .query("SELECT DISTINCT epoch_no FROM serve.epoch_stake", &[])
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        Result::<Vec<i32>>::Ok(epochs)
+    };
+    let drive = async {
+        // Every failure of the refused epoch as published: its count and the
+        // wait before the next attempt.
+        let mut waits = BTreeMap::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        while waits.keys().next_back().is_none_or(|last| *last < 10) {
+            let failure = view.borrow().stake_failure.clone();
+            if let Some(failure) = failure.filter(|failure| failure["epoch"] == refused) {
+                assert_eq!(failure["error"]["error"], "provider_epoch_total_mismatch");
+                assert_eq!(failure["error"]["active_stake"], "1");
+                assert!(
+                    failure["error"]["sum"]
+                        .as_str()
+                        .is_some_and(|sum| sum != "1")
+                );
+                let count = failure["failures"].as_u64().unwrap();
+                let wait = failure["retry_at"].as_u64().unwrap() - failure["at"].as_u64().unwrap();
+                waits.insert(count, wait);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ten failures never published: {waits:?}"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(200), view.changed()).await;
+        }
+        let epochs = stored(start.database.config.clone()).await;
+        let _ = stopper.send(true);
+        (waits, epochs)
+    };
+    let (report, (waits, epochs)) = tokio::join!(run, drive);
+    report.map_err(|error| error.report().to_string())?;
+    let epochs = epochs?;
+    let schedule = [1, 2, 4, 8, 16, 30, 60, 300, 600];
+    for (count, wait) in &waits {
+        let expected = schedule[(*count as usize - 1).min(schedule.len() - 1)];
+        assert_eq!(*wait, expected, "failure {count}: {waits:?}");
+    }
+    assert!(
+        epochs.contains(&(next as i32)),
+        "the next epoch's stake: {epochs:?}"
+    );
+    assert!(!epochs.contains(&(refused as i32)), "{epochs:?}");
+    println!(
+        "{}",
+        json!({"event":"refused_stake_epoch","refused":refused,"next":next,"waits":waits,
+            "summary_requests":fake.requests(&format!("/epochs/{refused}"))})
+    );
+    start.cleanup().await
+}
+
 /// At the tip each poll costs one request, a poll that finds nothing new
 /// reads the provider's head at most once a minute, and each block with
 /// transactions costs one page request. DSA_FOLLOW_TIP_BLOCKS sets the number

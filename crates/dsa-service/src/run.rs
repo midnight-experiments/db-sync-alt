@@ -178,6 +178,8 @@ fn phase(provider: &Provider, state: State, reason: &str, wait_until: Option<u64
         last_refusal: status.last_refusal,
         blocks_remaining: None,
         blocks_per_hour: None,
+        stake_failure: None,
+        stake_missing: None,
     }
 }
 

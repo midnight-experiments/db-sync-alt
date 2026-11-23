@@ -167,6 +167,25 @@ Codes starting with `cbor_` name what the decoder refused in a transaction's
 bytes. If one stays, report it with the block height from `last_error.detail`:
 content the ledger accepts must never stop the follower.
 
+## Stake distributions
+
+A stake read that fails is logged as `stake_read_failed` and shown in
+`epochs.stake_failure` of `/status`; it never stops following. The epoch is
+tried again at growing waits, and newer epochs are read meanwhile
+([provider](provider.md#stake-distributions)).
+
+| Code | Cause | What to do |
+| --- | --- | --- |
+| `provider_epoch_total_mismatch` | The pools' stake does not sum to the epoch's active stake; `active_stake` and `sum` are in the error. | Nothing while it is short; if it stays for one epoch, report it with both numbers. |
+| `provider_duplicate_pool` | A pool appears twice in one list; `pool` and `list` name them. | As above. |
+| `provider_invalid_pool_id` | A pool ID is not the form of a pool hash; `pool` names it. | As above. |
+| `provider_invalid_stake_row` | An answer about one pool fails a check: `retired_pool_unknown` (the provider does not know a pool it lists as retired) or `stake_address_of_another_network`; `pool` and `check` name them. | As above. |
+| `provider_epoch_not_ready` | The provider has no active stake for the epoch yet. | Nothing. |
+| `provider_epoch_changed` | The latest block's epoch moved during the read. | Nothing; read again. |
+| `provider_empty_epoch` | The epoch's active stake is zero. | Report it. |
+| `provider_epoch_size_limit` | A list holds more pools than one distribution may. | Report it. |
+| `provider_page_limit` | A list has more pages than the client reads. | Report it. |
+
 ## Checks that close the gate
 
 | Code | Cause | What to do |

@@ -32,7 +32,8 @@
   "epochs": {
     "current_epoch": 667,
     "newest_parameters_epoch": 667,
-    "newest_stake_epoch": 666
+    "newest_stake_epoch": 666,
+    "stake_failure": null
   },
   "error_code": "quota_exhausted",
   "first_observations": {

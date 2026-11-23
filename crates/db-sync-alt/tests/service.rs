@@ -206,6 +206,8 @@ fn at_tip(view: &dsa_store::service_view::DatabaseView, now: u64) -> FollowerVie
         last_refusal: None,
         blocks_remaining: Some(0),
         blocks_per_hour: None,
+        stake_failure: None,
+        stake_missing: None,
     }
 }
 

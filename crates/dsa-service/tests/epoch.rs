@@ -11,9 +11,10 @@ use dsa_service::{
     follow::Requests,
 };
 use dsa_testkit::{
-    chain::{Block, Chain, Pools},
-    server::{KEY, Server},
+    chain::{Block, Chain, Pools, pool_id},
+    server::{Behavior, KEY, Server},
 };
+use serde_json::json;
 
 fn pool(name: &str) -> String {
     dsa_testkit::tx::hash(name.as_bytes())[..56].to_owned()
@@ -147,4 +148,78 @@ async fn both_stake_methods_agree_and_a_wrong_total_is_refused() {
     );
     let counted = requests.get();
     assert!(counted["pools"] > 0 && counted["epochs"] > 0 && counted["headers"] > 0);
+}
+
+/// In an ended epoch a history row with stake and a delegator count of zero
+/// is taken, a row with zero stake and zero delegators is skipped, and one
+/// with zero stake and a delegator is taken; the sum then matches.
+#[tokio::test]
+async fn history_rows_are_taken_by_their_stake_and_delegators() {
+    let mut pools = scripted();
+    let (a, e, f) = (pool("a"), pool("e"), pool("f"));
+    pools.registered.extend([e.clone(), f.clone()]);
+    let ended = pools.stake.get_mut(&9).unwrap();
+    ended.insert(e.clone(), 0);
+    ended.insert(f.clone(), 0);
+    pools
+        .delegators
+        .insert(9, BTreeMap::from([(a.clone(), 0), (e, 0)]));
+    let fake = Fake::start(pools, 10).await;
+    let provider = fake.provider();
+    let requests = Requests::default();
+    let read = epoch::read_stake(&provider, &requests, 9, "preprod")
+        .await
+        .unwrap();
+    assert_eq!((read.method, read.active_stake), (Method::History, 6_000));
+    assert_eq!(
+        read.pools,
+        BTreeMap::from([(a, 1_000), (pool("b"), 2_000), (pool("c"), 3_000), (f, 0),])
+    );
+}
+
+/// Each stake refusal names its cause: a pool listed twice names the pool
+/// and the list, a retired pool the provider does not know names the pool and
+/// the check, and a sum that does not match names both numbers.
+#[tokio::test]
+async fn every_stake_refusal_names_its_cause() {
+    let requests = Requests::default();
+    let fake = Fake::start(scripted(), 10).await;
+    let a = pool_id(&pool("a"));
+    fake.chain
+        .lock()
+        .unwrap()
+        .route("/pools", json!([a.clone(), a.clone()]));
+    let error = epoch::read_stake(&fake.provider(), &requests, 9, "preprod")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.report(),
+        json!({"error": "provider_duplicate_pool", "pool": a, "list": "pools"})
+    );
+    let fake = Fake::start(scripted(), 10).await;
+    let b = pool_id(&pool("b"));
+    fake.chain
+        .lock()
+        .unwrap()
+        .fault(&format!("/pools/{b}"), Behavior::status(404), 1);
+    let error = epoch::read_stake(&fake.provider(), &requests, 10, "preprod")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.report(),
+        json!({"error": "provider_invalid_stake_row", "pool": b, "check": "retired_pool_unknown"})
+    );
+    fake.chain
+        .lock()
+        .unwrap()
+        .pools
+        .reported_total
+        .insert(10, 9_999);
+    let error = epoch::read_stake(&fake.provider(), &requests, 10, "preprod")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.report(),
+        json!({"error": "provider_epoch_total_mismatch", "active_stake": "9999", "sum": "6300"})
+    );
 }

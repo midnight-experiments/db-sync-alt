@@ -24,7 +24,33 @@ a request.
 | `/scripts/datum/{hash}/cbor` | A datum the node reads whose bytes are not in the transaction. Rare. |
 | `/txs/{hash}/metadata` | A valid transaction with an output at the ICS address: the bridge metadata. Rare. |
 | `/txs/{hash}/utxos` | An output the decoder cannot classify; it is never taken as not relevant. Rare. |
-| `/epochs/{n}`, `/pools/extended`, `/pools`, `/pools/retired`, `/pools/{id}`, `/pools/{id}/history`, `/epochs/{n}/stakes/{pool}` | The stake distribution of each new epoch, read in the background while the service is at the tip, and accepted only when its sum equals the epoch's active stake. It never delays an update. |
+| `/epochs/{n}`, `/pools/extended`, `/pools`, `/pools/retired`, `/pools/{id}`, `/pools/{id}/history`, `/epochs/{n}/stakes/{pool}` | The stake distribution of each epoch without one, read in the background while the service is at the tip ([stake distributions](#stake-distributions)). It never delays an update. |
+
+## Stake distributions
+
+The node selects its committee from the stake distribution of each epoch. The
+service reads it in the background, one epoch at a time: the oldest epoch of
+the window without a stored distribution whose own retry time has passed. The
+epoch of the provider's latest block is read from `/pools/extended`, the pools
+retired in the last two epochs and, for a pool with zero stake, the epoch's
+listing of that pool. An ended epoch is read from the history of every
+registered pool and of the pools retired in the two epochs before it: a
+history row of the epoch with stake above zero counts whatever its delegator
+count; a row with zero stake counts only when it names a delegator (the pool
+then holds stake of amount zero) and is skipped otherwise. A distribution is
+stored only when its sum equals the epoch's active stake from `/epochs/{n}`
+and the latest block's epoch did not move during the read.
+
+A read that fails is tried again for that epoch only: after a transport
+failure in 1, 2, 4, 8 and 16 seconds and then every 30 seconds; after a
+refusal of the answers (a sum that does not match, a pool listed twice, an
+invalid row) in 1, 2, 4, 8, 16, 30, 60 and 300 seconds and then every 600
+seconds. Meanwhile the newer epochs are read, so one epoch that cannot be read
+does not hold back the others. `/status` shows the last failure in
+`epochs.stake_failure`, with the epoch, the number of failures, the time of
+the next attempt and the error with its cause ([troubleshooting](troubleshooting.md#stake-distributions)),
+and the warning `stake_missing:<epoch>` while the target's epoch has had no
+stored distribution for more than 10 minutes at the tip.
 
 ## Pace and requests in flight
 

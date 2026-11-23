@@ -97,6 +97,9 @@ pub struct Pools {
     pub reported_total: BTreeMap<u32, u64>,
     /// The prefix of the stake addresses in `/epochs/{n}/stakes/{pool}`.
     pub stake_prefix: String,
+    /// Epoch -> pool -> the delegator count of its history row, 1 unless
+    /// named here.
+    pub delegators: BTreeMap<u32, BTreeMap<String, u64>>,
 }
 
 /// The Bech32 pool ID of a 28-byte pool hash in hexadecimal.
@@ -340,9 +343,15 @@ impl Chain {
                         .iter()
                         .rev()
                         .filter_map(|(epoch, stake)| {
+                            let delegators = pools
+                                .delegators
+                                .get(epoch)
+                                .and_then(|counts| counts.get(&pool))
+                                .copied()
+                                .unwrap_or(1);
                             stake.get(&pool).map(|amount| {
                                 json!({"epoch": epoch, "blocks": 0, "active_stake": amount.to_string(),
-                                    "active_size": 0.0, "delegators_count": 1, "rewards": "0", "fees": "0"})
+                                    "active_size": 0.0, "delegators_count": delegators, "rewards": "0", "fees": "0"})
                             })
                         })
                         .collect(),

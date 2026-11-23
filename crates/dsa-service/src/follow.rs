@@ -147,6 +147,14 @@ pub struct ProviderTip {
     pub observed_at: u64,
 }
 
+/// The target's epoch without a stored stake distribution while the
+/// follower is at the tip, and since when (Unix seconds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct StakeMissing {
+    pub epoch: u32,
+    pub since: u64,
+}
+
 /// What only the running loop knows, published after every step.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
@@ -168,6 +176,10 @@ pub struct Progress {
     pub last_error: Option<Value>,
     /// The stored target as the loop knows it.
     pub target: Option<u32>,
+    /// The last failed stake read: its epoch, when it failed, when it is
+    /// tried again, its failures in a row and the error with its cause.
+    pub stake_failure: Option<Value>,
+    pub stake_missing: Option<StakeMissing>,
 }
 
 /// Where a run left the database.
@@ -443,12 +455,29 @@ enum Outcome {
     },
 }
 
-/// The background stake read: one epoch at a time, oldest first.
+/// The waits after a stake read the provider's answers made fail, for one
+/// epoch, in seconds; the last repeats. A transport failure waits by
+/// [`crate::retry::BACKOFF`].
+pub const STAKE_REFUSED_BACKOFF: [u64; 9] = [1, 2, 4, 8, 16, 30, 60, 300, 600];
+
+/// The next attempt at one epoch's stake.
+#[derive(Clone, Copy, Debug, Default)]
+struct StakeRetry {
+    failures: usize,
+    at: u64,
+}
+
+/// The background stake read: one epoch at a time, the oldest without stake
+/// whose own retry time has passed, so that an epoch that cannot be read
+/// does not hold back newer ones.
 #[derive(Default)]
 struct Stake {
     task: Option<(u32, JoinHandle<Result<Distribution, StakeError>>)>,
-    retry_at: u64,
-    failures: Backoff,
+    /// Epochs whose read failed.
+    retries: BTreeMap<u32, StakeRetry>,
+    /// A failed read of the stored stake epochs waits until then.
+    window_retry_at: u64,
+    window_failures: Backoff,
 }
 
 enum StakeStatus {
@@ -1378,68 +1407,112 @@ impl<'a> Follower<'a> {
         result: Result<Result<Distribution, StakeError>, tokio::task::JoinError>,
     ) {
         let now = self.now();
-        let failure = match result {
+        let (failure, refusal) = match result {
             Ok(Ok(distribution)) => {
                 let Some(store) = self.store.as_mut() else {
                     // Read again once the connection is back.
-                    self.stake.retry_at = now;
+                    self.stake.retries.entry(epoch).or_default().at = now;
                     return;
                 };
                 match store.put_epoch_stake(epoch, &distribution.rows()).await {
                     Ok(_) | Err(dsa_store::Error::Refusal("stake_epoch_below_window")) => {
-                        self.stake.failures.reset();
+                        self.stake.retries.remove(&epoch);
                         eprintln!(
                             "{}",
                             json!({"event":"stake_stored","epoch":epoch,"method":distribution.method,
                                 "pools":distribution.pools.len(),"active_stake":distribution.active_stake.to_string()})
                         );
+                        self.progress.send_modify(|progress| {
+                            if progress
+                                .stake_failure
+                                .as_ref()
+                                .is_some_and(|failure| failure["epoch"] == epoch)
+                            {
+                                progress.stake_failure = None;
+                            }
+                        });
                         return;
                     }
                     Err(error) => {
                         if error.temporary() {
                             self.store = None;
                         }
-                        error.report()
+                        (error.report(), false)
                     }
                 }
             }
-            Ok(Err(error)) => error.report(),
-            Err(_) => json!({"error":"stake_task_failed"}),
+            Ok(Err(error)) => (error.report(), error.refusal()),
+            Err(_) => (json!({"error":"stake_task_failed"}), false),
         };
-        let wait = self.stake.failures.failed(now).as_secs();
-        self.stake.retry_at = now + wait;
+        let retry = self.stake.retries.entry(epoch).or_default();
+        let wait = if refusal {
+            STAKE_REFUSED_BACKOFF[retry.failures.min(STAKE_REFUSED_BACKOFF.len() - 1)]
+        } else {
+            crate::retry::BACKOFF[retry.failures.min(crate::retry::BACKOFF.len() - 1)]
+        };
+        retry.failures += 1;
+        retry.at = now + wait;
+        let report = json!({"epoch":epoch,"at":now,"retry_at":retry.at,"failures":retry.failures,
+            "error":failure});
         eprintln!(
             "{}",
-            json!({"event":"stake_read_failed","epoch":epoch,"error":failure,"retry_at":self.stake.retry_at})
+            json!({"event":"stake_read_failed","epoch":epoch,"error":report["error"],
+                "retry_at":retry.at,"failures":retry.failures})
         );
+        self.progress
+            .send_modify(|progress| progress.stake_failure = Some(report));
     }
 
     /// Starts the read of the oldest epoch up to the target's that has no
-    /// distribution, unless one runs or waits.
+    /// distribution and whose own retry time has passed, unless a read runs.
+    /// At the tip it notes since when the target's epoch has no stake.
     async fn start_stake(&mut self) -> StakeStatus {
-        if self.stake.task.is_some() || self.now() < self.stake.retry_at {
+        let now = self.now();
+        if self.stake.task.is_some() || now < self.stake.window_retry_at {
             return StakeStatus::Busy;
         }
         let Some(store) = self.store.as_ref() else {
             return StakeStatus::Busy;
         };
-        let window = match store.stake_window().await {
+        let through = self.stored.target.epoch;
+        let window = match store.stake_window(through).await {
             Ok(window) => window,
             Err(error) => {
                 if error.temporary() {
                     self.store = None;
                 }
-                let now = self.now();
-                self.stake.retry_at = now + self.stake.failures.failed(now).as_secs();
+                self.stake.window_retry_at = now + self.stake.window_failures.failed(now).as_secs();
                 return StakeStatus::Busy;
             }
         };
-        let first = window
-            .newest
-            .map_or(window.first, |newest| (newest + 1).max(window.first));
-        if first > self.stored.target.epoch {
+        self.stake.window_failures.reset();
+        self.stake
+            .retries
+            .retain(|epoch, _| window.missing.contains(epoch));
+        let missing = window.missing.contains(&through).then(|| {
+            self.progress
+                .borrow()
+                .stake_missing
+                .filter(|missing| missing.epoch == through)
+                .unwrap_or(StakeMissing {
+                    epoch: through,
+                    since: now,
+                })
+        });
+        self.progress
+            .send_modify(|progress| progress.stake_missing = missing);
+        if window.missing.is_empty() {
             return StakeStatus::Done;
         }
+        let due = window.missing.iter().copied().find(|epoch| {
+            self.stake
+                .retries
+                .get(epoch)
+                .is_none_or(|retry| retry.at <= now)
+        });
+        let Some(first) = due else {
+            return StakeStatus::Busy;
+        };
         let provider = self.provider.clone();
         let requests = self.requests.clone();
         let network = self.profile.network.clone();
@@ -1449,6 +1522,22 @@ impl<'a> Follower<'a> {
             );
         self.stake.task = Some((first, task));
         StakeStatus::Busy
+    }
+
+    /// When the next stake read may start: the window's retry, otherwise the
+    /// earliest retry of an epoch.
+    fn next_stake_attempt(&self) -> u64 {
+        let now = self.now();
+        if now < self.stake.window_retry_at {
+            return self.stake.window_retry_at;
+        }
+        self.stake
+            .retries
+            .values()
+            .map(|retry| retry.at)
+            .min()
+            .unwrap_or(now)
+            .max(now)
     }
 
     /// Reads and stores the stake of every epoch up to the target's.
@@ -1478,7 +1567,7 @@ impl<'a> Follower<'a> {
                     self.stake_result(epoch, result).await;
                 }
                 None => {
-                    let until = self.stake.retry_at;
+                    let until = self.next_stake_attempt().max(self.now() + 1);
                     self.set_state(State::Waiting, "stake_pending", Some(until), None)
                         .await;
                     if !pause_until(&*self.time, &self.stop, until).await {

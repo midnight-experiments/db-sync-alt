@@ -171,7 +171,7 @@ composed. Times are Unix seconds unless stated. A position (`provider_head`,
 | `last_error` | The last error: `code`, `at` and `detail`, the full report. |
 | `retention` | `seconds`; `horizon_first_served_at`, when the horizon block was first served; `next_horizon_move_at`, the earliest time the horizon moves. |
 | `provider` | `utc_day`; `calls_today`; `calls_previous_days`, the seven UTC days before today with their `day` and `requests`; `pace_requests_per_second`; `requests_in_flight`; `last_refusal`, the provider's last 402, 418 or 429 with its `http_status`, `code`, `at` and `until`. |
-| `epochs` | `current_epoch`, the epoch of the stored tip; `newest_parameters_epoch`; `newest_stake_epoch`. |
+| `epochs` | `current_epoch`, the epoch of the stored tip; `newest_parameters_epoch`; `newest_stake_epoch`; `stake_failure`, the last failed read of a stake distribution until that epoch's distribution is stored: its `epoch`, `at`, `retry_at`, `failures` and `error` with the cause ([provider](provider.md#stake-distributions)). |
 | `integrity` | `unspent_outputs`, as counted by the last supply check; `supply_check`, the last [supply check](#supply-check) with `at`, `passed`, `failure`, `supply` and `unspent_outputs`; `snapshot`, the last [daily snapshot file](#daily-snapshot-files) with `at`, `file`, `content_digest`, `target` and `bytes`; `unspent_at_profile_addresses`, the stored unspent outputs per profile address. |
 | `database` | `observed_at` and `observation_age_seconds` of the last read; `size_bytes`; `tls_available`, whether the server offers TLS; `reader_check`, with `role`, `passed`, `error`, `violations` and `warnings`; `index_rebuilds`, each index's size after its last rebuild. |
 | `identity` | The stored identity: `database_format`, `network`, `profile_hash`, `keep_rule_version`, `tool_version`, `node_release`, `origin` (where the data came from) and `created_at`. |
@@ -181,7 +181,7 @@ composed. Times are Unix seconds unless stated. A position (`provider_head`,
 | `capabilities` | What the database serves to node 2.1.101's operator commands: registered-candidate results are `unsupported` ([limitations](limitations.md)). |
 | `limitations` | The [limitations](limitations.md), each with a `code` and a `description`. |
 | `unsupported_node_statements` | The node's SQL statements a pruned database does not answer completely: those of the node's genesis subcommands. |
-| `warnings` | Conditions that do not fail `/health`: `database_tls_unavailable`; the reader warnings `reader_statement_timeout_unset`, `reader_idle_in_transaction_timeout_unset`, `reader_search_path_not_public`, `reader_connection_limit_unset` and `reader_connection_limit_below_node_pool` ([PostgreSQL](postgresql.md#the-reader-login)); `status_read_failed:<code>` while the database part cannot be read; and `upkeep_failed:<job>:<code>` until an upkeep job succeeds again. |
+| `warnings` | Conditions that do not fail `/health`: `database_tls_unavailable`; the reader warnings `reader_statement_timeout_unset`, `reader_idle_in_transaction_timeout_unset`, `reader_search_path_not_public`, `reader_connection_limit_unset` and `reader_connection_limit_below_node_pool` ([PostgreSQL](postgresql.md#the-reader-login)); `status_read_failed:<code>` while the database part cannot be read; `upkeep_failed:<job>:<code>` until an upkeep job succeeds again; and `stake_missing:<epoch>` while the target's epoch has had no stored stake distribution for more than 10 minutes at the tip. |
 | `health` | The limits of `/health`: `max_lag_blocks`, `provider_observation_max_age_seconds` and `database_observation_max_age_seconds`. |
 
 `/status` and `/health` answer from memory: in a test, 1,000 requests in a row
@@ -223,7 +223,9 @@ output carries only a command's result.
   `follower_retry` with the error and the time of the next attempt,
   `follower_state` on a change of state, `gate_closed` with the check's report,
   `retention_changed`, `status_read_failed` and `status_read_recovered`,
-  `stake_stored` and `stake_read_failed`, and `service_stopped` or
+  `stake_stored` and `stake_read_failed` (with the epoch, the error with its
+  cause, the failures in a row and the time of the next attempt), and
+  `service_stopped` or
   `follower_stopped` with the error that ended the run.
 
 No line holds a password, a provider key, a connection string or a provider
