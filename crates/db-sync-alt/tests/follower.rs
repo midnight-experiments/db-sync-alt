@@ -847,3 +847,317 @@ async fn held_datums_three_pages_and_unclassified_outputs() -> Result {
         .map_err(named)?;
     start.cleanup().await
 }
+
+/// An unrelated transaction of about 16.5 KB: metadata of 250 byte strings
+/// of 64 bytes, skipped by the decoder by structure.
+fn bulky(seed: u64) -> Built {
+    let mut value = vec![0x99, 0x00, 250];
+    for index in 0..250_u64 {
+        value.extend([0x58, 64]);
+        value.extend(
+            (0..64_u64).map(|byte| ((seed.wrapping_mul(31) + index * 64 + byte) % 251) as u8),
+        );
+    }
+    Tx::new()
+        .input(&tx::hash(&seed.to_be_bytes()), 0)
+        .output(Output::new(tx::enterprise_address(0, [9; 28]), 1_000_000))
+        .metadata(674, value)
+        .fee(500_000)
+        .build()
+}
+
+/// Peak resident memory of a process, sampled until it exits (kibibytes).
+fn watch_memory(pid: u32) -> tokio::task::JoinHandle<u64> {
+    tokio::spawn(async move {
+        let mut peak = 0;
+        while let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            if let Some(kib) = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmHWM:"))
+                .and_then(|value| {
+                    value
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                })
+            {
+                peak = peak.max(kib);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        peak
+    })
+}
+
+fn follow_command(
+    database: &Database,
+    fake: &Fake,
+    key: &std::path::Path,
+    arguments: &[&str],
+) -> tokio::process::Child {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+        .args([
+            "follow",
+            "--database",
+            &database.dsn(false),
+            "--network",
+            "preprod",
+        ])
+        .args(["--provider-url", &fake.server.url])
+        .arg("--provider-key-file")
+        .arg(key)
+        .args(["--requests-per-second", "10", "--max-in-flight", "4"])
+        .args(arguments)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// The `follow` command catches up from a converted store with the real
+/// Preprod profile (k = 2,160) to its stop target, with a window of full
+/// blocks (about 120 KB of transaction CBOR each, so the CBOR limit ends
+/// the batches there); its peak resident memory is recorded. SIGTERM ends a
+/// run within 5 seconds without a partial update, and a new run continues.
+/// A stop target below the stored target is refused.
+/// DSA_FOLLOW_COMMAND_BLOCKS sets the blocks of the catch-up (default 300).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn the_follow_command_catches_up_stops_and_is_stopped() -> Result {
+    let blocks = setting("DSA_FOLLOW_COMMAND_BLOCKS", 300) as u32;
+    let extra = 200;
+    let profile = dsa_chain::profiles::Profile::load("preprod")?;
+    let k = profile.cardano.security_parameter;
+    let t0 = 20;
+    let stop_at = t0 + blocks;
+    let mut g = chain(&profile, 29, 1, stop_at + extra + k + 5, false).known_from_start();
+    g.lengthen_epochs(1_000);
+    let full = (blocks / 10).clamp(50, 300);
+    for block in g
+        .blocks
+        .iter_mut()
+        .filter(|block| (t0 + 51..=t0 + 50 + full).contains(&block.height))
+    {
+        let seed = u64::from(block.height) << 8;
+        block.transactions.extend((0..7).map(|n| bulky(seed + n)));
+    }
+    let history = derive(&profile, &g).await?;
+    let mut source = Source::new().await?;
+    let headers = (1..=t0 + k)
+        .map(|height| header(g.block(height).unwrap()))
+        .collect::<Vec<_>>();
+    source.start(&g, &history, t0, &headers).await?;
+    let database = Database::new().await?;
+    convert(&database, &source.database, &profile, t0 - 2, DAY).await?;
+    let fake = Fake::start(&g, &profile).await;
+    let key = tempfile::NamedTempFile::new()?;
+    std::fs::write(key.path(), dsa_testkit::server::KEY)?;
+
+    let began = Instant::now();
+    let child = follow_command(
+        &database,
+        &fake,
+        key.path(),
+        &["--stop-at-target", &stop_at.to_string()],
+    );
+    let peak = watch_memory(child.id().unwrap());
+    let output = child.wait_with_output().await?;
+    let seconds = began.elapsed().as_secs_f64();
+    let peak = peak.await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["stopped"], "stop_target");
+    assert_eq!(report["position"]["target"]["height"], stop_at);
+    let batches = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["event"] == "update")
+        .map(|line| {
+            (
+                line["blocks"].as_u64().unwrap_or(0),
+                line["cbor_bytes"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        json!({"event":"follow_command_catch_up","blocks":blocks,"full_blocks":full,"seconds":seconds,
+            "peak_resident_kib":peak,"report":report,"logged_batches":batches})
+    );
+    assert!(peak < 64 * 1024, "peak resident memory {peak} KiB");
+    let mut store = Store::connect(database.config.clone(), None).await?;
+    store.verify(&profile).await.map_err(named)?;
+    let calls: i64 = common::connect(&database.config)
+        .await?
+        .query_one(
+            "SELECT coalesce(sum(requests),0)::bigint FROM dsa.calls",
+            &[],
+        )
+        .await?
+        .get(0);
+    let sent = report["requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|count| count.as_i64().unwrap())
+        .sum::<i64>();
+    assert!(calls >= sent - 8, "calls {calls}, requests {sent}");
+
+    // SIGTERM during a run: it ends within 5 seconds, the store holds a
+    // whole update, and a new run continues to the end.
+    let child = follow_command(
+        &database,
+        &fake,
+        key.path(),
+        &["--stop-at-target", &(stop_at + extra).to_string()],
+    );
+    let pid = child.id().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let state = store.follow_state(&profile).await.map_err(named)?;
+        if state.target.height > stop_at + 20 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the run did not advance");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let signalled = Instant::now();
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()?;
+    assert!(killed.success());
+    let output = child.wait_with_output().await?;
+    let ended = signalled.elapsed();
+    assert!(ended < Duration::from_secs(5), "ended after {ended:?}");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["stopped"], "stop_requested");
+    let state = store.follow_state(&profile).await.map_err(named)?;
+    assert_eq!(report["position"]["target"]["height"], state.target.height);
+    store.verify(&profile).await.map_err(named)?;
+    println!(
+        "{}",
+        json!({"event":"follow_command_sigterm","ended_seconds":ended.as_secs_f64(),"target":state.target.height})
+    );
+    let output = follow_command(
+        &database,
+        &fake,
+        key.path(),
+        &["--stop-at-target", &(stop_at + extra).to_string()],
+    )
+    .wait_with_output()
+    .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A stop target below the stored target is refused.
+    let output = follow_command(
+        &database,
+        &fake,
+        key.path(),
+        &["--stop-at-target", &t0.to_string()],
+    )
+    .wait_with_output()
+    .await?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stop_target_below_stored_target"));
+    store.verify(&profile).await.map_err(named)?;
+    drop(store);
+    source.database.cleanup().await?;
+    database.cleanup().await
+}
+
+/// Every provider and follower flag is checked before any connection and
+/// read from its DSA_ variable; the flag wins.
+#[tokio::test]
+async fn follow_flags_come_from_the_environment_and_the_flag_wins() -> Result {
+    let key = tempfile::NamedTempFile::new()?;
+    std::fs::write(key.path(), "key")?;
+    let run = |environment: &[(&str, &str)], arguments: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+        command.args([
+            "follow",
+            "--database",
+            "host=127.0.0.1 port=1 user=nobody sslmode=disable",
+            "--network",
+            "preprod",
+        ]);
+        command.args(arguments);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        command.output().unwrap()
+    };
+    let refused = |output: &std::process::Output| -> String {
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let key_path = key.path().to_str().unwrap();
+    // The key file comes from the environment.
+    let missing = refused(&run(&[("DSA_PROVIDER_KEY_FILE", "/nonexistent/key")], &[]));
+    assert!(
+        missing.contains("\"flag\":\"--provider-key-file\""),
+        "{missing}"
+    );
+    // A value out of range in the environment is named by its flag.
+    for (name, value, flag) in [
+        ("DSA_MAX_IN_FLIGHT", "99", "--max-in-flight"),
+        ("DSA_POLL_INTERVAL_SECONDS", "0", "--poll-interval-seconds"),
+        (
+            "DSA_PRUNE_INTERVAL_SECONDS",
+            "10",
+            "--prune-interval-seconds",
+        ),
+        ("DSA_MAX_BATCH_BLOCKS", "0", "--max-batch-blocks"),
+        ("DSA_MAX_BATCH_CBOR_BYTES", "1", "--max-batch-cbor-bytes"),
+        ("DSA_MAX_BATCH_ROWS", "1", "--max-batch-rows"),
+    ] {
+        let message = refused(&run(&[(name, value)], &["--provider-key-file", key_path]));
+        assert!(message.contains(flag), "{name}: {message}");
+    }
+    let message = refused(&run(
+        &[("DSA_REQUESTS_PER_SECOND", "11")],
+        &["--provider-key-file", key_path],
+    ));
+    assert!(
+        message.contains("\"flag\":\"--requests-per-second\""),
+        "{message}"
+    );
+    let message = refused(&run(
+        &[("DSA_PROVIDER_URL", "http://example.invalid/api/v0")],
+        &["--provider-key-file", key_path],
+    ));
+    assert!(message.contains("\"flag\":\"--provider-url\""), "{message}");
+    // The flag wins over its variable: the run passes the checks and fails
+    // only at the database, which nothing serves.
+    let output = run(
+        &[
+            ("DSA_MAX_IN_FLIGHT", "99"),
+            ("DSA_PROVIDER_KEY_FILE", "/nonexistent/key"),
+        ],
+        &["--max-in-flight", "2", "--provider-key-file", key_path],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(75),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
