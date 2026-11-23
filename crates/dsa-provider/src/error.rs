@@ -15,6 +15,12 @@ pub enum Kind {
     Fatal { field: &'static str },
 }
 
+/// The codes of a transport failure, a timeout or a 5xx answer. Every other
+/// error to retry is an answer the client refused: not valid for the
+/// endpoint's type, larger than its limit, a 404 where the endpoint must
+/// answer, or another status.
+pub const TRANSPORT_CODES: [&str; 2] = ["provider_unavailable", "provider_timeout"];
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, thiserror::Error)]
 #[error("{code}")]
 pub struct Error {
@@ -39,6 +45,12 @@ impl Error {
             kind: Kind::Retry { until },
             http_status: None,
         }
+    }
+
+    /// The provider's transport failed, it did not answer in time or it
+    /// answered 5xx, as opposed to an answer the client refused.
+    pub fn transport(&self) -> bool {
+        matches!(self.kind, Kind::Retry { .. }) && TRANSPORT_CODES.contains(&self.code)
     }
 
     /// When the caller may try again; `None` for a fatal error.

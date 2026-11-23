@@ -679,7 +679,11 @@ impl<'a> Follower<'a> {
                     self.persist_counts_if_due().await;
                     return Ok(until);
                 }
-                Kind::Retry { until } => (Condition::Temporary, until),
+                // A transport failure, a timeout or a 5xx counts towards the
+                // fatal time; an answer the client refused is one the
+                // follower refuses.
+                Kind::Retry { until } if provider.transport() => (Condition::Temporary, until),
+                Kind::Retry { until } => (Condition::Answer, until),
             },
             Error::Store(store) => match retried(store) {
                 Some(reconnect) => {

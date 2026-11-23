@@ -77,7 +77,7 @@ block with transactions, plus the epoch requests.
 | 418 | The key is banned for a while (`provider_banned`). Every request waits for the time in `Retry-After`, at least 1 hour and at most 24 hours. |
 | 429 | Too many requests (`provider_rate_limited`). Every request waits for the time in `Retry-After`, 60 seconds when it names none. |
 | 5xx, a timeout, a dropped connection | Retried after 1, 2, 4, 8 and 16 seconds and then every 30 seconds (`provider_unavailable`, `provider_timeout`). After `--database-fatal-after-seconds` (default 1,800) without a success, the service ends with exit status 75 and its restart policy starts it again. |
-| An answer that contradicts itself or the chain | Nothing is written. The step is retried every 30 seconds without end and named in `/status` ([troubleshooting](troubleshooting.md#answers-the-follower-refuses)). |
+| An answer that contradicts itself or the chain, or that the client refuses: not valid for the endpoint, larger than its limit, a 404 where the endpoint must answer, another 4xx or a 3xx | Nothing is written. The step is retried every 30 seconds without end and named in `/status` ([troubleshooting](troubleshooting.md#answers-the-follower-refuses)). |
 
 A 402, 418 or 429 is waited out until the time it names and never ends the
 service: `/status` shows `waiting`, the code and `wait_until`, and

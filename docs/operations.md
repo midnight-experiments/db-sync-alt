@@ -59,14 +59,18 @@ Reasons of `waiting`:
 | `epoch_parameters_pending` | The provider does not have the parameters of the next epoch yet. The update ends before that epoch's first block; asked again after 60 seconds. |
 | `target_contradicted` | The provider returned another block at the stored target's height. Read again after 60 seconds; a second contradiction closes the gate (`canonical_conflict`). |
 | `provider_chain_shorter` | The provider's chain is shorter than the stored tip, as after a provider-side rollback. Waited out. |
-| any other code | A failed step that is retried: a transport failure or 5xx of the provider (`provider_unavailable`, `provider_timeout`), an answer the follower refused (for example `transaction_count` or `cbor_body_hash_mismatch`), or a database condition. `wait_until` is the next attempt. |
+| any other code | A failed step that is retried: a transport failure or 5xx of the provider (`provider_unavailable`, `provider_timeout`), an answer the provider client or the follower refused (for example `provider_invalid_response`, `transaction_count` or `cbor_body_hash_mismatch`), or a database condition. `wait_until` is the next attempt. |
 
 A failed step writes nothing and is retried after 1, 2, 4, 8 and 16 seconds and
 then every 30 seconds. A database condition, a transport failure or a provider
 5xx that lasts longer than `--database-fatal-after-seconds` ends the service
-with exit status 75. An answer the follower refuses never ends the service: it
-is retried every 30 seconds, named in `state_reason`, `error_code` and
-`last_error`, and `/health` turns 503 once the database falls behind.
+with exit status 75. An answer that the provider client or the follower refuses
+never ends the service: it is retried every 30 seconds, named in
+`state_reason`, `error_code` and `last_error`, and `/health` turns 503 once the
+database falls behind. The client refuses an answer that is not valid for its
+endpoint, larger than the endpoint's limit, a 404 where the endpoint must
+answer, or another 4xx or 3xx status
+([troubleshooting](troubleshooting.md#answers-the-follower-refuses)).
 
 The database conditions that are retried: a lost connection, a server that is
 starting or stopping, too many connections and the other errors of SQLSTATE

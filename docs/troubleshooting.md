@@ -114,14 +114,21 @@ and a `--listen` address that is in use (`listen_address_unavailable`).
 
 ## Answers the follower refuses
 
-The follower checks every answer against the chain before it writes anything.
-When an answer fails a check, nothing is written and the step is retried every
-30 seconds without end; `/status` shows the state `waiting` with the code, and
+The provider client reads every answer into the endpoint's type, and the
+follower checks it against the chain before it writes anything. When an
+answer fails either, nothing is written and the step is retried every 30
+seconds without end; `/status` shows the state `waiting` with the code, and
 `/health` fails once the database falls behind. A short spell is usually the
 provider's; a code that stays for one block points at that block.
 
 | Code | What did not match |
 | --- | --- |
+| `provider_invalid_response` | An answer is not valid for its endpoint: not JSON of the expected shape, or a header of another height or epoch than asked for. |
+| `provider_bad_page` | A list holds more rows than one page. |
+| `provider_not_found` | The provider answered 404 where the endpoint must answer, for example `/blocks/latest` or a transaction's metadata. |
+| `provider_response_size_limit` | An answer is larger than the limit of its endpoint. |
+| `provider_json_depth_limit` | A `/txs/{hash}/utxos` answer nests deeper than the client reads. |
+| `provider_request_rejected` | The provider answered another 4xx or a 3xx status. |
 | `transaction_count` | A block's transaction list is shorter or longer than its header says. |
 | `cbor_body_hash_mismatch` | A transaction's bytes do not hash to its ID. |
 | `duplicate_transaction` | A transaction appears twice in one block. |

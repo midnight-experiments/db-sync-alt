@@ -408,6 +408,63 @@ async fn temporary_conditions_never_end_the_service() -> Result {
     world.start.cleanup().await
 }
 
+/// A block whose transaction page the provider client refuses on every
+/// attempt (not valid JSON) keeps the service waiting with the code in
+/// `/status`, past the fatal time; once the page is right it follows on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn an_answer_the_client_refuses_never_ends_the_service() -> Result {
+    let world = World::new(57, 80).await?;
+    let mut samples = Vec::new();
+    let target = world.start.target;
+    let busy = (target + 1..=target + 8)
+        .filter_map(|height| world.start.g.block(height))
+        .find(|block| !block.transactions.is_empty())
+        .expect("a block with transactions")
+        .clone();
+    let height = busy.height + K;
+    world.serve(height);
+    let page = format!("/blocks/{}/txs/cbor", busy.hash);
+    world.fake.set_hook(Some(Arc::new(move |path, _, _| {
+        path.contains(&page)
+            .then(|| Behavior::raw("not a transaction page".to_owned()))
+    })));
+    let (address, stopper, task) = world.run(300).await;
+    let refused = status_until(address, &mut samples, "refused page", |document| {
+        document["error_code"] == "provider_invalid_response" && waiting_with_its_end(document)
+    })
+    .await;
+    let began = world.clock.now();
+    tokio::time::sleep(world.clock.real(900)).await;
+    assert!(world.clock.now() >= began + 900);
+    assert!(!task.is_finished(), "a refused page ended the service");
+    let (code, health) = get(address, "/health").await.unwrap();
+    assert_eq!(code, 503, "{health}");
+    assert_eq!(
+        health["error_code"], "provider_invalid_response",
+        "{health}"
+    );
+    println!(
+        "{}",
+        json!({"event":"client_refused_answer","status":summary(&refused),"lasted_simulated_seconds":world.clock.now()-began})
+    );
+    world.fake.set_hook(None);
+    status_until(
+        address,
+        &mut samples,
+        "following after the page",
+        target_at(height),
+    )
+    .await;
+    stopper.send(true)?;
+    let report = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.stopped, "stop_requested");
+    world.start.cleanup().await
+}
+
 /// Review of what ends the service: a database that stays unreachable, and
 /// a provider that answers 5xx, end it after the fatal time with the lasting
 /// condition, which the command reports with exit status 75.
