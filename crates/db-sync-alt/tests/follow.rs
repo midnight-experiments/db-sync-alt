@@ -1129,9 +1129,16 @@ async fn a_lost_output_stops_the_block_and_close_gate_stops_serving() -> Result 
     let state = store.follow_state(&setup.profile).await.map_err(named)?;
     assert!(!state.serving);
     assert_eq!(state.reason, "asset_conservation");
-    let status = store.status(&setup.profile).await.map_err(named)?;
-    assert_eq!(status["service_state"]["state"], "stopped");
-    assert_eq!(status["service_state"]["reason"], "asset_conservation");
+    let stored = store
+        .service_view(&setup.profile, None)
+        .await
+        .map_err(named)?
+        .service_state
+        .ok_or("no service state")?;
+    assert_eq!(
+        (stored.state.as_str(), stored.reason.as_str()),
+        ("stopped", "asset_conservation")
+    );
     drop(reader);
     drop(store);
     setup.database.cleanup().await?;

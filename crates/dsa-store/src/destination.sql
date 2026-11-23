@@ -11,7 +11,7 @@ SELECT p.serving,i.origin->>'kind',
  OR EXISTS(SELECT 1 FROM dsa.supply) OR EXISTS(SELECT 1 FROM dsa.consumed_before_horizon)
  OR EXISTS(SELECT 1 FROM dsa.first_served) OR EXISTS(SELECT 1 FROM dsa.calls)
  OR EXISTS(SELECT 1 FROM dsa.service_state) OR EXISTS(SELECT 1 FROM dsa.unspent)
- OR EXISTS(SELECT 1 FROM dsa.first_observation),
+ OR EXISTS(SELECT 1 FROM dsa.first_observation) OR EXISTS(SELECT 1 FROM dsa.upkeep),
  to_regnamespace('dsa_retired') IS NOT NULL,
  EXISTS(SELECT 1 FROM pg_class c WHERE c.relnamespace='serve'::regnamespace
   AND NOT (c.relkind='r' AND c.relname=ANY($1::text[])) AND NOT (c.relkind='i' AND c.relname=ANY($2::text[])))

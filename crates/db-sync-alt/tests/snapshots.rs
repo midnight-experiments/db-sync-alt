@@ -450,9 +450,18 @@ async fn snapshot_corruption_refusal_retry_and_serving_protection() -> Result {
     );
     let after = dest.cli("verify", &f.profile.network, &[]).await?;
     assert_eq!(before["content_digest"], after["content_digest"]);
+    // The status document also carries its own time and the database's
+    // size and read time; everything the database says about itself stays.
+    let stored = |mut status: Value| {
+        status.as_object_mut().unwrap().remove("generated_at");
+        for key in ["observed_at", "observation_age_seconds", "size_bytes"] {
+            status["database"].as_object_mut().unwrap().remove(key);
+        }
+        status
+    };
     assert_eq!(
-        before_status,
-        dest.cli("status", &f.profile.network, &[]).await?
+        stored(before_status),
+        stored(dest.cli("status", &f.profile.network, &[]).await?)
     );
     let after_storage: i64 = client
         .query_one(

@@ -2,6 +2,7 @@
 //! command to the store through the wrapper of `wrapper.rs`.
 
 mod follow_arguments;
+mod service_arguments;
 mod wrapper;
 
 use std::{
@@ -111,10 +112,14 @@ enum Command {
         #[command(flatten)]
         database: DatabaseArguments,
     },
-    /// Read identity, serving position and capabilities.
+    /// Print the status document from the database alone. Fields only a
+    /// running service knows are null, and the state is never `following`.
     Status {
         #[command(flatten)]
         database: DatabaseArguments,
+        /// The node's reader login to check, as `grant-reader --check` does.
+        #[arg(long, env = "DSA_READER")]
+        reader: Option<String>,
     },
     /// Verify logical content, supply, references and positional integrity.
     Verify {
@@ -177,6 +182,17 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Ask a running service's /health; exit 0 when it answers 200 and 1
+    /// otherwise, within 3 seconds.
+    Health {
+        /// The address of the service's /health.
+        #[arg(
+            long,
+            env = "DSA_HEALTH_URL",
+            default_value = "http://127.0.0.1:18080/health"
+        )]
+        url: String,
+    },
     /// Follow the provider's chain into a serving database.
     #[command(hide = true)]
     Follow {
@@ -197,14 +213,14 @@ impl Command {
     fn database(&self) -> Option<&DatabaseArguments> {
         match self {
             Self::Create { database }
-            | Self::Status { database }
+            | Self::Status { database, .. }
             | Self::Verify { database }
             | Self::Snapshot { database, .. }
             | Self::Restore { database, .. }
             | Self::Convert { database, .. }
             | Self::GrantReader { database, .. }
             | Self::Follow { database, .. } => Some(database),
-            Self::Profile { .. } | Self::Compare(_) => None,
+            Self::Profile { .. } | Self::Compare(_) | Self::Health { .. } => None,
         }
     }
 }
@@ -357,6 +373,7 @@ fn prepare(command: Command) -> Result<(Operation, Job), Usage> {
             ))
         }
         Command::Compare(args) => compare(args),
+        Command::Health { url } => health(url),
         Command::Follow {
             database,
             provider,
@@ -426,6 +443,29 @@ fn compare(args: CompareArguments) -> Result<(Operation, Job), Usage> {
     ))
 }
 
+/// `health`: one request to a running service, answered within 3 seconds.
+fn health(url: String) -> Result<(Operation, Job), Usage> {
+    use dsa_service::http::{Target, probe};
+    let target = Target::parse(&url).map_err(|error| usage(error, "--url"))?;
+    Ok((
+        Operation::new("health", Effect::Reads, Some(3)),
+        Box::new(move |_| {
+            Box::pin(async move {
+                match probe(&target, std::time::Duration::from_millis(2500)).await {
+                    Ok(200) => Ok(json!({"url": url, "http_status": 200, "healthy": true})),
+                    Ok(code) => Err(Error::Mismatch {
+                        error: "service_unhealthy",
+                        item: "http_status".to_owned(),
+                        expected: "200".to_owned(),
+                        actual: code.to_string(),
+                    }),
+                    Err(error) => Err(Error::Refusal(error.code())),
+                }
+            })
+        }),
+    ))
+}
+
 fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
     use Effect::{Changes, Checks, Reads};
     let database = command.database().expect("a database command");
@@ -446,7 +486,10 @@ fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
         Command::Convert { .. } => ("convert", Changes, deadline.or(Some(3600))),
         Command::GrantReader { check: true, .. } => ("grant-reader", Checks, deadline),
         Command::GrantReader { .. } => ("grant-reader", Changes, deadline),
-        Command::Profile { .. } | Command::Compare(_) | Command::Follow { .. } => {
+        Command::Profile { .. }
+        | Command::Compare(_)
+        | Command::Follow { .. }
+        | Command::Health { .. } => {
             unreachable!("not a database command")
         }
     };
@@ -510,6 +553,25 @@ async fn open(
     Ok(store)
 }
 
+/// The status document composed from the database alone.
+async fn stored_status(
+    store: &mut Store,
+    profile: &Profile,
+    reader: Option<&str>,
+) -> Result<Value, Error> {
+    use dsa_service::status::{Settings, compose};
+    let view = store.service_view(profile, reader).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    Ok(serde_json::to_value(compose(
+        Some(&view),
+        None,
+        &Settings::new(&profile.network),
+        now,
+    ))?)
+}
+
 async fn execute(
     command: Command,
     profile: Profile,
@@ -522,15 +584,10 @@ async fn execute(
     match &command {
         Command::Create { .. } => {
             store.create(&profile).await?;
-            store.status(&profile).await
+            stored_status(&mut store, &profile, None).await
         }
-        Command::Status { .. } => {
-            let mut value = store.status(&profile).await?;
-            value["capabilities"] =
-                serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?;
-            value["unsupported_node_statements"] =
-                serde_json::to_value(dsa_store::catalogue::unsupported().collect::<Vec<_>>())?;
-            Ok(value)
+        Command::Status { reader, .. } => {
+            stored_status(&mut store, &profile, reader.as_deref()).await
         }
         Command::Verify { .. } => Ok(serde_json::to_value(store.verify(&profile).await?)?),
         Command::Snapshot { file, .. } => {
@@ -589,7 +646,10 @@ async fn execute(
             role, check: true, ..
         } => store.check_reader(&profile, role).await,
         Command::GrantReader { role, .. } => store.grant_reader(&profile, role).await,
-        Command::Profile { .. } | Command::Compare(_) | Command::Follow { .. } => {
+        Command::Profile { .. }
+        | Command::Compare(_)
+        | Command::Follow { .. }
+        | Command::Health { .. } => {
             unreachable!("not a database command")
         }
     }

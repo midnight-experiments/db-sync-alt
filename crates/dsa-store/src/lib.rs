@@ -10,8 +10,10 @@ pub mod horizon;
 pub mod keep;
 mod load;
 mod restore;
+pub mod service_view;
 pub mod snapshot;
 pub mod source_capture;
+pub mod upkeep;
 pub mod verify;
 
 use std::{
@@ -546,18 +548,6 @@ impl Store {
             return Err(Error::Refusal("keep_rule_version_mismatch"));
         }
         Ok(())
-    }
-
-    /// The identity, the position and the follower's state rows: the service
-    /// state, the unspent outputs per profile address, the first observations
-    /// (their answers by size only) and the calls of the last eight UTC days.
-    pub async fn status(&self, profile: &Profile) -> Result<Value, Error> {
-        self.open(profile).await?;
-        Ok(self
-            .client
-            .query_one(include_str!("status.sql"), &[])
-            .await?
-            .get(0))
     }
 
     pub async fn grant_reader(&mut self, profile: &Profile, role: &str) -> Result<Value, Error> {

@@ -351,7 +351,7 @@ async fn check_indexes<C: GenericClient>(client: &C) -> Result<(), Error> {
 }
 
 /// The unspent amount of each fixed unit equals its recorded supply.
-async fn check_supply<C: GenericClient>(
+pub(crate) async fn check_supply<C: GenericClient>(
     client: &C,
     profile: &Profile,
 ) -> Result<BTreeMap<String, String>, Error> {
