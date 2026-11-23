@@ -3,11 +3,13 @@
 -- eight UTC days and tables bounded by the profile or the layout (unspent
 -- counts per profile address, first observations per shape, upkeep records
 -- per index). Nothing here grows with the served rows. Times are Unix
--- seconds; `identity` and `position` are the stored rows.
+-- seconds; `identity` and `position` are the stored rows, every hash in
+-- lowercase hexadecimal.
 SELECT jsonb_build_object(
  'observed_at',floor(extract(epoch FROM clock_timestamp()))::bigint,
  'identity',(SELECT to_jsonb(i)-'id' FROM dsa.identity i WHERE id=1),
- 'position',(SELECT to_jsonb(p)-'id' FROM dsa.position p WHERE id=1),
+ 'position',(SELECT (to_jsonb(p)-'id')||jsonb_build_object('target_hash',encode(p.target_hash,'hex'),
+   'tip_hash',encode(p.tip_hash,'hex'),'horizon_hash',encode(p.horizon_hash,'hex')) FROM dsa.position p WHERE id=1),
  'target',(SELECT jsonb_build_object('height',target_height,'hash',encode(target_hash,'hex'),
    'timestamp',floor(extract(epoch FROM target_time))::bigint) FROM dsa.position WHERE id=1 AND target_height IS NOT NULL),
  'tip',(SELECT jsonb_build_object('height',tip_height,'hash',encode(tip_hash,'hex'),

@@ -39,10 +39,11 @@ pub struct IndexPolicy {
 }
 
 impl Default for IndexPolicy {
+    /// More than twice the size after the last rebuild, and above 8 MiB.
     fn default() -> Self {
         Self {
             growth: 2.0,
-            min_bytes: 64 * 1024 * 1024,
+            min_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -308,19 +309,25 @@ mod tests {
             &[
                 size("a", 200 * MIB, Some(90 * MIB)),
                 size("b", 300 * MIB, Some(100 * MIB)),
-                size("c", 60 * MIB, Some(10 * MIB)),
+                size("c", 7 * MIB, Some(MIB)),
                 size("d", 100 * MIB, Some(60 * MIB)),
                 size("e", 5 * MIB, None),
             ],
             &policy,
         );
-        // b grew 3x, a 2.2x; c is below 64 MiB; d grew only 1.67x.
+        // b grew 3x, a 2.2x; c grew 7x but is below 8 MiB; d grew only 1.67x.
         assert_eq!(decision.rebuild.as_deref(), Some("b"));
         assert_eq!(decision.baselines, vec!["e".to_owned()]);
         let decision = index_decision(&[size("a", 128 * MIB, Some(64 * MIB))], &policy);
         assert_eq!(decision.rebuild, None, "exactly twice is not more");
         let decision = index_decision(&[size("a", 65 * MIB, None)], &policy);
         assert_eq!(decision.rebuild, None, "no record: the size becomes it");
+        // The floor is 8 MiB: an index just above it that has more than
+        // doubled is rebuilt; one of exactly 8 MiB is not.
+        let decision = index_decision(&[size("a", 9 * MIB, Some(4 * MIB))], &policy);
+        assert_eq!(decision.rebuild.as_deref(), Some("a"));
+        let decision = index_decision(&[size("a", 8 * MIB, Some(MIB))], &policy);
+        assert_eq!(decision.rebuild, None, "exactly 8 MiB is not larger");
     }
 
     fn at(hours: u32, minutes: u32) -> NaiveTime {

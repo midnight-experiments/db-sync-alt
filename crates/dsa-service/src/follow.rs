@@ -44,6 +44,9 @@ pub const COUNTS_INTERVAL: u64 = 600;
 const RATE_WINDOW: u64 = 600;
 /// While catching up, at most one update line per this many seconds.
 const UPDATE_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// During a long wait, the work between steps runs at least this often
+/// (seconds).
+const BETWEEN_INTERVAL: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -56,6 +59,11 @@ pub struct Settings {
     pub max_in_flight: usize,
     /// A database or provider condition that lasts longer ends the run.
     pub fatal_after: Duration,
+    /// Whether an answer the follower refuses on every attempt (it
+    /// contradicts itself or the chain) also ends the run once it has lasted
+    /// `fatal_after`. Otherwise it is retried without end and named in the
+    /// state.
+    pub refused_answers_end_the_run: bool,
     /// Make no block above this height final, complete the stake of the
     /// epochs up to it and return once the stored target equals it.
     pub stop_at_target: Option<u32>,
@@ -69,6 +77,7 @@ impl Default for Settings {
             limits: Limits::default(),
             max_in_flight: 4,
             fatal_after: Duration::from_secs(1_800),
+            refused_answers_end_the_run: true,
             stop_at_target: None,
         }
     }
@@ -255,13 +264,67 @@ pub struct Context<'a> {
     pub progress: watch::Sender<Progress>,
 }
 
+/// Work that runs on the writer's connection between two steps of the loop,
+/// never during an update.
+pub trait Between: Send {
+    /// Runs what is due at `now` (Unix seconds). A `Check` error closes the
+    /// gate with its code and ends the run; a temporary store error drops the
+    /// connection; other errors are the work's own to report.
+    fn run<'s>(
+        &'s mut self,
+        store: &'s mut Store,
+        now: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 's>>;
+}
+
 /// Follows the provider's chain into the store until a stop request, the
 /// stop target, or a condition that cannot be retried.
 pub async fn follow(context: Context<'_>) -> Result<Report, Error> {
+    follow_with(context, None).await
+}
+
+/// [`follow`], with `between` run on the writer's connection between steps.
+pub async fn follow_with<'a>(
+    context: Context<'a>,
+    between: Option<Box<dyn Between + 'a>>,
+) -> Result<Report, Error> {
     let started = Instant::now();
     let mut follower = Follower::start(context).await?;
+    follower.between = between;
     let result = follower.run().await;
     follower.finish(result, started).await
+}
+
+/// The kind of condition a failed step belongs to: how long one condition
+/// has lasted is measured within its kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Condition {
+    /// The database or the provider's transport: retried, and ends the run
+    /// once it has lasted `fatal_after`.
+    Temporary,
+    /// An answer the follower refuses.
+    Answer,
+}
+
+/// The SQLSTATE of a store error, if the server gave one.
+fn sqlstate(error: &dsa_store::Error) -> Option<String> {
+    error.report()["sqlstate"].as_str().map(str::to_owned)
+}
+
+/// Store errors a retry may cure, and whether the connection is dropped
+/// first: a lost connection or a server that is starting or stopping (drop),
+/// a stored position that moved, as after a commit whose outcome was not
+/// seen (drop, then read it again), and on the service's own rows a lock or
+/// statement timeout, a serialization failure, a deadlock or a lack of
+/// resources (keep).
+fn retried(error: &dsa_store::Error) -> Option<bool> {
+    if error.temporary() || matches!(error, dsa_store::Error::Refusal("update_base_mismatch")) {
+        return Some(true);
+    }
+    let code = sqlstate(error)?;
+    (code.starts_with("53") || matches!(code.as_str(), "55P03" | "57014" | "40001" | "40P01"))
+        .then_some(false)
 }
 
 /// The stored position: the target's header, the headers above it and the
@@ -408,6 +471,9 @@ struct Follower<'a> {
     samples: VecDeque<(u64, u32)>,
     stake: Stake,
     backoff: Backoff,
+    /// The condition the current failures belong to.
+    condition: Option<Condition>,
+    between: Option<Box<dyn Between + 'a>>,
 }
 
 impl<'a> Follower<'a> {
@@ -462,6 +528,8 @@ impl<'a> Follower<'a> {
             stored,
             stake: Stake::default(),
             backoff: Backoff::default(),
+            condition: None,
+            between: None,
             time,
         };
         follower
@@ -494,79 +562,147 @@ impl<'a> Follower<'a> {
             self.collect_stake().await;
             let wait = match outcome {
                 Ok(Outcome::More) => {
-                    self.backoff.reset();
+                    self.recovered();
                     self.set_state(State::CatchingUp, "catching_up", None, None)
                         .await;
-                    continue;
+                    None
                 }
                 Ok(Outcome::AtTip) => {
-                    self.backoff.reset();
+                    self.recovered();
                     self.set_state(State::Following, "following", None, None)
                         .await;
                     self.start_stake().await;
                     self.persist_counts_if_due().await;
-                    self.now() + self.settings.poll_interval.as_secs()
+                    Some(self.now() + self.settings.poll_interval.as_secs())
                 }
                 Ok(Outcome::Wait { reason, until }) => {
-                    self.backoff.reset();
+                    self.recovered();
                     self.set_state(State::Waiting, reason, Some(until), None)
                         .await;
                     self.persist_counts_if_due().await;
-                    until
+                    Some(until)
                 }
                 Err(Error::Stopped) => return Ok("stop_requested"),
-                Err(error) => self.failed(error).await?,
+                Err(error) => Some(self.failed(error).await?),
             };
-            if !pause_until(&*self.time, &self.stop, wait).await {
+            self.between_steps().await?;
+            if let Some(wait) = wait
+                && !self.wait_until(wait).await?
+            {
                 return Ok("stop_requested");
             }
         }
+    }
+
+    /// Ends a run of failures: logs how long the condition lasted.
+    fn recovered(&mut self) {
+        if let Some(condition) = self.condition.take() {
+            let now = self.now();
+            eprintln!(
+                "{}",
+                json!({"event":"follower_recovered","condition":condition,
+                    "failures":self.backoff.failures(),"lasted_seconds":self.backoff.lasted(now)})
+            );
+        }
+        self.backoff.reset();
+    }
+
+    /// Runs the work between steps on the writer's connection, if any.
+    async fn between_steps(&mut self) -> Result<(), Error> {
+        let now = self.now();
+        let (Some(between), Some(store)) = (self.between.as_mut(), self.store.as_mut()) else {
+            return Ok(());
+        };
+        match between.run(store, now).await {
+            Ok(()) => Ok(()),
+            Err(error @ Error::Check { .. }) => Err(self.closed_by_check(error).await),
+            Err(Error::Store(error)) if error.temporary() => {
+                self.store = None;
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Waits until `until`; `false` when a stop came first. With work
+    /// between steps, the wait is cut so that the work runs at least every
+    /// minute.
+    async fn wait_until(&mut self, until: u64) -> Result<bool, Error> {
+        if self.between.is_none() {
+            return Ok(pause_until(&*self.time, &self.stop, until).await);
+        }
+        loop {
+            let now = self.now();
+            if now >= until {
+                return Ok(!self.stop.requested());
+            }
+            if !pause_until(&*self.time, &self.stop, until.min(now + BETWEEN_INTERVAL)).await {
+                return Ok(false);
+            }
+            self.between_steps().await?;
+        }
+    }
+
+    /// Closes the gate with a check's code and returns the error that ends
+    /// the run.
+    async fn closed_by_check(&mut self, error: Error) -> Error {
+        let Error::Check { code, detail } = &error else {
+            return self.fatal(error).await;
+        };
+        let (code, detail) = (*code, detail.clone());
+        if let Err(closing) = self.close_gate(code, &detail).await {
+            eprintln!(
+                "{}",
+                json!({"event":"gate_close_failed","check":code,"error":closing.report()})
+            );
+            return self.fatal(closing).await;
+        }
+        self.fatal(error).await
     }
 
     /// Decides what a failed step leads to: the time of the next attempt, or
     /// the error that ends the run.
     async fn failed(&mut self, error: Error) -> Result<u64, Error> {
         let now = self.now();
-        let until = match &error {
+        let (condition, not_before) = match &error {
             Error::Provider(provider) => match provider.kind {
                 Kind::Fatal { .. } => return Err(self.fatal(error).await),
                 // A refusal of every request names its own end: waited out,
                 // never fatal (a spent allowance resumes the next UTC day).
                 Kind::Wait { until } => {
+                    // The provider answers: an earlier condition has ended,
+                    // and the wait does not count towards the next one.
+                    self.recovered();
                     let report = error.report();
                     self.set_state(State::Waiting, provider.code, Some(until), Some(&report))
                         .await;
                     self.persist_counts_if_due().await;
                     return Ok(until);
                 }
-                Kind::Retry { until } => until.max(now + self.backoff.failed(now).as_secs()),
+                Kind::Retry { until } => (Condition::Temporary, until),
             },
-            Error::Store(store) if store.temporary() => {
-                self.store = None;
-                now + self.backoff.failed(now).as_secs()
-            }
-            // The stored position moved, as after a commit whose outcome was
-            // not seen: read it again.
-            Error::Store(dsa_store::Error::Refusal("update_base_mismatch")) => {
-                self.store = None;
-                now + self.backoff.failed(now).as_secs()
-            }
-            Error::Answer { .. } => now + self.backoff.failed(now).as_secs(),
-            Error::Check { code, detail } => {
-                let (code, detail) = (*code, detail.clone());
-                if let Err(closing) = self.close_gate(code, &detail).await {
-                    eprintln!(
-                        "{}",
-                        json!({"event":"gate_close_failed","check":code,"error":closing.report()})
-                    );
-                    return Err(self.fatal(closing).await);
+            Error::Store(store) => match retried(store) {
+                Some(reconnect) => {
+                    if reconnect {
+                        self.store = None;
+                    }
+                    (Condition::Temporary, now)
                 }
-                return Err(self.fatal(error).await);
-            }
+                None => return Err(self.fatal(error).await),
+            },
+            Error::Answer { .. } => (Condition::Answer, now),
+            Error::Check { .. } => return Err(self.closed_by_check(error).await),
             _ => return Err(self.fatal(error).await),
         };
+        // Failures of another kind start a new condition.
+        if self.condition != Some(condition) {
+            self.backoff.reset();
+            self.condition = Some(condition);
+        }
+        let until = not_before.max(now + self.backoff.failed(now).as_secs());
         let lasted = self.backoff.lasted(now);
-        if lasted > self.settings.fatal_after.as_secs() {
+        let ends = condition == Condition::Temporary || self.settings.refused_answers_end_the_run;
+        if ends && lasted > self.settings.fatal_after.as_secs() {
             return Err(self
                 .fatal(Error::Lasting {
                     seconds: lasted,
@@ -577,7 +713,8 @@ impl<'a> Follower<'a> {
         let report = error.report();
         eprintln!(
             "{}",
-            json!({"event":"follower_retry","error":report,"retry_at":until,"failures":self.backoff.failures()})
+            json!({"event":"follower_retry","condition":condition,"error":report,"retry_at":until,
+                "failures":self.backoff.failures(),"lasted_seconds":lasted})
         );
         let code = error.code();
         self.set_state(State::Waiting, &code, Some(until), Some(&report))
@@ -1024,20 +1161,29 @@ impl<'a> Follower<'a> {
 
     /// The highest stored height at or above the target whose hash the
     /// provider still returns. The target itself must be on the provider's
-    /// chain: a contradiction is read again after a minute, and a second one
-    /// closes the gate.
+    /// chain: another hash is read again after a minute, and another hash on
+    /// both reads closes the gate. A missing answer at the target's height,
+    /// while the provider's head is not below the stored tip, is an answer
+    /// that contradicts the chain: nothing is written and the step is tried
+    /// again.
     async fn find_fork(&mut self) -> Result<u32, Error> {
         let target = self.stored.target.clone();
-        let first = self.hash_at(target.height).await?;
-        if first.as_deref() != Some(target.hash.as_str()) {
+        let missing = || {
+            Error::answer(
+                "provider_target_missing",
+                json!({"height":target.height,"stored":target.hash}),
+            )
+        };
+        let first = self.hash_at(target.height).await?.ok_or_else(missing)?;
+        if first != target.hash {
             let until = self.now() + RECHECK.as_secs();
             self.set_state(State::Waiting, "target_contradicted", Some(until), None)
                 .await;
             if !pause_until(&*self.time, &self.stop, until).await {
                 return Err(Error::Stopped);
             }
-            let second = self.hash_at(target.height).await?;
-            if second.as_deref() != Some(target.hash.as_str()) {
+            let second = self.hash_at(target.height).await?.ok_or_else(missing)?;
+            if second != target.hash {
                 return Err(Error::Check {
                     code: "canonical_conflict",
                     detail: json!({"height":target.height,"stored":target.hash,"provider":[first,second]}),
