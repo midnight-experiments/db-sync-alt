@@ -579,15 +579,20 @@ fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
     ))
 }
 
-/// Connects the destination, registers it for cancellation and applies the
-/// session limits.
+/// Connects the destination, registers it for cancellation (under `role`,
+/// replacing the earlier connection of that role) and applies the session
+/// limits.
 async fn open(
     connection: Connection,
     database: &DatabaseArguments,
     session: &Session,
+    role: Option<&'static str>,
 ) -> Result<Store, Error> {
     let store = Store::connect(connection.config, connection.root.as_deref()).await?;
-    session.watch(store.cancellation());
+    match role {
+        Some(role) => session.watch_as(role, store.cancellation()),
+        None => session.watch(store.cancellation()),
+    }
     for (name, seconds) in [
         ("statement_timeout", database.statement_timeout_seconds),
         (
@@ -635,7 +640,7 @@ async fn execute(
     session: Session,
 ) -> Result<Value, Error> {
     let database = command.database().expect("a database command");
-    let mut store = open(destination, database, &session).await?;
+    let mut store = open(destination, database, &session, None).await?;
     match &command {
         Command::Create { .. } => {
             store.create(&profile).await?;

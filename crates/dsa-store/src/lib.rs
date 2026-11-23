@@ -373,8 +373,10 @@ impl Cancellation {
     pub fn commit_sent(&self) -> bool {
         self.commit_sent.load(Ordering::SeqCst)
     }
-    /// The connection ended or its store was dropped: nothing is left to
-    /// cancel.
+    /// The connection ended on its own (the server closed it or it broke):
+    /// its backend runs nothing that could be cancelled. A store that is
+    /// dropped is not closed in this sense: its backend may still be running
+    /// a statement.
     pub fn closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
@@ -384,7 +386,6 @@ impl Drop for Store {
     fn drop(&mut self) {
         // Closing the socket also releases this session's advisory lock.
         self.connection.abort();
-        self.cancellation.closed.store(true, Ordering::SeqCst);
     }
 }
 

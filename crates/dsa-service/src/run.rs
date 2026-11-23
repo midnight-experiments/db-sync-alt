@@ -49,9 +49,35 @@ const REFRESH_DEADLINE: Duration = Duration::from_secs(15);
 /// The longest the last read of the status may take after a stop.
 const FINAL_READ_DEADLINE: Duration = Duration::from_millis(1_500);
 
-/// Opens one new connection, registered for cancellation by the caller.
+/// What a connection is for. The caller registers each connection for
+/// cancellation under its role, so that a new connection of a role replaces
+/// the earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The writer: the start, the follower and its reconnects.
+    Writer,
+    /// The read of the status's database part.
+    Status,
+    /// One upkeep job.
+    Upkeep,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Writer => "writer",
+            Self::Status => "status",
+            Self::Upkeep => "upkeep",
+        }
+    }
+}
+
+/// Opens one new connection for a role, registered for cancellation by the
+/// caller.
 pub type Open = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = Result<Store, dsa_store::Error>> + Send>> + Send + Sync,
+    dyn Fn(Role) -> Pin<Box<dyn Future<Output = Result<Store, dsa_store::Error>> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// The service's outside world and settings.
@@ -248,7 +274,7 @@ fn handing(store: Store, open: Open) -> follow::Connect {
         Box::pin(async move {
             match first {
                 Some(store) => Ok(store),
-                None => open().await,
+                None => open(Role::Writer).await,
             }
         })
     })
@@ -334,7 +360,7 @@ impl Service {
     /// database, check the retention and grant and check the reader.
     async fn prepare(&self) -> Result<Prepared, Error> {
         self.show(State::Waiting, "database_connecting", None);
-        let mut store = (self.open)().await?;
+        let mut store = (self.open)(Role::Writer).await?;
         store.lock_writer().await?;
         let state = match store.follow_state(&self.profile).await {
             Ok(state) => Some(state),
@@ -563,7 +589,7 @@ async fn read_view(
     time: &dyn Time,
 ) -> Result<DatabaseView, dsa_store::Error> {
     if store.is_none() {
-        let opened = open().await?;
+        let opened = open(Role::Status).await?;
         opened
             .client()
             .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
@@ -612,7 +638,7 @@ struct Upkeep {
 
 impl Upkeep {
     async fn connect(&self) -> Result<Store, dsa_store::Error> {
-        let store = (self.open)().await?;
+        let store = (self.open)(Role::Upkeep).await?;
         *lock(&self.current) = Some(store.cancellation());
         Ok(store)
     }

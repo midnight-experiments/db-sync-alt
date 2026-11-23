@@ -120,7 +120,7 @@ impl World {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let config = self.proxy.config(&self.start.database.config);
-        let open: Open = Arc::new(move || {
+        let open: Open = Arc::new(move |_| {
             let config = config.clone();
             Box::pin(async move { Store::connect(config, None).await })
         });

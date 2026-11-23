@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 use dsa_service::{
     follow,
     retry::{Stop, WallTime},
-    run::{Context, Open, REFRESH_INTERVAL, UPKEEP_TICK, run},
+    run::{Context, Open, REFRESH_INTERVAL, Role, UPKEEP_TICK, run},
     upkeep::IndexPolicy,
 };
 use serde_json::json;
@@ -79,13 +79,15 @@ pub(crate) fn command(
                     })?;
                 let open: Open = {
                     let session = session.clone();
-                    Arc::new(move || {
+                    Arc::new(move |role: Role| {
                         let connection = Connection {
                             config: destination.config.clone(),
                             root: destination.root.clone(),
                         };
                         let (database, session) = (Arc::clone(&database), session.clone());
-                        Box::pin(async move { open(connection, &database, &session).await })
+                        Box::pin(async move {
+                            open(connection, &database, &session, Some(role.as_str())).await
+                        })
                     })
                 };
                 let (stopper, stop) = Stop::new();
