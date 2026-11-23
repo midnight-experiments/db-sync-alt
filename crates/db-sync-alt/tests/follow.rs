@@ -330,10 +330,12 @@ async fn an_update_is_atomic_after_every_statement() -> Result {
     };
     f.store.probe().fail_after = None;
     assert!(failures >= 15, "only {failures} statements");
-    assert_eq!(report.statements, failures + 1);
+    // Every statement is a failure point, the last one included.
+    assert_eq!(report.statements, failures);
+    // Rows reached every table (the descriptor statement also ran: its units
+    // were stored already, so it inserted none).
     for table in [
         "block",
-        "multi_asset",
         "datum",
         "tx",
         "tx_out",
@@ -778,35 +780,51 @@ async fn first_served_rows_follow_the_window() -> Result {
     let plan = advance(&setup.g, &setup.follower, 2, Some(target));
     setup.step(&plan).await?;
     assert_eq!(heights(&first_served(&config).await?), expect(&setup));
+    // The two new heights are recent: the candidate is the first of them.
     let store = &setup.follower.store;
-    assert_eq!(store.horizon_candidate().await.map_err(named)?, target);
+    let candidate = store.horizon_candidate().await.map_err(named)?;
+    assert_eq!(candidate, target + 1);
+    assert!(candidate <= setup.follower.target.height);
     setup.cleanup().await
 }
 
-/// Old outputs, their transactions and their asset rows below the chain:
-/// rows outside every update's range.
+/// Rows outside every update's range that a store keeps: old unspent outputs
+/// with their transactions and cNIGHT rows (every tenth at the mapping
+/// address, with its datum), and every fourth of them spent by transactions
+/// at the `window` height.
 async fn fill(
     config: &tokio_postgres::Config,
     profile: &dsa_chain::profiles::Profile,
     first: i32,
     blocks: i32,
+    window: u32,
 ) -> Result {
     let cnight = &profile.assets["cnight"];
+    let last = first + blocks - 1;
     let client = connect(config).await?;
     client
         .execute(
             "INSERT INTO serve.tx(id,hash,block_id,block_index,valid_contract)
              SELECT b::bigint*4096+i,decode(md5('f'||b||'/'||i)||md5('g'||b||'/'||i),'hex'),b,i,true
              FROM generate_series($1::integer,$2::integer) b,generate_series(0,99) i",
-            &[&first, &(first + blocks - 1)],
+            &[&first, &last],
         )
         .await?;
     client
         .execute(
             "INSERT INTO serve.tx_out(id,tx_id,index,address,value,data_hash,consumed_by_tx_id)
-             SELECT t.id*4096+j,t.id,j,'addr_filler_'||(t.id%997),1000000,NULL,NULL
+             SELECT t.id*4096+j,t.id,j,CASE WHEN t.id%10=0 THEN $3 ELSE 'addr_filler_'||(t.id%997) END,1000000,
+              CASE WHEN t.id%10=0 THEN decode(md5('d'||t.id||'/'||j)||md5('e'||t.id||'/'||j),'hex') END,NULL
              FROM serve.tx t,generate_series(0,1) j WHERE t.block_id BETWEEN $1 AND $2 AND (j=0 OR t.id%2=0)",
-            &[&i64::from(first), &i64::from(first + blocks - 1)],
+            &[&i64::from(first), &i64::from(last), &profile.addresses["mapping"]],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO serve.datum(id,hash,value)
+             SELECT nextval('dsa.datum_id_seq'),o.data_hash,jsonb_build_object('int',o.id)
+             FROM serve.tx_out o WHERE o.tx_id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.data_hash IS NOT NULL",
+            &[&i64::from(first), &i64::from(last)],
         )
         .await?;
     client
@@ -817,10 +835,24 @@ async fn fill(
              WHERE o.tx_id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095",
             &[
                 &i64::from(first),
-                &i64::from(first + blocks - 1),
+                &i64::from(last),
                 &cnight.policy,
                 &cnight.name,
             ],
+        )
+        .await?;
+    // Spending transactions at the window height, 4,000 inputs each.
+    let base = i64::from(window) * 4096 + 1000 + i64::from(first);
+    client
+        .execute(
+            "WITH spent AS (SELECT row_number() OVER (ORDER BY o.id)-1 AS n,o.tx_id,o.index FROM serve.tx_out o
+              WHERE o.tx_id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.index=0 AND o.tx_id%4=1),
+             spenders AS (INSERT INTO serve.tx(id,hash,block_id,block_index,valid_contract)
+              SELECT DISTINCT $3::bigint+n/4000,decode(md5('s'||($3::bigint+n/4000))||md5('t'||($3::bigint+n/4000)),'hex'),
+               $4::bigint,$3::bigint+n/4000-$4::bigint*4096,true FROM spent)
+             INSERT INTO serve.tx_in(id,tx_in_id,tx_out_id,tx_out_index)
+             SELECT ($3::bigint+n/4000)*4096+n%4000,$3::bigint+n/4000,tx_id,index FROM spent",
+            &[&i64::from(first), &i64::from(last), &base, &i64::from(window)],
         )
         .await?;
     client.batch_execute("ANALYZE").await?;
@@ -840,20 +872,39 @@ fn buffers(plan: &Value) -> u64 {
     .sum()
 }
 
+/// Relations that grow with the store. The others hold a handful of rows by
+/// construction (descriptors, epochs, the state rows), where a sequential
+/// scan of their one page is the cheapest plan.
+const GROWING: [&str; 10] = [
+    "serve.block",
+    "serve.tx",
+    "serve.tx_out",
+    "serve.tx_in",
+    "serve.ma_tx_out",
+    "serve.datum",
+    "serve.tx_metadata",
+    "serve.epoch_stake",
+    "dsa.consumed_before_horizon",
+    "dsa.first_served",
+];
+
 fn sequential_scans(node: &Value, found: &mut Vec<String>) {
-    if node["Node Type"] == "Seq Scan" && matches!(node["Schema"].as_str(), Some("serve" | "dsa")) {
-        found.push(format!(
-            "{}.{}",
-            node["Schema"].as_str().unwrap_or(""),
-            node["Relation Name"].as_str().unwrap_or("")
-        ));
+    let relation = format!(
+        "{}.{}",
+        node["Schema"].as_str().unwrap_or(""),
+        node["Relation Name"].as_str().unwrap_or("")
+    );
+    if node["Node Type"] == "Seq Scan" && GROWING.contains(&relation.as_str()) {
+        found.push(relation);
     }
     for child in node["Plans"].as_array().into_iter().flatten() {
         sequential_scans(child, found);
     }
 }
 
-async fn costed(setup: &mut Setup, plan: &Plan) -> Result<BTreeMap<String, (u64, Vec<String>)>> {
+type Costs = BTreeMap<String, (u64, Vec<String>, Vec<Value>)>;
+
+async fn costed(setup: &mut Setup, plan: &Plan) -> Result<Costs> {
     setup.follower.store.probe().explain = true;
     setup.step(plan).await?;
     let mut probe = setup.follower.store.probe();
@@ -862,9 +913,10 @@ async fn costed(setup: &mut Setup, plan: &Plan) -> Result<BTreeMap<String, (u64,
     for (label, plan) in probe.plans.drain(..) {
         let mut scans = Vec::new();
         sequential_scans(&plan[0]["Plan"], &mut scans);
-        let entry = costs.entry(label).or_insert((0, Vec::new()));
+        let entry = costs.entry(label).or_insert((0, Vec::new(), Vec::new()));
         entry.0 += buffers(&plan);
         entry.1.extend(scans);
+        entry.2.push(plan);
     }
     Ok(costs)
 }
@@ -878,8 +930,9 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
     let first = 1_000_000;
     let mut small = Setup::new(19, first, 60, true, WEEK).await?;
     let mut large = Setup::new(19, first, 60, true, WEEK).await?;
-    fill(&small.database.config, &small.profile, 1_000, 50).await?;
-    fill(&large.database.config, &large.profile, 1_000, 500).await?;
+    let window = small.follower.target.height;
+    fill(&small.database.config, &small.profile, 1_000, 50, window).await?;
+    fill(&large.database.config, &large.profile, 1_000, 500, window).await?;
     let mut results = Vec::new();
     for step in 0..3u64 {
         let plans = [&small, &large].map(|setup| {
@@ -896,15 +949,19 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
         let [small_plan, large_plan] = plans;
         let small_cost = costed(&mut small, &small_plan).await?;
         let large_cost = costed(&mut large, &large_plan).await?;
-        for (label, (large_buffers, scans)) in &large_cost {
-            let small_buffers = small_cost.get(label).map_or(0, |cost| cost.0);
+        for (label, (large_buffers, scans, large_plans)) in &large_cost {
+            let (small_buffers, small_plans) = small_cost
+                .get(label)
+                .map_or((0, Vec::new()), |cost| (cost.0, cost.2.clone()));
             assert!(
                 scans.is_empty(),
                 "step {step} {label}: sequential scans {scans:?}"
             );
             assert!(
                 *large_buffers <= small_buffers * 3 / 2 + 16,
-                "step {step} {label}: {small_buffers} buffers grew to {large_buffers}"
+                "step {step} {label}: {small_buffers} buffers grew to {large_buffers}: small {} large {}",
+                serde_json::to_string(&small_plans)?,
+                serde_json::to_string(large_plans)?
             );
             results.push(json!({"step":step,"statement":label,"buffers_small":small_buffers,"buffers_large":large_buffers}));
         }
@@ -913,7 +970,8 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
     let counts: Value = client
         .query_one(
             "SELECT jsonb_build_object('tx',(SELECT count(*) FROM serve.tx),'tx_out',(SELECT count(*) FROM serve.tx_out),
-              'ma_tx_out',(SELECT count(*) FROM serve.ma_tx_out),'tx_in',(SELECT count(*) FROM serve.tx_in),'block',(SELECT count(*) FROM serve.block))",
+              'ma_tx_out',(SELECT count(*) FROM serve.ma_tx_out),'tx_in',(SELECT count(*) FROM serve.tx_in),'block',(SELECT count(*) FROM serve.block),
+              'datum',(SELECT count(*) FROM serve.datum))",
             &[],
         )
         .await?
@@ -923,7 +981,7 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
         json!({"event":"update_cost","large_store_rows":counts,"statements":results})
     );
     // A Mainnet-size store: about 300,000 outputs, 200,000 transactions.
-    fill(&large.database.config, &large.profile, 2_000, 1_500).await?;
+    fill(&large.database.config, &large.profile, 2_000, 1_500, window).await?;
     let mainnet: Value = client
         .query_one(
             "SELECT jsonb_build_object('tx',(SELECT count(*) FROM serve.tx),'tx_out',(SELECT count(*) FROM serve.tx_out),
@@ -1187,11 +1245,10 @@ async fn verify_counts_unspent_outputs_and_first_observations_are_kept_once() ->
     let lost: i64 = client
         .query_opt(
             "SELECT o.id FROM serve.tx_out o WHERE o.address=ANY($1) AND o.data_hash IS NULL
-             AND o.id>=$2::bigint*16777216
              AND NOT EXISTS(SELECT 1 FROM serve.ma_tx_out a WHERE a.tx_out_id=o.id)
              AND NOT EXISTS(SELECT 1 FROM serve.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index)
-             ORDER BY o.id LIMIT 1",
-            &[&addresses, &i64::from(setup.follower.horizon)],
+             ORDER BY o.id DESC LIMIT 1",
+            &[&addresses],
         )
         .await?
         .ok_or("no token-less unspent output at a profile address")?

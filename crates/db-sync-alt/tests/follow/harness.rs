@@ -744,11 +744,42 @@ impl Follower {
             };
             self.headers.retain(|height, _| *height > target);
         }
+        // The position the plan leads to, checked against the store's own.
+        let tip = self.target.height + K;
         self.tip = HeaderRef {
-            height: report.tip,
-            hash: self.headers[&report.tip].hash.clone(),
+            height: tip,
+            hash: self.headers[&tip].hash.clone(),
         };
-        self.horizon = report.horizon;
+        if let Some(horizon) = plan.prune_to.filter(|_| self.prune) {
+            self.horizon = horizon;
+        }
+        let state = self.store.follow_state(profile).await.map_err(named)?;
+        if (report.target, report.tip, report.horizon) != (self.target.height, tip, self.horizon)
+            || (
+                state.target.height,
+                &state.target.hash,
+                state.tip.height,
+                &state.tip.hash,
+                state.horizon.height,
+            ) != (
+                self.target.height,
+                &self.target.hash,
+                tip,
+                &self.tip.hash,
+                self.horizon,
+            )
+        {
+            return Err(format!(
+                "the store is at target {} tip {} horizon {}, the plan leads to {} {} {}",
+                state.target.height,
+                state.tip.height,
+                state.horizon.height,
+                self.target.height,
+                tip,
+                self.horizon
+            )
+            .into());
+        }
         for param in &params {
             if self.staked.insert(param.epoch) {
                 self.store

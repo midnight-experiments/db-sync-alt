@@ -401,6 +401,16 @@ impl Generator<'_> {
         }
         let count = 1 + self.random.below(2) as usize;
         draft.outputs.extend(self.split(&tokens, count));
+        if self.random.chance(4) {
+            // A plain output at a profile address: selected, token-less.
+            draft.outputs.push(Utxo {
+                place: Place::Role("reserve".to_owned()),
+                coin: 1_200_000,
+                tokens: BTreeMap::new(),
+                datum: Datum::None,
+                special: Special::Plain,
+            });
+        }
     }
 
     fn transfer(&mut self, draft: &mut Draft) {

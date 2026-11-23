@@ -351,22 +351,66 @@ fn source_text(source: &Source) -> String {
     }
 }
 
-/// The rows of all final blocks as statement parameters.
+#[derive(Default)]
+struct TxColumns {
+    id: Vec<i64>,
+    hash: Vec<Vec<u8>>,
+    block: Vec<i64>,
+    index: Vec<i32>,
+    valid: Vec<bool>,
+}
+
+#[derive(Default)]
+struct OutputColumns {
+    id: Vec<i64>,
+    tx: Vec<i64>,
+    index: Vec<i32>,
+    address: Vec<String>,
+    value: Vec<String>,
+    data_hash: Vec<Option<Vec<u8>>>,
+}
+
+#[derive(Default)]
+struct AssetColumns {
+    id: Vec<i64>,
+    quantity: Vec<String>,
+    output: Vec<i64>,
+    policy: Vec<Vec<u8>>,
+    name: Vec<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct InputColumns {
+    id: Vec<i64>,
+    tx: Vec<i64>,
+    output_tx: Vec<i64>,
+    output_index: Vec<i32>,
+}
+
+#[derive(Default)]
+struct DatumColumns {
+    hash: Vec<Vec<u8>>,
+    value: Vec<Option<String>>,
+}
+
+#[derive(Default)]
+struct MetadataColumns {
+    id: Vec<i64>,
+    key: Vec<i64>,
+    tx: Vec<i64>,
+    json: Vec<Option<String>>,
+}
+
+/// The rows of all final blocks as statement parameters, one array per
+/// column.
 #[derive(Default)]
 struct Columns {
-    tx: (Vec<i64>, Vec<Vec<u8>>, Vec<i64>, Vec<i32>, Vec<bool>),
-    out: (
-        Vec<i64>,
-        Vec<i64>,
-        Vec<i32>,
-        Vec<String>,
-        Vec<String>,
-        Vec<Option<Vec<u8>>>,
-    ),
-    asset: (Vec<i64>, Vec<String>, Vec<i64>, Vec<Vec<u8>>, Vec<Vec<u8>>),
-    input: (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i32>),
-    datum: (Vec<Vec<u8>>, Vec<Option<String>>),
-    metadata: (Vec<i64>, Vec<i64>, Vec<i64>, Vec<Option<String>>),
+    tx: TxColumns,
+    out: OutputColumns,
+    asset: AssetColumns,
+    input: InputColumns,
+    datum: DatumColumns,
+    metadata: MetadataColumns,
 }
 
 impl Columns {
@@ -374,19 +418,19 @@ impl Columns {
         let mut c = Self::default();
         for rows in blocks.iter().map(|block| &block.rows) {
             for row in &rows.tx {
-                c.tx.0.push(row.id);
-                c.tx.1.push(bytes(&row.hash, Some(32))?);
-                c.tx.2.push(row.block_id);
-                c.tx.3.push(i32::from(row.block_index));
-                c.tx.4.push(row.valid_contract);
+                c.tx.id.push(row.id);
+                c.tx.hash.push(bytes(&row.hash, Some(32))?);
+                c.tx.block.push(row.block_id);
+                c.tx.index.push(i32::from(row.block_index));
+                c.tx.valid.push(row.valid_contract);
             }
             for row in &rows.tx_out {
-                c.out.0.push(row.id);
-                c.out.1.push(row.tx_id);
-                c.out.2.push(i32::from(row.index));
-                c.out.3.push(row.address.clone());
-                c.out.4.push(row.value.clone());
-                c.out.5.push(
+                c.out.id.push(row.id);
+                c.out.tx.push(row.tx_id);
+                c.out.index.push(i32::from(row.index));
+                c.out.address.push(row.address.clone());
+                c.out.value.push(row.value.clone());
+                c.out.data_hash.push(
                     row.data_hash
                         .as_deref()
                         .map(|hash| bytes(hash, Some(32)))
@@ -394,29 +438,29 @@ impl Columns {
                 );
             }
             for row in &rows.ma_tx_out {
-                c.asset.0.push(row.id);
-                c.asset.1.push(row.quantity.clone());
-                c.asset.2.push(row.tx_out_id);
-                c.asset.3.push(bytes(&row.policy, Some(28))?);
-                c.asset.4.push(bytes(&row.name, None)?);
+                c.asset.id.push(row.id);
+                c.asset.quantity.push(row.quantity.clone());
+                c.asset.output.push(row.tx_out_id);
+                c.asset.policy.push(bytes(&row.policy, Some(28))?);
+                c.asset.name.push(bytes(&row.name, None)?);
             }
             for row in &rows.tx_in {
-                c.input.0.push(row.id);
-                c.input.1.push(row.tx_in_id);
-                c.input.2.push(row.tx_out_id);
-                c.input.3.push(i32::from(row.tx_out_index));
+                c.input.id.push(row.id);
+                c.input.tx.push(row.tx_in_id);
+                c.input.output_tx.push(row.tx_out_id);
+                c.input.output_index.push(i32::from(row.tx_out_index));
             }
             for row in &rows.datum {
-                c.datum.0.push(bytes(&row.hash, Some(32))?);
-                c.datum.1.push(row.value.clone());
+                c.datum.hash.push(bytes(&row.hash, Some(32))?);
+                c.datum.value.push(row.value.clone());
             }
             for row in &rows.tx_metadata {
-                c.metadata.0.push(row.id);
-                c.metadata.1.push(
+                c.metadata.id.push(row.id);
+                c.metadata.key.push(
                     i64::try_from(row.key).map_err(|_| Error::Refusal("update_invalid_row"))?,
                 );
-                c.metadata.2.push(row.tx_id);
-                c.metadata.3.push(row.json.clone());
+                c.metadata.tx.push(row.tx_id);
+                c.metadata.json.push(row.json.clone());
             }
         }
         Ok(c)
@@ -457,11 +501,15 @@ const INSERT_FIRST_SERVED: &str = "INSERT INTO dsa.first_served(height,first_ser
 const UPDATE_SUPPLY: &str = "WITH d AS (SELECT * FROM unnest($1::text[],$2::text[]) d(unit,delta))
  UPDATE dsa.supply s SET quantity=s.quantity+d.delta::numeric FROM d
  WHERE s.unit=d.unit AND s.quantity+d.delta::numeric>=0";
-const UPDATE_UNSPENT: &str = "WITH changes AS (
+// The spent outputs are found from the update's inputs first: a filter on
+// the profile addresses must not turn into a scan of every output there.
+const UPDATE_UNSPENT: &str = "WITH spent AS MATERIALIZED (
+  SELECT o.address FROM unnest($2::bigint[],$3::integer[]) i(tx_id,index)
+  JOIN serve.tx_out o ON o.tx_id=i.tx_id AND o.index=i.index
+ ), changes AS (
   SELECT address,1 AS delta FROM unnest($1::text[]) address
   UNION ALL
-  SELECT o.address,-1 FROM unnest($2::bigint[],$3::integer[]) i(tx_id,index)
-  JOIN serve.tx_out o ON o.tx_id=i.tx_id AND o.index=i.index
+  SELECT address,-1 FROM spent
  ), totals AS (
   SELECT address,sum(delta)::bigint AS delta FROM changes WHERE address=ANY($4::text[]) GROUP BY address
  )
@@ -913,7 +961,7 @@ async fn apply(
     }
 
     // Whether the window already holds a spend; see `keep_reapplied_seconds`.
-    let window_spent = if columns.input.0.is_empty() || update.prune_to.is_some() {
+    let window_spent = if columns.input.id.is_empty() || update.prune_to.is_some() {
         true
     } else {
         steps
@@ -970,82 +1018,105 @@ async fn apply(
         count(&mut inserted, "block", rows);
     }
     let c = columns;
-    if !c.asset.0.is_empty() {
+    if !c.asset.id.is_empty() {
         let rows = steps
             .execute(
                 transaction,
                 "insert_multi_asset",
                 INSERT_ASSETS,
-                &[&c.asset.3, &c.asset.4],
+                &[&c.asset.policy, &c.asset.name],
             )
             .await?;
         count(&mut inserted, "multi_asset", rows);
     }
-    if !c.datum.0.is_empty() {
+    if !c.datum.hash.is_empty() {
         let rows = steps
             .execute(
                 transaction,
                 "insert_datum",
                 INSERT_DATUMS,
-                &[&c.datum.0, &c.datum.1],
+                &[&c.datum.hash, &c.datum.value],
             )
             .await?;
         count(&mut inserted, "datum", rows);
     }
-    if !c.tx.0.is_empty() {
+    if !c.tx.id.is_empty() {
         let rows = steps
             .execute(
                 transaction,
                 "insert_tx",
                 INSERT_TRANSACTIONS,
-                &[&c.tx.0, &c.tx.1, &c.tx.2, &c.tx.3, &c.tx.4],
+                &[&c.tx.id, &c.tx.hash, &c.tx.block, &c.tx.index, &c.tx.valid],
             )
             .await?;
         count(&mut inserted, "tx", rows);
     }
-    if !c.out.0.is_empty() {
+    if !c.out.id.is_empty() {
         let rows = steps
             .execute(
                 transaction,
                 "insert_tx_out",
                 INSERT_OUTPUTS,
-                &[&c.out.0, &c.out.1, &c.out.2, &c.out.3, &c.out.4, &c.out.5],
+                &[
+                    &c.out.id,
+                    &c.out.tx,
+                    &c.out.index,
+                    &c.out.address,
+                    &c.out.value,
+                    &c.out.data_hash,
+                ],
             )
             .await?;
         count(&mut inserted, "tx_out", rows);
     }
-    if !c.asset.0.is_empty() {
+    if !c.asset.id.is_empty() {
         let rows = steps
             .execute(
                 transaction,
                 "insert_ma_tx_out",
                 INSERT_ASSET_ROWS,
-                &[&c.asset.0, &c.asset.1, &c.asset.2, &c.asset.3, &c.asset.4],
+                &[
+                    &c.asset.id,
+                    &c.asset.quantity,
+                    &c.asset.output,
+                    &c.asset.policy,
+                    &c.asset.name,
+                ],
             )
             .await?;
-        if rows != c.asset.0.len() as u64 {
+        if rows != c.asset.id.len() as u64 {
             return Err(Error::Refusal("update_asset_descriptor_missing"));
         }
         count(&mut inserted, "ma_tx_out", rows);
     }
-    if !c.input.0.is_empty() {
+    if !c.input.id.is_empty() {
         let rows = steps
             .execute(
                 transaction,
                 "insert_tx_in",
                 INSERT_INPUTS,
-                &[&c.input.0, &c.input.1, &c.input.2, &c.input.3],
+                &[
+                    &c.input.id,
+                    &c.input.tx,
+                    &c.input.output_tx,
+                    &c.input.output_index,
+                ],
             )
             .await?;
         count(&mut inserted, "tx_in", rows);
     }
-    if !c.metadata.0.is_empty() {
+    if !c.metadata.id.is_empty() {
         let rows = steps
             .execute(
                 transaction,
                 "insert_tx_metadata",
                 INSERT_METADATA,
-                &[&c.metadata.0, &c.metadata.1, &c.metadata.2, &c.metadata.3],
+                &[
+                    &c.metadata.id,
+                    &c.metadata.key,
+                    &c.metadata.tx,
+                    &c.metadata.json,
+                ],
             )
             .await?;
         count(&mut inserted, "tx_metadata", rows);
@@ -1112,16 +1183,16 @@ async fn apply(
             return Err(Error::Refusal("update_supply_negative"));
         }
     }
-    if !c.out.0.is_empty() || !c.input.0.is_empty() {
+    if !c.out.id.is_empty() || !c.input.id.is_empty() {
         steps
             .execute(
                 transaction,
                 "update_unspent",
                 UPDATE_UNSPENT,
                 &[
-                    &c.out.3,
-                    &c.input.2,
-                    &c.input.3,
+                    &c.out.address,
+                    &c.input.output_tx,
+                    &c.input.output_index,
                     &profile_addresses(profile),
                 ],
             )
