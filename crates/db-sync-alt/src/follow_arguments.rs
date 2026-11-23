@@ -98,7 +98,7 @@ pub(crate) struct FollowerArguments {
     pub(crate) max_batch_blocks: u32,
     /// Transaction CBOR bytes of one update; the update ends with the block
     /// that reaches it.
-    #[arg(long, env = "DSA_MAX_BATCH_CBOR_BYTES", default_value_t = 8 * 1024 * 1024,
+    #[arg(long, env = "DSA_MAX_BATCH_CBOR_BYTES", default_value_t = 4 * 1024 * 1024,
         value_parser = clap::value_parser!(u32).range(65_536..=67_108_864))]
     pub(crate) max_batch_cbor_bytes: u32,
     /// Rows of one update; the update ends with the block that reaches it.

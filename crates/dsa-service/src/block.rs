@@ -45,11 +45,14 @@ pub struct Limits {
     pub rows: usize,
 }
 
+/// One header page holds 100 blocks. At 4 MiB of CBOR a batch of full
+/// blocks keeps the process well below 64 MiB resident with four requests
+/// in flight; at 8 MiB it nears that bound.
 impl Default for Limits {
     fn default() -> Self {
         Self {
             blocks: 100,
-            cbor_bytes: 8 * 1024 * 1024,
+            cbor_bytes: 4 * 1024 * 1024,
             rows: 50_000,
         }
     }
