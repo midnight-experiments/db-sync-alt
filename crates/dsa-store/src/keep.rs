@@ -1,7 +1,10 @@
-//! SQL selection for the pure keep rule. Table queries preserve source payloads
-//! and stream once per family. Destination batches never re-execute the source
-//! prefix selection. Aggregates consume bounded materialized inputs, so they
-//! cannot turn into a backward min/max walk on source indexes.
+//! The keep rule in SQL. `keep.sql` is the one definition; every form is
+//! assembled from its named blocks by concatenation and placeholder values:
+//! the complete-history source form (conversion, comparison), the pruned form
+//! of a store (verification, horizon advance) and the staged form that
+//! conversion evaluates step by step on its private copy.
+
+use std::{collections::BTreeMap, sync::LazyLock};
 
 use dsa_chain::{
     keep::{Bounds, RetainedRows, TABLES},
@@ -15,7 +18,7 @@ use crate::Error;
 pub enum SourceSchema {
     Public,
     Serve,
-    /// Private conversion facts, never a source-reader schema.
+    /// The conversion's private copy, never a source-reader schema.
     Temporary,
 }
 impl SourceSchema {
@@ -26,6 +29,188 @@ impl SourceSchema {
             Self::Temporary => "pg_temp",
         }
     }
+}
+
+/// Which rows the rule reads.
+#[derive(Debug, Clone, Copy)]
+pub enum Form {
+    /// Complete history in the given schema.
+    Source(SourceSchema),
+    /// A store that is already pruned: outputs recorded in
+    /// `dsa.consumed_before_horizon` are spent before H although their spend
+    /// is no longer stored.
+    Pruned,
+}
+
+const MARKER_FILTER: &str =
+    "AND NOT EXISTS(SELECT 1 FROM dsa.consumed_before_horizon c WHERE c.tx_out_id=o.id)\n ";
+
+struct Cte {
+    name: &'static str,
+    materialized: bool,
+    body: &'static str,
+}
+struct Definition {
+    ctes: Vec<Cte>,
+    fragments: BTreeMap<&'static str, &'static str>,
+}
+
+static DEFINITION: LazyLock<Definition> = LazyLock::new(|| parse(include_str!("keep.sql")));
+
+/// Split `keep.sql` at its `-- cte NAME [inline]` and `-- fragment NAME` lines.
+fn parse(text: &'static str) -> Definition {
+    let mut ctes = Vec::new();
+    let mut fragments = BTreeMap::new();
+    let mut current: Option<(&str, &str, usize)> = None;
+    let mut finish = |current: Option<(&'static str, &'static str, usize)>, end: usize| {
+        if let Some((kind, header, start)) = current {
+            let body = text[start..end].trim_end_matches('\n');
+            let mut words = header.split_whitespace();
+            let name = words.next().expect("keep.sql block name");
+            if kind == "fragment" {
+                fragments.insert(name, body);
+            } else {
+                ctes.push(Cte {
+                    name,
+                    materialized: words.next() != Some("inline"),
+                    body,
+                });
+            }
+        }
+    };
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let header = line.trim_end();
+        if let Some(rest) = header.strip_prefix("-- cte ") {
+            finish(current.take(), start);
+            current = Some(("cte", rest, offset));
+        } else if let Some(rest) = header.strip_prefix("-- fragment ") {
+            finish(current.take(), start);
+            current = Some(("fragment", rest, offset));
+        }
+    }
+    finish(current, text.len());
+    Definition { ctes, fragments }
+}
+
+/// Conversion progress through its staged evaluation: CTEs already
+/// materialized in temporary tables, and which retained facts exist.
+#[derive(Default, Clone)]
+struct Staged {
+    checkpoints: Vec<(&'static str, &'static str)>,
+    output_facts: bool,
+    asset_facts: bool,
+    datum_hashes: bool,
+}
+
+const STAGED_DATUM: &str = " SELECT DISTINCT d.id FROM pg_temp.conversion_datum_hashes h CROSS JOIN LATERAL (SELECT d.id FROM pg_temp.datum d WHERE d.hash=h.hash OFFSET 0) d";
+
+fn fill(
+    text: &str,
+    schema: SourceSchema,
+    markers: bool,
+    staged: &Staged,
+    datum_facts: bool,
+) -> String {
+    let definition = &*DEFINITION;
+    let mut text = text.to_owned();
+    for (name, body) in &definition.fragments {
+        text = text.replace(&format!("__{}__", name.to_uppercase()), body);
+    }
+    let facts = |ready: bool, table: &str, source: &str| {
+        if ready {
+            format!("pg_temp.{table}")
+        } else {
+            format!("__SOURCE__.{source}")
+        }
+    };
+    text.replace(
+        "__OUTPUT_FACTS__",
+        &facts(staged.output_facts, "conversion_output_facts", "tx_out"),
+    )
+    .replace(
+        "__ASSET_FACTS__",
+        &facts(staged.asset_facts, "conversion_asset_facts", "ma_tx_out"),
+    )
+    .replace(
+        "__DATUM_ASSETS__",
+        &facts(datum_facts, "conversion_asset_facts", "ma_tx_out"),
+    )
+    .replace("__MARKERS__", if markers { MARKER_FILTER } else { "" })
+    .replace(
+        "__ELIGIBLE_ASSET__",
+        &format!("({})", Selection::asset_predicate(schema, "a")),
+    )
+    .replace("__SOURCE__", schema.name())
+}
+
+fn render(schema: SourceSchema, markers: bool, staged: &Staged, bindings: bool) -> String {
+    let ctes = DEFINITION
+        .ctes
+        .iter()
+        .map(|cte| {
+            let body = match staged
+                .checkpoints
+                .iter()
+                .find(|(name, _)| *name == cte.name)
+            {
+                Some((_, table)) => format!(" SELECT * FROM pg_temp.{table}"),
+                None if cte.name == "keep_datum" && staged.datum_hashes => STAGED_DATUM.to_owned(),
+                None => cte.body.to_owned(),
+            };
+            let kind = if cte.materialized {
+                "MATERIALIZED "
+            } else {
+                ""
+            };
+            format!("{} AS {kind}(\n{body}\n)", cte.name)
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let bindings = if bindings { BINDINGS } else { "" };
+    fill(
+        &format!("WITH\n{bindings}{ctes}\n"),
+        schema,
+        markers,
+        staged,
+        false,
+    )
+}
+
+/// One step of the conversion's staged evaluation. Each step is evaluated
+/// once into a temporary table, then indexed and analyzed before its
+/// consumers are planned.
+#[derive(Debug)]
+pub struct KeyStage {
+    pub table: String,
+    pub create_sql: String,
+    pub prepare_sql: String,
+}
+
+/// Every parameter stays typed when a staged form no longer references it.
+pub(crate) const BINDINGS: &str = "conversion_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,\
+    $3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,\
+    $6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,\
+    $9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names),\n";
+
+/// The final selection of one family. The asset family also keeps every
+/// eligible window row, so that an orphan in a corrupt source reaches the
+/// closure check instead of disappearing.
+fn family_keys(table: &str) -> String {
+    if table == "ma_tx_out" {
+        format!(
+            "SELECT 'ma_tx_out'::text AS family,id FROM (SELECT id FROM keep_ma_tx_out UNION SELECT a.id FROM pg_temp.ma_tx_out a WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND ({})) selected",
+            Selection::asset_predicate(SourceSchema::Temporary, "a")
+        )
+    } else {
+        format!("SELECT '{table}'::text AS family,id FROM keep_{table}")
+    }
+}
+
+fn bytes(value: &str) -> Result<Vec<u8>, Error> {
+    hex::decode(value).map_err(|_| Error::Refusal("invalid_keep_profile"))
 }
 
 #[derive(Debug)]
@@ -42,263 +227,106 @@ pub struct Selection {
     fixed_names: Vec<Vec<u8>>,
 }
 
-/// Destination-only checkpoint derived from the same retention CTEs. Source
-/// facts are immutable private tables in one writer transaction. Each step is
-/// evaluated once, then indexed/analyzed before its consumers are planned.
-#[derive(Debug)]
-pub struct KeyStage {
-    pub table: &'static str,
-    pub create_sql: String,
-    pub prepare_sql: String,
-}
-
-const KEY_UNION_MARKER: &str = " SELECT 'block'::text AS family,id FROM keep_block";
-fn prefix(full: &str) -> Result<&str, Error> {
-    full.split_once(KEY_UNION_MARKER)
-        .and_then(|(prefix, _)| {
-            prefix.strip_prefix("CREATE TEMP TABLE conversion_keep_keys ON COMMIT DROP AS ")
-        })
-        .ok_or(Error::Refusal("invalid_staging_keep_definition"))
-}
-fn cte_body(full: &str, cte: &str, next: &str) -> Result<String, Error> {
-    let begin = full
-        .find(&format!("{cte} AS MATERIALIZED ("))
-        .map(|n| n + format!("{cte} AS MATERIALIZED (").len())
-        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-    let end = full
-        .find(&format!("{next} AS MATERIALIZED ("))
-        .and_then(|n| full[..n].rfind("),"))
-        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-    full.get(begin..end)
-        .map(str::to_owned)
-        .ok_or(Error::Refusal("invalid_staging_keep_definition"))
-}
-fn replace_cte(full: &mut String, cte: &str, next: &str, body: &str) -> Result<(), Error> {
-    let old = cte_body(full, cte, next)?;
-    let begin = full
-        .find(&format!("{cte} AS MATERIALIZED ("))
-        .map(|n| n + format!("{cte} AS MATERIALIZED (").len())
-        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-    full.replace_range(begin..begin + old.len(), body);
-    Ok(())
-}
-fn required_replace(sql: &str, original: &str, replacement: &str) -> Result<String, Error> {
-    if sql.matches(original).count() != 1 {
-        return Err(Error::Refusal("invalid_staging_keep_definition"));
-    }
-    Ok(sql.replacen(original, replacement, 1))
-}
-
-fn projection_stage(
-    full: &str,
-    table: &'static str,
-    query: &str,
-    prepare: &str,
-) -> Result<KeyStage, Error> {
-    // Replacing K4 with its hash checkpoint removes the last use of $4
-    // from some prefixes. Keep every node-domain parameter explicitly typed,
-    // even when all its consumers are now independent destination stages.
-    let bindings = "conversion_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,$3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,$6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,$9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names),\n";
-    let prefix = prefix(full)?;
-    let start = prefix
-        .find("WITH\n")
-        .map(|n| n + 5)
-        .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-    let prefix = format!("{}{}{}", &prefix[..start], bindings, &prefix[start..]);
-    Ok(KeyStage {
-        table,
-        create_sql: format!("CREATE TEMP TABLE {table} ON COMMIT DROP AS {prefix} {query}"),
-        prepare_sql: prepare.to_owned(),
-    })
-}
-
-fn bytes(value: &str) -> Result<Vec<u8>, Error> {
-    hex::decode(value).map_err(|_| Error::Refusal("invalid_keep_profile"))
-}
-
 impl Selection {
-    pub fn staging_plan() -> Result<Vec<KeyStage>, Error> {
-        let mut full = crate::canonical::staging_keys_sql();
+    /// The conversion's staged evaluation of the source form over its private
+    /// copy: five checkpoints, three retained-fact projections, one key table
+    /// per family and their union.
+    pub fn staging_plan() -> Vec<KeyStage> {
+        let mut staged = Staged::default();
         let mut stages = Vec::new();
-        // Preserve multiplicity for permissioned candidates and epoch headers:
+        // Permissioned candidates and epoch headers keep their multiplicity:
         // empty epochs can select the same historical header twice. The final
-        // original UNION, rather than a new uniqueness constraint, deduplicates.
-        for (cte, next, table, index, unique) in [
-            (
-                "old_unspent",
-                "governance_candidates",
-                "conversion_keys_unspent",
-                "id",
-                true,
-            ),
+        // UNION deduplicates.
+        for (cte, table, column, unique) in [
+            ("old_unspent", "conversion_keys_unspent", "id", true),
             (
                 "permissioned_candidates",
-                "permissioned_last_transaction",
                 "conversion_keys_permissioned",
                 "tx_id",
                 false,
             ),
-            (
-                "epoch_headers",
-                "fallback_candidates",
-                "conversion_keys_epochs",
-                "id",
-                false,
-            ),
-            (
-                "keep_tx_out",
-                "keep_block",
-                "conversion_keys_outputs",
-                "id",
-                true,
-            ),
-            (
-                "keep_ma_tx_out",
-                "keep_multi_asset",
-                "conversion_keys_assets",
-                "id",
-                true,
-            ),
+            ("epoch_headers", "conversion_keys_epochs", "id", false),
+            ("keep_tx_out", "conversion_keys_outputs", "id", true),
+            ("keep_ma_tx_out", "conversion_keys_assets", "id", true),
         ] {
-            let prefix = full
-                .split_once(" SELECT 'block'::text AS family,id FROM keep_block")
-                .and_then(|(prefix, _)| {
-                    prefix.strip_prefix("CREATE TEMP TABLE conversion_keep_keys ON COMMIT DROP AS ")
-                })
-                .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
+            let prefix = render(SourceSchema::Temporary, false, &staged, false);
             stages.push(KeyStage {
-                table,
-                create_sql: format!("CREATE TEMP TABLE {table} ON COMMIT DROP AS {prefix} SELECT * FROM {cte}"),
-                prepare_sql: format!("CREATE {}INDEX {table}_lookup ON pg_temp.{table}({index});ANALYZE pg_temp.{table}", if unique {"UNIQUE "} else {""}),
+                table: table.to_owned(),
+                create_sql: format!(
+                    "CREATE TEMP TABLE {table} ON COMMIT DROP AS {prefix} SELECT * FROM {cte}"
+                ),
+                prepare_sql: format!(
+                    "CREATE {}INDEX {table}_lookup ON pg_temp.{table}({column});ANALYZE pg_temp.{table}",
+                    if unique { "UNIQUE " } else { "" }
+                ),
             });
-            let start = full
-                .find(&format!("{cte} AS MATERIALIZED ("))
-                .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-            let end = full
-                .find(&format!("{next} AS MATERIALIZED ("))
-                .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-            if start >= end {
-                return Err(Error::Refusal("invalid_staging_keep_definition"));
-            }
-            full.replace_range(
-                start..end,
-                &format!("{cte} AS MATERIALIZED (SELECT * FROM pg_temp.{table}),\n"),
-            );
+            staged.checkpoints.push((cte, table));
         }
-        // Freeze only the retained join fields before planning eligibility.
-        // They use exactly the source/bounds joins from K3/K4/K9. A small,
-        // analyzed relation prevents a datum preimage join from driving a scan
-        // of the full-width source copy before output eligibility is known.
-        let tx = cte_body(&full, "keep_tx", "keep_tx_in")?;
-        let output_join = tx
-            .split_once(" UNION SELECT o.tx_id ")
-            .map(|(_, tail)| tail)
-            .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-        let outputs = format!("SELECT o.id,o.tx_id,o.address,o.data_hash {output_join}");
-        stages.push(projection_stage(&full, "conversion_output_facts", &outputs,
-            "CREATE UNIQUE INDEX conversion_output_facts_lookup ON pg_temp.conversion_output_facts(id);ANALYZE pg_temp.conversion_output_facts")?);
-        replace_cte(
-            &mut full,
-            "keep_tx",
-            "keep_tx_in",
-            &required_replace(&tx, "pg_temp.tx_out o", "pg_temp.conversion_output_facts o")?,
-        )?;
-
-        let catalogue = cte_body(&full, "keep_multi_asset", "keep_datum")?;
-        let asset_join = catalogue
-            .split_once(" UNION SELECT a.ident ")
-            .map(|(_, tail)| tail)
-            .ok_or(Error::Refusal("invalid_staging_keep_definition"))?;
-        let assets = format!("SELECT a.id,a.tx_out_id,a.ident {asset_join}");
-        stages.push(projection_stage(&full, "conversion_asset_facts", &assets,
-            "CREATE UNIQUE INDEX conversion_asset_facts_lookup ON pg_temp.conversion_asset_facts(id);CREATE INDEX conversion_asset_facts_outpoint ON pg_temp.conversion_asset_facts(tx_out_id,ident);ANALYZE pg_temp.conversion_asset_facts")?);
-        replace_cte(
-            &mut full,
-            "keep_multi_asset",
-            "keep_datum",
-            &required_replace(
-                &catalogue,
-                "pg_temp.ma_tx_out a",
-                "pg_temp.conversion_asset_facts a",
-            )?,
-        )?;
-
-        let datum = cte_body(&full, "keep_datum", "keep_epoch_param")?;
-        let datum_driver = required_replace(
-            &datum,
-            "SELECT DISTINCT d.id",
-            "SELECT DISTINCT o.data_hash AS hash",
-        )?;
-        let datum_driver = required_replace(
-            &datum_driver,
-            "pg_temp.tx_out o JOIN keep_tx_out k ON k.id=o.id",
-            "pg_temp.conversion_output_facts o",
-        )?;
-        let datum_driver = required_replace(
-            &datum_driver,
-            " JOIN pg_temp.datum d ON d.hash=o.data_hash",
-            "",
-        )?;
-        let datum_driver = required_replace(
-            &datum_driver,
-            "pg_temp.ma_tx_out a",
-            "pg_temp.conversion_asset_facts a",
-        )?;
-        if datum_driver.contains("d.id") || datum_driver.contains("pg_temp.datum") {
-            return Err(Error::Refusal("invalid_staging_keep_definition"));
-        }
-        // An exact permissioned unit at a retained output is always an eligible
-        // v2 asset. Thus its retained asset facts preserve every K4 token probe;
-        // unknown descriptors still cannot match the original catalogue join.
-        stages.push(projection_stage(&full, "conversion_datum_hashes", &datum_driver,
-            "CREATE UNIQUE INDEX conversion_datum_hashes_lookup ON pg_temp.conversion_datum_hashes(hash);ANALYZE pg_temp.conversion_datum_hashes")?);
-        replace_cte(
-            &mut full,
-            "keep_datum",
-            "keep_epoch_param",
-            " SELECT DISTINCT d.id FROM pg_temp.conversion_datum_hashes h CROSS JOIN LATERAL (SELECT d.id FROM pg_temp.datum d WHERE d.hash=h.hash OFFSET 0) d\n",
-        )?;
-
-        // Each original family is evaluated once, with a separate finite
-        // command budget. No large joins survive into final key assembly.
-        let family_tables = [
-            ("block", "conversion_family_block"),
-            ("tx", "conversion_family_tx"),
-            ("tx_out", "conversion_family_tx_out"),
-            ("tx_in", "conversion_family_tx_in"),
-            ("ma_tx_out", "conversion_family_ma_tx_out"),
-            ("multi_asset", "conversion_family_multi_asset"),
-            ("datum", "conversion_family_datum"),
-            ("epoch_param", "conversion_family_epoch_param"),
-            ("pool_hash", "conversion_family_pool_hash"),
-            ("epoch_stake", "conversion_family_epoch_stake"),
-            ("tx_metadata", "conversion_family_tx_metadata"),
-        ];
-        if family_tables
-            .iter()
-            .map(|(family, _)| *family)
-            .ne(crate::NODE_RELATIONS.iter().copied())
-        {
-            return Err(Error::Refusal("invalid_staging_keep_definition"));
-        }
-        for (family, table) in family_tables {
-            stages.push(projection_stage(
-                &full,
+        let project = |staged: &Staged, table: String, query: String, prepare: String| {
+            let prefix = render(SourceSchema::Temporary, false, staged, true);
+            KeyStage {
+                create_sql: format!("CREATE TEMP TABLE {table} ON COMMIT DROP AS {prefix} {query}"),
                 table,
-                &crate::canonical::staging_key_family(family),
-                &format!(
+                prepare_sql: prepare,
+            }
+        };
+        // Only the retained join fields, frozen before eligibility is planned:
+        // a small analyzed relation keeps a datum preimage join from driving a
+        // scan of the full-width copy.
+        let projection = |staged: &Staged, query: &str, datum_facts: bool| {
+            fill(query, SourceSchema::Temporary, false, staged, datum_facts)
+        };
+        stages.push(project(
+            &staged,
+            "conversion_output_facts".to_owned(),
+            projection(&staged, "SELECT o.id,o.tx_id,o.address,o.data_hash __RETAINED_OUTPUT_JOIN__", false),
+            "CREATE UNIQUE INDEX conversion_output_facts_lookup ON pg_temp.conversion_output_facts(id);ANALYZE pg_temp.conversion_output_facts".to_owned(),
+        ));
+        staged.output_facts = true;
+        stages.push(project(
+            &staged,
+            "conversion_asset_facts".to_owned(),
+            projection(&staged, "SELECT a.id,a.tx_out_id,a.ident __RETAINED_ASSET_JOIN__", false),
+            "CREATE UNIQUE INDEX conversion_asset_facts_lookup ON pg_temp.conversion_asset_facts(id);CREATE INDEX conversion_asset_facts_outpoint ON pg_temp.conversion_asset_facts(tx_out_id,ident);ANALYZE pg_temp.conversion_asset_facts".to_owned(),
+        ));
+        staged.asset_facts = true;
+        // An exact permissioned unit at a retained output is always an eligible
+        // asset, so the retained asset facts preserve every datum token probe.
+        stages.push(project(
+            &staged,
+            "conversion_datum_hashes".to_owned(),
+            projection(
+                &staged,
+                "SELECT DISTINCT o.data_hash AS hash FROM pg_temp.conversion_output_facts o\n__DATUM_ELIGIBLE__",
+                true,
+            ),
+            "CREATE UNIQUE INDEX conversion_datum_hashes_lookup ON pg_temp.conversion_datum_hashes(hash);ANALYZE pg_temp.conversion_datum_hashes".to_owned(),
+        ));
+        staged.datum_hashes = true;
+        // Each family is evaluated once, with its own statement budget.
+        for family in TABLES {
+            let table = format!("conversion_family_{family}");
+            stages.push(project(
+                &staged,
+                table.clone(),
+                family_keys(family),
+                format!(
                     "ALTER TABLE pg_temp.{table} ADD PRIMARY KEY(family,id);ANALYZE pg_temp.{table}"
                 ),
-            )?);
+            ));
         }
-        let union = family_tables
+        let union = TABLES
             .iter()
-            .map(|(_, table)| format!("SELECT family,id FROM pg_temp.{table}"))
+            .map(|family| format!("SELECT family,id FROM pg_temp.conversion_family_{family}"))
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
-        stages.push(projection_stage(&full, "conversion_keep_keys", &union,
-            "ALTER TABLE pg_temp.conversion_keep_keys ADD PRIMARY KEY(family,id);ANALYZE pg_temp.conversion_keep_keys")?);
-        Ok(stages)
+        stages.push(project(
+            &staged,
+            "conversion_keep_keys".to_owned(),
+            union,
+            "ALTER TABLE pg_temp.conversion_keep_keys ADD PRIMARY KEY(family,id);ANALYZE pg_temp.conversion_keep_keys".to_owned(),
+        ));
+        stages
     }
 
     pub fn new(profile: &Profile, bounds: Bounds) -> Result<Self, Error> {
@@ -308,47 +336,28 @@ impl Selection {
                 _ => "invalid_keep_bounds",
             })
         })?;
+        let address = |role: &str| {
+            profile
+                .addresses
+                .get(role)
+                .cloned()
+                .ok_or(Error::Refusal("invalid_keep_profile"))
+        };
+        let asset = |role: &str| {
+            profile
+                .assets
+                .get(role)
+                .ok_or(Error::Refusal("invalid_keep_profile"))
+        };
         let mut governance_addresses = Vec::new();
         let mut governance_policies = Vec::new();
         for body in ["council", "technical_committee"] {
-            governance_addresses.push(
-                profile
-                    .addresses
-                    .get(body)
-                    .ok_or(Error::Refusal("invalid_keep_profile"))?
-                    .clone(),
-            );
-            governance_policies.push(bytes(
-                &profile
-                    .assets
-                    .get(body)
-                    .ok_or(Error::Refusal("invalid_keep_profile"))?
-                    .policy,
-            )?);
+            governance_addresses.push(address(body)?);
+            governance_policies.push(bytes(&asset(body)?.policy)?);
         }
-        let permissioned = profile
-            .assets
-            .get("permissioned_candidates")
-            .ok_or(Error::Refusal("invalid_keep_profile"))?;
+        let permissioned = asset("permissioned_candidates")?;
         let fixed = dsa_chain::assets::fixed_units(profile);
-        let fixed_policies = fixed
-            .iter()
-            .map(|unit| {
-                bytes(
-                    unit.get(..56)
-                        .ok_or(Error::Refusal("invalid_keep_profile"))?,
-                )
-            })
-            .collect::<Result<_, _>>()?;
-        let fixed_names = fixed
-            .iter()
-            .map(|unit| {
-                bytes(
-                    unit.get(56..)
-                        .ok_or(Error::Refusal("invalid_keep_profile"))?,
-                )
-            })
-            .collect::<Result<_, _>>()?;
+        let part = |part: Option<&str>| bytes(part.ok_or(Error::Refusal("invalid_keep_profile"))?);
         Ok(Self {
             horizon: i64::from(bounds.horizon),
             target: i64::from(bounds.target),
@@ -360,15 +369,21 @@ impl Selection {
                 "ics",
                 "reserve",
             ]
-            .iter()
-            .map(|role| profile.addresses[*role].clone())
-            .collect(),
+            .into_iter()
+            .map(address)
+            .collect::<Result<_, _>>()?,
             governance_addresses,
             governance_policies,
             permissioned_policy: bytes(&permissioned.policy)?,
             permissioned_name: bytes(&permissioned.name)?,
-            fixed_policies,
-            fixed_names,
+            fixed_policies: fixed
+                .iter()
+                .map(|unit| part(unit.get(..56)))
+                .collect::<Result<_, _>>()?,
+            fixed_names: fixed
+                .iter()
+                .map(|unit| part(unit.get(56..)))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -387,61 +402,51 @@ impl Selection {
         ]
     }
 
-    /// Six fixed units include governance descriptors; their exact unit arms
-    /// are a subset of the two whole-policy arms. Unknown descriptors are kept
-    /// for closure refusal rather than classified as foreign by absence.
+    /// Six fixed units include the governance descriptors; their exact unit
+    /// arms are a subset of the two whole-policy arms. Unknown descriptors are
+    /// kept so that the closure check refuses them, rather than classified as
+    /// foreign by absence.
     pub(crate) fn asset_predicate(schema: SourceSchema, alias: &str) -> String {
         format!(
-            "{alias}.ident NOT IN(SELECT catalogue.id FROM {}.multi_asset catalogue) OR {alias}.ident IN(SELECT catalogue.id FROM {}.multi_asset catalogue WHERE catalogue.policy=ANY($6::bytea[]) OR EXISTS(SELECT 1 FROM unnest($9::bytea[],$10::bytea[]) fixed(policy,name) WHERE fixed.policy=catalogue.policy AND fixed.name=catalogue.name))",
-            schema.name(),
-            schema.name()
+            "{alias}.ident NOT IN(SELECT catalogue.id FROM {schema}.multi_asset catalogue) \
+             OR {alias}.ident IN(SELECT catalogue.id FROM {schema}.multi_asset catalogue \
+             WHERE catalogue.policy=ANY($6::bytea[]) OR EXISTS(SELECT 1 FROM unnest($9::bytea[],$10::bytea[]) \
+             fixed(policy,name) WHERE fixed.policy=catalogue.policy AND fixed.name=catalogue.name))",
+            schema = schema.name()
         )
     }
 
-    pub fn ctes_sql(schema: SourceSchema) -> String {
-        include_str!("keep.sql")
-            .replace(
-                "__ELIGIBLE_ASSET__",
-                &format!("({})", Self::asset_predicate(schema, "a")),
-            )
-            .replace("__SOURCE__", schema.name())
+    /// The `WITH` clause defining `keep_<table>` for every served table.
+    pub fn ctes(form: Form) -> String {
+        match form {
+            Form::Source(schema) => render(schema, false, &Staged::default(), false),
+            Form::Pruned => render(SourceSchema::Serve, true, &Staged::default(), false),
+        }
     }
 
-    /// One fixed query per schema/table. Execute once and consume its RowStream;
-    /// batch destination writes without rerunning the source selection. This
-    /// needs no source TEMP privilege, DDL or writable transaction.
-    pub fn rows_sql(&self, schema: SourceSchema, table: &str) -> Result<String, Error> {
+    /// One query per table returning the kept rows with their original
+    /// payloads, ordered by key. Execute once and consume the stream.
+    pub fn rows_sql(&self, form: Form, table: &str) -> Result<String, Error> {
         if !TABLES.contains(&table) {
             return Err(Error::Refusal("invalid_keep_table"));
         }
+        let schema = match form {
+            Form::Source(schema) => schema.name(),
+            Form::Pruned => "serve",
+        };
         let key = if table == "epoch_param" {
             "epoch_no"
         } else {
             "id"
         };
         Ok(format!(
-            "{} SELECT s.* FROM {}.{table} s JOIN keep_{table} k ON k.id=s.{key} ORDER BY s.{key}",
-            Self::ctes_sql(schema),
-            schema.name()
+            "{} SELECT s.* FROM {schema}.{table} s JOIN keep_{table} k ON k.id=s.{key} ORDER BY s.{key}",
+            Self::ctes(form)
         ))
     }
 
-    /// Selection over an already pruned owned store. Its sparse before-H spend
-    /// bits prevent exceptional carry outputs from being reclassified by K3.
-    /// This does not change complete-source public/serve selection or perform
-    /// expiry/deletion; a writer must preserve markers before dropping spends.
-    pub fn pruned_rows_sql(&self, table: &str) -> Result<String, Error> {
-        let sql = self.rows_sql(SourceSchema::Serve, table)?;
-        let predicate = "AND NOT EXISTS(SELECT 1 FROM serve.tx_in i\n";
-        if sql.matches(predicate).count() != 1 {
-            return Err(Error::Refusal("invalid_keep_marker_template"));
-        }
-        Ok(sql.replace(predicate,"AND NOT EXISTS(SELECT 1 FROM dsa.consumed_before_horizon c WHERE c.tx_out_id=o.id)\n AND NOT EXISTS(SELECT 1 FROM serve.tx_in i\n"))
-    }
-
-    /// Complete-source conversion stream: original JSONB row text, lossless
-    /// canonical natural-key text, original key and optional sparse marker text.
-    /// One execution per family, sorted by its natural key; no source TEMP/DDL.
+    /// The complete-source conversion stream: original row text, canonical
+    /// natural-key text, original key and optional marker text.
     pub fn conversion_rows_sql(&self, table: &str) -> Result<String, Error> {
         crate::canonical::selected_source(table)
     }
@@ -449,12 +454,14 @@ impl Selection {
     pub async fn stream_rows<C: GenericClient>(
         &self,
         client: &C,
-        schema: SourceSchema,
+        form: Form,
         table: &str,
     ) -> Result<RowStream, Error> {
-        self.validate_source(client, schema).await?;
+        if let Form::Source(schema) = form {
+            self.validate_source(client, schema).await?;
+        }
         Ok(client
-            .query_raw(&self.rows_sql(schema, table)?, self.parameters())
+            .query_raw(&self.rows_sql(form, table)?, self.parameters())
             .await?)
     }
 
@@ -478,14 +485,15 @@ impl Selection {
         Ok(())
     }
 
-    /// Small-source validation only. Refuse above 100,000 total retained keys
-    /// before constructing JSON. Production conversion uses `stream_rows`.
+    /// Small sources only: refuse above 100,000 kept keys before building JSON.
     pub async fn collect_ids<C: GenericClient>(
         &self,
         client: &C,
-        schema: SourceSchema,
+        form: Form,
     ) -> Result<RetainedRows, Error> {
-        self.validate_source(client, schema).await?;
+        if let Form::Source(schema) = form {
+            self.validate_source(client, schema).await?;
+        }
         let entries=TABLES.iter().map(|table|format!("'{table}',(SELECT coalesce(jsonb_agg(id ORDER BY id),'[]'::jsonb) FROM keep_{table})")).collect::<Vec<_>>().join(",");
         let counts = TABLES
             .iter()
@@ -494,7 +502,7 @@ impl Selection {
             .join("+");
         let sql = format!(
             "{} SELECT CASE WHEN {counts}>100000 THEN NULL ELSE jsonb_build_object({entries}) END",
-            Self::ctes_sql(schema)
+            Self::ctes(form)
         );
         let row = client.query_one(&sql, &self.parameters()).await?;
         let value = row
@@ -505,17 +513,31 @@ impl Selection {
 }
 
 #[cfg(test)]
-mod stage_template_tests {
-    use super::required_replace;
-    use crate::Error;
+mod tests {
+    use super::*;
 
     #[test]
-    fn missing_or_ambiguous_stage_projection_refuses() {
-        for text in ["changed table", "raw table and raw table"] {
-            assert!(matches!(
-                required_replace(text, "raw table", "retained facts"),
-                Err(Error::Refusal("invalid_staging_keep_definition"))
-            ));
+    fn every_placeholder_is_filled_in_every_form() {
+        let mut texts = vec![
+            Selection::ctes(Form::Pruned),
+            Selection::ctes(Form::Source(SourceSchema::Public)),
+            Selection::ctes(Form::Source(SourceSchema::Serve)),
+        ];
+        texts.extend(
+            Selection::staging_plan()
+                .into_iter()
+                .map(|stage| stage.create_sql),
+        );
+        for text in texts {
+            assert!(!text.contains("__"), "unfilled placeholder in {text}");
+        }
+        let names = DEFINITION
+            .ctes
+            .iter()
+            .map(|cte| cte.name)
+            .collect::<Vec<_>>();
+        for table in TABLES {
+            assert!(names.contains(&format!("keep_{table}").as_str()), "{table}");
         }
     }
 }

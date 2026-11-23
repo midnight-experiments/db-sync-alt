@@ -1,8 +1,7 @@
--- Node-facing relations and positional constraints.
+-- Schemas, domains and the served tables of the layout.
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
-CREATE SCHEMA serve;
 CREATE SCHEMA dsa;
-REVOKE ALL ON SCHEMA serve,dsa FROM PUBLIC;
+REVOKE ALL ON SCHEMA dsa FROM PUBLIC;
 CREATE DOMAIN public.hash28type AS bytea CHECK(octet_length(VALUE)=28);
 CREATE DOMAIN public.hash32type AS bytea CHECK(octet_length(VALUE)=32);
 CREATE DOMAIN public.word31type AS integer CHECK(VALUE>=0);
@@ -12,6 +11,11 @@ CREATE DOMAIN public.txindex AS smallint CHECK(VALUE>=0);
 CREATE DOMAIN public.word64type AS numeric CHECK(VALUE=trunc(VALUE) AND VALUE>=0 AND VALUE<=18446744073709551615);
 CREATE DOMAIN public.lovelace AS numeric CHECK(VALUE=trunc(VALUE) AND VALUE>=0 AND VALUE<=18446744073709551615);
 CREATE DOMAIN public.asset32type AS bytea CHECK(octet_length(VALUE)<=32);
+-- served tables: the eleven node-facing tables with their positional
+-- constraints. A restore runs this part again to build them beside the empty
+-- ones the public views still read.
+CREATE SCHEMA serve;
+REVOKE ALL ON SCHEMA serve FROM PUBLIC;
 CREATE TABLE serve.block(id bigint PRIMARY KEY,hash public.hash32type NOT NULL,epoch_no public.word31type,slot_no public.word63type,block_no public.word31type NOT NULL,time timestamp NOT NULL,tx_count public.word63type NOT NULL,
  CONSTRAINT block_position CHECK(id=block_no AND id<134217728));
 CREATE TABLE serve.tx(id bigint PRIMARY KEY,hash public.hash32type NOT NULL,block_id bigint NOT NULL,block_index public.word31type NOT NULL,valid_contract boolean NOT NULL,

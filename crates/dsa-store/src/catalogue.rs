@@ -44,8 +44,7 @@ pub enum Checkpoint {
     Tx(i32, i32),
     ReserveTransfer(i32, i32),
 }
-/// Exact enabled-input QueryBuilder assembly, copied from the verified A3
-/// extractor. Interpolation accepts only typed integers and closed arm names.
+/// Exact enabled-input QueryBuilder assembly of the node source. Interpolation accepts only typed integers and closed arm names.
 pub fn bridge_sql(checkpoint: Checkpoint, limit: Option<u32>) -> String {
     use std::collections::BTreeMap;
     let source = include_str!(

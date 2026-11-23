@@ -1,7 +1,7 @@
-//! Private, temporary conversion copy. Every source COPY is fully drained into
-//! one bounded page before any destination write. Binary COPY preserves SQL
-//! NULL/JSON null and all supported PostgreSQL values without a Rust decoder.
-//! The unmodified A3 predicate is evaluated on the verified private copy only.
+//! The conversion's private temporary copy. Every source COPY is drained into
+//! one bounded page before any destination write. Binary COPY keeps SQL NULL
+//! apart from JSON null and carries every value without a Rust decoder. The
+//! keep rule is evaluated on the verified private copy only.
 
 use crate::{
     Error, NODE_RELATIONS, canonical,
@@ -84,7 +84,14 @@ fn page_sql(schema: &str, table: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "COPY (WITH RECURSIVE page AS ((SELECT s AS fact,s.{k}::bigint AS id,{size} AS bytes,1::bigint AS n FROM {schema}.{table} s WHERE ($1::bigint IS NULL OR s.{k}>$1) AND s.{k} BETWEEN $2::bigint AND $3::bigint ORDER BY s.{k} LIMIT 1) UNION ALL SELECT successor.fact,successor.id,p.bytes+successor.bytes,p.n+1 FROM page p CROSS JOIN LATERAL (SELECT s AS fact,s.{k}::bigint AS id,{size} AS bytes FROM {schema}.{table} s WHERE s.{k}>p.id AND s.{k} BETWEEN $2::bigint AND $3::bigint ORDER BY s.{k} LIMIT 1) successor WHERE p.bytes<$4::bigint AND p.n<$5::bigint) SELECT {fields} FROM page WHERE bytes<=$4::bigint OR n=1 ORDER BY page.id) TO STDOUT(FORMAT binary)"
+        "COPY (WITH RECURSIVE page AS ((SELECT s AS fact,s.{k}::bigint AS id,{size} AS bytes,1::bigint AS n \
+            FROM {schema}.{table} s WHERE ($1::bigint IS NULL OR s.{k}>$1) AND s.{k} BETWEEN $2::bigint \
+            AND $3::bigint ORDER BY s.{k} LIMIT 1) UNION ALL \
+            SELECT successor.fact,successor.id,p.bytes+successor.bytes,p.n+1 FROM page p CROSS \
+            JOIN LATERAL (SELECT s AS fact,s.{k}::bigint AS id,{size} AS bytes FROM {schema}.{table} s \
+            WHERE s.{k}>p.id AND s.{k} BETWEEN $2::bigint AND $3::bigint ORDER BY s.{k} LIMIT 1) successor \
+            WHERE p.bytes<$4::bigint AND p.n<$5::bigint) SELECT {fields} FROM page WHERE bytes<=$4::bigint \
+            OR n=1 ORDER BY page.id) TO STDOUT(FORMAT binary)"
     )
 }
 // COPY does not accept bound protocol parameters. Substitute only validated
@@ -213,10 +220,6 @@ async fn read_page(
 ) -> Result<Page, Error> {
     let sql = concrete_page(schema, table, state, after, options);
     let began = Instant::now();
-    eprintln!(
-        "{}",
-        json!({"event":"source_page_started","family":table,"schema":schema,"after_id":after,"row_limit":options.batch_rows.min(4096),"byte_budget":options.batch_bytes})
-    );
     let stream = tx.copy_out(&sql).await.map_err(|error| Error::SourceRead {
         family: table,
         elapsed_seconds: began.elapsed().as_secs_f64(),
@@ -224,19 +227,12 @@ async fn read_page(
     })?;
     pin_mut!(stream);
     let mut wire = BytesMut::new();
-    let mut first = true;
     while let Some(chunk) = stream.next().await {
-        let chunk=chunk.map_err(|error|{
-            eprintln!("{}",json!({"event":"source_page_failed","family":table,"schema":schema,"after_id":after,"wire_bytes_received":wire.len(),"elapsed_seconds":began.elapsed().as_secs_f64()}));
-            Error::SourceRead{family:table,elapsed_seconds:began.elapsed().as_secs_f64(),error}
+        let chunk = chunk.map_err(|error| Error::SourceRead {
+            family: table,
+            elapsed_seconds: began.elapsed().as_secs_f64(),
+            error,
         })?;
-        if first {
-            eprintln!(
-                "{}",
-                json!({"event":"source_page_first_copy_chunk","family":table,"schema":schema,"after_id":after,"seconds":began.elapsed().as_secs_f64(),"note":"COPY header may precede first row"})
-            );
-            first = false;
-        }
         wire.extend_from_slice(&chunk);
     }
     let (rows, last, largest) = parse(&wire, table, after, hash)?;
@@ -272,23 +268,22 @@ pub(crate) async fn stage(
         // A reader-compatible destination retains public secondary indexes;
         // do not clone/maintain those while streaming raw source history.
         let primary_only: bool = destination.query_one(
-            "SELECT count(*)=1 AND coalesce(bool_and(i.indisprimary AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive AND i.indnkeyatts=1 AND i.indnatts=1 AND i.indkey[0]=a.attnum),false) FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attname=$2 WHERE i.indrelid=to_regclass($1)",
+            "SELECT count(*)=1 AND coalesce(bool_and(i.indisprimary AND i.indisunique AND i.indisvalid \
+                AND i.indisready AND i.indislive AND i.indnkeyatts=1 AND i.indnatts=1 \
+                AND i.indkey[0]=a.attnum),false) FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid \
+                AND a.attname=$2 WHERE i.indrelid=to_regclass($1)",
             &[&format!("pg_temp.{table}"), &key(table)],
         ).await?.get(0);
         if !primary_only {
             return Err(Error::Refusal("invalid_conversion_staging_indexes"));
         }
-        eprintln!(
-            "{}",
-            json!({"event":"conversion_raw_table_prepared","family":table,"indexes":"primary_key_only"})
-        );
         let began = Instant::now();
         let mut cost = RawFamilyCost::default();
         let mut hash = FamilyHasher::new(table);
         let mut after = None;
         eprintln!(
             "{}",
-            json!({"event":"source_family_started","family":table,"mode":"bounded_binary_raw_staging"})
+            json!({"event":"source_family_started","family":table})
         );
         loop {
             let page = read_page(source, "public", table, state, after, options, &mut hash).await?;
@@ -321,10 +316,6 @@ pub(crate) async fn stage(
                 .max(destination_seconds);
             cost.rows += page.rows;
             cost.wire_bytes += page.wire.len() as u64;
-            eprintln!(
-                "{}",
-                json!({"event":"source_page_finished","family":table,"after_id":after,"last_id":page.last,"rows":page.rows,"wire_bytes":page.wire.len(),"source_seconds":page.seconds,"destination_write_seconds":destination_seconds,"completed_rows":cost.rows,"pages":cost.pages})
-            );
             if let Some(id) = page.last {
                 after = Some(id);
             } else {
@@ -343,7 +334,7 @@ pub(crate) async fn stage(
         cost.raw_digest = Some(digest.clone());
         eprintln!(
             "{}",
-            json!({"event":"source_family_finished","family":table,"mode":"raw_staging","elapsed_seconds":began.elapsed().as_secs_f64(),"cost":cost})
+            json!({"event":"source_family_finished","family":table,"elapsed_seconds":began.elapsed().as_secs_f64(),"cost":cost})
         );
         result.digests.insert(table.to_owned(), digest);
         result.costs.insert(table.to_owned(), cost);
@@ -351,7 +342,7 @@ pub(crate) async fn stage(
     restore(source, &before).await?;
     eprintln!(
         "{}",
-        json!({"event":"conversion_raw_staging_complete","temporary_relation_bytes":result.temporary_bytes,"planner_restored":before})
+        json!({"event":"conversion_raw_staging_finished","temporary_relation_bytes":result.temporary_bytes})
     );
     Ok(result)
 }
@@ -415,9 +406,9 @@ pub(crate) async fn select(
     }
     eprintln!(
         "{}",
-        json!({"event":"conversion_local_selection_started","source_reads_required":false,"temporary_relation_bytes":raw.temporary_bytes})
+        json!({"event":"conversion_local_selection_started","temporary_relation_bytes":raw.temporary_bytes})
     );
-    let plan = Selection::staging_plan()?;
+    let plan = Selection::staging_plan();
     let mut temporary_bytes = 0_i64;
     for stage in &plan {
         let began = Instant::now();
@@ -440,7 +431,7 @@ pub(crate) async fn select(
         temporary_bytes += bytes;
         eprintln!(
             "{}",
-            json!({"event":"conversion_key_stage_finished","stage":stage.table,"rows":rows,"select_seconds":selected_seconds,"elapsed_seconds":began.elapsed().as_secs_f64(),"relation_bytes":bytes,"sql_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(stage.create_sql.as_bytes()))})
+            json!({"event":"conversion_key_stage_finished","stage":stage.table,"rows":rows,"select_seconds":selected_seconds,"elapsed_seconds":began.elapsed().as_secs_f64(),"relation_bytes":bytes})
         );
     }
     // All consumers now use final keys; release intermediate disk/cache before
@@ -493,7 +484,16 @@ pub(crate) async fn select(
         );
         families.insert(table.to_owned(), digest.finish());
     }
-    destination.execute("INSERT INTO dsa.consumed_before_horizon SELECT o.id FROM pg_temp.tx_out o JOIN pg_temp.conversion_keep_keys k ON k.id=o.id AND k.family='tx_out' WHERE o.id<$1::bigint*16777216 AND EXISTS(SELECT 1 FROM pg_temp.tx_in i WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index AND i.id BETWEEN 0 AND $1::bigint*16777216-1)",&[&i64::from(state.horizon.height)]).await?;
+    destination
+        .execute(
+            "INSERT INTO dsa.consumed_before_horizon SELECT o.id FROM pg_temp.tx_out o \
+        JOIN pg_temp.conversion_keep_keys k ON k.id=o.id AND k.family='tx_out' \
+        WHERE o.id<$1::bigint*16777216 AND EXISTS(SELECT 1 FROM pg_temp.tx_in i \
+        WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index AND i.id BETWEEN 0 \
+        AND $1::bigint*16777216-1)",
+            &[&i64::from(state.horizon.height)],
+        )
+        .await?;
     eprintln!(
         "{}",
         json!({"event":"conversion_local_selection_finished","temporary_relation_bytes":indexed_bytes+temporary_bytes})

@@ -1,29 +1,38 @@
--- Parameters are H, T, P, profile addresses, governance addresses/policies,
--- permissioned policy/name, and fixed policies/names. __SOURCE__ is a closed
--- schema choice. Positional ranges use inclusive upper bounds to fit bigint.
-WITH
-horizon AS MATERIALIZED (
+-- Keep rule version 2: the rows a store keeps for horizon H, target T and tip P.
+--
+-- Parameters: $1 H, $2 T, $3 P, $4 profile addresses, $5 governance addresses,
+-- $6 governance policies, $7 and $8 the permissioned-candidates policy and name,
+-- $9 and $10 the fixed-unit policies and names. Positional ranges use inclusive
+-- upper bounds so that they fit a bigint.
+--
+-- Each "-- cte NAME" line starts the body of one CTE ("inline" ones are not
+-- materialized); each "-- fragment NAME" line starts text that replaces
+-- __NAME__ in the bodies. `Selection::ctes` fills the placeholders:
+--   __SOURCE__          the schema read: public (a 0.4.x source), serve (a
+--                       store) or pg_temp (the conversion's private copy)
+--   __MARKERS__         empty, or in the pruned form the exclusion of outputs
+--                       recorded in dsa.consumed_before_horizon
+--   __ELIGIBLE_ASSET__  the token rule for the asset row `a`
+--   __OUTPUT_FACTS__    the outputs keep_tx reads; __SOURCE__.tx_out, or the
+--                       conversion's retained output facts
+--   __ASSET_FACTS__     the asset rows keep_multi_asset reads; likewise
+--   __DATUM_ASSETS__    the asset rows the datum rule reads; likewise
+-- cte horizon
  SELECT epoch_no::integer AS epoch FROM __SOURCE__.block WHERE id=$1::bigint
-),
-window_blocks AS MATERIALIZED (
+-- cte window_blocks
  SELECT id FROM __SOURCE__.block WHERE id BETWEEN $1::bigint AND $3::bigint
-),
-window_transactions AS MATERIALIZED (
+-- cte window_transactions
  SELECT id FROM __SOURCE__.tx WHERE id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095
-),
-window_outputs AS MATERIALIZED (
+-- cte window_outputs
  SELECT id FROM __SOURCE__.tx_out WHERE id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215
-),
-window_inputs AS MATERIALIZED (
+-- cte window_inputs
  SELECT id FROM __SOURCE__.tx_in WHERE id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215
-),
-old_unspent AS MATERIALIZED (
+-- cte old_unspent
  SELECT o.id FROM __SOURCE__.tx_out o
  WHERE o.id>=0 AND o.id<$1::bigint*16777216
- AND NOT EXISTS(SELECT 1 FROM __SOURCE__.tx_in i
+ __MARKERS__AND NOT EXISTS(SELECT 1 FROM __SOURCE__.tx_in i
   WHERE i.tx_out_id=o.tx_id AND i.tx_out_index=o.index AND i.id>=0 AND i.id<$1::bigint*16777216)
-),
-governance_candidates AS MATERIALIZED (
+-- cte governance_candidates
  SELECT o.id,o.tx_id,t.block_id,g.body FROM unnest($5::text[],$6::bytea[]) WITH ORDINALITY g(address,policy,body)
  JOIN __SOURCE__.tx_out o ON o.address=g.address AND o.id>=0 AND o.id<$1::bigint*16777216
  JOIN __SOURCE__.datum d ON d.hash=o.data_hash
@@ -31,95 +40,81 @@ governance_candidates AS MATERIALIZED (
  JOIN __SOURCE__.block b ON b.id=t.block_id AND b.id>=0 AND b.id<$1::bigint
  WHERE EXISTS(SELECT 1 FROM __SOURCE__.ma_tx_out a JOIN __SOURCE__.multi_asset m ON m.id=a.ident
   WHERE a.tx_out_id=o.id AND m.policy=g.policy AND a.id>=0 AND a.id<$1::bigint*68719476736)
-),
-governance_last_transactions AS MATERIALIZED (
+-- cte governance_last_transactions
  SELECT body,max(tx_id) AS tx_id FROM governance_candidates GROUP BY body
-),
-governance_carry AS MATERIALIZED (
+-- cte governance_carry
  SELECT c.id,c.tx_id,c.block_id FROM governance_candidates c
  JOIN governance_last_transactions last ON last.body=c.body AND last.tx_id=c.tx_id
-),
-permissioned_candidates AS MATERIALIZED (
+-- cte permissioned_candidates
  SELECT o.id,o.tx_id,t.block_id,b.epoch_no FROM __SOURCE__.multi_asset m
  JOIN __SOURCE__.ma_tx_out a ON a.ident=m.id AND a.id>=0 AND a.id<$1::bigint*68719476736
  JOIN __SOURCE__.tx_out o ON o.id=a.tx_out_id AND o.id>=0 AND o.id<$1::bigint*16777216
  JOIN __SOURCE__.tx t ON t.id=o.tx_id AND t.id>=0 AND t.id<$1::bigint*4096
  JOIN __SOURCE__.block b ON b.id=t.block_id AND b.id>=0 AND b.id<$1::bigint
  WHERE m.policy=$7::bytea AND m.name=$8::bytea
-),
-permissioned_last_transaction AS MATERIALIZED (
+-- cte permissioned_last_transaction
  SELECT max(c.tx_id) AS tx_id FROM permissioned_candidates c CROSS JOIN horizon h WHERE c.epoch_no<=h.epoch-2
-),
-permissioned_carry AS MATERIALIZED (
+-- cte permissioned_carry
  SELECT c.id,c.tx_id,c.block_id FROM permissioned_candidates c CROSS JOIN horizon h
  WHERE c.epoch_no>h.epoch-2
  UNION SELECT c.id,c.tx_id,c.block_id FROM permissioned_candidates c JOIN permissioned_last_transaction last ON last.tx_id=c.tx_id
-),
-epoch_cutoffs AS (SELECT epoch-2 AS epoch FROM horizon UNION ALL SELECT epoch-1 FROM horizon),
-old_headers AS MATERIALIZED (
+-- cte epoch_cutoffs inline
+ SELECT epoch-2 AS epoch FROM horizon UNION ALL SELECT epoch-1 FROM horizon
+-- cte old_headers
  SELECT id,epoch_no,slot_no FROM __SOURCE__.block WHERE id>=0 AND id<$1::bigint
-),
-epoch_last_slots AS MATERIALIZED (
+-- cte epoch_last_slots
  SELECT e.epoch,max(b.slot_no) AS slot_no FROM epoch_cutoffs e
  JOIN old_headers b ON b.epoch_no<=e.epoch AND b.slot_no IS NOT NULL GROUP BY e.epoch
-),
-epoch_headers AS MATERIALIZED (
+-- cte epoch_headers
  SELECT b.id FROM old_headers b JOIN epoch_last_slots e ON b.epoch_no<=e.epoch AND b.slot_no=e.slot_no
-),
-fallback_candidates AS MATERIALIZED (
+-- cte fallback_candidates
  SELECT id,tx_in_id,tx_out_id,tx_out_index FROM __SOURCE__.tx_in
  WHERE id>=0 AND id<$1::bigint*16777216 AND NOT EXISTS(SELECT 1 FROM window_inputs)
-),
-fallback_last_id AS MATERIALIZED (
+-- cte fallback_last_id
  SELECT max(id) AS id FROM fallback_candidates
-),
-fallback_input AS MATERIALIZED (
+-- cte fallback_input
  SELECT i.* FROM fallback_candidates i JOIN fallback_last_id last ON i.id=last.id
-),
-keep_tx_out AS MATERIALIZED (
+-- cte keep_tx_out
  SELECT id FROM window_outputs UNION SELECT id FROM old_unspent
  UNION SELECT id FROM governance_carry UNION SELECT id FROM permissioned_carry
  UNION SELECT tx_out_id*4096+tx_out_index FROM fallback_input
-),
-keep_block AS MATERIALIZED (
+-- cte keep_block
  SELECT id FROM window_blocks UNION SELECT block_id FROM governance_carry
  UNION SELECT block_id FROM permissioned_carry UNION SELECT id FROM epoch_headers
-),
-keep_tx AS MATERIALIZED (
- SELECT id FROM window_transactions UNION SELECT tx_in_id FROM fallback_input
- UNION SELECT o.tx_id FROM __SOURCE__.tx_out o JOIN keep_tx_out k ON k.id=o.id
+-- fragment retained_output_join
+FROM __OUTPUT_FACTS__ o JOIN keep_tx_out k ON k.id=o.id
  WHERE o.id BETWEEN 0 AND $2::bigint*16777216+16777215
-),
-keep_tx_in AS MATERIALIZED (SELECT id FROM window_inputs UNION SELECT id FROM fallback_input),
-keep_ma_tx_out AS MATERIALIZED (
+-- cte keep_tx
+ SELECT id FROM window_transactions UNION SELECT tx_in_id FROM fallback_input
+ UNION SELECT o.tx_id __RETAINED_OUTPUT_JOIN__
+-- cte keep_tx_in
+ SELECT id FROM window_inputs UNION SELECT id FROM fallback_input
+-- cte keep_ma_tx_out
  SELECT a.id FROM __SOURCE__.ma_tx_out a JOIN keep_tx_out o ON o.id=a.tx_out_id
  WHERE a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735 AND __ELIGIBLE_ASSET__
-),
-keep_multi_asset AS MATERIALIZED (
+-- fragment retained_asset_join
+FROM __ASSET_FACTS__ a JOIN keep_ma_tx_out k ON k.id=a.id
+ WHERE a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
+-- cte keep_multi_asset
  SELECT m.id FROM unnest($9::bytea[],$10::bytea[]) f(policy,name)
  JOIN __SOURCE__.multi_asset m ON m.policy=f.policy AND m.name=f.name
- UNION SELECT a.ident FROM __SOURCE__.ma_tx_out a JOIN keep_ma_tx_out k ON k.id=a.id
- WHERE a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
-),
-keep_datum AS MATERIALIZED (
- SELECT DISTINCT d.id FROM __SOURCE__.tx_out o JOIN keep_tx_out k ON k.id=o.id
- JOIN __SOURCE__.datum d ON d.hash=o.data_hash
+ UNION SELECT a.ident __RETAINED_ASSET_JOIN__
+-- fragment datum_eligible
  -- The datum equality join already excludes NULL hashes. Make that filter
  -- explicit before the correlated permissioned-unit eligibility probe.
  WHERE o.data_hash IS NOT NULL AND o.id BETWEEN 0 AND $2::bigint*16777216+16777215 AND (o.address=ANY($4::text[]) OR EXISTS(
-  SELECT 1 FROM __SOURCE__.ma_tx_out a JOIN __SOURCE__.multi_asset m ON m.id=a.ident
+  SELECT 1 FROM __DATUM_ASSETS__ a JOIN __SOURCE__.multi_asset m ON m.id=a.ident
   WHERE a.tx_out_id=o.id AND a.id BETWEEN 0 AND $2::bigint*68719476736+68719476735
   AND (m.policy=$7::bytea AND m.name=$8::bytea)))
-),
-keep_epoch_param AS MATERIALIZED (
+-- cte keep_datum
+ SELECT DISTINCT d.id FROM __SOURCE__.tx_out o JOIN keep_tx_out k ON k.id=o.id
+ JOIN __SOURCE__.datum d ON d.hash=o.data_hash
+__DATUM_ELIGIBLE__
+-- cte keep_epoch_param
  SELECT e.epoch_no::bigint AS id FROM __SOURCE__.epoch_param e CROSS JOIN horizon h WHERE e.epoch_no>=h.epoch-2
-),
-keep_epoch_stake AS MATERIALIZED (
+-- cte keep_epoch_stake
  SELECT s.id FROM __SOURCE__.epoch_stake s CROSS JOIN horizon h WHERE s.epoch_no>=h.epoch-2
-),
-keep_pool_hash AS MATERIALIZED (
+-- cte keep_pool_hash
  SELECT DISTINCT s.pool_id AS id FROM __SOURCE__.epoch_stake s JOIN keep_epoch_stake k ON k.id=s.id
-),
-keep_tx_metadata AS MATERIALIZED (
+-- cte keep_tx_metadata
  SELECT id FROM __SOURCE__.tx_metadata WHERE id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095
-)

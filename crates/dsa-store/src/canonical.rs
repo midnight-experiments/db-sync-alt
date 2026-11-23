@@ -72,52 +72,24 @@ pub(crate) fn query(table: &str) -> Result<String, Error> {
 }
 
 pub(crate) fn selected_source(table: &str) -> Result<String, Error> {
+    use crate::keep::{Form, Selection, SourceSchema};
     selected(
         table,
-        crate::keep::SourceSchema::Public,
-        crate::keep::Selection::ctes_sql(crate::keep::SourceSchema::Public),
+        SourceSchema::Public,
+        Selection::ctes(Form::Source(SourceSchema::Public)),
     )
 }
 
-/// Exact same payload/closure/marker projection, over the private full source
-/// copy and the once-materialized, unchanged A3 retained keys.
+/// The same projection over the private copy and the conversion's final keys.
 pub(crate) fn selected_staging(table: &str) -> Result<String, Error> {
     selected(
         table,
         crate::keep::SourceSchema::Temporary,
         format!(
-            "WITH conversion_bindings AS (SELECT $1::bigint AS horizon,$2::bigint AS target,$3::bigint AS tip,$4::text[] AS addresses,$5::text[] AS governance_addresses,$6::bytea[] AS governance_policies,$7::bytea AS permissioned_policy,$8::bytea AS permissioned_name,$9::bytea[] AS fixed_policies,$10::bytea[] AS fixed_names), keep_{table} AS (SELECT id FROM pg_temp.conversion_keep_keys WHERE family='{table}')"
+            "WITH {} keep_{table} AS (SELECT id FROM pg_temp.conversion_keep_keys WHERE family='{table}')",
+            crate::keep::BINDINGS
         ),
     )
-}
-
-/// The once-materialized retained keys, including the existing bounded orphan
-/// window witness. Keep this statement shared with focused staging diagnostics.
-pub(crate) fn staging_keys_sql() -> String {
-    use crate::keep::{Selection, SourceSchema};
-    let unions = crate::NODE_RELATIONS
-        .iter()
-        .map(|table| staging_key_family(table))
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ");
-    format!(
-        "CREATE TEMP TABLE conversion_keep_keys ON COMMIT DROP AS {} {unions}",
-        Selection::ctes_sql(SourceSchema::Temporary)
-    )
-}
-
-/// Literal original final arm, including the asset orphan/missing-descriptor
-/// witness. The staged writer and the monolithic reference share this text.
-pub(crate) fn staging_key_family(table: &str) -> String {
-    use crate::keep::{Selection, SourceSchema};
-    if table == "ma_tx_out" {
-        format!(
-            "SELECT 'ma_tx_out'::text AS family,id FROM (SELECT id FROM keep_ma_tx_out UNION SELECT a.id FROM pg_temp.ma_tx_out a WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND ({})) selected",
-            Selection::asset_predicate(SourceSchema::Temporary, "a")
-        )
-    } else {
-        format!("SELECT '{table}'::text AS family,id FROM keep_{table}")
-    }
 }
 
 fn selected(

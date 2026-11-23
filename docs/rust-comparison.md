@@ -1,7 +1,7 @@
 # Compare the node's database answers
 
 `db-sync-alt compare --network mainnet --a '<reader DSN>' --b '<reader DSN>' --positions auto --horizon-block H`
-compares the complete pinned Midnight2.1.101 SELECT catalogue. Both connections
+compares the complete pinned Midnight 2.1.101 SELECT catalogue. Both connections
 must have the exact public reader grant. The command executes no index creation,
 DDL or source writes. Missing startup indexes fail the comparison.
 
@@ -27,10 +27,10 @@ zero a successful hit. Event classes with no available events remain quiet. An e
 and a `pairs` array, each containing `cursor` and `reference` objects with
 `block` and `tx_index`. Explicit pairs must stay within the window and order
 cursor before reference. All catalogue queries also receive hit/miss inputs;
-a deterministic28-byte policy is checked absent on both anchored readers
+a deterministic 28-byte policy is checked absent on both anchored readers
 (with retries on collisions). Its value and actual hit/miss row counts are
 reported. Independently exported captures must pin the same missing policy
-through `Options::missing_policy`; differing probes are refused. The original26
+through `Options::missing_policy`; differing probes are refused. The original 26
 gated statements/52 executions are accompanied by three
 read-only catalogue probes.
 
@@ -40,7 +40,7 @@ including duplicate multiplicities. Only the two internal bounds helpers may
 report valid differing IDs as information; unsupported registered-candidate observations use a separate coverage label. Their before/after anchors and
 related output/asset/input bounds are verified independently at each database.
 The actual `resolve_ident` lookup IDs are exact. `--verify-unbounded` additionally
-checks event answers with bounds0..i64::MAX; use this on generated scratch data
+checks event answers with bounds 0..i64::MAX; use this on generated scratch data
 or under an explicit source-access budget. It adds reads.
 
 JSON stdout includes the pinned catalogue, selected units, positions, settings,
@@ -49,10 +49,10 @@ and unbounded-check flags, and the first differing rows for every mismatch.
 Acceptance requires destination B's chain-order check. Source A remains
 unscanned globally. A pruned asset table may have leading/interior ordinal gaps;
 order verification does not infer dense rank from filtered facts. First-row
-previews are capped at4096characters, with full-row SHA256 and an explicit
-truncation flag. Whole rows are still compared exactly. Exit0 means supported-query parity,2 means a supported answer mismatch and1 means a refusal or query failure.
-Rule1 pruned stores and mismatched rule declarations/identity are refused.
-Genuine legacy schema5 readers remain supported. Preprod's empty-name cNIGHT
+previews are capped at 4,096 characters, with full-row SHA256 and an explicit
+truncation flag. Whole rows are still compared exactly. Exit 0 means supported-query parity, 2 means a supported answer mismatch and 1 means a refusal or query failure.
+Rule 1 pruned stores and mismatched rule declarations/identity are refused.
+Genuine legacy schema 5 readers remain supported. Preprod's empty-name cNIGHT
 and named NIGHT bridge unit are reported separately.
 
 For an advancing source, use the normal anchored pair:
@@ -81,33 +81,32 @@ numbers inside typed JSON/JSONB columns verbatim, since the node can distinguish
 `{"int":1}` from `{"int":1.0}`. Only SQL scalar numeric display scale is
 normalized. The pinned node type evidence is separate from integer amounts.
 
-Compare and convert default to a3600s overall deadline, configurable with
-`--overall-timeout-seconds`. Their source readers set statement/idle limits to60s
-only when the inherited value is0; every positive owner limit is preserved and
+Compare and convert default to a 3,600 s overall deadline, configurable with
+`--overall-timeout-seconds`. Their source readers set statement/idle limits to 60 s
+only when the inherited value is 0; every positive owner limit is preserved and
 explicit positive overrides remain connection-local. New sockets default to a
-10s connect timeout and30s TCP user timeout, with keepalive idle at most30s.
+10 s connect timeout and 30 s TCP user timeout, with keepalive idle at most 30 s.
 SIGINT/SIGTERM, deadlines and failures send cancellation to the operation's own
 backends through the original TLS configuration before the scoped clients close.
 This never cancels another program's query. The cancellation request itself is
-bounded by5s per socket, and logs whether it was sent. A7 rehearses release of
-this project's read transaction under its actual health stop.
+bounded by 5 s per socket, and logs whether it was sent.
 
 Capture streams each query and enforces row/UTF8 byte budgets before retaining
 its results. Paging accounts for previously retained rows; unbounded validation
 compares one page at a time against the native rows. Shared immutable row
-storage avoids result-vector clones. Defaults bound retained row text to512MiB
-and1million rows per endpoint; these limits are not a measured RSS guarantee.
-A7 records actual peak RSS/time for its500+ pairs and whole-window range.
+storage avoids result-vector clones. Defaults bound retained row text to 512 MiB
+and 1 million rows per endpoint; these limits are not a measured memory
+guarantee.
 
-Node2.1.101 supplies an empty registered-candidate list during authority selection.
+Node 2.1.101 supplies an empty registered-candidate list during authority selection.
 Registered-candidate results in operator RPCs and CLI are unsupported. Both literal
 registered-address query variants still execute, and the report retains their full
 raw observations and differences with `unsupported_registered_candidates` coverage.
 Only that configured-address scope is nonfatal. Other addresses, RPC queries,
 permissioned candidates, identifiers and every event/state query keep their exact
-checks. Q14 helper ID information remains separate. A node release enabling
+checks. Helper ID information remains separate. A node release enabling
 registered candidates requires full address coverage under a new keep-rule version.
 
-Observation-format2 files from the stricter rehearsal tool remain readable: omitted
-candidate input metadata is recovered only for its known initial/epoch call sites.
-Their raw rows/checksums are unchanged; the report states the current coverage.
+Capture files of observation format 2 are also read: their omitted candidate
+input metadata is recovered only for its known initial and epoch call sites.
+Their raw rows and checksums are unchanged; the report states the coverage.
