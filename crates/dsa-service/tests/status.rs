@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use chrono::NaiveDate;
 use dsa_provider::Refusal;
 use dsa_service::{
-    follow::ProviderTip,
+    follow::{ProviderTip, StakeMissing},
     status::{FollowerView, Settings, State, Status, compose, health},
 };
 use dsa_store::{
@@ -175,6 +175,8 @@ fn following() -> FollowerView {
         last_refusal: None,
         blocks_remaining: Some(1),
         blocks_per_hour: Some(180.0),
+        stake_failure: None,
+        stake_missing: None,
     }
 }
 
@@ -497,6 +499,42 @@ fn the_document_names_its_state_and_never_claims_following_without_a_follower() 
     }
 }
 
+/// The target's epoch without stake for more than ten minutes at the tip is
+/// a warning that names the epoch, not a reason of `/health`; the last
+/// stake failure is shown with its cause.
+#[test]
+fn missing_stake_of_the_target_epoch_is_a_warning() {
+    let mut follower = following();
+    follower.stake_missing = Some(StakeMissing {
+        epoch: 600,
+        since: NOW - 601,
+    });
+    let failure = json!({"epoch": 599, "at": NOW - 30, "retry_at": NOW + 270, "failures": 8,
+        "error": {"error": "provider_epoch_total_mismatch", "active_stake": "10", "sum": "9"}});
+    follower.stake_failure = Some(failure.clone());
+    let status = compose(Some(&serving_view()), Some(&follower), &settings(), NOW);
+    assert!(
+        status.warnings.contains(&"stake_missing:600".to_owned()),
+        "{:?}",
+        status.warnings
+    );
+    assert!(status.healthy, "{:?}", status.reason_codes);
+    assert_eq!(status.epochs.stake_failure, Some(failure));
+    follower.stake_missing = Some(StakeMissing {
+        epoch: 600,
+        since: NOW - 600,
+    });
+    let status = compose(Some(&serving_view()), Some(&follower), &settings(), NOW);
+    assert!(
+        !status
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("stake_missing")),
+        "{:?}",
+        status.warnings
+    );
+}
+
 #[test]
 fn health_is_200_only_when_every_condition_holds() {
     let healthy = compose(Some(&serving_view()), Some(&following()), &settings(), NOW);
@@ -516,6 +554,10 @@ fn health_is_200_only_when_every_condition_holds() {
     fresh.provider_tip.as_mut().unwrap().observed_at = NOW - 120;
     let mut unread = following();
     unread.provider_tip = None;
+    let mut old_head = following();
+    old_head.provider_tip.as_mut().unwrap().time = NOW - 601;
+    let mut head_at_limit = following();
+    head_at_limit.provider_tip.as_mut().unwrap().time = NOW - 600;
     let mut refused = serving_view();
     refused.reader_check = Some(ReaderCheck {
         passed: false,
@@ -555,6 +597,13 @@ fn health_is_200_only_when_every_condition_holds() {
             vec!["provider_observation_stale"],
         ),
         ("observation 120 s old", serving_view(), fresh, vec![]),
+        (
+            "a head older than 600 s",
+            serving_view(),
+            old_head,
+            vec!["provider_head_stale"],
+        ),
+        ("a head 600 s old", serving_view(), head_at_limit, vec![]),
         (
             "no provider observation",
             serving_view(),

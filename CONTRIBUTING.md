@@ -55,6 +55,10 @@ docker network rm dsa-test
 `DSA_KEEP_CASES` sets how many generated chains the keep-rule tests check; CI
 uses 64. The three skipped tests are the long ones CI also skips.
 
+The binary has a hidden command, `follow`, that runs only the follower and
+stops at `--stop-at-target`; the tests use it to prove catch-ups, and
+operators use `run`.
+
 The CI workflow (`.github/workflows/ci.yml`) runs these and also:
 
 ```sh

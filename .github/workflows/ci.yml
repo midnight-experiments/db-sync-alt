@@ -1,7 +1,10 @@
 name: ci
 on:
   push:
+    branches: [main]
   pull_request:
+  # The release workflow runs these checks before it publishes.
+  workflow_call:
 permissions:
   contents: read
 env:
@@ -12,10 +15,10 @@ jobs:
   check:
     name: source, format, lint, tests
     runs-on: ubuntu-24.04
-    container: rust:1.100.0-bookworm
+    container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Use the pinned toolchain
@@ -41,11 +44,11 @@ jobs:
   integration:
     name: PostgreSQL 17 integration tests
     runs-on: ubuntu-24.04
-    container: rust:1.100.0-bookworm
+    container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17
+        image: postgres:17.11-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea5649807491a0545b5eeeb8f0b8bb11857a5
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: dsa_test
@@ -55,7 +58,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Use the pinned toolchain
@@ -76,7 +79,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Install the pinned toolchain
@@ -97,7 +100,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - run: docker build -f deploy/Dockerfile -t db-sync-alt:ci .

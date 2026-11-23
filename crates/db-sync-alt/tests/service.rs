@@ -194,10 +194,11 @@ fn at_tip(view: &dsa_store::service_view::DatabaseView, now: u64) -> FollowerVie
         state: State::Following,
         reason: "at_tip".to_owned(),
         wait_until: None,
+        // The provider's head is the stored tip, made ten seconds ago.
         provider_tip: Some(ProviderTip {
             height: tip.height,
             hash: tip.hash.clone(),
-            time: u64::try_from(tip.timestamp).unwrap(),
+            time: now - 10,
             observed_at: now,
         }),
         requests_per_second: 8.0,
@@ -205,6 +206,8 @@ fn at_tip(view: &dsa_store::service_view::DatabaseView, now: u64) -> FollowerVie
         last_refusal: None,
         blocks_remaining: Some(0),
         blocks_per_hour: None,
+        stake_failure: None,
+        stake_missing: None,
     }
 }
 
@@ -220,7 +223,7 @@ async fn http_get(address: SocketAddr, path: &str) -> Result<(u16, String)> {
     Ok((head[9..12].parse()?, body.to_owned()))
 }
 
-/// Test 1 (database part): `db-sync-alt status` prints the document of a
+/// `db-sync-alt status` prints the document of a
 /// stopped service from the database alone, with the shape of the golden
 /// document; a stored `following` is not claimed; a closed gate is named.
 #[tokio::test]
@@ -387,7 +390,7 @@ fn plan_nodes(plan: &Value, nodes: &mut Vec<Value>) {
     }
 }
 
-/// Test 2 (database part): answers come from the last view; no statement
+/// The HTTP answers come from the last view; no statement
 /// runs on any session of the database while 1,000 requests are answered;
 /// every served table the view reads has an index path.
 #[tokio::test]
@@ -499,7 +502,7 @@ async fn index_name_counts(
         .collect())
 }
 
-/// Test 4: a rebuild of bloated indexes runs while a node reader repeats a
+/// A rebuild of bloated indexes runs while a node reader repeats a
 /// literal node query: no error, no wait above one second, and every node
 /// index name exactly once in `pg_indexes` at every sample. An interrupted
 /// rebuild's leftover is dropped at the next start.
@@ -522,7 +525,7 @@ async fn an_index_rebuild_keeps_each_index_name_once_while_the_node_reads() -> R
     };
     // The first look records every index's size.
     assert!(
-        upkeep::rebuild_indexes(&upkeep_store, &policy)
+        upkeep::rebuild_indexes(&upkeep_store, &policy, |_| {})
             .await
             .map_err(named)?
             .is_none()
@@ -609,7 +612,7 @@ async fn an_index_rebuild_keeps_each_index_name_once_while_the_node_reads() -> R
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut rebuilds = Vec::new();
-    while let Some(rebuild) = upkeep::rebuild_indexes(&upkeep_store, &policy)
+    while let Some(rebuild) = upkeep::rebuild_indexes(&upkeep_store, &policy, |_| {})
         .await
         .map_err(named)?
     {
@@ -707,6 +710,38 @@ async fn an_index_rebuild_keeps_each_index_name_once_while_the_node_reads() -> R
             .map_err(named)?
             .is_empty()
     );
+    // A leftover found while the service runs is dropped before the next
+    // rebuild, which is named first.
+    owner
+        .batch_execute("CREATE INDEX idx_tx_out_tx_id_ccnew ON serve.tx_out(tx_id)")
+        .await?;
+    owner
+        .execute(
+            "UPDATE dsa.upkeep SET detail=jsonb_build_object('bytes',1) WHERE name='index:idx_tx_out_address'",
+            &[],
+        )
+        .await?;
+    let mut named_first = None;
+    let eager = IndexPolicy {
+        growth: 2.0,
+        min_bytes: 0,
+    };
+    let rebuild = upkeep::rebuild_indexes(&upkeep_store, &eager, |name| {
+        named_first = Some(name.to_owned());
+    })
+    .await
+    .map_err(named)?
+    .ok_or("no rebuild")?;
+    assert_eq!(rebuild.name, "idx_tx_out_address");
+    assert_eq!(named_first.as_deref(), Some("idx_tx_out_address"));
+    let remaining: i64 = owner
+        .query_one(
+            "SELECT count(*) FROM pg_class WHERE relnamespace='serve'::regnamespace AND relname LIKE '%\\_cc%'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(remaining, 0, "the leftover stayed through a rebuild");
     setup.follower.store.verify(&profile).await.map_err(named)?;
     drop((owner, upkeep_store));
     setup.cleanup().await
@@ -749,7 +784,7 @@ const VACUUMED: &str = "VACUUM serve.block,serve.tx,serve.tx_out,serve.tx_in,ser
     serve.epoch_param,serve.pool_hash,serve.epoch_stake,serve.tx_metadata,dsa.first_served,dsa.consumed_before_horizon,\
     dsa.unspent,dsa.service_state,dsa.calls,dsa.upkeep,dsa.position,dsa.supply";
 
-/// Test 5: thirty simulated days of churn with a retention of one day, the
+/// Thirty simulated days of churn with a retention of one day, the
 /// horizon advanced every step and the upkeep on its schedule: the served
 /// and state tables stay within 1.3 times a fresh restore of the final
 /// content.
@@ -819,7 +854,7 @@ async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
                 }
                 Job::Indexes => {
                     if let Some(rebuild) =
-                        upkeep::rebuild_indexes(&upkeep_store, &IndexPolicy::default())
+                        upkeep::rebuild_indexes(&upkeep_store, &IndexPolicy::default(), |_| {})
                             .await
                             .map_err(named)?
                     {
@@ -901,10 +936,12 @@ async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
     fresh.cleanup().await
 }
 
-/// Test 6: the daily snapshot file on an injected clock: a start after the
+/// The daily snapshot file on an injected clock: a start after the
 /// time of day, a day without a run, a failed write tried again without
 /// losing the older files, the keep count; the recorded digest equals the
-/// one `verify` computes.
+/// one `verify` computes. A file of the network's name pattern that the
+/// service did not write, such as a release file put there for the first
+/// start, belongs to the rotation.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Result {
@@ -932,6 +969,8 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
     for name in &foreign {
         std::fs::write(dir.path().join(name), b"not ours")?;
     }
+    let release = format!("{network}-1-0123456789ab.snapshot");
+    std::fs::write(dir.path().join(&release), b"a release file")?;
     let stale = dir.path().join(format!(".{network}-snapshot-left"));
     std::fs::create_dir(&stale)?;
     std::fs::write(stale.join("snapshot"), b"partial")?;
@@ -971,6 +1010,11 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
     );
     assert_eq!(std::fs::metadata(dir.path().join(&a.file))?.len(), a.bytes);
     assert!(!stale.exists(), "a stale temporary directory stays");
+    assert_eq!(
+        ours(dir.path()),
+        BTreeSet::from([release.clone(), a.file.clone()]),
+        "the release file is the second newest"
+    );
     let view = writer.service_view(&profile, None).await.map_err(named)?;
     assert_eq!(view.upkeep.snapshot.as_ref().unwrap().record, a);
     let document = status::compose(Some(&view), None, &status::Settings::new(&network), now);
@@ -990,6 +1034,11 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
         .await
         .map_err(named)?;
     last = Some(now);
+    assert_eq!(
+        ours(dir.path()),
+        BTreeSet::from([a.file.clone(), b.file.clone()]),
+        "the release file is removed with the third newest"
+    );
     // A day without a run: one file at the next look.
     let plan = advance(&setup.g, &setup.follower, 2, None);
     setup.step(&plan).await?;
@@ -1087,7 +1136,7 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
     setup.cleanup().await
 }
 
-/// Test 7: a planted supply difference closes the gate; the node reads
+/// A planted supply difference closes the gate; the node reads
 /// SQLSTATE 55000 and `/status` names the check.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]

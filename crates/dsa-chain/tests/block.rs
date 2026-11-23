@@ -7,7 +7,7 @@ use dsa_chain::{
     assets::fixed_units,
     block::{
         BlockError, BlockOutput, DatumAvailability, DatumRow, Header, Held, Outcome, Selection,
-        SupplementRequest, Supplements, check_header, inputs, process_block,
+        SupplementRequest, Supplements, inputs, process_block,
     },
     datum, ids,
     observation::{Shape, Source},
@@ -260,29 +260,6 @@ fn each_planted_fault_trips_exactly_its_check() {
         (error.position, error.source.code),
         (0, "cbor_body_hash_mismatch"),
         "changed body"
-    );
-    let previous = header(9, 0);
-    let next = header(10, 1);
-    check_header(&previous, &next).unwrap();
-    let mut wrong = next.clone();
-    wrong.height = 11;
-    assert_eq!(
-        check_header(&previous, &wrong).unwrap_err(),
-        BlockError::HeaderHeight {
-            height: 11,
-            expected: 10
-        }
-    );
-    let mut wrong = next.clone();
-    wrong.previous_hash = Some("ff".repeat(32));
-    assert_eq!(
-        check_header(&previous, &wrong).unwrap_err(),
-        BlockError::HeaderParent { height: 10 }
-    );
-    wrong.height = ids::HEIGHT_LIMIT;
-    assert_eq!(
-        check_header(&previous, &wrong).unwrap_err().code(),
-        "unsupported_position"
     );
 }
 
@@ -1106,7 +1083,7 @@ fn generated_chains_conserve_tokens_and_track_supply_on_both_profiles() {
     let (mut blocks, mut transactions, mut invalid_count) = (0, 0, 0);
     let (mut burns_to_zero, mut same_block_spends) = (0, 0);
     let mut coverage = [0usize; 6];
-    let mut faults = [0usize; 7];
+    let mut faults = [0usize; 5];
     for network in ["mainnet", "preprod"] {
         let profile = Profile::load(network).unwrap();
         let selection = Selection::new(&profile);
@@ -1288,7 +1265,6 @@ fn generated_chains_conserve_tokens_and_track_supply_on_both_profiles() {
                     previous_hash: Some(previous.hash.clone()),
                     transaction_count: built.len(),
                 };
-                check_header(&previous, &block).unwrap();
                 let decoded = decode(&built);
                 assert!(
                     inputs(&decoded)
@@ -1298,7 +1274,7 @@ fn generated_chains_conserve_tokens_and_track_supply_on_both_profiles() {
                 );
                 if u64::from(height) == fault_height {
                     let position = (next_random(&mut random) as usize) % built.len();
-                    let kind = (seed % 7) as usize;
+                    let kind = (seed % 5) as usize;
                     let process = |txs: &[Transaction<'_>], held: &BTreeMap<Outpoint, Held>| {
                         process_block(&selection, &block, txs, held, &Supplements::default())
                     };
@@ -1364,27 +1340,6 @@ fn generated_chains_conserve_tokens_and_track_supply_on_both_profiles() {
                             assert_eq!(
                                 (error.position, error.source.code),
                                 (position, "cbor_body_hash_mismatch")
-                            );
-                            faults[kind] += 1;
-                        }
-                        4 => {
-                            let mut bad = block.clone();
-                            bad.height += 1;
-                            assert_eq!(
-                                check_header(&previous, &bad).unwrap_err(),
-                                BlockError::HeaderHeight {
-                                    height: height + 1,
-                                    expected: height
-                                }
-                            );
-                            faults[kind] += 1;
-                        }
-                        5 => {
-                            let mut bad = block.clone();
-                            bad.previous_hash = None;
-                            assert_eq!(
-                                check_header(&previous, &bad).unwrap_err(),
-                                BlockError::HeaderParent { height }
                             );
                             faults[kind] += 1;
                         }

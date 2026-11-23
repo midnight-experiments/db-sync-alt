@@ -14,12 +14,6 @@ use dsa_service::status::{self, Serving, Settings, State, Status};
 use dsa_store::service_view::ReaderCheck;
 use serde_json::Value;
 
-/// Commands a page may describe before the binary has them. Each is compared
-/// with its `--help` as soon as the binary has it.
-const PENDING: &[&str] = &["run"];
-/// A hidden command whose `--help` covers flag groups of a pending command.
-const HIDDEN: &[&str] = &["follow"];
-
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -256,11 +250,9 @@ fn the_configuration_page_states_every_flag_of_every_command() {
     let mut helps: BTreeMap<String, BTreeMap<String, Flag>> = BTreeMap::new();
     for (command, section) in &commands {
         let Some(text) = help(Some(command)) else {
-            if !PENDING.contains(&command.as_str()) {
-                errors.push(format!(
-                    "`{command}` is documented but the binary has no such command"
-                ));
-            }
+            errors.push(format!(
+                "`{command}` is documented but the binary has no such command"
+            ));
             continue;
         };
         let printed = help_flags(&text);
@@ -287,34 +279,13 @@ fn the_configuration_page_states_every_flag_of_every_command() {
         }
         helps.insert(command.clone(), printed);
     }
-    // A group whose commands are all pending is compared with the hidden
-    // commands that take the same flags, and otherwise waits for its command.
-    for (group, section) in &groups {
-        let users: Vec<&String> = commands
+    // Every group is taken by a command whose `--help` was compared above.
+    for group in groups.keys() {
+        let compared = commands
             .iter()
-            .filter(|(_, command)| linked(command).contains(group))
-            .map(|(name, _)| name)
-            .collect();
-        if users.is_empty() {
+            .any(|(name, command)| linked(command).contains(group) && helps.contains_key(name));
+        if !compared {
             errors.push(format!("#{group}: no command takes these flags"));
-            continue;
-        }
-        if users.iter().any(|user| helps.contains_key(*user)) {
-            continue;
-        }
-        let hidden: Vec<BTreeMap<String, Flag>> = HIDDEN
-            .iter()
-            .filter_map(|command| help(Some(command)))
-            .map(|text| help_flags(&text))
-            .collect();
-        for (name, (flag, _)) in flag_rows(section) {
-            match hidden.iter().find_map(|flags| flags.get(&name)) {
-                Some(printed) => {
-                    compare_flag(&format!("#{group}"), &name, &flag, printed, &mut errors)
-                }
-                None if users.iter().all(|user| PENDING.contains(&user.as_str())) => {}
-                None => errors.push(format!("#{group} {name}: in no --help")),
-            }
         }
     }
     assert!(
@@ -322,6 +293,56 @@ fn the_configuration_page_states_every_flag_of_every_command() {
         "docs/configuration.md:\n{}",
         errors.join("\n")
     );
+}
+
+/// `run` with `arguments` and `environment` and no other `DSA_` variable: its
+/// exit status and standard error.
+fn run_refusal(arguments: &[&str], environment: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut process = Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    process.args([
+        "run",
+        "--database",
+        "host=127.0.0.1 port=1 user=nobody dbname=nowhere sslmode=disable",
+        "--network",
+        "preprod",
+        "--provider-key-file",
+        "/nonexistent/key",
+        "--reader",
+        "reader",
+    ]);
+    process.args(arguments);
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DSA_")) {
+        process.env_remove(name);
+    }
+    process.envs(environment.iter().copied());
+    let output = process.output().expect("the binary runs");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn run_refuses_the_overall_timeout_as_the_page_says() {
+    let page = read("docs/configuration.md");
+    let sections = sections(&page, "## ");
+    let run = plain(&section(&sections, "`run`").text);
+    assert!(
+        run.contains("It refuses --overall-timeout-seconds and DSA_OVERALL_TIMEOUT_SECONDS with exit status 2"),
+        "## `run` in docs/configuration.md: {run}"
+    );
+    let refused = r#"{"error":"overall_timeout_not_supported","flag":"--overall-timeout-seconds"}"#;
+    for (arguments, environment) in [
+        (&["--overall-timeout-seconds", "60"][..], &[][..]),
+        (&[][..], &[("DSA_OVERALL_TIMEOUT_SECONDS", "60")][..]),
+    ] {
+        let (code, stderr) = run_refusal(arguments, environment);
+        assert_eq!(code, Some(2), "{arguments:?} {environment:?}: {stderr}");
+        assert!(
+            stderr.lines().any(|line| line == refused),
+            "{arguments:?} {environment:?}: {stderr}"
+        );
+    }
 }
 
 /// The statuses of an `Exit status:` block of `--help`, with single spaces.
@@ -379,10 +400,8 @@ fn the_operations_page_lists_the_exit_statuses_the_binary_prints() {
     let exit = section(&sections2, "Exit status");
     assert_eq!(documented_statuses(exit), printed, "## Exit status");
     let run = documented_statuses(section(&sections3, "Exit status of `run`"));
-    assert!(!run.is_empty());
-    if let Some(text) = help(Some("run")) {
-        assert_eq!(run, printed_statuses(&text), "### Exit status of `run`");
-    }
+    let text = help(Some("run")).expect("db-sync-alt run --help");
+    assert_eq!(run, printed_statuses(&text), "### Exit status of `run`");
 }
 
 /// The document without a database or a follower: every field present.
@@ -449,6 +468,15 @@ fn health_reasons() -> BTreeSet<&'static str> {
         variant.database.reader_check = check;
         variants.push(variant);
     }
+    // A provider head made long before the document.
+    let mut variant = healthy.clone();
+    variant.generated_at = 100_000;
+    variant.provider_head = Some(dsa_store::service_view::Point {
+        height: 1,
+        hash: "00".repeat(32),
+        timestamp: 0,
+    });
+    variants.push(variant);
     variants
         .iter()
         .flat_map(|variant| status::health(variant).1)

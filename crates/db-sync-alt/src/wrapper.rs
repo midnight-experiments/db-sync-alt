@@ -46,6 +46,10 @@ pub(crate) enum Effect {
     Changes,
     /// Checks the database: its refusal is a difference (exit status 3).
     Checks,
+    /// A service whose every write is one transaction: a stop that outlasts
+    /// the grace cancels its statements and is reported as a forced stop with
+    /// exit status 0, since no write can be left partly done.
+    Serves,
 }
 
 pub(crate) struct Operation {
@@ -307,6 +311,7 @@ async fn supervise(
     stop: &watch::Sender<bool>,
 ) -> (Result<Value, Error>, Option<&'static str>) {
     let mut stopped = None;
+    let mut forced = false;
     let result = tokio::select! {
         biased;
         result = &mut work => result,
@@ -317,12 +322,15 @@ async fn supervise(
                 let _ = stop.send(true);
                 match tokio::time::timeout(operation.grace, &mut work).await {
                     Ok(result) => result,
-                    Err(_) => Err(interrupted(operation, session, reason)),
+                    Err(_) => {
+                        forced = true;
+                        interrupted(operation, session, reason)
+                    }
                 }
             }
         },
     };
-    if result.is_err() {
+    if result.is_err() || forced {
         session.cancel().await;
     }
     // Dropping the command closes its connections and removes its temporary
@@ -331,17 +339,28 @@ async fn supervise(
     (result, stopped)
 }
 
-fn interrupted(operation: &Operation, session: &Session, reason: &'static str) -> Error {
+/// The result of a command that did not end within its grace after a stop.
+fn interrupted(
+    operation: &Operation,
+    session: &Session,
+    reason: &'static str,
+) -> Result<Value, Error> {
     match operation.effect {
-        Effect::Changes if session.commit_sent() => Error::OutcomeUnknown {
+        Effect::Serves => Ok(json!({
+            "stopped": "stop_forced_after_grace",
+            "grace_seconds": operation.grace.as_secs(),
+            "statements_cancelled": true,
+            "partial_update": false,
+        })),
+        Effect::Changes if session.commit_sent() => Err(Error::OutcomeUnknown {
             operation: operation.name,
             reason,
-        },
-        Effect::Changes => Error::Interrupted {
+        }),
+        Effect::Changes => Err(Error::Interrupted {
             operation: operation.name,
             reason,
-        },
-        Effect::Reads | Effect::Checks => Error::Refusal(reason),
+        }),
+        Effect::Reads | Effect::Checks => Err(Error::Refusal(reason)),
     }
 }
 
@@ -433,6 +452,44 @@ mod tests {
         let report = result.unwrap_err().report();
         assert_eq!(report["published"], false);
         assert_eq!(report["error"], "operation_deadline_exceeded");
+    }
+
+    /// A service that does not end within its grace, for example while its
+    /// writer waits on a lock, is stopped with success and a report that
+    /// says the stop was forced; it is dropped, and its statements are
+    /// cancelled.
+    #[tokio::test]
+    async fn a_service_that_outlasts_its_grace_is_stopped_with_success() {
+        let (session, stop) = session();
+        let mut operation = Operation::new("run", Effect::Serves, None);
+        operation.grace = Duration::from_millis(100);
+        struct Dropped(Arc<Mutex<bool>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = true;
+            }
+        }
+        let dropped = Arc::new(Mutex::new(false));
+        let guard = Dropped(Arc::clone(&dropped));
+        let work: Work = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(Value::Null)
+        });
+        let (result, stopped) = supervise(
+            &operation,
+            &session,
+            work,
+            async { Ok("operation_interrupted") },
+            &stop,
+        )
+        .await;
+        assert_eq!(stopped, Some("operation_interrupted"));
+        assert!(*dropped.lock().unwrap());
+        let report = result.expect("a forced stop of a service succeeds");
+        assert_eq!(report["stopped"], "stop_forced_after_grace");
+        assert_eq!(report["partial_update"], false);
+        assert!(report.get("outcome").is_none(), "{report}");
     }
 
     #[derive(Clone)]

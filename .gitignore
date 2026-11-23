@@ -1,13 +1,7 @@
 __pycache__/
 *.py[cod]
-.env
-.env.*
-!.env.example
 compose.env
 private/
-state/
-backups/
-*.dump
 *.log
 
 /target/

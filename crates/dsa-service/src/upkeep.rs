@@ -171,18 +171,23 @@ pub async fn start_indexes(store: &Store) -> Result<Vec<String>, Error> {
 }
 
 /// Records missing index sizes and rebuilds the index the policy names, if
-/// any, on `store`, a connection of its own.
+/// any, on `store`, a connection of its own. Before the rebuild,
+/// `rebuilding` is told the index's name and what an interrupted rebuild left
+/// is dropped.
 pub async fn rebuild_indexes(
     store: &Store,
     policy: &IndexPolicy,
+    rebuilding: impl FnOnce(&str),
 ) -> Result<Option<Rebuild>, Error> {
     let sizes = store.index_sizes().await?;
     let decision = index_decision(&sizes, policy);
     store.record_index_baselines(&sizes).await?;
-    match decision.rebuild {
-        Some(name) => Ok(Some(store.rebuild_index(&name).await?)),
-        None => Ok(None),
-    }
+    let Some(name) = decision.rebuild else {
+        return Ok(None);
+    };
+    rebuilding(&name);
+    store.drop_interrupted_rebuilds().await?;
+    Ok(Some(store.rebuild_index(&name).await?))
 }
 
 /// The name of a daily snapshot file.
