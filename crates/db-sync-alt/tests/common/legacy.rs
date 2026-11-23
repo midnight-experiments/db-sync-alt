@@ -39,12 +39,19 @@ impl Database {
     pub(crate) async fn new() -> Result<Self> {
         let root: Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
         let admin = connect(&root).await?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let owner = format!("conversion_owner_{}_{nonce:x}", std::process::id());
-        let reader = format!("conversion_reader_{}_{nonce:x}", std::process::id());
-        let name = format!("conversion_{}_{nonce:x}", std::process::id());
+        // Tests of one process run in parallel and may read the same clock
+        // value, so a counter makes the names distinct.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = format!(
+            "{:x}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let owner = format!("conversion_owner_{}_{nonce}", std::process::id());
+        let reader = format!("conversion_reader_{}_{nonce}", std::process::id());
+        let name = format!("conversion_{}_{nonce}", std::process::id());
         admin.batch_execute(&format!("CREATE ROLE {owner} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;CREATE ROLE {reader} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 36;ALTER ROLE {reader} SET default_transaction_read_only=on;ALTER ROLE {reader} SET search_path=public;ALTER ROLE {reader} SET statement_timeout='60s';ALTER ROLE {reader} SET idle_in_transaction_session_timeout='60s'")).await?;
         admin
             .batch_execute(&format!("CREATE DATABASE {name} OWNER {owner};"))
