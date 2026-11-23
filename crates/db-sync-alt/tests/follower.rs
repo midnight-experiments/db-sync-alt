@@ -1191,3 +1191,144 @@ async fn follow_flags_come_from_the_environment_and_the_flag_wins() -> Result {
     );
     Ok(())
 }
+
+/// While no update happens the call counts are stored at least every ten
+/// minutes, and once more before a requested stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn call_counts_are_stored_while_no_update_happens() -> Result {
+    let start = Start::new(31, 40, 15).await?;
+    let fake = Fake::start(&start.g, &start.profile).await;
+    fake.serve(served(&start.g, start.target + K));
+    let (stopper, stop) = Stop::new();
+    let (progress, _view) = watch::channel(Progress::default());
+    let run = follow::follow(context(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        Settings::default(),
+        stop,
+        progress,
+    ));
+    let stored_calls = |config: tokio_postgres::Config| async move {
+        let client = common::connect(&config).await.unwrap();
+        client
+            .query_one(
+                "SELECT coalesce(sum(requests),0)::bigint FROM dsa.calls",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    };
+    let drive = async {
+        until_true(|| fake.clock.now() >= support::START + 700).await;
+        let stored = stored_calls(start.database.config.clone()).await;
+        stopper.send(true).unwrap();
+        stored
+    };
+    let (report, stored) = tokio::join!(run, drive);
+    let report = report.map_err(|error| error.report().to_string())?;
+    assert_eq!((report.updates, report.stopped), (0, "stop_requested"));
+    // Thirty-five polls in 700 simulated seconds; the counts of the first
+    // ten minutes are stored without an update.
+    assert!(stored >= 25, "{stored} requests stored while idle");
+    assert_eq!(
+        stored_calls(start.database.config.clone()).await,
+        report.sent
+    );
+    start.cleanup().await
+}
+
+/// A database connection that drops is retried with a reconnect; the stored
+/// position is read again and following continues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_dropped_database_connection_is_retried_with_a_reconnect() -> Result {
+    let mut start = Start::new(37, 70, 15).await?;
+    let fake = Fake::start(&start.g, &start.profile).await;
+    let stop_at = start.target + 40;
+    let (_stopper, stop) = Stop::new();
+    let (progress, mut view) = watch::channel(Progress::default());
+    let settings = Settings {
+        limits: Limits {
+            blocks: 2,
+            ..Limits::default()
+        },
+        ..until(stop_at)
+    };
+    let run = follow::follow(context(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        settings,
+        stop,
+        progress,
+    ));
+    let database = start.database.name.clone();
+    let admin = &start.database.admin;
+    let drive = async {
+        let mut terminated = 0;
+        for step in 1..=3 {
+            let after = start.target + 10 * step;
+            progress_until(&mut view, |progress| {
+                progress.target.is_some_and(|target| target >= after)
+            })
+            .await;
+            terminated += admin
+                .query_one(
+                    "SELECT count(pg_terminate_backend(pid))::bigint FROM pg_stat_activity
+                     WHERE datname=$1 AND pid<>pg_backend_pid()",
+                    &[&database],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0);
+        }
+        terminated
+    };
+    let (report, terminated) = tokio::join!(run, drive);
+    let report = report.map_err(|error| error.report().to_string())?;
+    assert_eq!(report.position.target.height, stop_at);
+    assert!(terminated >= 3, "{terminated} sessions ended");
+    start.check("after dropped connections").await?;
+    start.cleanup().await
+}
+
+/// A provider failure that lasts longer than `fatal_after` ends the run
+/// with that failure, recorded as the stopped state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_lasting_failure_ends_the_run() -> Result {
+    let start = Start::new(41, 40, 15).await?;
+    let fake = Fake::start(&start.g, &start.profile).await;
+    fake.chain
+        .lock()
+        .unwrap()
+        .fault("/blocks/", Behavior::status(503), usize::MAX);
+    let settings = Settings {
+        fatal_after: Duration::from_secs(300),
+        ..until(start.target + 5)
+    };
+    let error = tokio::time::timeout(
+        Duration::from_secs(120),
+        follow_to(&start.profile, &fake, &start.database.config, settings),
+    )
+    .await
+    .expect("the run ends")
+    .unwrap_err();
+    let report = error.report();
+    assert!(matches!(error, follow::Error::Lasting { .. }), "{report}");
+    assert_eq!(report["error"], "provider_unavailable");
+    assert!(report["lasted_seconds"].as_u64().unwrap() > 300, "{report}");
+    let service: (String, String) = common::connect(&start.database.config)
+        .await?
+        .query_one("SELECT state,reason FROM dsa.service_state", &[])
+        .await
+        .map(|row| (row.get(0), row.get(1)))?;
+    assert_eq!(
+        service,
+        ("stopped".to_owned(), "provider_unavailable".to_owned())
+    );
+    start.cleanup().await
+}
