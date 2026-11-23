@@ -19,6 +19,8 @@ use crate::{
 
 /// The statement limit of the view's transaction.
 pub const STATEMENT_LIMIT: &str = "5s";
+/// The view's one statement.
+pub const STATEMENT: &str = include_str!("status.sql");
 
 /// A block by height, hash (lowercase hexadecimal) and time (Unix seconds).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,7 +268,7 @@ impl Store {
             .await?;
         tx.batch_execute(&format!("SET LOCAL statement_timeout='{STATEMENT_LIMIT}'"))
             .await?;
-        let value: Value = tx.query_one(include_str!("status.sql"), &[]).await?.get(0);
+        let value: Value = tx.query_one(STATEMENT, &[]).await?.get(0);
         let reader_check = match reader {
             Some(role) => Some(reader_check(&tx, role).await?),
             None => None,
