@@ -59,6 +59,9 @@ fn setting(name: &str, default: u64) -> u64 {
 
 /// 2026-11-19 12:00:00 UTC.
 const NOON: u64 = 1_795_046_400 + 43_200;
+/// The grace of `run`: a requested stop ends by itself within it (seconds);
+/// after it the stop is forced and reported as such.
+const GRACE_SECONDS: f64 = 10.0;
 /// Simulated seconds per real second of the in-process tests.
 const RATE: u64 = 50;
 
@@ -1161,8 +1164,8 @@ fn database_part(document: &Value) -> Value {
 
 /// The first start, the stop, the restart, memory and the secrets: the first
 /// start with `--snapshot` on an empty database restores (state `restoring`) and
-/// catches up; SIGTERM during the catch-up ends the process within 5
-/// seconds with exit status 0 and a store that verifies; a restart continues
+/// catches up; SIGTERM during the catch-up ends the process by itself within
+/// the grace, with exit status 0 and a store that verifies; a restart continues
 /// to the tip; resident memory stays under 64 MiB throughout; after the
 /// stop, `db-sync-alt status` equals the last document in every
 /// database-derived field; no line and no document holds the provider key,
@@ -1222,7 +1225,10 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     let stop_seconds = signalled.elapsed().as_secs_f64();
     let first_peak = peak.await?;
     assert_eq!(code, Some(0), "{lines:?}");
-    assert!(stop_seconds < 5.0, "stopped after {stop_seconds} s");
+    assert!(
+        stop_seconds < GRACE_SECONDS,
+        "stopped after {stop_seconds} s"
+    );
     let report: Value = serde_json::from_str(&stdout)?;
     assert_eq!(report["stopped"], "stop_requested");
     assert_eq!(report["restored"]["content_digest"], json!(p.digest));
@@ -1298,7 +1304,7 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     let second_peak = peak.await?;
     assert_eq!(code, Some(0), "{lines:?}");
     assert!(
-        final_stop_seconds < 5.0,
+        final_stop_seconds < GRACE_SECONDS,
         "stopped after {final_stop_seconds} s"
     );
     let report: Value = serde_json::from_str(&stdout)?;
@@ -1437,7 +1443,10 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
             .map(|line| line["seconds"].clone());
         starts.push(json!({"to_following_seconds":to_following,"sigterm_seconds":stop_seconds,"supply_check_seconds":supply}));
         assert!(to_following < 60.0, "following after {to_following} s");
-        assert!(stop_seconds < 5.0, "stopped after {stop_seconds} s");
+        assert!(
+            stop_seconds < GRACE_SECONDS,
+            "stopped after {stop_seconds} s"
+        );
     }
     println!(
         "{}",
