@@ -1,0 +1,74 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+env:
+  IMAGE: ghcr.io/midnight-experiments/db-sync-alt
+  BINARY_MAX_BYTES: 30000000
+  IMAGE_MAX_BYTES: 50000000
+jobs:
+  release:
+    name: binary, checksums, image
+    # Linux release binaries are built on Ubuntu 24.04 (glibc 2.39).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal
+          rustup show active-toolchain
+      - run: cargo build --release --locked -p db-sync-alt
+      - name: Version equals the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          printed=$(target/release/db-sync-alt --version)
+          echo "$printed"
+          test "$printed" = "db-sync-alt $version"
+          size=$(stat -c %s target/release/db-sync-alt)
+          echo "db-sync-alt: $size bytes (at most $BINARY_MAX_BYTES)"
+          test "$size" -le "$BINARY_MAX_BYTES"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Archive and checksums
+        run: |
+          name="db-sync-alt-$VERSION-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/db-sync-alt LICENSE NOTICE THIRD_PARTY_NOTICES.md "dist/$name/"
+          tar -C dist --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > SHA256SUMS && cat SHA256SUMS)
+      - name: Image
+        run: |
+          docker build -f deploy/Dockerfile \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE:$VERSION" .
+          size=$(docker image inspect --format '{{.Size}}' "$IMAGE:$VERSION")
+          echo "$IMAGE:$VERSION: $size bytes (at most $IMAGE_MAX_BYTES)"
+          test "$size" -le "$IMAGE_MAX_BYTES"
+          test "$(docker run --rm "$IMAGE:$VERSION" --version)" = "db-sync-alt $VERSION"
+      - name: Push the image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          docker logout ghcr.io
+      - name: Attach the archive and checksums to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The maintainer creates and publishes the release; a missing one is
+          # created as a draft so that the files are never lost.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+                 --title "db-sync-alt $VERSION" --notes-from-tag
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+            "dist/db-sync-alt-$VERSION-linux-x86_64.tar.gz" dist/SHA256SUMS
