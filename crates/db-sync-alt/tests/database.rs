@@ -440,7 +440,7 @@ async fn identity_refusals_status_and_single_writer() -> Result {
     ] {
         // The owner session still holds its writer lock. Restore each identity
         // field after the named open refusal so the following case is independent.
-        let original: Value = first.status(&preprod).await?;
+        let original = serde_json::to_value(first.service_view(&preprod, None).await?)?;
         first
             .client()
             .batch_execute(&format!(
@@ -501,12 +501,12 @@ async fn status_prints_identity_position_and_capabilities_without_writing() -> R
     let profile = Profile::load("preprod")?;
     let mut store = db.store().await?;
     store.create(&profile).await?;
-    let before = store.status(&profile).await?;
+    let before = store.service_view(&profile, None).await?;
     let output = db.cli("status", "preprod", &[]).await?;
     assert!(output.status.success());
     let first: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(first["identity"], before["identity"]);
-    assert_eq!(first["position"], before["position"]);
+    assert_eq!(first["identity"], serde_json::to_value(&before.identity)?);
+    assert_eq!(first["position"], serde_json::to_value(&before.position)?);
     assert_eq!(first["position"]["serving"], false);
     assert_eq!(
         first["capabilities"],
@@ -519,9 +519,10 @@ async fn status_prints_identity_position_and_capabilities_without_writing() -> R
             |s| s["class"] == "unsupported" && !s["subcommands"].as_array().unwrap().is_empty()
         )
     );
+    let after = store.service_view(&profile, None).await?;
     assert_eq!(
-        store.status(&profile).await?,
-        before,
+        (&after.identity, &after.position, &after.service_state, &after.upkeep),
+        (&before.identity, &before.position, &before.service_state, &before.upkeep),
         "status writes nothing"
     );
     store.grant_reader(&profile, &db.reader).await?;

@@ -522,10 +522,10 @@ async fn execute(
     match &command {
         Command::Create { .. } => {
             store.create(&profile).await?;
-            store.status(&profile).await
+            Ok(serde_json::to_value(store.service_view(&profile, None).await?)?)
         }
         Command::Status { .. } => {
-            let mut value = store.status(&profile).await?;
+            let mut value = serde_json::to_value(store.service_view(&profile, None).await?)?;
             value["capabilities"] =
                 serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?;
             value["unsupported_node_statements"] =

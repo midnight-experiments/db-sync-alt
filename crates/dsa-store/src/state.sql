@@ -78,6 +78,15 @@ CREATE TABLE dsa.first_observation (
  answers bytea[] NOT NULL CHECK(cardinality(answers)=cardinality(sources)),
  observed_at timestamptz NOT NULL DEFAULT now()
 );
+-- The service's upkeep records, outside the snapshot file and both digests:
+-- `supply` (the last supply check), `snapshot` (the last daily snapshot file)
+-- and `index:<name>` (an index's size after its last rebuild). The follower
+-- never writes this table, so upkeep writes it without the writer lock.
+CREATE TABLE dsa.upkeep (
+ name text PRIMARY KEY,
+ at timestamptz NOT NULL,
+ detail jsonb NOT NULL
+);
 REVOKE ALL ON ALL TABLES IN SCHEMA dsa FROM PUBLIC;
 CREATE FUNCTION dsa.gate() RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path=pg_catalog,dsa AS $$
