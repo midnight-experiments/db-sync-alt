@@ -14,6 +14,18 @@ What db-sync-alt 0.5.0 works with. Anything else is refused or unsupported.
 | Database format | 1 | Stored in the database (`identity.database_format`); another format is refused (`unsupported_database_format`). |
 | Snapshot file format | 1 | Another format is refused (`unsupported_snapshot_format`). |
 
+## What the release checks cover
+
+- Queries: every statement of the node's query catalogue returns the same rows
+  from a 0.5.0 database as from the 0.4.9 database at the same block
+  ([comparison](comparison.md)).
+- Following: the follower ran on real Preprod and Mainnet blocks, and on
+  Preprod its database had the content digest of a conversion of a 0.4.9
+  database at the same blocks ([provider](provider.md#catching-up)).
+- A Midnight node running against a 0.5.0 database is not part of these
+  checks. Before a node depends on a new database, run the connection check of
+  [connect a node](connect-a-node.md) and watch the node follow.
+
 ## Networks and their profiles
 
 The values of each network are compiled into the binary as its profile,

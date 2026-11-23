@@ -35,7 +35,7 @@ struct DatabaseArguments {
     /// PostgreSQL connection string. Read the password from --password-file.
     #[arg(long, env = "DSA_DATABASE", hide_env_values = true)]
     database: String,
-    /// The network: mainnet, preprod or preview.
+    /// The network: mainnet or preprod.
     #[arg(long, env = "DSA_NETWORK")]
     network: String,
     /// A file holding the database password.
