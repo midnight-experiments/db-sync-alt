@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use dsa_chain::profiles::Profile;
+use dsa_chain::{block::BlockOutput, profiles::Profile};
 use dsa_provider::{Clock, Config, Provider};
 use dsa_service::{
     epoch::stake_prefix,
@@ -25,6 +25,11 @@ use dsa_testkit::{
     server::{Behavior, Handler, KEY, Server},
 };
 use tokio::sync::watch;
+
+use crate::{
+    common::Database,
+    harness::{self, K, Source, chain, convert, derive, header, named, profile, same},
+};
 
 /// The retention of the followed stores: the smallest allowed.
 pub const DAY: i64 = 86_400;
@@ -202,4 +207,104 @@ pub async fn follow_to(
     let (_stopper, stop) = Stop::new();
     let (progress, _view) = watch::channel(Progress::default());
     follow::follow(context(profile, fake, config, settings, stop, progress)).await
+}
+
+/// A converted store on a generated chain, with the chain's full history as
+/// a schema-5 source for the conversion oracle.
+pub struct Start {
+    pub profile: Profile,
+    pub g: Generated,
+    pub history: Vec<BlockOutput>,
+    pub source: Source,
+    pub database: Database,
+    pub converted: Database,
+    pub target: u32,
+}
+
+impl Start {
+    /// The chain from height 1, converted at target `target` and horizon
+    /// `target - 2`.
+    pub async fn new(seed: u64, blocks: u32, target: u32) -> harness::Result<Self> {
+        let profile = profile(seed);
+        let g = chain(&profile, seed, 1, blocks, false).known_from_start();
+        Self::from_chain(profile, g, target).await
+    }
+
+    pub async fn from_chain(profile: Profile, g: Generated, target: u32) -> harness::Result<Self> {
+        let history = derive(&profile, &g).await?;
+        let mut source = Source::new().await?;
+        let headers = (1..=target + K)
+            .map(|height| header(g.block(height).unwrap()))
+            .collect::<Vec<_>>();
+        source.start(&g, &history, target, &headers).await?;
+        let database = Database::new().await?;
+        convert(&database, &source.database, &profile, target - 2, DAY).await?;
+        Ok(Self {
+            profile,
+            g,
+            history,
+            source,
+            database,
+            converted: Database::new().await?,
+            target,
+        })
+    }
+
+    pub async fn store(&self) -> harness::Result<Store> {
+        Ok(Store::connect(self.database.config.clone(), None).await?)
+    }
+
+    /// The followed store equals a conversion of the full history at its
+    /// horizon, target and tip, and verifies.
+    pub async fn check(&mut self, context: &str) -> harness::Result {
+        let mut store = self.store().await?;
+        let state = store.follow_state(&self.profile).await.map_err(named)?;
+        let target = state.target.height;
+        let above = store.headers_above(target).await.map_err(named)?;
+        let headers = (self.source.through + 1..=target)
+            .map(|height| header(self.g.block(height).unwrap()))
+            .chain(above)
+            .collect::<Vec<_>>();
+        self.source
+            .extend(&self.g, &self.history, target, &headers)
+            .await?;
+        let conversion = convert(
+            &self.converted,
+            &self.source.database,
+            &self.profile,
+            state.horizon.height,
+            DAY,
+        )
+        .await?;
+        let verified = store.verify(&self.profile).await.map_err(named)?;
+        same(&verified, &conversion, context)
+    }
+
+    pub async fn cleanup(self) -> harness::Result {
+        self.database.cleanup().await?;
+        self.converted.cleanup().await?;
+        self.source.database.cleanup().await
+    }
+}
+
+/// `serve.block` as (height, hash), in height order.
+pub async fn block_rows(config: &tokio_postgres::Config) -> harness::Result<Vec<(i64, String)>> {
+    Ok(crate::common::connect(config)
+        .await?
+        .query(
+            "SELECT id::bigint,encode(hash,'hex') FROM serve.block ORDER BY id",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
+/// Settings that stop at `target`.
+pub fn until(target: u32) -> Settings {
+    Settings {
+        stop_at_target: Some(target),
+        ..Settings::default()
+    }
 }
