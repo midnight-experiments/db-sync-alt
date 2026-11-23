@@ -328,7 +328,7 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
     fallback.no_window_spend();
     result.insert("no_spend_in_window", fallback);
     result.insert("spend_of_output_below_horizon", Fixture::base(2));
-    result.insert("v2_mixed_assets_and_q4_datums", Fixture::base(42));
+    result.insert("v2_mixed_assets_and_node_read_datums", Fixture::base(42));
     let mut expanded = Fixture::base(42);
     expanded.bounds.horizon = 7;
     expanded.expanded_token_rule_edges();
@@ -436,7 +436,7 @@ fn named_keep_rule_edges() -> Result {
 }
 
 #[test]
-fn version_two_projection_and_q4_boundaries() -> Result {
+fn version_two_projection_and_datum_boundaries() -> Result {
     for seed in [1, 2] {
         let f = Fixture::base(seed);
         let kept = keep(&f.chain, &f.profile, f.bounds)?;
@@ -744,7 +744,7 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
         }
     }
     cases.push(empty_epochs);
-    // Supported Q4 outputs may carry a hash without an available preimage.
+    // Supported datum-hash outputs may carry a hash without an available preimage.
     // Eligibility must not invent a datum for either address or exact-unit arm.
     for (seed, address, unit) in [
         (18, "mapping", "cnight"),

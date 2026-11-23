@@ -827,7 +827,7 @@ async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
-async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
+async fn compare_incidental_candidate_literal_counterexamples() -> Result {
     for scenario in [
         "window_datum",
         "epoch_minus_two_spent",
@@ -906,13 +906,13 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
             } else {
                 assert_ne!(
                     left, right,
-                    "Q19 counterexample {scenario}/{name} disappeared"
+                    "registered-candidate counterexample {scenario}/{name} disappeared"
                 );
             }
             literal_rows.insert(name, (left.clone(), right.clone()));
             println!(
                 "{}",
-                json!({"event":"q19_literal_counterexample","scenario":scenario,"query":name,"sql_sha256":sql.sha256,"address":address,"reference_block":reference,"horizon":6,"source_rows":left,"converted_rows":right})
+                json!({"event":"candidate_literal_counterexample","scenario":scenario,"query":name,"sql_sha256":sql.sha256,"address":address,"reference_block":reference,"horizon":6,"source_rows":left,"converted_rows":right})
             );
         }
         let actual = cli(&source, &target, &f.profile, &[]).await?;
@@ -1003,12 +1003,12 @@ async fn compare_q19_incidental_candidate_literal_counterexamples() -> Result {
             }
             println!(
                 "{}",
-                json!({"event":"q19_cli_raw_variant","scenario":scenario,"query":name,"observations":variant})
+                json!({"event":"candidate_cli_raw_variant","scenario":scenario,"query":name,"observations":variant})
             );
         }
         println!(
             "{}",
-            json!({"event":"q19_cli_counterexample","scenario":scenario,"exit":actual.status.code()})
+            json!({"event":"candidate_cli_counterexample","scenario":scenario,"exit":actual.status.code()})
         );
         ta.commit().await?;
         tb.commit().await?;
@@ -1883,7 +1883,7 @@ async fn compare_cli_refuses_duplicate_units_on_window_and_old_spent_outputs() -
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL17"]
-async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result {
+async fn compare_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result {
     for mutation in [
         "epoch_header",
         "stake",
@@ -1972,7 +1972,7 @@ async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result
         }
         println!(
             "{}",
-            json!({"event":"q19_supported_control","mutation":mutation,"exit":output.status.code(),"supported_differences":report["supported_difference_count"],"unsupported_differences":report["unsupported_difference_count"]})
+            json!({"event":"candidate_supported_control","mutation":mutation,"exit":output.status.code(),"supported_differences":report["supported_difference_count"],"unsupported_differences":report["unsupported_difference_count"]})
         );
         source.cleanup().await?;
         target.cleanup().await?;
@@ -1981,8 +1981,8 @@ async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17; optional DSA_TEST_OLD_CLI proves actual b683 file reuse"]
-async fn compare_q19_compatible_b683_observation_without_reconversion() -> Result {
+#[ignore = "requires isolated PostgreSQL17; optional DSA_TEST_OLD_CLI proves reuse of a format-2 capture written by an older binary"]
+async fn compare_format2_capture_without_reconversion() -> Result {
     let mut f = fixture(375);
     let output = f.output(7, 12, 20, "other", "cnight", Some(99075));
     f.chain.outputs.get_mut(&output).unwrap().address =
@@ -2090,7 +2090,7 @@ async fn compare_q19_compatible_b683_observation_without_reconversion() -> Resul
     ));
     println!(
         "{}",
-        json!({"event":"q19_capture_compatibility","actual_b683_binary":actual_old.is_some(),"format":2,"file_unchanged":true,"new_exit":compared.status.code()})
+        json!({"event":"candidate_capture_compatibility","older_binary":actual_old.is_some(),"format":2,"file_unchanged":true,"new_exit":compared.status.code()})
     );
     source.cleanup().await?;
     target.cleanup().await?;

@@ -22,7 +22,7 @@
 //! Sparse consumed-before-horizon state is a separate protected family keyed by
 //! (creator hash,index); row presence is the bit. Its natural-key state_digest is
 //! bound by snapshot integrity separately from the eleven-family node-content
-//! digest (FR-044). No unobserved historical spending height must be reproduced.
+//! digest. No unobserved historical spending height must be reproduced.
 //! Supply quantities are keyed by exact unit and protected in the description.
 //! Operational first-served timestamps, provider call counts, database allocation
 //! sequences and provenance do not change logical content.

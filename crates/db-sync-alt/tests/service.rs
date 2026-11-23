@@ -220,7 +220,7 @@ async fn http_get(address: SocketAddr, path: &str) -> Result<(u16, String)> {
     Ok((head[9..12].parse()?, body.to_owned()))
 }
 
-/// Test 1 (database part): `db-sync-alt status` prints the document of a
+/// `db-sync-alt status` prints the document of a
 /// stopped service from the database alone, with the shape of the golden
 /// document; a stored `following` is not claimed; a closed gate is named.
 #[tokio::test]
@@ -387,7 +387,7 @@ fn plan_nodes(plan: &Value, nodes: &mut Vec<Value>) {
     }
 }
 
-/// Test 2 (database part): answers come from the last view; no statement
+/// The HTTP answers come from the last view; no statement
 /// runs on any session of the database while 1,000 requests are answered;
 /// every served table the view reads has an index path.
 #[tokio::test]
@@ -499,7 +499,7 @@ async fn index_name_counts(
         .collect())
 }
 
-/// Test 4: a rebuild of bloated indexes runs while a node reader repeats a
+/// A rebuild of bloated indexes runs while a node reader repeats a
 /// literal node query: no error, no wait above one second, and every node
 /// index name exactly once in `pg_indexes` at every sample. An interrupted
 /// rebuild's leftover is dropped at the next start.
@@ -749,7 +749,7 @@ const VACUUMED: &str = "VACUUM serve.block,serve.tx,serve.tx_out,serve.tx_in,ser
     serve.epoch_param,serve.pool_hash,serve.epoch_stake,serve.tx_metadata,dsa.first_served,dsa.consumed_before_horizon,\
     dsa.unspent,dsa.service_state,dsa.calls,dsa.upkeep,dsa.position,dsa.supply";
 
-/// Test 5: thirty simulated days of churn with a retention of one day, the
+/// Thirty simulated days of churn with a retention of one day, the
 /// horizon advanced every step and the upkeep on its schedule: the served
 /// and state tables stay within 1.3 times a fresh restore of the final
 /// content.
@@ -901,7 +901,7 @@ async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
     fresh.cleanup().await
 }
 
-/// Test 6: the daily snapshot file on an injected clock: a start after the
+/// The daily snapshot file on an injected clock: a start after the
 /// time of day, a day without a run, a failed write tried again without
 /// losing the older files, the keep count; the recorded digest equals the
 /// one `verify` computes.
@@ -1087,7 +1087,7 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
     setup.cleanup().await
 }
 
-/// Test 7: a planted supply difference closes the gate; the node reads
+/// A planted supply difference closes the gate; the node reads
 /// SQLSTATE 55000 and `/status` names the check.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]

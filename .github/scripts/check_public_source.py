@@ -21,6 +21,15 @@ PATTERNS = {
     'github_credential': re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b'),
     'credential_url': re.compile(r'(?:postgres(?:ql)?|https?)://[^\s/:]+:[^\s/@]+@'),
     'private_host_identity': re.compile(r'\b(?:eddie|acedward)@(?:[^\s]+)'),
+    # References to the development process: a plan's test numbers as a
+    # comment prefix, question numbers, requirement numbers, and short commit
+    # hashes named as history. Text states what the software is now.
+    'plan_test_number': re.compile(r'//[/!]?[ \t]*Tests? \d+\b'),
+    'question_reference': re.compile(r'(?<![A-Za-z0-9])[Qq]\d+(?![A-Za-z0-9])'),
+    'requirement_reference': re.compile(r'\b(?:FR|SC)-\d+\b'),
+    'commit_as_history': re.compile(
+        r'(?i:\b(?:commit|from|at|since|before|after|exact|in|of)[ \t]+`?)'
+        r'(?=[0-9a-f]{0,6}[a-f])(?=[0-9a-f]{0,6}[0-9])[0-9a-f]{7}(?![0-9A-Za-z_])'),
 }
 # Binary assets require an exact path and SHA-256. Compressed JSON fixtures
 # additionally receive bounded expansion, member validation and text scans.

@@ -233,7 +233,7 @@ fn broken_links() -> Hook {
     })
 }
 
-/// Test 1: the service starts while PostgreSQL is down and waits; follows
+/// The service starts while PostgreSQL is down and waits; follows
 /// once it is up; survives a restart of PostgreSQL while following; waits
 /// out a dropped provider connection, 429, 418, 5xx and 402, each for 60
 /// simulated seconds, with `/status` naming the state and the time the wait
@@ -685,8 +685,8 @@ fn database_part(document: &Value) -> Value {
     Value::Object(part)
 }
 
-/// Tests 2 (first start), 4, 5 and 6, and the secrets: the first start with
-/// `--snapshot` on an empty database restores (state `restoring`) and
+/// The first start, the stop, the restart, memory and the secrets: the first
+/// start with `--snapshot` on an empty database restores (state `restoring`) and
 /// catches up; SIGTERM during the catch-up ends the process within 5
 /// seconds with exit status 0 and a store that verifies; a restart continues
 /// to the tip; resident memory stays under 64 MiB throughout; after the
@@ -836,7 +836,7 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     let verified = store.verify(&p.profile).await.map_err(named)?;
     assert_eq!(verified.state.target.height, end);
 
-    // Test 6: the status command after the stop equals the last document.
+    // The status command after the stop equals the last document.
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
         .args([
             "status",
@@ -884,7 +884,7 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     p.cleanup().await
 }
 
-/// Test 2 (restart): a serving store of Mainnet size follows again within
+/// A serving store of Mainnet size follows again within
 /// 60 seconds of the process start, also the second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated PostgreSQL 17"]
@@ -972,7 +972,7 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
     p.cleanup().await
 }
 
-/// Test 3: each condition that retrying cannot cure ends `run` with exit
+/// Each condition that retrying cannot cure ends `run` with exit
 /// status 1 and a named error; an invalid setting with 2; a database that
 /// stays unreachable and a provider that answers 5xx, each longer than
 /// `--database-fatal-after-seconds`, with 75.

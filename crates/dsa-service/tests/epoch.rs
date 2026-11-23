@@ -93,7 +93,7 @@ fn scripted() -> Pools {
     }
 }
 
-/// Test 5: both methods give the same per-pool stake on a set with a
+/// Both methods give the same per-pool stake on a set with a
 /// retired, a re-registered and a zero-stake pool; a sum that differs from
 /// the epoch's active stake is refused.
 #[tokio::test]

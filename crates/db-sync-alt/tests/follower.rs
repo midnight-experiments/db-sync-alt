@@ -209,7 +209,7 @@ async fn equivalence(
     Ok(())
 }
 
-/// Test 1: following through the provider equals a conversion of the full
+/// Following through the provider equals a conversion of the full
 /// history at the same position, with random batch limits, poll timing,
 /// branches at the tip, horizon advances and a restart every round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -317,7 +317,7 @@ fn times_of(fake: &Fake, exact: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Test 2: forks of depth 1, 10 and k − 1 replace only the headers above
+/// Forks of depth 1, 10 and k − 1 replace only the headers above
 /// the fork point; a target contradicted once is read again a minute later
 /// and following goes on; contradicted twice, the gate closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -621,7 +621,7 @@ async fn a_missing_target_is_retried_and_only_another_hash_twice_closes_the_gate
     start.cleanup().await
 }
 
-/// Test 3: answers that contradict themselves or the chain and every fault
+/// Answers that contradict themselves or the chain and every fault
 /// of the fake provider write nothing; the loop retries and continues. A
 /// spent allowance is waited out until the next UTC day without an exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -709,7 +709,7 @@ async fn faulty_answers_write_nothing_and_are_retried() -> Result {
     start.cleanup().await
 }
 
-/// Test 4: at an epoch change the parameters are stored before the epoch's
+/// At an epoch change the parameters are stored before the epoch's
 /// first block is served; while the provider does not have them the batch
 /// ends before that block. The stake arrives later, and a failing stake read
 /// never delays an update.
@@ -801,7 +801,7 @@ async fn epoch_parameters_come_first_and_stake_never_delays_an_update() -> Resul
     start.cleanup().await
 }
 
-/// Test 6: at the tip each poll costs one request and each block with
+/// At the tip each poll costs one request and each block with
 /// transactions one page request. DSA_FOLLOW_TIP_BLOCKS sets the number of
 /// followed blocks (default 200).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -873,7 +873,7 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     start.cleanup().await
 }
 
-/// Test 7: a datum already held is not asked for again, also across a
+/// A datum already held is not asked for again, also across a
 /// restart; a block of 201 transactions is read in three pages; an output the
 /// decoder cannot classify is resolved through the provider's outputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

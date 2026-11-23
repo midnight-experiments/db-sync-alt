@@ -85,4 +85,36 @@ class DocumentationChecks(unittest.TestCase):
                          ['unknown_code:invented_code'])
         self.assertEqual(self.errors({**source,checker.TROUBLESHOOTING:'No table.\n'}),['no_codes'])
 
+class ProcessReferenceChecks(unittest.TestCase):
+    def errors(self,text,name='crates/x/tests/a.rs'):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/name).parent.mkdir(parents=True)
+            (root/name).write_text(text)
+            errors,_=checker.check(root)
+        return sorted(code for found,code in errors if found==name)
+
+    def test_development_references_are_refused(self):
+        # Built by concatenation so that this file passes the check itself.
+        refused=[('plan_test_number','/// '+'Test 3: a fork is replaced.\n'),
+                 ('plan_test_number','    // '+'Tests 2 (first start), 4 and 5\n'),
+                 ('question_reference','// See '+'Q'+'19.\n'),
+                 ('question_reference','fn compare_'+'q'+'19_case() {}\n'),
+                 ('question_reference','SELECT 1 '+'q'+'22_original;\n'),
+                 ('requirement_reference','//! The digest ('+'FR'+'-044).\n'),
+                 ('requirement_reference','// Bounded by '+'SC'+'-012.\n'),
+                 ('commit_as_history','/// Captures from '+'b683'+'466 omit it.\n'),
+                 ('commit_as_history','-- Exact `'+'e058'+'f39` query.\n')]
+        for code,text in refused:
+            self.assertEqual(self.errors(text),[code],text)
+
+    def test_ordinary_text_passes(self):
+        passed=['/// Tests the fork search.\n','// Test that 3 blocks follow.\n',
+                'let quantity = q;\nlet sequence = seq1;\n',
+                'const HASH: &str = "'+'b683466'+'e058f39'+'00";\n',
+                '// The label 6500973 and 4194304 bytes.\n',
+                '// FRAME-1 and SCALE-2 are not requirement numbers.\n',
+                '// From deadbee: letters only; from 1234567: digits only.\n']
+        for text in passed:
+            self.assertEqual(self.errors(text),[],text)
+
 if __name__=='__main__':unittest.main()
