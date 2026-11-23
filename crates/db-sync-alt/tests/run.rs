@@ -1029,6 +1029,122 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
     p.cleanup().await
 }
 
+/// Runs a one-shot command of the binary on `database` with no `DSA_`
+/// variable; its output.
+async fn command(database: &Database, arguments: &[&str]) -> Result<std::process::Output> {
+    let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    process
+        .args(arguments)
+        .args(["--database", &database.dsn(false), "--network", "preprod"]);
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DSA_")) {
+        process.env_remove(name);
+    }
+    Ok(process.output().await?)
+}
+
+/// A first restore stopped after its build committed and before it
+/// published leaves a closed database with the build beside it; the next
+/// `run --snapshot` restores it and follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn run_completes_a_restore_interrupted_between_its_commits() -> Result {
+    let p = Preprod::new(83, 1, 0, false).await?;
+    let k = p.k();
+    let fake = p.fake(p.t0 + k).await;
+    let database = Database::new().await?;
+    for arguments in [
+        &["create"][..],
+        &["grant-reader", "--role", &database.reader],
+    ] {
+        let output = command(&database, arguments).await?;
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+    }
+    // A reader holds a view, so the restore's publication waits; it is
+    // stopped once its build has committed.
+    let mut reader_config = database.config.clone();
+    reader_config.user(&database.reader);
+    let holder = common::connect(&reader_config).await?;
+    holder
+        .batch_execute("BEGIN;DECLARE held CURSOR FOR SELECT * FROM public.block")
+        .await?;
+    let mut restore = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    restore.args([
+        "restore",
+        "--database",
+        &database.dsn(false),
+        "--network",
+        "preprod",
+        "--file",
+        &p.file(),
+    ]);
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DSA_")) {
+        restore.env_remove(name);
+    }
+    let restore = restore
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = restore.id().ok_or("restore ended")?.to_string();
+    let owner = common::connect(&database.config).await?;
+    let built = "SELECT to_regnamespace('dsa_retired') IS NOT NULL";
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !owner.query_one(built, &[]).await?.get::<_, bool>(0) {
+        assert!(Instant::now() < deadline, "the build never committed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()?
+            .success()
+    );
+    let output = restore.wait_with_output().await?;
+    assert!(!output.status.success(), "{output:?}");
+    holder.batch_execute("COMMIT").await?;
+    drop(holder);
+    assert!(owner.query_one(built, &[]).await?.get::<_, bool>(0));
+    // The next start with --snapshot restores again and follows.
+    let extra = vec![
+        "--snapshot".to_owned(),
+        p.file(),
+        "--expect-content-digest".to_owned(),
+        p.digest.clone(),
+    ];
+    let child = Child::start(
+        &run_arguments(&database, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let address = child.address().await;
+    let (mut bodies, mut states) = (Vec::new(), std::collections::BTreeSet::new());
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| {
+            document["state"] == "following" && document["served_target"]["height"] == json!(p.t0)
+        },
+    )
+    .await;
+    child.signal("TERM");
+    let (code, stdout, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let report: Value = serde_json::from_str(&stdout)?;
+    assert_eq!(
+        report["restored"]["content_digest"],
+        json!(p.digest),
+        "{report}"
+    );
+    assert!(!owner.query_one(built, &[]).await?.get::<_, bool>(0));
+    let mut store = Store::connect(database.config.clone(), None).await?;
+    let verified = store.verify(&p.profile).await.map_err(named)?;
+    assert_eq!(verified.content_digest, p.digest);
+    drop((store, owner));
+    database.cleanup().await?;
+    p.cleanup().await
+}
+
 /// Waits (at most a minute) until a `db-sync-alt` session of `database`
 /// waits for a lock.
 async fn writer_waits_for_a_lock(database: &Database) -> Result {

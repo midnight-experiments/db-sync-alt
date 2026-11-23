@@ -21,9 +21,10 @@ At start the service:
 4. Takes the [writer lock](glossary.md#database). A second process that writes
    to the same database is refused (`writer_busy`).
 5. On an empty database, restores the `--snapshot` file (state `restoring`).
-   Without `--snapshot` an empty database is refused (`snapshot_required`). A
-   database whose gate is closed is refused (`database_not_serving`): see
-   [a closed gate](#a-closed-gate).
+   Without `--snapshot` an empty database is refused (`snapshot_required`).
+   What an interrupted restore left (its build, not yet published) is
+   restored again from `--snapshot`. A database whose gate is closed is
+   refused (`database_not_serving`): see [a closed gate](#a-closed-gate).
 6. Compares `--retention-seconds`, when given, with the stored retention
    ([change the retention](#change-the-retention)).
 7. Grants the `--reader` login the node's rights and checks that it has no

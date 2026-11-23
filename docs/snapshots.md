@@ -96,8 +96,9 @@ start. A restore:
    seconds.
 
 If a restore stops after the build and before publication, the database is not
-serving and still answers 55000; the next restore, with the same or another
-valid file, undoes the build and loads again. A restore stopped by a signal
+serving and still answers 55000; the next restore, or the next start of `run`
+with `--snapshot`, undoes the build and loads again, with the same or another
+valid file. A restore stopped by a signal
 reports `"published": false` before its publishing commit was sent and
 `"outcome": "unknown"` after: run `status` and `verify` to see which state it
 reached.

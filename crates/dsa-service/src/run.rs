@@ -356,8 +356,9 @@ impl Service {
         }
     }
 
-    /// One attempt: connect, take the writer lock, restore an empty
-    /// database, check the retention and grant and check the reader.
+    /// One attempt: connect, take the writer lock, restore an empty database
+    /// or the build an interrupted restore left, check the retention and
+    /// grant and check the reader.
     async fn prepare(&self) -> Result<Prepared, Error> {
         self.show(State::Waiting, "database_connecting", None);
         let mut store = (self.open)(Role::Writer).await?;
@@ -376,11 +377,16 @@ impl Service {
         };
         let restored = match state {
             Some(state) if state.serving => None,
+            // The build of an interrupted restore, or an empty layout, is
+            // restored again; a database that served is refused.
             Some(state) => {
-                return Err(Error::Refusal {
-                    code: "database_not_serving",
-                    detail: json!({"reason": state.reason}),
-                });
+                if self.settings.restore.is_none() || !store.loadable(&self.profile).await? {
+                    return Err(Error::Refusal {
+                        code: "database_not_serving",
+                        detail: json!({"reason": state.reason}),
+                    });
+                }
+                Some(self.restore(&mut store).await?)
             }
             None => Some(self.restore(&mut store).await?),
         };
