@@ -1509,6 +1509,54 @@ async fn a_missing_snapshot_file_matters_only_for_a_restore() -> Result {
     p.cleanup().await
 }
 
+/// The status is read once the first start has restored the database and
+/// granted the reader: the first document in which the service catches up
+/// or follows carries a passing reader check and no failed status read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn the_first_document_after_the_start_reads_the_prepared_database() -> Result {
+    let p = Preprod::new(91, 1, 0, false).await?;
+    let fake = p.fake(p.t0 + p.k()).await;
+    let database = Database::new().await?;
+    let extra = vec!["--snapshot".to_owned(), p.file()];
+    let child = Child::start(
+        &run_arguments(&database, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let address = child.address().await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let first = loop {
+        if let Some((_, document)) = get(address, "/status").await
+            && matches!(
+                document["state"].as_str(),
+                Some("catching_up" | "following")
+            )
+        {
+            break document;
+        }
+        assert!(Instant::now() < deadline, "{:?}", child.events());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    child.signal("TERM");
+    let (code, _, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let warnings = first["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.as_str().unwrap().starts_with("status_read_failed")),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        first["database"]["reader_check"]["passed"], true,
+        "{}",
+        first["database"]["reader_check"]
+    );
+    assert_eq!(first["serving"], "ready");
+    database.cleanup().await?;
+    p.cleanup().await
+}
+
 /// Runs a one-shot command of the binary on `database` with no `DSA_`
 /// variable; its output.
 async fn command(database: &Database, arguments: &[&str]) -> Result<std::process::Output> {

@@ -117,6 +117,10 @@ struct Shared {
     database: watch::Sender<Option<Arc<DatabaseView>>>,
     /// Failures of the status read and of the upkeep jobs, as warnings.
     notes: Mutex<Notes>,
+    /// Requests for a status read now, numbered; and the last request a
+    /// finished read served.
+    refresh_wanted: watch::Sender<u64>,
+    refresh_done: watch::Sender<u64>,
     documents: watch::Sender<Documents>,
     settings: status::Settings,
 }
@@ -580,18 +584,22 @@ async fn refresh(
 ) {
     let mut store: Option<Store> = None;
     let mut failing: Option<Instant> = None;
+    let mut wanted = shared.refresh_wanted.subscribe();
+    let mut served = 0;
     loop {
+        let requested = *wanted.borrow_and_update();
         // A restore builds and publishes the tables: no read holds a lock
-        // its publication would wait for.
+        // its publication would wait for. A request comes once it is done.
         let restoring = shared
             .phase
             .borrow()
             .as_ref()
             .is_some_and(|view| view.state == State::Restoring);
-        if restoring {
+        if restoring && requested == served {
             store = None;
             tokio::select! {
                 () = tokio::time::sleep(interval) => continue,
+                _ = wanted.changed() => continue,
                 _ = halt.wait_for(|halt| *halt) => return,
             }
         }
@@ -634,8 +642,11 @@ async fn refresh(
                 lock(&shared.notes).refresh = Some(code(&report));
             }
         }
+        served = requested;
+        shared.refresh_done.send_replace(requested);
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
+            _ = wanted.changed() => {}
             _ = halt.wait_for(|halt| *halt) => return,
         }
     }
@@ -884,6 +895,8 @@ pub async fn run(context: Context) -> Result<Report, Error> {
         .0,
         database: watch::channel(None).0,
         notes: Mutex::new(Notes::default()),
+        refresh_wanted: watch::channel(0).0,
+        refresh_done: watch::channel(0).0,
         documents: watch::channel(Documents {
             healthy: false,
             body: "{}".into(),
@@ -950,6 +963,21 @@ pub async fn run(context: Context) -> Result<Report, Error> {
             Err(error) => break Err(error),
         };
         restored = restored.or(prepared.restored);
+        // The database part of the status is read once the database is
+        // prepared (restored, reader granted), so that the first document
+        // of the follower is current.
+        let mut generation = 0;
+        shared.refresh_wanted.send_modify(|wanted| {
+            *wanted += 1;
+            generation = *wanted;
+        });
+        let mut done = shared.refresh_done.subscribe();
+        let read =
+            tokio::time::timeout(REFRESH_DEADLINE, done.wait_for(|done| *done >= generation));
+        tokio::select! {
+            _ = read => {}
+            () = stop.wait() => {}
+        }
         if !upkeep_started {
             upkeep_started = true;
             let upkeep = Upkeep {

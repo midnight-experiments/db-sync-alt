@@ -34,8 +34,10 @@ At start the service:
    ([change the retention](#change-the-retention)).
 7. Grants the `--reader` login the node's rights and checks that it has no
    others ([PostgreSQL](postgresql.md#the-reader-login)).
-8. Follows the chain, reads the database part of the status every 20 seconds on
-   a read-only connection of its own, and runs the [upkeep](#upkeep).
+8. Reads the database part of the status once, so that the first document of
+   the follower is current; then follows the chain, reads that part every 20
+   seconds on a read-only connection of its own, and runs the
+   [upkeep](#upkeep).
 
 A restart does the same. It reads no history: it continues from the stored
 target, and the node keeps reading the last update meanwhile.
