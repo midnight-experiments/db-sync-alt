@@ -20,8 +20,8 @@ command: each flag, its variable and its default.
 
 ## Database flags
 
-`run`, `create`, `restore`, `snapshot`, `verify`, `status`, `convert` and
-`grant-reader` take these flags for the database db-sync-alt writes or reads.
+`run`, `create`, `restore`, `snapshot`, `verify`, `status` and `grant-reader`
+take these flags for the database db-sync-alt writes or reads.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
@@ -31,7 +31,7 @@ command: each flag, its variable and its default.
 | `--tls-root-cert` | `DSA_TLS_ROOT_CERT` | none | PEM certificates of the authorities that signed the server's certificate. With it, the connection uses TLS and checks the certificate and the host name in `--database`. |
 | `--statement-timeout-seconds` | `DSA_STATEMENT_TIMEOUT_SECONDS` | PostgreSQL's setting | `statement_timeout` of this connection, 1 to 86,400 seconds. |
 | `--idle-transaction-timeout-seconds` | `DSA_IDLE_TRANSACTION_TIMEOUT_SECONDS` | PostgreSQL's setting | `idle_in_transaction_session_timeout` of this connection, 1 to 86,400 seconds. |
-| `--overall-timeout-seconds` | `DSA_OVERALL_TIMEOUT_SECONDS` | none; `convert`: 3600 | Stop the command after this many seconds, 1 to 86,400. |
+| `--overall-timeout-seconds` | `DSA_OVERALL_TIMEOUT_SECONDS` | none | Stop the command after this many seconds, 1 to 86,400. |
 
 TLS: without `--tls-root-cert` the connection still requires TLS and checks
 the server's certificate against the public certificate authorities. Put
@@ -89,8 +89,8 @@ no others.
 
 ## `create`
 
-Creates the empty layout in a blank database. `restore`, `convert` and `run`
-create it themselves, so this command is optional. Takes the
+Creates the empty layout in a blank database. `restore` and `run` create it
+themselves, so this command is optional. Takes the
 [database flags](#database-flags) only.
 
 ## `restore`
@@ -140,26 +140,6 @@ start. Takes the [database flags](#database-flags) and:
 | `--role` | — | required | The reader login. |
 | `--check` | — | off | Only check the existing rights; change nothing. |
 
-## `convert`
-
-Builds a database from a serving 0.4.x database, read through its reader login
-([upgrade](upgrade.md)). Takes the [database flags](#database-flags) for the new
-database and:
-
-| Flag | Variable | Default | Meaning |
-| --- | --- | --- | --- |
-| `--source` | — | required | Connection string of the 0.4.x database, as its reader login. It must not hold a password. |
-| `--source-password-file` | — | none | A file holding the source login's password. |
-| `--source-tls-root-cert` | — | none | PEM certificates for the source server, as `--tls-root-cert`. |
-| `--horizon-block` | — | from the retention | The horizon height. Without it, the horizon is the newest source block at least `--retention-seconds` older than the target. |
-| `--retention-seconds` | — | `604800` | The retention stored in the new database, at least 86,400. |
-| `--batch-rows` | — | `4096` | Rows per page read from the source, 1 to 65,536. |
-| `--batch-bytes` | — | `4194304` | Bytes per page read from the source, 1,024 to 67,108,864. |
-| `--snapshot` | — | none | Also write a snapshot file of the result. |
-| `--capture-source` | — | none | Save the source's answers to the node's queries, read in the same transaction, for `compare --a-capture`. |
-| `--source-statement-timeout-seconds` | — | the source's setting | `statement_timeout` of the source connection, 1 to 86,400 seconds. A source login without a limit gets 60 seconds. |
-| `--source-idle-transaction-timeout-seconds` | — | the source's setting | `idle_in_transaction_session_timeout` of the source connection, 1 to 86,400 seconds. A source login without a limit gets 60 seconds. |
-
 ## `compare`
 
 Runs the node's queries against two databases and reports every difference
@@ -167,11 +147,10 @@ Runs the node's queries against two databases and reports every difference
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `--a` | — | required unless `--a-capture` | Connection string of side A, as a reader login. |
-| `--a-capture` | — | none | A capture file written by `convert --capture-source`, read instead of side A. |
+| `--a` | — | required | Connection string of side A, as a reader login. |
 | `--b` | — | required | Connection string of side B, as a reader login. |
 | `--network` | — | required | `mainnet` or `preprod`. |
-| `--positions` | — | `auto` | A JSON file of cursor and reference positions, or `auto`: positions across the window of `--horizon-block` or of the capture. |
+| `--positions` | — | `auto` | A JSON file of cursor and reference positions, or `auto`: positions across the window of `--horizon-block`. |
 | `--horizon-block` | — | none | The horizon of the positions. |
 | `--max-pairs` | — | `500` | Position pairs of the uniform sample, 1 to 5,000. |
 | `--a-password-file` | — | none | Password file of side A. |

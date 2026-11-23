@@ -59,17 +59,17 @@ connection, is starting or stopping, or has too many connections.
 | `tls_error` | Another TLS failure, for example a server without TLS. | Turn TLS on ([PostgreSQL](postgresql.md#tls)) or use `sslmode=disable` for a local server. |
 | `postgresql_17_required` | The server is not PostgreSQL 17. | |
 | `invalid_owner_role` | The login does not own the database, or has superuser or other role attributes. | [PostgreSQL](postgresql.md#the-database-and-its-logins). |
-| `writer_busy` | Another process holds the writer lock: a running service, or a restore or conversion. | Stop the other one, or wait for it. |
+| `writer_busy` | Another process holds the writer lock: a running service, or a restore. | Stop the other one, or wait for it. |
 
 ## The database
 
 | Code | Cause | What to do |
 | --- | --- | --- |
-| `unsupported_database_format` | The database is not a db-sync-alt 0.5.0 database: for example a 0.4.x database. | Give the right database; a 0.4.x database is the source of [`convert`](upgrade.md). |
+| `unsupported_database_format` | The database is not a db-sync-alt database of this format. | Give the right database. |
 | `network_mismatch` | The database belongs to another network. | Check `--network` and `--database`. |
 | `profile_hash_mismatch` | The database was made with another profile. | Restore a file made by this release into a new database. |
 | `keep_rule_version_mismatch` | The database was made with another keep rule. | As above. |
-| `destination_not_empty` | `restore`, `convert` or `create` was given a database that holds data. | Use an empty database. |
+| `destination_not_empty` | `restore` or `create` was given a database that holds data. | Use an empty database. |
 | `database_not_serving` | The gate is closed, or the database never served. | See `position.reason` in `db-sync-alt status`; for a closed gate, [restore a snapshot file](operations.md#a-closed-gate). |
 | `stored_headers_incomplete` | The headers between the target and the tip are not all stored. | Run `verify`; restore a snapshot file into a new database. |
 
@@ -160,20 +160,6 @@ file into a new database. The faults include:
 | `unspent_count_mismatch` | The count of unspent outputs at a profile address differs from a recount. |
 | `header_gap` | A header between the horizon and the tip is missing. |
 | `missing_supply` | A fixed-supply asset has no recorded supply. |
-
-## `convert`
-
-| Code | Cause | What to do |
-| --- | --- | --- |
-| `source_not_serving` | The 0.4.x database does not serve: it answered SQLSTATE 55000. | Let the 0.4.x service publish, then convert. |
-| `invalid_source_reader_role` | The source login is not exactly the 0.4.x reader. | Use the 0.4.x reader login. |
-| `unsupported_legacy_schema` | The source is not a 0.4.x schema-5 database. | Upgrade the 0.4.x database with 0.4.x first. |
-| `source_network_ambiguous` | The source holds nothing that proves its network. | |
-| `horizon_before_source_history` | `--horizon-block` is older than the source's history. | Choose a later horizon. |
-| `horizon_above_source_target` | `--horizon-block` is above the source's target. | |
-| `source_statement_timeout` | A source statement reached its limit. | Raise `--source-statement-timeout-seconds`. |
-| `source_read_failed` | A source read failed; the report has the server's message. | |
-| `conversion_completed_snapshot_failed` | The database was converted and serves; only the snapshot file failed. | Run `snapshot` with a new path; do not convert again. |
 
 ## `compare`
 

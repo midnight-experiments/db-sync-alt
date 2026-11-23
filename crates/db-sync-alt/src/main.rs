@@ -52,7 +52,7 @@ struct DatabaseArguments {
     #[arg(long, env = "DSA_IDLE_TRANSACTION_TIMEOUT_SECONDS",
         value_parser = clap::value_parser!(u32).range(1..=86400))]
     idle_transaction_timeout_seconds: Option<u32>,
-    /// Stop the command after this many seconds (default: none; convert: 3600).
+    /// Stop the command after this many seconds.
     #[arg(long, env = "DSA_OVERALL_TIMEOUT_SECONDS",
         value_parser = clap::value_parser!(u32).range(1..=86400))]
     overall_timeout_seconds: Option<u32>,
@@ -66,13 +66,13 @@ struct CompareArguments {
         conflicts_with = "a_capture"
     )]
     a: Option<String>,
-    #[arg(long, conflicts_with_all = ["a", "a_password_file", "a_tls_root_cert"])]
+    #[arg(long, hide = true, conflicts_with_all = ["a", "a_password_file", "a_tls_root_cert"])]
     a_capture: Option<PathBuf>,
     #[arg(long)]
     b: String,
     #[arg(long)]
     network: String,
-    /// JSON positions file; auto uses --horizon-block or a source capture.
+    /// JSON positions file; auto generates them from side A at --horizon-block.
     #[arg(long, default_value = "auto")]
     positions: String,
     #[arg(long)]
@@ -150,6 +150,9 @@ enum Command {
         expect_content_digest: Option<String>,
     },
     /// Convert a serving legacy public reader snapshot into this database.
+    ///
+    /// Stops after 3600 seconds unless --overall-timeout-seconds says otherwise.
+    #[command(hide = true)]
     Convert {
         #[command(flatten)]
         database: DatabaseArguments,

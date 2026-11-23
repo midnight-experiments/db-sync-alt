@@ -81,6 +81,11 @@ of `docs/operations.md` with the binary's, and the `/status` fields and
 `/health` reason codes with the status document. A change that adds a flag, a
 field or a code fails these tests until the page says what it means.
 
+The binary has two commands outside the documented interface, `follow` and
+`convert` (with the `compare` flag `--a-capture`, which reads the answers
+`convert` captures), used in development and maintenance: `--help` does not
+list them and the pages do not describe them.
+
 ## Changes
 
 1. Open an issue first for anything larger than a small fix: the problem, the
