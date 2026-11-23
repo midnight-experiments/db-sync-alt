@@ -506,7 +506,8 @@ fn unrelated(scenario: &Scenario, seed: u8) -> Tx {
 }
 
 /// Transaction metadata nested 1,000 levels deep, a repeated key in a
-/// metadatum map, and bridge metadata of every depth at the ICS address.
+/// metadatum map, and bridge metadata at the ICS address beside a deep label,
+/// nested 1,000 levels, at the 2,000-level limit and past it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn deep_and_repeated_key_metadata_never_stops_the_follower() -> Result {
@@ -543,6 +544,11 @@ async fn deep_and_repeated_key_metadata_never_stops_the_follower() -> Result {
         .output(Output::new(ics.clone(), 3_000_000))
         .metadata(6_500_973, nested_lists(2001).0)
         .build();
+    let b4 = Tx::new()
+        .input(&tx::hash(b"bridge four"), 0)
+        .output(Output::new(ics.clone(), 3_000_000))
+        .metadata(6_500_973, nested_lists(2000).0)
+        .build();
     // The provider renders every label of a transaction; one stored past
     // 2,000 levels is null.
     scenario.answer(
@@ -563,6 +569,13 @@ async fn deep_and_repeated_key_metadata_never_stops_the_follower() -> Result {
         &format!("/txs/{}/metadata", b3.hash),
         "[{\"label\":\"6500973\",\"json_metadata\":null}]".to_owned(),
     );
+    scenario.answer(
+        &format!("/txs/{}/metadata", b4.hash),
+        format!(
+            "[{{\"label\":\"6500973\",\"json_metadata\":{}}}]",
+            nested_json(2000)
+        ),
+    );
     let block = scenario.serve(vec![
         ordinary.built.clone(),
         u1.clone(),
@@ -570,6 +583,7 @@ async fn deep_and_repeated_key_metadata_never_stops_the_follower() -> Result {
         b1.clone(),
         b2.clone(),
         b3.clone(),
+        b4.clone(),
     ]);
     scenario.follow(&block, &ordinary).await?;
     let config = scenario.config();
@@ -581,6 +595,7 @@ async fn deep_and_repeated_key_metadata_never_stops_the_follower() -> Result {
         (&b1, Some("[\"0xcafe01\"]".to_owned())),
         (&b2, Some(nested_json(1000))),
         (&b3, None),
+        (&b4, Some(nested_json(2000))),
     ] {
         let mut row = served(config, &bridge.hash).await?;
         row["block"] = Value::Null;
