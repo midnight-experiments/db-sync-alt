@@ -194,7 +194,8 @@ not grow (2026-11-23, test build, one process in a 4-CPU container).
 
 ```sh
 db-sync-alt status --network mainnet --database '<connection string>' \
-  --password-file owner.password --reader db_sync_alt_reader
+  --password-file owner.password --tls-root-cert root-ca.crt \
+  --reader db_sync_alt_reader
 ```
 
 `status` prints the same document from the database alone, for example while

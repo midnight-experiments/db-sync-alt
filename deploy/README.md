@@ -39,9 +39,11 @@ Blockfrost key file for the network.
 
 ### 1. Directories and secrets
 
-Pick a directory you own, one per network (`/srv/db-sync-alt/mainnet` here):
+Start in the root of this repository, and pick a directory you own, one per
+network (`/srv/db-sync-alt/mainnet` here):
 
 ```sh
+repo=$PWD
 dir=/srv/db-sync-alt/mainnet
 mkdir -p "$dir/snapshots"
 install -d -m 700 "$dir/secrets"
@@ -67,7 +69,7 @@ openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=db-sync-alt Post
 openssl req -newkey rsa:3072 -nodes -subj '/CN=postgres' -keyout server.key -out server.csr
 printf 'subjectAltName=DNS:postgres\nextendedKeyUsage=serverAuth\n' > server.ext
 openssl x509 -req -in server.csr -CA root-ca.crt -CAkey ../root-ca.key -CAcreateserial \
-  -days 365 -extfile server.ext -out server.crt
+  -days 825 -extfile server.ext -out server.crt
 ```
 
 The containers need `root-ca.crt`, `server.crt` and `server.key`; keep
@@ -81,12 +83,16 @@ authority that db-sync-alt checks the server against: Compose sets it to
 checks that the certificate is for the host name in the connection string. Give
 the node the same file as `SSL_ROOT_CERT`.
 
-To renew the server certificate, replace `server.crt` and `server.key` and
-restart the server: `docker compose … restart postgres`.
+The server certificate is valid for 825 days. Once it has expired, every new
+connection of db-sync-alt and of a node that checks it fails its TLS check:
+db-sync-alt ends with exit status 1 at its next connection
+(`tls_certificate_invalid`). Renew it before then: replace `server.crt` and
+`server.key` and restart the server, `docker compose … restart postgres`.
 
 ### 3. Settings
 
 ```sh
+cd "$repo"
 cp deploy/compose.env.example deploy/compose.env
 ```
 
@@ -169,7 +175,27 @@ copy them off the host. Every file of the network's daily name pattern in that
 directory belongs to the rotation, a release file put there for the first
 start included: the newest `DSA_SNAPSHOT_KEEP` stay, older ones are removed.
 The first-start lines `DSA_SNAPSHOT` and `DSA_EXPECT_CONTENT_DIGEST` may stay
-set. To restore one, see
-[a closed gate](../docs/operations.md#a-closed-gate).
+set. To restore one, see [a closed gate under Compose](#a-closed-gate-under-compose).
 
 To upgrade, set `DSA_IMAGE` to the new version and run `up -d` again.
+
+### A closed gate under Compose
+
+When a check closes the gate ([a closed gate](../docs/operations.md#a-closed-gate)),
+the service stops and refuses to start on that database. Start over from a
+snapshot file in a new database; the logins, their passwords and the node's
+connection stay as they are:
+
+1. Stop both services: `docker compose -f deploy/compose.yaml --env-file deploy/compose.env down`.
+2. Remove the database volume, which deletes the closed database (the snapshot
+   files and the secrets stay): `docker volume rm <project>_database`, where
+   `<project>` is `COMPOSE_PROJECT_NAME`. Keep a copy of the volume first if
+   you want to diagnose the fault.
+3. Put the newest daily file, or a published one, in `DSA_SNAPSHOT_HOST_DIR`,
+   and set the first-start lines in `compose.env`: `DSA_SNAPSHOT` to its path
+   as the service sees it and `DSA_EXPECT_CONTENT_DIGEST` to its content
+   digest (for a daily file, `integrity.snapshot.content_digest` of the last
+   `/status`; leave the line out if you do not have it).
+4. Start again: `docker compose -f deploy/compose.yaml --env-file deploy/compose.env up -d`.
+   The server creates the logins and an empty database from the same secrets,
+   and the service restores the file and catches up from its target.

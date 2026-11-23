@@ -123,7 +123,8 @@ day old costs a day of catching up ([provider](provider.md#catching-up)).
 
 ```sh
 db-sync-alt snapshot --network mainnet --database '<connection string>' \
-  --password-file owner.password --file mainnet.snapshot
+  --password-file owner.password --tls-root-cert root-ca.crt \
+  --file mainnet.snapshot
 ```
 
 `snapshot` reads one consistent state of a serving database in a single
@@ -140,7 +141,7 @@ exists; do not write over it.
 
 ```sh
 db-sync-alt verify --network mainnet --database '<connection string>' \
-  --password-file owner.password
+  --password-file owner.password --tls-root-cert root-ca.crt
 ```
 
 `verify` checks a serving database in one consistent read: the positional IDs,

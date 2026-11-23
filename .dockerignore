@@ -5,7 +5,6 @@
 !rust-toolchain.toml
 !crates/
 !tools/
-!reference/
 !LICENSE
 !NOTICE
 !THIRD_PARTY_NOTICES.md
