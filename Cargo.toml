@@ -28,3 +28,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
