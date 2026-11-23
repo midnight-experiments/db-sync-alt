@@ -972,6 +972,109 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
     p.cleanup().await
 }
 
+/// Waits (at most a minute) until a `db-sync-alt` session of `database`
+/// waits for a lock.
+async fn writer_waits_for_a_lock(database: &Database) -> Result {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let waiting: bool = database
+            .admin
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event_type='Lock')",
+                &[&database.name],
+            )
+            .await?
+            .get(0);
+        if waiting {
+            return Ok(());
+        }
+        assert!(Instant::now() < deadline, "no session waited for the lock");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A stop that arrives while an update waits for a lock that another session
+/// holds outlasts the grace of 10 seconds: the statements are cancelled and
+/// `run` ends with exit status 0 and a report that says the stop was forced,
+/// never with an unknown outcome. The update is absent, and a restart
+/// follows on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_stop_during_a_long_statement_is_forced_after_the_grace() -> Result {
+    let p = Preprod::new(79, 1, 0, false).await?;
+    let k = p.k();
+    let fake = p.fake(p.t0 + k).await;
+    let database = &p.converted;
+    let extra = ["--poll-interval-seconds", "1"].map(str::to_owned);
+    let arguments = run_arguments(database, "preprod", &fake, &extra);
+    let (mut bodies, mut states) = (Vec::new(), std::collections::BTreeSet::new());
+    let child = Child::start(&arguments, &key_environment(&fake));
+    let address = child.address().await;
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| document["state"] == "following",
+    )
+    .await;
+    // Another session holds the stored position: the next update waits.
+    let holder = common::connect(&database.config).await?;
+    holder
+        .batch_execute("BEGIN;SELECT 1 FROM dsa.position FOR UPDATE")
+        .await?;
+    *fake.chain.lock().unwrap().blocks_mut() = served(&p.g, p.t0 + k + 5);
+    writer_waits_for_a_lock(database).await?;
+    let signalled = Instant::now();
+    child.signal("TERM");
+    let (code, stdout, lines) = child.finish().await;
+    let stop_seconds = signalled.elapsed().as_secs_f64();
+    holder.batch_execute("ROLLBACK").await?;
+    assert_eq!(code, Some(0), "{lines:?}");
+    assert!(
+        (10.0..20.0).contains(&stop_seconds),
+        "stopped after {stop_seconds} s"
+    );
+    let report: Value = serde_json::from_str(&stdout)?;
+    assert_eq!(report["stopped"], "stop_forced_after_grace", "{report}");
+    assert_eq!(report["partial_update"], false, "{report}");
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("\"outcome\":\"unknown\"")),
+        "{lines:?}"
+    );
+    let mut store = Store::connect(database.config.clone(), None).await?;
+    let verified = store.verify(&p.profile).await.map_err(named)?;
+    assert_eq!(verified.state.target.height, p.t0, "the update is absent");
+    drop(store);
+    let child = Child::start(&arguments, &key_environment(&fake));
+    let address = child.address().await;
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| {
+            document["state"] == "following"
+                && document["served_target"]["height"] == json!(p.t0 + 5)
+        },
+    )
+    .await;
+    child.signal("TERM");
+    let (code, stdout, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let report: Value = serde_json::from_str(&stdout)?;
+    assert_eq!(report["stopped"], "stop_requested", "{report}");
+    println!(
+        "{}",
+        json!({"event":"forced_stop","stop_seconds":stop_seconds,"report_stopped":"stop_forced_after_grace"})
+    );
+    p.cleanup().await
+}
+
 /// Each condition that retrying cannot cure ends `run` with exit
 /// status 1 and a named error; an invalid setting with 2; a database that
 /// stays unreachable and a provider that answers 5xx, each longer than

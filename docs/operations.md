@@ -234,6 +234,9 @@ exits with status 1. A command that changes the database reports
 `"outcome": "unknown"` when that commit had been sent: run `status` and
 `verify` to see which state it reached.
 
+`run` is different: it ends with status 0 on SIGINT or SIGTERM, also when the
+stop is forced after its grace ([stop and restart](#stop-and-restart)).
+
 ### Exit status of `run`
 
 | Status | Meaning |
@@ -248,10 +251,19 @@ its own end (402, 418, 429) never ends the service.
 
 ## Stop and restart
 
-SIGINT or SIGTERM stops the service within 5 seconds: an update in progress is
-either committed or absent, never partly written. `docker stop` sends SIGTERM.
-The gate lives in the database, so the node keeps reading the last update
-while the service is stopped, and gets the same answers as before.
+SIGINT or SIGTERM stops the service, usually within a second: an update in
+progress is either committed or absent, never partly written. A stop that
+arrives during a long statement (a large update, the supply check, an update
+that waits for a lock another session holds, a connection attempt to a server
+that does not answer) can take the whole grace of 10 seconds. After the grace
+the service cancels its statements and ends with exit status 0 and the report
+`{"stopped":"stop_forced_after_grace","grace_seconds":10,"statements_cancelled":true,"partial_update":false}`:
+every update is one transaction, so a cancelled one leaves nothing behind.
+
+`docker stop` sends SIGTERM. Give the service more than 10 seconds before a
+supervisor kills it: the Compose file sets `stop_grace_period: 15s`. The gate
+lives in the database, so the node keeps reading the last update while the
+service is stopped, and gets the same answers as before.
 
 ## Upkeep
 
