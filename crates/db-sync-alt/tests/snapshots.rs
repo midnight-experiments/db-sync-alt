@@ -175,8 +175,8 @@ async fn populate(db: &Database, f: &Fixture) -> Result<Rows> {
     for unit in f
         .profile
         .assets
-        .values()
-        .map(|a| a.unit())
+        .iter()
+        .map(|(_, a)| a.unit())
         .collect::<BTreeSet<_>>()
     {
         let spent = f

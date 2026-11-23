@@ -572,7 +572,7 @@ async fn keep_rule_v2_literal_governance_and_datum_edges() -> Result {
                 let height = f.chain.transactions[&tx].block;
                 let rows = f.rows();
                 let expected = json!({"full_datum":{"constructor":0,"fields":[{"int":90200+body_index as i64*10+if kind=="live" {1}else{0}}]},"block_number":height,"block_hash":rows["block"].iter().find(|r|r["id"]==height).unwrap()["hash"],"tx_index_in_block":12+body_index*2,"tx_hash":rows["tx"].iter().find(|r|r["id"]==tx).unwrap()["hash"],"utxo_index":20});
-                let policy = hex::decode(&f.profile.assets[body].policy)?;
+                let policy = hex::decode(&fixtures::role_asset(&f.profile, body).policy)?;
                 for (queries, client) in
                     [(&db.full_queries, &db.full), (&db.kept_queries, &db.kept)]
                 {
@@ -580,7 +580,11 @@ async fn keep_rule_v2_literal_governance_and_datum_edges() -> Result {
                         .rows(
                             client,
                             "get_governance_body_utxo",
-                            &[&f.profile.addresses[body], &policy, &reference],
+                            &[
+                                &fixtures::role_address(&f.profile, body).unwrap(),
+                                &policy,
+                                &reference,
+                            ],
                         )
                         .await?;
                     assert_eq!(
@@ -1161,8 +1165,8 @@ async fn keep_rule_partial_order_witnesses() -> Result {
         assert!(ids["tx_out"].contains(&id));
     }
     db.full.batch_execute("SET enable_indexscan=off; SET enable_bitmapscan=off; SET enable_hashjoin=off; SET enable_mergejoin=off; SET join_collapse_limit=1").await?;
-    let address = &fixture.profile.addresses["council"];
-    let policy = hex::decode(&fixture.profile.assets["council"].policy)?;
+    let address = &fixture.profile.addresses.council;
+    let policy = hex::decode(&fixture.profile.assets.council.policy)?;
     let ident = fixture.asset_id("permissioned_candidates");
     let reference = 5_i32;
     let epoch = 1_i32;
@@ -1379,10 +1383,10 @@ async fn keep_rule_page_and_bridge_checkpoints() -> Result {
                 }
             }
         }
-        let ics = &fixture.profile.addresses["ics"];
-        let reserve = &fixture.profile.addresses["reserve"];
-        let policy = hex::decode(&fixture.profile.assets["bridge"].policy)?;
-        let name = hex::decode(&fixture.profile.assets["bridge"].name)?;
+        let ics = &fixture.profile.addresses.ics;
+        let reserve = &fixture.profile.addresses.reserve;
+        let policy = hex::decode(&fixture.profile.assets.bridge.policy)?;
+        let name = hex::decode(&fixture.profile.assets.bridge.name)?;
         let metadata = 6500973_i64;
         for block in h..=t {
             let max = fixture
@@ -1520,7 +1524,7 @@ async fn keep_rule_realistic_plans() -> Result {
         );
     }
     verify_prefix(i64::from(tip)).await?;
-    let asset = &profile.assets["cnight"];
+    let asset = &profile.assets.cnight;
     db.store
         .client()
         .execute(

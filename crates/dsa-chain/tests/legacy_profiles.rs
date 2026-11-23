@@ -33,7 +33,11 @@ fn mainnet_and_preprod_match_legacy_profiles() {
         .into_iter()
         .collect();
         assert_eq!(
-            profile.addresses.values().cloned().collect::<BTreeSet<_>>(),
+            profile
+                .addresses
+                .iter()
+                .map(|(_, address)| address.to_owned())
+                .collect::<BTreeSet<_>>(),
             expected_addresses
         );
         let asset_unit = |asset: &Value| {
@@ -70,8 +74,8 @@ fn mainnet_and_preprod_match_legacy_profiles() {
         assert_eq!(
             profile
                 .assets
-                .values()
-                .map(|asset| asset.unit())
+                .iter()
+                .map(|(_, asset)| asset.unit())
                 .collect::<BTreeSet<_>>(),
             expected_units
         );

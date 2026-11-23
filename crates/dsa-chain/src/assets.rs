@@ -2,24 +2,24 @@
 
 use std::collections::BTreeSet;
 
-use crate::profiles::Profile;
+use crate::profiles::{AssetRole, Profile};
 
 pub const RULE_VERSION: u32 = 2;
 
 /// Fixed descriptor/supply guarantee; transaction-asset eligibility remains
 /// AssetRule's four exact units plus the two governance policies.
-pub const FIXED_UNIT_ROLES: [&str; 6] = [
-    "cnight",
-    "auth",
-    "permissioned_candidates",
-    "bridge",
-    "council",
-    "technical_committee",
+pub const FIXED_UNIT_ROLES: [AssetRole; 6] = [
+    AssetRole::Cnight,
+    AssetRole::Auth,
+    AssetRole::PermissionedCandidates,
+    AssetRole::Bridge,
+    AssetRole::Council,
+    AssetRole::TechnicalCommittee,
 ];
 pub fn fixed_units(profile: &Profile) -> BTreeSet<String> {
     FIXED_UNIT_ROLES
         .iter()
-        .map(|role| profile.assets[*role].unit())
+        .map(|role| profile.assets.get(*role).unit())
         .collect()
 }
 
@@ -32,13 +32,19 @@ pub struct AssetRule {
 impl AssetRule {
     pub fn from_profile(profile: &Profile) -> Self {
         Self {
-            exact_units: ["cnight", "auth", "permissioned_candidates", "bridge"]
+            exact_units: [
+                &profile.assets.cnight,
+                &profile.assets.auth,
+                &profile.assets.permissioned_candidates,
+                &profile.assets.bridge,
+            ]
+            .iter()
+            .map(|asset| asset.unit())
+            .collect(),
+            governance_policies: profile
+                .governance()
                 .iter()
-                .map(|role| profile.assets[*role].unit())
-                .collect(),
-            governance_policies: ["council", "technical_committee"]
-                .iter()
-                .map(|role| profile.assets[*role].policy.clone())
+                .map(|body| body.asset.policy.clone())
                 .collect(),
         }
     }

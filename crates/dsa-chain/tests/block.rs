@@ -77,8 +77,21 @@ fn apply(held: &mut BTreeMap<Outpoint, Held>, output: &BlockOutput) {
 }
 
 fn unit(profile: &Profile, role: &str) -> (String, String) {
-    let asset = &profile.assets[role];
+    let (_, asset) = profile
+        .assets
+        .iter()
+        .find(|(candidate, _)| candidate.name() == role)
+        .expect("profile asset role");
     (asset.policy.clone(), asset.name.clone())
+}
+
+fn address_of<'a>(profile: &'a Profile, role: &str) -> &'a str {
+    profile
+        .addresses
+        .iter()
+        .find(|(candidate, _)| candidate.name() == role)
+        .map(|(_, address)| address)
+        .expect("profile address role")
 }
 
 fn asset(profile: &Profile, role: &str, quantity: i128) -> Asset {
@@ -91,7 +104,7 @@ fn asset(profile: &Profile, role: &str, quantity: i128) -> Asset {
 }
 
 fn to(profile: &Profile, role: &str, coin: u64) -> Output {
-    Output::to(&profile.addresses[role], coin)
+    Output::to(address_of(profile, role), coin)
 }
 
 fn with(output: Output, asset: &Asset) -> Output {
@@ -112,7 +125,7 @@ fn point(seed: &str, index: u16) -> Outpoint {
 fn held(profile: &Profile, role: &str, assets: Vec<Asset>, transaction_id: i64) -> Held {
     Held {
         transaction_id,
-        address: profile.addresses[role].clone(),
+        address: address_of(profile, role).to_owned(),
         assets,
         data_hash: None,
     }
@@ -138,7 +151,7 @@ fn each_planted_fault_trips_exactly_its_check() {
     let start = BTreeMap::from([(origin.clone(), holding.clone())]);
     let output = ready(run(&profile, 10, &clean, &start, &Supplements::default()));
     assert_eq!(output.spent, vec![origin.clone()]);
-    let cnight = profile.assets["cnight"].unit();
+    let cnight = profile.assets.cnight.unit();
     let balance = |transaction: &Built, inputs, mint, outputs| BlockError::AssetBalance {
         height: 10,
         transaction: transaction.hash.clone(),
@@ -417,8 +430,8 @@ fn a_failed_block_changes_nothing_and_a_retry_equals_a_clean_run() {
         match failure {
             "output" => {
                 let resolved = transaction::Output {
-                    address_raw: transaction::address_bytes(&profile.addresses["mapping"]).unwrap(),
-                    address: Some(profile.addresses["mapping"].clone()),
+                    address_raw: transaction::address_bytes(&profile.addresses.mapping).unwrap(),
+                    address: Some(profile.addresses.mapping.clone()),
                     coin: 100,
                     assets: Vec::new(),
                     data_hash: None,
@@ -507,16 +520,12 @@ fn datums_are_read_for_reader_addresses_and_the_permissioned_unit_only() {
 #[test]
 fn version_two_filters_every_address_and_keeps_full_list_ordinals() {
     let mut profile = Profile::load("mainnet").unwrap();
-    for (role, policy) in [
-        ("cnight", "40"),
-        ("auth", "80"),
-        ("permissioned_candidates", "c0"),
-        ("bridge", "e0"),
-        ("council", "60"),
-        ("technical_committee", "a0"),
-    ] {
-        profile.assets.get_mut(role).unwrap().policy = policy.repeat(28);
-    }
+    profile.assets.cnight.policy = "40".repeat(28);
+    profile.assets.auth.policy = "80".repeat(28);
+    profile.assets.permissioned_candidates.policy = "c0".repeat(28);
+    profile.assets.bridge.policy = "e0".repeat(28);
+    profile.assets.council.policy = "60".repeat(28);
+    profile.assets.technical_committee.policy = "a0".repeat(28);
     let foreign = |policy: &str| Asset {
         policy: policy.repeat(28),
         name: String::new(),
@@ -537,7 +546,7 @@ fn version_two_filters_every_address_and_keeps_full_list_ordinals() {
         asset(&profile, "bridge", 1),
         foreign("f0"),
     ];
-    let address = |role: &str| Output::to(&profile.addresses[role], 100);
+    let address = |role: &str| Output::to(address_of(&profile, role), 100);
     let outputs = [
         address("ics"),
         address("reserve"),
@@ -783,10 +792,7 @@ fn a_phase_two_invalid_transaction_spends_collateral_and_creates_its_return() {
 #[test]
 fn fixed_units_have_supply_entries_and_names_never_offset() {
     let profile = Profile::load("preprod").unwrap();
-    assert_ne!(
-        profile.assets["cnight"].unit(),
-        profile.assets["bridge"].unit()
-    );
+    assert_ne!(profile.assets.cnight.unit(), profile.assets.bridge.unit());
     let origin = point("origin", 0);
     let alternate = Asset {
         name: "ffff".to_owned(),
@@ -819,15 +825,15 @@ fn fixed_units_have_supply_entries_and_names_never_offset() {
     assert_eq!(
         output.mint_delta,
         BTreeMap::from([
-            (profile.assets["cnight"].unit(), -2),
-            (profile.assets["bridge"].unit(), 3)
+            (profile.assets.cnight.unit(), -2),
+            (profile.assets.bridge.unit(), 3)
         ]),
         "governance names conserve; only fixed units have supply entries"
     );
     let offset = spend([101, 6, 11], &[]);
     assert!(matches!(
         run(&profile, 10, &offset, &start, &Supplements::default()),
-        Err(BlockError::AssetBalance { unit, .. }) if unit == profile.assets["cnight"].unit()
+        Err(BlockError::AssetBalance { unit, .. }) if unit == profile.assets.cnight.unit()
     ));
     let sibling = Asset {
         name: "01".to_owned(),
@@ -880,7 +886,7 @@ fn fixed_units_have_supply_entries_and_names_never_offset() {
         BlockError::AssetBalance {
             height: 10,
             transaction: lost[0].hash.clone(),
-            unit: profile.assets["cnight"].unit(),
+            unit: profile.assets.cnight.unit(),
             inputs: 100,
             mint: 0,
             outputs: 0
@@ -1104,12 +1110,12 @@ fn generated_chains_conserve_tokens_and_track_supply_on_both_profiles() {
     for network in ["mainnet", "preprod"] {
         let profile = Profile::load(network).unwrap();
         let selection = Selection::new(&profile);
-        let mapping = profile.addresses["mapping"].clone();
+        let mapping = profile.addresses.mapping.clone();
         let mut units: BTreeMap<String, (String, String)> = fixed_units(&profile)
             .into_iter()
             .map(|unit| (unit.clone(), (unit[..56].to_owned(), unit[56..].to_owned())))
             .collect();
-        let alternate = (profile.assets["council"].policy.clone(), "ff00".to_owned());
+        let alternate = (profile.assets.council.policy.clone(), "ff00".to_owned());
         let foreign = ("ff".repeat(28), "01".to_owned());
         units.insert(format!("{}{}", alternate.0, alternate.1), alternate);
         units.insert(format!("{}{}", foreign.0, foreign.1), foreign.clone());
@@ -1198,8 +1204,8 @@ fn generated_chains_conserve_tokens_and_track_supply_on_both_profiles() {
                     let mut tx = Tx::new().fee(170_000 + (u64::from(height) << 8) + index as u64);
                     if invalid {
                         tx = tx.mint(
-                            &profile.assets["cnight"].policy,
-                            &profile.assets["cnight"].name,
+                            &profile.assets.cnight.policy,
+                            &profile.assets.cnight.name,
                             17,
                         );
                     } else {
@@ -1389,7 +1395,7 @@ fn generated_chains_conserve_tokens_and_track_supply_on_both_profiles() {
                                 .find(|index| decoded[*index].is_valid());
                             if let Some(position) = valid {
                                 let mut tampered = builders.clone();
-                                let cnight = &profile.assets["cnight"];
+                                let cnight = &profile.assets.cnight;
                                 tampered[position] = tampered[position].clone().output(
                                     Output::to(&mapping, 6).token(&cnight.policy, &cnight.name, 1),
                                 );

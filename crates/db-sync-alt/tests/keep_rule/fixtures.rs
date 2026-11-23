@@ -9,6 +9,25 @@ use dsa_chain::{
     profiles::{Asset, Profile},
 };
 use model::{Chain, Datum, Header, Input, Output, OutputAsset, Stake, Transaction};
+
+/// The profile address of a role named as the fixtures name it.
+pub fn role_address<'a>(profile: &'a Profile, role: &str) -> Option<&'a str> {
+    profile
+        .addresses
+        .iter()
+        .find(|(candidate, _)| candidate.name() == role)
+        .map(|(_, address)| address)
+}
+
+/// The profile token of a role named as the fixtures name it.
+pub fn role_asset<'a>(profile: &'a Profile, role: &str) -> &'a Asset {
+    profile
+        .assets
+        .iter()
+        .find(|(candidate, _)| candidate.name() == role)
+        .map(|(_, asset)| asset)
+        .expect("profile asset role")
+}
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -68,8 +87,8 @@ impl Fixture {
         let units: BTreeMap<_, _> = fixture
             .profile
             .assets
-            .values()
-            .map(|asset| (asset.unit(), asset.clone()))
+            .iter()
+            .map(|(_, asset)| (asset.unit(), asset.clone()))
             .collect();
         for (index, asset) in units.into_values().enumerate() {
             fixture
@@ -87,7 +106,10 @@ impl Fixture {
         fixture.chain.assets.insert(
             9002,
             Asset {
-                policy: fixture.profile.assets["permissioned_candidates"]
+                policy: fixture
+                    .profile
+                    .assets
+                    .permissioned_candidates
                     .policy
                     .clone(),
                 name: "01".to_owned(),
@@ -361,7 +383,7 @@ impl Fixture {
                 let asset = &f.chain.assets[&f.chain.output_assets[id].asset];
                 let singleton = ["council", "technical_committee", "permissioned_candidates"]
                     .iter()
-                    .any(|role| f.profile.assets[*role] == *asset);
+                    .any(|role| role_asset(&f.profile, role) == asset);
                 (*id, if singleton { 1 } else { 1 + random.next(3) })
             })
             .collect();
@@ -376,7 +398,7 @@ impl Fixture {
             (9011, "ff".repeat(28), "".to_owned()),
             (
                 9012,
-                self.profile.assets["council"].policy.clone(),
+                self.profile.assets.council.policy.clone(),
                 "01".to_owned(),
             ),
         ] {
@@ -422,7 +444,7 @@ impl Fixture {
             self.chain.assets.insert(
                 asset,
                 Asset {
-                    policy: self.profile.assets[body].policy.clone(),
+                    policy: role_asset(&self.profile, body).policy.clone(),
                     name: format!("a5{:016x}", self.seed),
                 },
             );
@@ -443,7 +465,7 @@ impl Fixture {
             .into_iter()
             .enumerate()
         {
-            let unit = &self.profile.assets[role];
+            let unit = role_asset(&self.profile, role);
             let asset = Asset {
                 policy: unit.policy.clone(),
                 name: format!("{}ff{:02x}", unit.name, self.seed % 251),
@@ -572,7 +594,7 @@ impl Fixture {
     }
 
     pub fn asset_id(&self, role: &str) -> i64 {
-        let asset = &self.profile.assets[role];
+        let asset = role_asset(&self.profile, role);
         *self
             .chain
             .assets
@@ -593,12 +615,9 @@ impl Fixture {
     ) -> i64 {
         let transaction = self.ensure_transaction(height, tx_index);
         let id = ids::output_id(height, tx_index, index).unwrap();
-        let address = self
-            .profile
-            .addresses
-            .get(address_role)
-            .cloned()
-            .unwrap_or_else(|| "addr_external_holder".to_owned());
+        let address = role_address(&self.profile, address_role)
+            .unwrap_or("addr_external_holder")
+            .to_owned();
         let datum_hash = datum.map(|datum| {
             let hash = hash(self.seed, datum);
             self.chain

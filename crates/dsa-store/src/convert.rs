@@ -535,12 +535,13 @@ pub(crate) async fn network_evidence(
     .collect::<Result<_, _>>()?;
     let policies = profile
         .assets
-        .values()
+        .iter()
+        .map(|(_, asset)| asset)
         .filter(|a| {
             !known
                 .iter()
                 .filter(|p| p.network != profile.network)
-                .any(|p| p.assets.values().any(|other| other.policy == a.policy))
+                .any(|p| p.assets.iter().any(|(_, other)| other.policy == a.policy))
         })
         .map(|a| hex::decode(&a.policy).map_err(|_| Error::Refusal("invalid_keep_profile")))
         .collect::<Result<Vec<_>, _>>()?;

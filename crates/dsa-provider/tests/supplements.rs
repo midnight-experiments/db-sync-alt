@@ -118,7 +118,8 @@ fn an_invalid_transaction_resolves_only_its_return_at_the_body_output_count() {
     use dsa_testkit::tx::{Output, Tx, hash};
     let address = dsa_chain::profiles::Profile::load("mainnet")
         .unwrap()
-        .addresses["mapping"]
+        .addresses
+        .mapping
         .clone();
     let built = Tx::new()
         .collateral(&hash(b"collateral"), 0)

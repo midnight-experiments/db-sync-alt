@@ -446,7 +446,7 @@ pub async fn paged_events(
     let (start, start_index, end, end_index) = range;
     let (limit, offset) = page;
     let (low, high) = bounds;
-    let mapping = &fixture.profile.addresses["mapping"];
+    let mapping = &fixture.profile.addresses.mapping;
     let auth = fixture.asset_id("auth");
     let night = fixture.asset_id("cnight");
     let mut result = BTreeMap::new();
@@ -553,16 +553,16 @@ pub async fn states(
     reference: i32,
 ) -> Result<BTreeMap<String, Vec<Value>>> {
     let mut result = BTreeMap::new();
-    for body in ["council", "technical_committee"] {
-        let address = &fixture.profile.addresses[body];
-        let policy = hex::decode(&fixture.profile.assets[body].policy)?;
+    for body in fixture.profile.governance() {
+        let address = body.address.to_owned();
+        let policy = hex::decode(&body.asset.policy)?;
         result.insert(
-            body.to_owned(),
+            body.name.to_owned(),
             queries
                 .rows(
                     client,
                     "get_governance_body_utxo",
-                    &[address, &policy, &reference],
+                    &[&address, &policy, &reference],
                 )
                 .await?,
         );
@@ -599,10 +599,10 @@ pub async fn states(
             .rows(client, "get_max_tx_size", &[&reference])
             .await?,
     );
-    let ics = &fixture.profile.addresses["ics"];
-    let reserve = &fixture.profile.addresses["reserve"];
-    let policy = hex::decode(&fixture.profile.assets["bridge"].policy)?;
-    let name = hex::decode(&fixture.profile.assets["bridge"].name)?;
+    let ics = &fixture.profile.addresses.ics;
+    let reserve = &fixture.profile.addresses.reserve;
+    let policy = hex::decode(&fixture.profile.assets.bridge.policy)?;
+    let name = hex::decode(&fixture.profile.assets.bridge.name)?;
     let metadata_key = 6500973_i64;
     for cursor in fixture.bounds.horizon..=reference as u32 {
         result.insert(

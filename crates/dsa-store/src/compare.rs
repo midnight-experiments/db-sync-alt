@@ -18,7 +18,7 @@ use crate::{
     catalogue::{self, Checkpoint, Statement},
 };
 use chrono::NaiveDateTime;
-use dsa_chain::profiles::Profile;
+use dsa_chain::profiles::{AssetRole, Profile};
 use futures_util::{StreamExt, pin_mut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -239,10 +239,9 @@ impl Positions {
             }
             Ok(())
         };
-        let units = ["cnight", "bridge"]
+        let units = [&profile.assets.cnight, &profile.assets.bridge]
             .into_iter()
-            .map(|role| profile.assets[role].clone())
-            .map(|a| (a.unit(), a))
+            .map(|a| (a.unit(), a.clone()))
             .collect::<BTreeMap<_, _>>();
         for (unit, asset) in units {
             let policy =
@@ -256,24 +255,20 @@ impl Positions {
             out.event_hint_queries += 1;
             remember("asset_spend", Some(unit), spends)?;
         }
-        let auth = &profile.assets["auth"];
+        let auth = &profile.assets.auth;
         let policy =
             hex::decode(&auth.policy).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
         let name = hex::decode(&auth.name).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
-        let mapping = &profile.addresses["mapping"];
+        let mapping = &profile.addresses.mapping;
         let registrations=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.ma_tx_out a JOIN public.multi_asset m ON m.id=a.ident JOIN public.tx_out o ON o.id=a.tx_out_id JOIN public.datum d ON d.hash=o.data_hash JOIN public.tx t ON t.id=o.tx_id WHERE a.id BETWEEN $1::bigint*68719476736 AND $2::bigint*68719476736+68719476735 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND m.policy=$3::bytea AND m.name=$4::bytea AND o.address=$5::text AND a.quantity=1 ORDER BY t.id LIMIT $6::bigint",&[&h,&t,&policy,&name,&mapping,&limit]).await?;
         out.event_hint_queries += 1;
         remember("registration", Some(auth.unit()), registrations)?;
         let deregistrations=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.tx_in i JOIN public.tx t ON t.id=i.tx_in_id JOIN public.tx_out o ON o.tx_id=i.tx_out_id AND o.index=i.tx_out_index JOIN public.datum d ON d.hash=o.data_hash WHERE i.id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.address=$3::text ORDER BY t.id LIMIT $4::bigint",&[&h,&t,&mapping,&limit]).await?;
         out.event_hint_queries += 1;
         remember("deregistration", None, deregistrations)?;
-        let bridge=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.tx_out o JOIN public.tx t ON t.id=o.tx_id WHERE o.id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.address=$3::text ORDER BY t.id LIMIT $4::bigint",&[&h,&t,&profile.addresses["ics"],&limit]).await?;
+        let bridge=tx.query("SELECT DISTINCT t.block_id::bigint,t.block_index::bigint,t.id FROM public.tx_out o JOIN public.tx t ON t.id=o.tx_id WHERE o.id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215 AND t.id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.address=$3::text ORDER BY t.id LIMIT $4::bigint",&[&h,&t,&profile.addresses.ics,&limit]).await?;
         out.event_hint_queries += 1;
-        remember(
-            "bridge_output",
-            Some(profile.assets["bridge"].unit()),
-            bridge,
-        )?;
+        remember("bridge_output", Some(profile.assets.bridge.unit()), bridge)?;
         out.pairs = pairs.into_iter().collect();
         out.event_anchors = anchors.into_iter().collect();
         if out.witness_tx_hash.is_none() {
@@ -1126,15 +1121,15 @@ struct Context {
     horizon: Header,
     target: Header,
     first_epoch: i32,
-    units: BTreeMap<String, i64>,
+    units: BTreeMap<AssetRole, i64>,
     profile: Profile,
     positions: Positions,
     options: Options,
 }
 impl Context {
-    fn id(&self, role: &str) -> Result<i64, Error> {
+    fn id(&self, role: AssetRole) -> Result<i64, Error> {
         self.units
-            .get(role)
+            .get(&role)
             .copied()
             .ok_or(Error::Refusal("comparison_missing_profile_unit"))
     }
@@ -1159,8 +1154,9 @@ impl Context {
         } else {
             vec![0; 32]
         };
-        let asset =
-            |role: &str| -> Result<i64, Error> { Ok(if hit { self.id(role)? } else { i64::MAX }) };
+        let asset = |role: AssetRole| -> Result<i64, Error> {
+            Ok(if hit { self.id(role)? } else { i64::MAX })
+        };
         Ok(match s.name.as_str() {
             "get_low_bounds" | "get_high_bounds" | "get_max_tx_size" => vec![I32(reference)],
             "get_latest_stable_epoch" => vec![I32(if hit {
@@ -1203,7 +1199,7 @@ impl Context {
                     .expect("capture pins missing tx hash")
             })],
             "resolve_ident" => {
-                let a = &self.profile.assets["cnight"];
+                let a = &self.profile.assets.cnight;
                 vec![
                     Bytes(if hit {
                         hex::decode(&a.policy)
@@ -1223,9 +1219,9 @@ impl Context {
             }
             "get_token_utxo_for_epoch" => {
                 if s.parameters.len() == 2 {
-                    vec![I64(asset("permissioned_candidates")?), I32(epoch)]
+                    vec![I64(asset(AssetRole::PermissionedCandidates)?), I32(epoch)]
                 } else {
-                    let a = &self.profile.assets["permissioned_candidates"];
+                    let a = &self.profile.assets.permissioned_candidates;
                     vec![
                         Bytes(if hit {
                             hex::decode(&a.policy).unwrap()
@@ -1242,12 +1238,12 @@ impl Context {
             }
             "get_governance_body_utxo" => vec![
                 Text(if hit {
-                    self.profile.addresses["council"].clone()
+                    self.profile.addresses.council.clone()
                 } else {
                     String::new()
                 }),
                 Bytes(if hit {
-                    hex::decode(&self.profile.assets["council"].policy).unwrap()
+                    hex::decode(&self.profile.assets.council.policy).unwrap()
                 } else {
                     self.options
                         .missing_policy
@@ -1283,18 +1279,18 @@ impl Context {
                 let mut args = match s.name.as_str() {
                     "get_registrations" => vec![
                         Text(if hit {
-                            self.profile.addresses["mapping"].clone()
+                            self.profile.addresses.mapping.clone()
                         } else {
                             String::new()
                         }),
-                        I64(asset("auth")?),
+                        I64(asset(AssetRole::Auth)?),
                     ],
                     "get_deregistrations" => vec![Text(if hit {
-                        self.profile.addresses["mapping"].clone()
+                        self.profile.addresses.mapping.clone()
                     } else {
                         String::new()
                     })],
-                    _ => vec![I64(asset("cnight")?)],
+                    _ => vec![I64(asset(AssetRole::Cnight)?)],
                 };
                 args.extend([
                     I32(pair.cursor.block as i32),
@@ -1519,7 +1515,7 @@ pub async fn capture(
             units: profile
                 .assets
                 .iter()
-                .map(|(k, v)| (k.clone(), v.unit()))
+                .map(|(role, asset)| (role.name().to_owned(), asset.unit()))
                 .collect(),
             settings,
             newest_height: newest,
@@ -1541,19 +1537,19 @@ pub async fn capture(
         .unwrap();
     let mut units = BTreeMap::new();
     for role in dsa_chain::assets::FIXED_UNIT_ROLES {
-        let a = &profile.assets[role];
+        let a = profile.assets.get(role);
         let data = result
             .add(
                 tx,
                 resolver,
-                &format!("unit/{role}/{}", a.unit()),
+                &format!("unit/{}/{}", role.name(), a.unit()),
                 &[
                     Bind::Bytes(hex::decode(&a.policy).unwrap()),
                     Bind::Bytes(hex::decode(&a.name).unwrap()),
                 ],
             )
             .await?;
-        if data.is_empty() && ["council", "technical_committee"].contains(&role) {
+        if data.is_empty() && matches!(role, AssetRole::Council | AssetRole::TechnicalCommittee) {
             // These fixed descriptors are retained when available, but the node
             // governance query resolves a policy directly rather than this ID.
             // The recorded exact lookup still catches one-sided presence.
@@ -1564,19 +1560,19 @@ pub async fn capture(
         }
         let v: serde_json::Value = serde_json::from_str(&data[0])?;
         units.insert(
-            role.to_owned(),
+            role,
             v["id"]
                 .as_i64()
                 .ok_or(Error::Refusal("comparison_invalid_ident"))?,
         );
     }
-    for alias in ["ics", "reserve"] {
+    for alias in [AssetRole::Ics, AssetRole::Reserve] {
         if let Some((_, id)) = units
             .iter()
-            .find(|(role, _)| profile.assets[*role].unit() == profile.assets[alias].unit())
+            .find(|(role, _)| profile.assets.get(**role).unit() == profile.assets.get(alias).unit())
         {
             let id = *id;
-            units.insert(alias.to_owned(), id);
+            units.insert(alias, id);
         }
     }
     let context = Context {
@@ -1806,15 +1802,20 @@ pub async fn capture(
         }) {
             let roles = if s.name.starts_with("get_asset_") {
                 let mut seen = BTreeSet::new();
-                ["cnight", "bridge", "ics", "reserve"]
-                    .into_iter()
-                    .filter(|role| {
-                        context.units.contains_key(*role)
-                            && seen.insert(profile.assets[*role].unit())
-                    })
-                    .collect::<Vec<_>>()
+                [
+                    AssetRole::Cnight,
+                    AssetRole::Bridge,
+                    AssetRole::Ics,
+                    AssetRole::Reserve,
+                ]
+                .into_iter()
+                .filter(|role| {
+                    context.units.contains_key(role)
+                        && seen.insert(profile.assets.get(*role).unit())
+                })
+                .collect::<Vec<_>>()
             } else {
-                vec!["auth"]
+                vec![AssetRole::Auth]
             };
             for role in roles {
                 let started = Instant::now();
@@ -1882,7 +1883,7 @@ pub async fn capture(
                 }
                 result.record(
                     s,
-                    &format!("pair/{n}/{role}"),
+                    &format!("pair/{n}/{}", role.name()),
                     pages,
                     started.elapsed().as_secs_f64(),
                 )?;
@@ -1892,15 +1893,15 @@ pub async fn capture(
             .iter()
             .find(|s| s.name == "get_governance_body_utxo" && s.kind == "read")
             .unwrap();
-        for body in ["council", "technical_committee"] {
+        for body in profile.governance() {
             result
                 .add(
                     tx,
                     governance,
-                    &format!("pair/{n}/{body}"),
+                    &format!("pair/{n}/{}", body.name),
                     &[
-                        Bind::Text(profile.addresses[body].clone()),
-                        Bind::Bytes(hex::decode(&profile.assets[body].policy).unwrap()),
+                        Bind::Text(body.address.to_owned()),
+                        Bind::Bytes(hex::decode(&body.asset.policy).unwrap()),
                         Bind::I32(reference.height as i32),
                     ],
                 )
@@ -1932,13 +1933,13 @@ pub async fn capture(
                 &[Bind::I32(pair.cursor.block as i32)],
             )
             .await?;
-        let bridge_units = ["bridge", "ics", "reserve"]
+        let bridge_units = [AssetRole::Bridge, AssetRole::Ics, AssetRole::Reserve]
             .into_iter()
-            .filter(|role| context.units.contains_key(*role))
-            .map(|r| (profile.assets[r].unit(), r))
+            .filter(|role| context.units.contains_key(role))
+            .map(|r| (profile.assets.get(r).unit(), r))
             .collect::<BTreeMap<_, _>>();
         for (unit, role) in bridge_units {
-            let a = &profile.assets[role];
+            let a = profile.assets.get(role);
             let sql = catalogue::bridge_sql(Checkpoint::Block(pair.cursor.block as i32 - 1), None);
             let statement = Statement {
                 id: "get_bridge_txs:enabled".to_owned(),
@@ -1958,8 +1959,8 @@ pub async fn capture(
                     &statement,
                     &format!("pair/{n}/unit/{unit}"),
                     &[
-                        Bind::Text(profile.addresses["ics"].clone()),
-                        Bind::Text(profile.addresses["reserve"].clone()),
+                        Bind::Text(profile.addresses.ics.clone()),
+                        Bind::Text(profile.addresses.reserve.clone()),
                         Bind::Bytes(hex::decode(&a.policy).unwrap()),
                         Bind::Bytes(hex::decode(&a.name).unwrap()),
                         Bind::I64(6500973),

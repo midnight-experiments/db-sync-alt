@@ -229,8 +229,8 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
                 "comparison_capture_context_mismatch"
             ))
         ));
-        assert_eq!(report.units["bridge"], f.profile.assets["bridge"].unit());
-        assert_eq!(report.units["ics"], f.profile.assets["ics"].unit());
+        assert_eq!(report.units["bridge"], f.profile.assets.bridge.unit());
+        assert_eq!(report.units["ics"], f.profile.assets.ics.unit());
         let seen = left
             .cases
             .values()
@@ -266,8 +266,8 @@ async fn compare_detects_removed_unspent_governance_changed_header_and_ident() -
     for mutation in ["unspent", "governance", "tx_count", "ident"] {
         let (source, target, f) = setup(305).await?;
         match mutation{
-   "unspent"=>{let out=f.chain.inputs.values().find(|i|f.chain.transactions[&i.transaction].block>=6&&f.chain.transactions[&f.chain.outputs[&i.output].transaction].block<6&&f.chain.output_assets.values().any(|a|a.output==i.output&&f.chain.assets[&a.asset]==f.profile.assets["cnight"])).unwrap().output;target.write(&format!("DELETE FROM serve.tx_out WHERE id={out}")).await?;},
-   "governance"=>{let policy=hex::decode(&f.profile.assets["council"].policy)?;let c=connect(&target.config).await?;c.execute("DELETE FROM serve.tx_out WHERE id=(SELECT o.id FROM serve.tx_out o JOIN serve.ma_tx_out a ON a.tx_out_id=o.id JOIN serve.multi_asset m ON m.id=a.ident JOIN serve.tx t ON t.id=o.tx_id WHERE m.policy=$1 ORDER BY t.id DESC LIMIT 1)",&[&policy]).await?;},
+   "unspent"=>{let out=f.chain.inputs.values().find(|i|f.chain.transactions[&i.transaction].block>=6&&f.chain.transactions[&f.chain.outputs[&i.output].transaction].block<6&&f.chain.output_assets.values().any(|a|a.output==i.output&&f.chain.assets[&a.asset]==f.profile.assets.cnight)).unwrap().output;target.write(&format!("DELETE FROM serve.tx_out WHERE id={out}")).await?;},
+   "governance"=>{let policy=hex::decode(&f.profile.assets.council.policy)?;let c=connect(&target.config).await?;c.execute("DELETE FROM serve.tx_out WHERE id=(SELECT o.id FROM serve.tx_out o JOIN serve.ma_tx_out a ON a.tx_out_id=o.id JOIN serve.multi_asset m ON m.id=a.ident JOIN serve.tx t ON t.id=o.tx_id WHERE m.policy=$1 ORDER BY t.id DESC LIMIT 1)",&[&policy]).await?;},
    "tx_count"=>target.write("UPDATE serve.block SET tx_count=tx_count+1 WHERE id=8").await?,
    "ident"=>target.write("UPDATE serve.multi_asset SET id=id+50000;UPDATE serve.ma_tx_out SET ident=ident+50000").await?,
    _=>unreachable!()
@@ -1030,7 +1030,9 @@ async fn compare_optional_governance_descriptors_both_absent_and_one_sided() -> 
         f.chain.assets.insert(
             alternate,
             dsa_chain::profiles::Asset {
-                policy: f.profile.assets[role].policy.clone(),
+                policy: common::fixtures::role_asset(&f.profile, role)
+                    .policy
+                    .clone(),
                 name: "fe".to_owned(),
             },
         );
@@ -1062,7 +1064,7 @@ async fn compare_optional_governance_descriptors_both_absent_and_one_sided() -> 
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
-    let policy = &f.profile.assets["council"].policy;
+    let policy = &f.profile.assets.council.policy;
     target
         .write(&format!(
             "INSERT INTO serve.multi_asset VALUES(9800,decode('{policy}','hex'),''::bytea)"
@@ -1468,8 +1470,8 @@ async fn compare_event_anchors_real_transaction_witness_and_full_window_coverage
     assert!(positions["witness_tx_hash"].as_str().unwrap().len() == 64);
     let anchors = positions["event_anchors"].as_array().unwrap();
     for unit in [
-        f.profile.assets["cnight"].unit(),
-        f.profile.assets["bridge"].unit(),
+        f.profile.assets.cnight.unit(),
+        f.profile.assets.bridge.unit(),
     ] {
         assert!(
             anchors
@@ -1855,7 +1857,7 @@ async fn compare_cli_refuses_duplicate_units_on_window_and_old_spent_outputs() -
                         && f.chain.transactions[&f.chain.outputs[&i.output].transaction].block < 6
                         && f.chain.output_assets.values().any(|a| {
                             a.output == i.output
-                                && f.chain.assets[&a.asset] == f.profile.assets["cnight"]
+                                && f.chain.assets[&a.asset] == f.profile.assets.cnight
                         })
                 })
                 .unwrap()
@@ -1931,10 +1933,7 @@ async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result
             }
         }
         let args = if mutation == "other_address" {
-            vec![
-                "--candidate-address",
-                f.profile.addresses["mapping"].as_str(),
-            ]
+            vec!["--candidate-address", f.profile.addresses.mapping.as_str()]
         } else {
             vec![]
         };

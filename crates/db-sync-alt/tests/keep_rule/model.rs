@@ -163,24 +163,24 @@ pub fn keep(chain: &Chain, profile: &Profile, bounds: Bounds) -> Result<Retained
         .map(|(id, _)| *id)
         .collect();
     let mut carry = BTreeSet::new();
-    for body in ["council", "technical_committee"] {
+    for body in profile.governance() {
         let candidates = chain
             .outputs
             .iter()
             .filter(|(id, output)| {
                 chain.transactions[&output.transaction].block < h
-                    && output.address == profile.addresses[body]
+                    && output.address == body.address
                     && output
                         .datum_hash
                         .as_ref()
                         .is_some_and(|hash| chain.datums.values().any(|datum| datum.hash == *hash))
-                    && chain.has_asset(**id, |asset| asset.policy == profile.assets[body].policy)
+                    && chain.has_asset(**id, |asset| asset.policy == body.asset.policy)
             })
             .map(|(id, _)| *id)
             .collect();
         carry.extend(chain.newest_outputs(&candidates));
     }
-    let permissioned = &profile.assets["permissioned_candidates"];
+    let permissioned = &profile.assets.permissioned_candidates;
     let eligible: BTreeSet<_> = chain
         .outputs
         .iter()
@@ -263,16 +263,11 @@ pub fn keep(chain: &Chain, profile: &Profile, bounds: Bounds) -> Result<Retained
         .filter(|(id, asset)| referenced_assets.contains(id) || fixed_units.contains(&asset.unit()))
         .map(|(id, _)| *id)
         .collect();
-    let addresses: BTreeSet<_> = [
-        "mapping",
-        "council",
-        "technical_committee",
-        "ics",
-        "reserve",
-    ]
-    .iter()
-    .map(|role| &profile.addresses[*role])
-    .collect();
+    let addresses: BTreeSet<_> = profile
+        .addresses
+        .iter()
+        .map(|(_, address)| address.to_owned())
+        .collect();
     let hashes: BTreeSet<_> = outputs
         .iter()
         .filter_map(|id| {

@@ -606,7 +606,7 @@ async fn convert_network_identity_rejects_shared_units_and_uses_positive_anchor(
     // Preview-like schema5 data: only shared Preprod/Preview policies, never
     // placeholder multi_asset rows as evidence of a held network-specific unit.
     let mut f = fixture(204);
-    let shared = f.profile.assets["cnight"].policy.clone();
+    let shared = f.profile.assets.cnight.policy.clone();
     f.chain
         .output_assets
         .retain(|_, a| f.chain.assets[&a.asset].policy == shared);
@@ -1432,7 +1432,7 @@ async fn convert_large_lossless_rows_and_k10_fallback() -> Result {
         )
         .await?;
     assert_eq!(
-        converted["verified"]["supply"][f.profile.assets["auth"].unit()],
+        converted["verified"]["supply"][f.profile.assets.auth.unit()],
         "0"
     );
     let c = connect(&target.config).await?;
@@ -2060,11 +2060,8 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
         .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        expected[&f.profile.assets["technical_committee"].unit()],
-        "0"
-    );
-    assert!(expected[&f.profile.assets["cnight"].unit()].parse::<i128>()? > i128::from(u64::MAX));
+    assert_eq!(expected[&f.profile.assets.technical_committee.unit()], "0");
+    assert!(expected[&f.profile.assets.cnight.unit()].parse::<i128>()? > i128::from(u64::MAX));
     tx.batch_execute("SET LOCAL enable_seqscan=off;SET LOCAL enable_bitmapscan=off;SET LOCAL enable_indexscan=on;SET LOCAL enable_indexonlyscan=on").await?;
     let sql = include_str!("../../dsa-store/src/conversion_supply.sql");
     let mut previous = vec!["0".to_owned(); units.len()];
@@ -2158,7 +2155,7 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
         .into_iter()
         .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
         .collect();
-    assert!(expected[&f.profile.assets["cnight"].unit()].parse::<i128>()? > i128::from(i64::MAX));
+    assert!(expected[&f.profile.assets.cnight.unit()].parse::<i128>()? > i128::from(i64::MAX));
     snapshot.commit().await?;
     drop(session);
     let target = Database::new().await?;
@@ -2309,7 +2306,7 @@ async fn supply_source_realistic_cost() -> Result {
     }
     assert_eq!(counts["ma_tx_out"], wanted);
     assert_eq!(counts["block"], i64::from(headers));
-    let u = f.profile.assets["cnight"].unit();
+    let u = f.profile.assets.cnight.unit();
     expected.insert(
         u.clone(),
         (expected[&u].parse::<i128>()? + i128::from(generated - spent)).to_string(),

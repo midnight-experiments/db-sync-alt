@@ -304,8 +304,8 @@ async fn horizon_advance_equals_one_step_the_model_and_a_conversion() -> Result 
         spent_governance += u64::from(expected_markers.iter().any(|id| {
             let address = &f.chain.outputs[id].address;
             [
-                &f.profile.addresses["council"],
-                &f.profile.addresses["technical_committee"],
+                &f.profile.addresses.council,
+                &f.profile.addresses.technical_committee,
             ]
             .contains(&address)
         }));

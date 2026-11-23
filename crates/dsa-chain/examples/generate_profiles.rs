@@ -10,7 +10,8 @@ use std::{
 
 use clap::Parser;
 use dsa_chain::profiles::{
-    Asset, Cardano, NODE_COMMIT, NODE_RELEASE, Profile, Provenance, StartPosition,
+    Addresses, Asset, Assets, Cardano, NODE_COMMIT, NODE_RELEASE, Profile, Provenance,
+    StartPosition,
 };
 use parity_scale_codec::Encode;
 use serde_json::Value;
@@ -164,74 +165,44 @@ fn profile(root: &Path, network: &str) -> Result<Profile, Box<dyn Error>> {
     if mapping_bytes.len() != 29 || mapping_bytes[0] >> 4 != 7 {
         return Err("invalid_node_config: mapping_validator_address".into());
     }
-    let addresses = BTreeMap::from([
-        ("mapping".to_owned(), mapping.to_owned()),
-        (
-            "council".to_owned(),
-            string(&governance["council"], "address")?.to_owned(),
-        ),
-        (
-            "technical_committee".to_owned(),
-            string(&governance["technical_committee"], "address")?.to_owned(),
-        ),
-        (
-            "ics".to_owned(),
-            string(&ics, "illiquid_circulation_supply_validator_address")?.to_owned(),
-        ),
-        (
-            "reserve".to_owned(),
-            string(&reserve, "reserve_validator_address")?.to_owned(),
-        ),
-    ]);
-    let assets = BTreeMap::from([
-        (
-            "bridge".to_owned(),
-            Asset {
-                policy: hex::encode(bridge_policy),
-                name: hex::encode(bridge_name),
-            },
-        ),
-        (
-            "cnight".to_owned(),
-            Asset {
-                policy: hex_field(string(&cn["addresses"], "cnight_policy_id")?, 28)?,
-                name: hex::encode(string(&cn["addresses"], "cnight_asset_name")?.as_bytes()),
-            },
-        ),
-        (
-            "auth".to_owned(),
-            Asset {
-                policy: hex::encode(&mapping_bytes[1..]),
-                name: hex::encode(string(&cn["addresses"], "auth_token_asset_name")?.as_bytes()),
-            },
-        ),
-        (
-            "permissioned_candidates".to_owned(),
-            Asset {
-                policy: hex_field(
-                    string(&permissioned, "permissioned_candidates_policy_id")?,
-                    28,
-                )?,
-                name: String::new(),
-            },
-        ),
-        (
-            "council".to_owned(),
-            Asset {
-                policy: hex_field(string(&governance["council"], "policy_id")?, 28)?,
-                name: String::new(),
-            },
-        ),
-        (
-            "technical_committee".to_owned(),
-            Asset {
-                policy: hex_field(string(&governance["technical_committee"], "policy_id")?, 28)?,
-                name: String::new(),
-            },
-        ),
-        ("ics".to_owned(), asset(&ics["asset"])?),
-        ("reserve".to_owned(), asset(&reserve["asset"])?),
-    ]);
+    let addresses = Addresses {
+        council: string(&governance["council"], "address")?.to_owned(),
+        ics: string(&ics, "illiquid_circulation_supply_validator_address")?.to_owned(),
+        mapping: mapping.to_owned(),
+        reserve: string(&reserve, "reserve_validator_address")?.to_owned(),
+        technical_committee: string(&governance["technical_committee"], "address")?.to_owned(),
+    };
+    let assets = Assets {
+        auth: Asset {
+            policy: hex::encode(&mapping_bytes[1..]),
+            name: hex::encode(string(&cn["addresses"], "auth_token_asset_name")?.as_bytes()),
+        },
+        bridge: Asset {
+            policy: hex::encode(bridge_policy),
+            name: hex::encode(bridge_name),
+        },
+        cnight: Asset {
+            policy: hex_field(string(&cn["addresses"], "cnight_policy_id")?, 28)?,
+            name: hex::encode(string(&cn["addresses"], "cnight_asset_name")?.as_bytes()),
+        },
+        council: Asset {
+            policy: hex_field(string(&governance["council"], "policy_id")?, 28)?,
+            name: String::new(),
+        },
+        ics: asset(&ics["asset"])?,
+        permissioned_candidates: Asset {
+            policy: hex_field(
+                string(&permissioned, "permissioned_candidates_policy_id")?,
+                28,
+            )?,
+            name: String::new(),
+        },
+        reserve: asset(&reserve["asset"])?,
+        technical_committee: Asset {
+            policy: hex_field(string(&governance["technical_committee"], "policy_id")?, 28)?,
+            name: String::new(),
+        },
+    };
     let position = &cn["next_cardano_position"];
     let start = StartPosition {
         block_number: integer(position, "block_number")?.try_into()?,

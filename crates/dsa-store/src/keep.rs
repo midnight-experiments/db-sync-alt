@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, sync::LazyLock};
 
 use dsa_chain::{
     keep::{Bounds, RetainedRows, TABLES},
-    profiles::Profile,
+    profiles::{AddressRole, Profile},
 };
 use tokio_postgres::{GenericClient, RowStream, types::ToSql};
 
@@ -336,26 +336,13 @@ impl Selection {
                 _ => "invalid_keep_bounds",
             })
         })?;
-        let address = |role: &str| {
-            profile
-                .addresses
-                .get(role)
-                .cloned()
-                .ok_or(Error::Refusal("invalid_keep_profile"))
-        };
-        let asset = |role: &str| {
-            profile
-                .assets
-                .get(role)
-                .ok_or(Error::Refusal("invalid_keep_profile"))
-        };
         let mut governance_addresses = Vec::new();
         let mut governance_policies = Vec::new();
-        for body in ["council", "technical_committee"] {
-            governance_addresses.push(address(body)?);
-            governance_policies.push(bytes(&asset(body)?.policy)?);
+        for body in profile.governance() {
+            governance_addresses.push(body.address.to_owned());
+            governance_policies.push(bytes(&body.asset.policy)?);
         }
-        let permissioned = asset("permissioned_candidates")?;
+        let permissioned = &profile.assets.permissioned_candidates;
         let fixed = dsa_chain::assets::fixed_units(profile);
         let part = |part: Option<&str>| bytes(part.ok_or(Error::Refusal("invalid_keep_profile"))?);
         Ok(Self {
@@ -363,15 +350,15 @@ impl Selection {
             target: i64::from(bounds.target),
             tip: i64::from(bounds.tip),
             addresses: [
-                "mapping",
-                "council",
-                "technical_committee",
-                "ics",
-                "reserve",
+                AddressRole::Mapping,
+                AddressRole::Council,
+                AddressRole::TechnicalCommittee,
+                AddressRole::Ics,
+                AddressRole::Reserve,
             ]
             .into_iter()
-            .map(address)
-            .collect::<Result<_, _>>()?,
+            .map(|role| profile.addresses.get(role).to_owned())
+            .collect(),
             governance_addresses,
             governance_policies,
             permissioned_policy: bytes(&permissioned.policy)?,

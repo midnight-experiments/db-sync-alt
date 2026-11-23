@@ -211,21 +211,12 @@ pub(crate) async fn verify<C: GenericClient>(
     if exists(client, &invalid, &selection.parameters()).await? {
         return Err(Error::Refusal("ineligible_asset_row"));
     }
-    let addresses = [
-        "mapping",
-        "council",
-        "technical_committee",
-        "ics",
-        "reserve",
-    ]
-    .iter()
-    .map(|role| profile.addresses.get(*role).cloned())
-    .collect::<Option<Vec<_>>>()
-    .ok_or(Error::Refusal("invalid_keep_profile"))?;
-    let pc = profile
-        .assets
-        .get("permissioned_candidates")
-        .ok_or(Error::Refusal("invalid_keep_profile"))?;
+    let addresses = profile
+        .addresses
+        .iter()
+        .map(|(_, address)| address.to_owned())
+        .collect::<Vec<_>>();
+    let pc = &profile.assets.permissioned_candidates;
     let pc_policy = hex::decode(&pc.policy).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
     let pc_name = hex::decode(&pc.name).map_err(|_| Error::Refusal("invalid_keep_profile"))?;
     let extra_datum = "SELECT EXISTS(SELECT 1 FROM serve.datum d WHERE NOT EXISTS(SELECT 1 FROM serve.tx_out o

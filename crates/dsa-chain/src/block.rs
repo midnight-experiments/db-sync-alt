@@ -222,18 +222,20 @@ pub struct Selection<'a> {
     assets: AssetRule,
     fixed: BTreeSet<String>,
     permissioned: String,
-    ics: Option<String>,
 }
 
 impl<'a> Selection<'a> {
     pub fn new(profile: &'a Profile) -> Self {
         Self {
             profile,
-            addresses: profile.addresses.values().cloned().collect(),
+            addresses: profile
+                .addresses
+                .iter()
+                .map(|(_, address)| address.to_owned())
+                .collect(),
             assets: AssetRule::from_profile(profile),
             fixed: fixed_units(profile),
-            permissioned: profile.assets["permissioned_candidates"].unit(),
-            ics: profile.addresses.get("ics").cloned(),
+            permissioned: profile.assets.permissioned_candidates.unit(),
         }
     }
     pub fn profile(&self) -> &Profile {
@@ -548,7 +550,7 @@ impl Pass<'_, '_> {
                 });
                 continue;
             };
-            ics |= selection.ics.as_ref() == Some(&address);
+            ics |= address == selection.profile.addresses.ics;
             let output_id = id(ids::output_id(self.height, tx_index, index))?;
             self.rows.tx_out.push(OutputRow {
                 id: output_id,
