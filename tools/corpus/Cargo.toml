@@ -18,7 +18,7 @@ dsa-chain.workspace = true
 dsa-provider = { path = "../../crates/dsa-provider" }
 hex = "0.4"
 pallas-primitives = "=0.33.0"
-pallas-traverse = "=0.33.0"
+pallas-traverse = "=1.4.0"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
