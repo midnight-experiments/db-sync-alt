@@ -706,7 +706,7 @@ const VACUUMED: &str = "VACUUM serve.block,serve.tx,serve.tx_out,serve.tx_in,ser
 /// Test 5: thirty simulated days of churn with a retention of one day, the
 /// horizon advanced every step and the upkeep on its schedule: the served
 /// and state tables stay within 1.3 times a fresh restore of the final
-/// content (SC-012).
+/// content.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
