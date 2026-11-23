@@ -194,10 +194,11 @@ fn at_tip(view: &dsa_store::service_view::DatabaseView, now: u64) -> FollowerVie
         state: State::Following,
         reason: "at_tip".to_owned(),
         wait_until: None,
+        // The provider's head is the stored tip, made ten seconds ago.
         provider_tip: Some(ProviderTip {
             height: tip.height,
             hash: tip.hash.clone(),
-            time: u64::try_from(tip.timestamp).unwrap(),
+            time: now - 10,
             observed_at: now,
         }),
         requests_per_second: 8.0,

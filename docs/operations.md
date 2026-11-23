@@ -98,7 +98,9 @@ curl -i http://127.0.0.1:18080/health
 - the state is `following`;
 - the served target is at most `--health-max-lag-blocks` (default 9) behind the
   provider's tip minus k;
-- the provider's tip was read less than 120 seconds ago;
+- the provider's tip was read less than 120 seconds ago, and its block is at
+  most 600 seconds old: Cardano makes a block every 20 seconds on average, so an
+  older head is a provider whose chain stands still;
 - the database part of the status was read less than 120 seconds ago;
 - the reader login has exactly the node's rights.
 
@@ -118,6 +120,7 @@ that fails, each with its own code; the list is empty when the answer is 200.
 | `serving_block_lag_unknown` | The provider's tip or the stored tip is not known yet. |
 | `provider_observation_stale` | The provider's tip was read too long ago. |
 | `provider_observation_unknown` | The provider's tip has not been read since the start. |
+| `provider_head_stale` | The provider's head block is more than 600 seconds old: its chain does not advance. `/status` answers 200 meanwhile, and `provider_head.timestamp` shows the block's time. |
 | `database_observation_stale` | The database part of the status was read too long ago. |
 | `reader_check_failed` | The reader login has other rights than the node's, or lacks some ([PostgreSQL](postgresql.md#the-reader-login)). |
 | `reader_check_unknown` | The reader login has not been checked yet. |

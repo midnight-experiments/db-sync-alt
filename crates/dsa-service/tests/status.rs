@@ -516,6 +516,10 @@ fn health_is_200_only_when_every_condition_holds() {
     fresh.provider_tip.as_mut().unwrap().observed_at = NOW - 120;
     let mut unread = following();
     unread.provider_tip = None;
+    let mut old_head = following();
+    old_head.provider_tip.as_mut().unwrap().time = NOW - 601;
+    let mut head_at_limit = following();
+    head_at_limit.provider_tip.as_mut().unwrap().time = NOW - 600;
     let mut refused = serving_view();
     refused.reader_check = Some(ReaderCheck {
         passed: false,
@@ -555,6 +559,13 @@ fn health_is_200_only_when_every_condition_holds() {
             vec!["provider_observation_stale"],
         ),
         ("observation 120 s old", serving_view(), fresh, vec![]),
+        (
+            "a head older than 600 s",
+            serving_view(),
+            old_head,
+            vec!["provider_head_stale"],
+        ),
+        ("a head 600 s old", serving_view(), head_at_limit, vec![]),
         (
             "no provider observation",
             serving_view(),

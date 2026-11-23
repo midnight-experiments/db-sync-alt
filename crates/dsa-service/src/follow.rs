@@ -43,6 +43,9 @@ pub const RECHECK: Duration = Duration::from_secs(60);
 /// While no update happens, call counts are stored at least this often
 /// (seconds).
 pub const COUNTS_INTERVAL: u64 = 600;
+/// At the tip, while a poll finds nothing after the stored tip, the
+/// provider's head is read this often.
+pub const HEAD_INTERVAL: Duration = Duration::from_secs(60);
 /// The window of the blocks-per-hour figure (seconds).
 const RATE_WINDOW: u64 = 600;
 /// While catching up, at most one update line per this many seconds.
@@ -413,10 +416,6 @@ fn block_row(header: &Header) -> BlockRow {
     }
 }
 
-fn unix(time: NaiveDateTime) -> u64 {
-    u64::try_from(time.and_utc().timestamp()).unwrap_or(0)
-}
-
 /// The position of the first header that does not follow the one before it,
 /// starting from (`height`, `hash`).
 fn first_break(height: u32, hash: &str, headers: &[Header]) -> Option<usize> {
@@ -472,6 +471,11 @@ struct Follower<'a> {
     store: Option<Store>,
     stored: Stored,
     provider_tip: Option<ProviderTip>,
+    /// When `/blocks/latest` was last read.
+    head_read_at: Option<u64>,
+    /// Reads of the head in a row that stood above the stored tip while
+    /// nothing followed the stored tip.
+    head_above: u32,
     last_prune_check: Option<u64>,
     last_counts: u64,
     last_update_log: Option<Instant>,
@@ -530,6 +534,8 @@ impl<'a> Follower<'a> {
             progress,
             store: Some(store),
             provider_tip: None,
+            head_read_at: None,
+            head_above: 0,
             last_prune_check: None,
             last_counts: now,
             last_update_log: None,
@@ -960,7 +966,42 @@ impl<'a> Follower<'a> {
         self.requests.count("headers");
         let latest = guarded(&self.stop, self.provider.latest_block()).await?;
         self.observe(&latest);
+        self.head_read_at = Some(self.now());
         Ok(latest)
+    }
+
+    /// At the tip, when nothing follows the stored tip: reads the provider's
+    /// own head once a minute, so that its age shows a provider whose chain
+    /// stands still. A head above the stored tip on two such reads in a row
+    /// means that the stored tip left the provider's chain although its
+    /// `/next` stays empty: the head is returned, and the fork search runs.
+    async fn head_at_tip(&mut self, tip: u32) -> Result<Option<Header>, Error> {
+        let now = self.now();
+        if self
+            .head_read_at
+            .is_some_and(|at| now.saturating_sub(at) < HEAD_INTERVAL.as_secs())
+        {
+            // The provider answered; its head is the one read last.
+            if let Some(head) = self.provider_tip.as_mut() {
+                head.observed_at = now;
+            }
+            return Ok(None);
+        }
+        let head = self.latest().await?;
+        if head.height <= tip {
+            self.head_above = 0;
+            return Ok(None);
+        }
+        self.head_above += 1;
+        if self.head_above < 2 {
+            return Ok(None);
+        }
+        self.head_above = 0;
+        eprintln!(
+            "{}",
+            json!({"event":"next_empty_below_head","tip":tip,"provider_head":head.height})
+        );
+        Ok(Some(head))
     }
 
     /// The hash the provider returns for `height`, if any.
@@ -1018,18 +1059,10 @@ impl<'a> Follower<'a> {
         let linked = page.as_ref().is_some_and(|rows| {
             rows.is_empty() || first_break(tip, &tip_hash, &rows[..1]).is_none()
         });
-        let (fork_point, fetched) = match page {
-            Some(rows) if linked => {
-                if rows.is_empty() {
-                    let row = self.stored.tip();
-                    self.provider_tip = Some(ProviderTip {
-                        height: row.height,
-                        hash: row.hash.clone(),
-                        time: unix(row.time),
-                        observed_at: self.now(),
-                    });
-                    return Ok(Outcome::AtTip);
-                }
+        let rows = page.filter(|_| linked);
+        let (fork_point, fetched) = match rows {
+            Some(rows) if !rows.is_empty() => {
+                self.head_above = 0;
                 if let Some(index) = first_break(tip, &tip_hash, &rows) {
                     return Err(Error::answer(
                         "provider_header_link_mismatch",
@@ -1043,9 +1076,16 @@ impl<'a> Follower<'a> {
                 }
                 (tip, rows)
             }
-            // The stored tip left the provider's chain.
-            _ => {
-                let latest = self.latest().await?;
+            rows => {
+                let latest = match rows {
+                    // Nothing follows the stored tip.
+                    Some(_) => match self.head_at_tip(tip).await? {
+                        Some(head) => head,
+                        None => return Ok(Outcome::AtTip),
+                    },
+                    // The stored tip left the provider's chain.
+                    None => self.latest().await?,
+                };
                 if latest.height < tip {
                     return Ok(Outcome::Wait {
                         reason: "provider_chain_shorter",

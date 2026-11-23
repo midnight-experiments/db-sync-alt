@@ -22,6 +22,10 @@ use serde_json::Value;
 
 use crate::follow::ProviderTip;
 
+/// `/health` fails when the provider's head block is older than this
+/// (seconds): Cardano makes a block every 20 seconds on average.
+pub const PROVIDER_HEAD_MAX_AGE_SECONDS: u64 = 600;
+
 /// The thresholds of `/health`, and the network the service runs for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Settings {
@@ -411,6 +415,14 @@ pub fn health(status: &Status) -> (bool, Vec<&'static str>) {
             reasons.push("provider_observation_stale")
         }
         Some(_) => {}
+    }
+    if status.provider_head.as_ref().is_some_and(|head| {
+        status
+            .generated_at
+            .saturating_sub(u64::try_from(head.timestamp).unwrap_or(0))
+            > PROVIDER_HEAD_MAX_AGE_SECONDS
+    }) {
+        reasons.push("provider_head_stale");
     }
     match &status.database.reader_check {
         None => reasons.push("reader_check_unknown"),

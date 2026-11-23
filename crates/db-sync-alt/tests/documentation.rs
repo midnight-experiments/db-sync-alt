@@ -468,6 +468,15 @@ fn health_reasons() -> BTreeSet<&'static str> {
         variant.database.reader_check = check;
         variants.push(variant);
     }
+    // A provider head made long before the document.
+    let mut variant = healthy.clone();
+    variant.generated_at = 100_000;
+    variant.provider_head = Some(dsa_store::service_view::Point {
+        height: 1,
+        hash: "00".repeat(32),
+        timestamp: 0,
+    });
+    variants.push(variant);
     variants
         .iter()
         .flat_map(|variant| status::health(variant).1)

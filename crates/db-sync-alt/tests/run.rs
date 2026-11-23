@@ -423,6 +423,71 @@ async fn temporary_conditions_never_end_the_service() -> Result {
     world.start.cleanup().await
 }
 
+/// Serves the generated chain through `height` with recent block times: 20
+/// seconds apart, the newest made 20 seconds ago on the world's clock.
+fn serve_recent(world: &World, height: u32) {
+    let now = world.clock.now();
+    let mut blocks = served(&world.start.g, height);
+    for block in &mut blocks {
+        block.time = now - 20 * u64::from(height - block.height) - 20;
+    }
+    *world.fake.chain.lock().unwrap().blocks_mut() = blocks;
+}
+
+/// A provider whose chain stands still: the polls keep finding nothing new,
+/// and once the provider's head block is older than 600 seconds `/health`
+/// answers 503 with `provider_head_stale` while `/status` answers 200. A new
+/// block makes the service healthy again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_provider_whose_chain_stands_still_fails_health() -> Result {
+    let world = World::new(63, 80).await?;
+    let mut samples = Vec::new();
+    let height = world.start.target + K + 2;
+    serve_recent(&world, height);
+    let (address, stopper, task) = world.run(600).await;
+    status_until(address, &mut samples, "healthy at the tip", |document| {
+        document["healthy"] == true
+    })
+    .await;
+    let stale = status_until(
+        address,
+        &mut samples,
+        "a head older than 600 s",
+        |document| {
+            document["reason_codes"]
+                .as_array()
+                .is_some_and(|codes| codes.contains(&json!("provider_head_stale")))
+        },
+    )
+    .await;
+    assert_eq!(stale["state"], "following", "{}", summary(&stale));
+    assert_eq!(stale["reason_codes"], json!(["provider_head_stale"]));
+    let (code, health) = get(address, "/health").await.unwrap();
+    assert_eq!(code, 503, "{health}");
+    let (code, _) = get(address, "/status").await.unwrap();
+    assert_eq!(code, 200);
+    println!(
+        "{}",
+        json!({"event":"provider_head_stale","provider_head":stale["provider_head"],"generated_at":stale["generated_at"]})
+    );
+    serve_recent(&world, height + 1);
+    status_until(
+        address,
+        &mut samples,
+        "healthy after a new block",
+        |document| document["healthy"] == true,
+    )
+    .await;
+    stopper.send(true)?;
+    let report = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.stopped, "stop_requested");
+    world.start.cleanup().await
+}
+
 /// A block whose transaction page the provider client refuses on every
 /// attempt (not valid JSON) keeps the service waiting with the code in
 /// `/status`, past the fatal time; once the page is right it follows on.

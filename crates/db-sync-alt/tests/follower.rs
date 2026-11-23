@@ -495,6 +495,73 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
     start.cleanup().await
 }
 
+/// A provider that keeps answering an empty page after a stored tip that left
+/// its chain, while its head moves on: two reads of the head a minute apart
+/// that stand above the stored tip lead to the fork search, and following
+/// goes on on the provider's chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn an_empty_next_below_a_higher_head_leads_to_the_fork_search() -> Result {
+    let mut start = Start::new(31, 80, 20).await?;
+    let target = start.target;
+    let tip = start.g.block(target + K).unwrap().hash.clone();
+    let empty = format!("/blocks/{tip}/next");
+    let fake = Fake::with_chain(
+        Chain::from_generated(
+            &start.g,
+            dsa_service::epoch::stake_prefix(&start.profile.network),
+        ),
+        Some(Arc::new(move |path, _, _| {
+            path.contains(&empty).then(|| Behavior::json(json!([])))
+        })),
+    )
+    .await;
+    // The top two stored headers are replaced, and the chain is longer.
+    let mut blocks = served(&start.g, target + K + 3);
+    let keep = blocks.len() - 5;
+    let branch = generate::branch(&blocks[keep..], 31);
+    blocks.truncate(keep);
+    blocks.extend(branch);
+    let provider: BTreeMap<i64, String> = blocks
+        .iter()
+        .map(|block| (i64::from(block.height), block.hash.clone()))
+        .collect();
+    fake.serve(blocks);
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        follow_to(
+            &start.profile,
+            &fake,
+            &start.database.config,
+            until(target + 1),
+        ),
+    )
+    .await
+    .map_err(|_| "the follower stayed at the stored tip")?
+    .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.position.target.height, target + 1);
+    let polls = times_of(
+        &fake,
+        &format!("/api/v0/blocks/{tip}/next?count=100&page=1"),
+    );
+    let heads = times_of(&fake, "/api/v0/blocks/latest");
+    assert!(polls.len() >= 3, "{polls:?}");
+    assert!(heads.len() >= 3, "{heads:?}");
+    assert!(
+        heads[2] - heads[1] >= 60,
+        "two reads of the head a minute apart: {heads:?}"
+    );
+    // The fork search read the target and the stored headers by height.
+    assert!(height_requests(&fake) >= 1);
+    for (height, hash) in block_rows(&start.database.config).await? {
+        if let Some(expected) = provider.get(&height) {
+            assert_eq!(&hash, expected, "header {height}");
+        }
+    }
+    start.check("after the fork search").await?;
+    start.cleanup().await
+}
+
 /// A `/genesis` of the network with this magic.
 fn genesis(magic: u32) -> Behavior {
     Behavior::json(json!({
@@ -919,9 +986,10 @@ async fn epoch_parameters_come_first_and_stake_never_delays_an_update() -> Resul
     start.cleanup().await
 }
 
-/// At the tip each poll costs one request and each block with
-/// transactions one page request. DSA_FOLLOW_TIP_BLOCKS sets the number of
-/// followed blocks (default 200).
+/// At the tip each poll costs one request, a poll that finds nothing new
+/// reads the provider's head at most once a minute, and each block with
+/// transactions costs one page request. DSA_FOLLOW_TIP_BLOCKS sets the number
+/// of followed blocks (default 200).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
@@ -931,20 +999,25 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     g.lengthen_epochs(100);
     let mut start = Start::from_chain(profile, g, 20).await?;
     let stop_at = start.target + blocks;
-    // One new block appears with every poll.
+    // One new block appears with every second poll; the poll between finds
+    // nothing new.
     let canonical = start.g.blocks.clone();
     let last = stop_at + K;
-    let hook: Hook = Arc::new(move |path, chain: &mut Chain, _| {
-        if path.contains("/next") {
-            let height = chain.tip().map_or(0, |tip| tip.height) + 1;
-            if height <= last
-                && let Some(block) = canonical.iter().find(|block| block.height == height)
-            {
-                chain.blocks_mut().push(block.clone());
+    let polled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hook: Hook = {
+        let polled = polled.clone();
+        Arc::new(move |path, chain: &mut Chain, _| {
+            if path.contains("/next") && polled.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+                let height = chain.tip().map_or(0, |tip| tip.height) + 1;
+                if height <= last
+                    && let Some(block) = canonical.iter().find(|block| block.height == height)
+                {
+                    chain.blocks_mut().push(block.clone());
+                }
             }
-        }
-        None
-    });
+            None
+        })
+    };
     let fake = Fake::with_chain(
         Chain::from_generated(
             &start.g,
@@ -955,6 +1028,7 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     .await;
     fake.serve(served(&start.g, start.target + K));
     let began = Instant::now();
+    let simulated = fake.clock.now();
     let report = follow_to(
         &start.profile,
         &fake,
@@ -963,19 +1037,14 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     )
     .await
     .map_err(|error| error.report().to_string())?;
+    let simulated = fake.clock.now() - simulated;
     let busy = (start.target + 1..=stop_at)
         .filter(|height| !start.g.block(*height).unwrap().transactions.is_empty())
         .count();
     let polls = fake.requests("/next");
     let pages = fake.requests("/txs/cbor");
-    println!(
-        "{}",
-        json!({"event":"follow_at_the_tip","blocks":blocks,"blocks_with_transactions":busy,"polls":polls,
-            "page_requests":pages,"requests":report.requests,"all_requests":fake.paths().len(),
-            "updates":report.updates,"seconds":began.elapsed().as_secs_f64()})
-    );
-    assert_eq!(polls, blocks as usize, "one poll per block");
-    // `/blocks/latest` only for the first status and twice per stake read.
+    // `/blocks/latest` for the first status, twice per stake read, and the
+    // reads of the head while the polls find nothing new.
     let summaries = fake
         .paths()
         .iter()
@@ -984,7 +1053,20 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
                 .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
         })
         .count();
-    assert_eq!(fake.requests("/blocks/latest"), 1 + 2 * summaries);
+    let head_reads = fake.requests("/blocks/latest") - 1 - 2 * summaries;
+    println!(
+        "{}",
+        json!({"event":"follow_at_the_tip","blocks":blocks,"blocks_with_transactions":busy,"polls":polls,
+            "head_reads":head_reads,"simulated_seconds":simulated,
+            "page_requests":pages,"requests":report.requests,"all_requests":fake.paths().len(),
+            "updates":report.updates,"seconds":began.elapsed().as_secs_f64()})
+    );
+    assert_eq!(polls, 2 * blocks as usize - 1, "two polls per block");
+    assert!(head_reads > 0, "the head is read while nothing new comes");
+    assert!(
+        head_reads as u64 <= simulated / 60 + 1,
+        "{head_reads} reads of the head in {simulated} s"
+    );
     assert_eq!(pages, busy, "one page request per block with transactions");
     assert_eq!(report.updates, u64::from(blocks));
     start.check("at the tip").await?;

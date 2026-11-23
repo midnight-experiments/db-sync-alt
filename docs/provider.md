@@ -17,7 +17,7 @@ a request.
 | --- | --- |
 | `/genesis` | Once when the follower starts, and again before a contradiction of the stored target would close the gate (`canonical_conflict`). Its `network_magic` must be the network's: 764824073 for Mainnet, 1 for Preprod. Another ends the service with `provider_network_mismatch` and exit status 1, and leaves the gate open; a provider of another network contradicts the stored chain without anything being wrong with it. |
 | `/blocks/{stored tip hash}/next` | Every poll at the tip, every `--poll-interval-seconds` (default 20): one request when nothing changed. While behind: the headers to fetch, 100 a page. |
-| `/blocks/latest` | Only when a page of headers is full, after a "not found", and for the first status. |
+| `/blocks/latest` | When a page of headers is full, after a "not found", for the first status, and at the tip at most once a minute while a poll finds nothing after the stored tip: the provider's own head, whose age `/health` checks. When that head stands above the stored tip on two such reads in a row while the poll stays empty, the stored tip has left the provider's chain and the fork search runs. |
 | `/blocks/{height}` | After a fork at the tip, to find the highest stored block the provider still has: a binary search, at most 12 requests for k = 2,160. Also to read the target again when the provider contradicts it. |
 | `/blocks/{hash}/txs/cbor` | Each block that becomes final and has transactions: one page per 100 transactions. None for an empty block. |
 | `/epochs/{n}/parameters` | Once per epoch, before its first block is served. |
@@ -66,8 +66,10 @@ were retried. The range needed no datum, metadata or output request. The
 database then held exactly the content of a conversion of the 0.4.x database at
 the same horizon, target and tip.
 
-At the tip the follower sends one request per poll and one page request per
-block with transactions, plus the epoch requests.
+At the tip the follower sends one request per poll, at most one `/blocks/latest`
+a minute while the polls find nothing new, one page request per block with
+transactions, and the epoch requests. At the default poll of 20 seconds that is
+4,320 polls a day and at most 1,440 reads of the head.
 
 ## Refusals and outages
 
