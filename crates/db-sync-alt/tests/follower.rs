@@ -713,6 +713,16 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
             "updates":report.updates,"seconds":began.elapsed().as_secs_f64()})
     );
     assert_eq!(polls, blocks as usize, "one poll per block");
+    // `/blocks/latest` only for the first status and twice per stake read.
+    let summaries = fake
+        .paths()
+        .iter()
+        .filter(|path| {
+            path.strip_prefix("/api/v0/epochs/")
+                .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .count();
+    assert_eq!(fake.requests("/blocks/latest"), 1 + 2 * summaries);
     assert_eq!(pages, busy, "one page request per block with transactions");
     assert_eq!(report.updates, u64::from(blocks));
     start.check("at the tip").await?;
