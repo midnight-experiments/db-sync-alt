@@ -525,7 +525,7 @@ async fn an_index_rebuild_keeps_each_index_name_once_while_the_node_reads() -> R
     };
     // The first look records every index's size.
     assert!(
-        upkeep::rebuild_indexes(&upkeep_store, &policy)
+        upkeep::rebuild_indexes(&upkeep_store, &policy, |_| {})
             .await
             .map_err(named)?
             .is_none()
@@ -612,7 +612,7 @@ async fn an_index_rebuild_keeps_each_index_name_once_while_the_node_reads() -> R
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut rebuilds = Vec::new();
-    while let Some(rebuild) = upkeep::rebuild_indexes(&upkeep_store, &policy)
+    while let Some(rebuild) = upkeep::rebuild_indexes(&upkeep_store, &policy, |_| {})
         .await
         .map_err(named)?
     {
@@ -710,6 +710,38 @@ async fn an_index_rebuild_keeps_each_index_name_once_while_the_node_reads() -> R
             .map_err(named)?
             .is_empty()
     );
+    // A leftover found while the service runs is dropped before the next
+    // rebuild, which is named first.
+    owner
+        .batch_execute("CREATE INDEX idx_tx_out_tx_id_ccnew ON serve.tx_out(tx_id)")
+        .await?;
+    owner
+        .execute(
+            "UPDATE dsa.upkeep SET detail=jsonb_build_object('bytes',1) WHERE name='index:idx_tx_out_address'",
+            &[],
+        )
+        .await?;
+    let mut named_first = None;
+    let eager = IndexPolicy {
+        growth: 2.0,
+        min_bytes: 0,
+    };
+    let rebuild = upkeep::rebuild_indexes(&upkeep_store, &eager, |name| {
+        named_first = Some(name.to_owned());
+    })
+    .await
+    .map_err(named)?
+    .ok_or("no rebuild")?;
+    assert_eq!(rebuild.name, "idx_tx_out_address");
+    assert_eq!(named_first.as_deref(), Some("idx_tx_out_address"));
+    let remaining: i64 = owner
+        .query_one(
+            "SELECT count(*) FROM pg_class WHERE relnamespace='serve'::regnamespace AND relname LIKE '%\\_cc%'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(remaining, 0, "the leftover stayed through a rebuild");
     setup.follower.store.verify(&profile).await.map_err(named)?;
     drop((owner, upkeep_store));
     setup.cleanup().await
@@ -822,7 +854,7 @@ async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
                 }
                 Job::Indexes => {
                     if let Some(rebuild) =
-                        upkeep::rebuild_indexes(&upkeep_store, &IndexPolicy::default())
+                        upkeep::rebuild_indexes(&upkeep_store, &IndexPolicy::default(), |_| {})
                             .await
                             .map_err(named)?
                     {

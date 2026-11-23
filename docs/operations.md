@@ -305,9 +305,9 @@ service looks at the index sizes and rebuilds the one index that is larger than
 twice its size after its last rebuild and larger than 8 MiB, with
 `REINDEX INDEX CONCURRENTLY` on a connection of its own. The node keeps
 reading meanwhile, and every index name the node checks exists at every
-moment. A rebuild interrupted by a stop leaves an invalid copy, which the next
-start removes. `database.index_rebuilds` shows each index's size after its last
-rebuild.
+moment. A rebuild interrupted by a stop or a failure leaves an invalid copy,
+which the next start or the next rebuild removes. `database.index_rebuilds`
+shows each index's size after its last rebuild.
 
 In a test over thirty days of a generated chain (1,440 blocks a day, an update
 and a horizon advance every hour, a retention of one day, release build,

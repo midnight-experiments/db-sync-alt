@@ -21,6 +21,7 @@ mod harness;
 mod support;
 
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     sync::{
         Arc,
@@ -131,6 +132,22 @@ impl World {
         tokio::sync::watch::Sender<bool>,
         JoinHandle<std::result::Result<Report, follow::Error>>,
     ) {
+        self.run_changed(|context| {
+            context.settings.database_fatal_after = Duration::from_secs(fatal_after);
+            context.settings.writer_busy_after = Duration::from_secs(writer_busy_after);
+        })
+        .await
+    }
+
+    /// Starts the service with the world's context after `change`.
+    async fn run_changed(
+        &self,
+        change: impl FnOnce(&mut Context),
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        JoinHandle<std::result::Result<Report, follow::Error>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let config = self.proxy.config(&self.start.database.config);
@@ -150,8 +167,8 @@ impl World {
                 retention: None,
                 snapshots: None,
                 health_max_lag_blocks: 9,
-                database_fatal_after: Duration::from_secs(fatal_after),
-                writer_busy_after: Duration::from_secs(writer_busy_after),
+                database_fatal_after: Duration::from_secs(config::MIN_DATABASE_FATAL_AFTER_SECONDS),
+                writer_busy_after: Duration::from_secs(config::WRITER_BUSY_AFTER_SECONDS),
             },
             follower: follow::Settings::default(),
             index_policy: IndexPolicy::default(),
@@ -161,6 +178,8 @@ impl World {
             time: self.clock.clone(),
             stop,
         };
+        let mut context = context;
+        change(&mut context);
         (address, stopper, tokio::spawn(run(context)))
     }
 }
@@ -650,6 +669,217 @@ async fn a_held_writer_lock_is_waited_for_and_taken_once_free() -> Result {
     println!("{}", json!({"event":"writer_busy","refused":report}));
     drop(holder);
     world.start.cleanup().await
+}
+
+/// Plants a size after the last rebuild of one byte for `index`, so that the
+/// index counts as grown past twice that size.
+async fn plant_index_record(config: &tokio_postgres::Config, index: &str) -> Result {
+    common::connect(config)
+        .await?
+        .execute(
+            "INSERT INTO dsa.upkeep(name,at,detail) VALUES('index:'||$1,clock_timestamp(),jsonb_build_object('bytes',1))
+             ON CONFLICT(name) DO UPDATE SET detail=EXCLUDED.detail",
+            &[&index],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The `dsa.upkeep` rows by name.
+async fn upkeep_rows(config: &tokio_postgres::Config) -> Result<BTreeMap<String, Value>> {
+    Ok(common::connect(config)
+        .await?
+        .query("SELECT name,detail FROM dsa.upkeep", &[])
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
+/// The snapshot files of `network` in `dir`.
+fn daily_files(dir: &std::path::Path, network: &str) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&format!("{network}-")) && name.ends_with(".snapshot"))
+        .collect()
+}
+
+/// The service itself rebuilds an index grown past twice its size after its
+/// last rebuild, and writes a snapshot file every day at its time, keeping
+/// the newest two: after files of three days the oldest is gone, and
+/// `dsa.upkeep` and `/status` name the newest file and the rebuilt index. As
+/// the `run` command it logs both operations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn the_service_rebuilds_an_index_and_keeps_its_daily_files() -> Result {
+    let world = World::new(67, 120).await?;
+    let mut samples = Vec::new();
+    let config = world.start.database.config.clone();
+    plant_index_record(&config, "idx_tx_out_tx_id").await?;
+    let dir = tempfile::tempdir()?;
+    let mut height = world.start.target + K;
+    world.serve(height);
+    let snapshots = config::Snapshots {
+        dir: dir.path().to_owned(),
+        keep: 2,
+        at: chrono::NaiveTime::from_hms_opt(3, 0, 0).unwrap(),
+    };
+    // The service's days start after the wall clock's, which the database
+    // uses for the time a file was recorded.
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let midnight = wall - wall % 86_400 + 2 * 86_400;
+    world.clock.jump_to(midnight + 43_200);
+    let (address, stopper, task) = world
+        .run_changed(|context| {
+            context.settings.snapshots = Some(snapshots);
+            context.settings.database_fatal_after = Duration::from_secs(600);
+            context.index_policy = IndexPolicy {
+                growth: 2.0,
+                min_bytes: 0,
+            };
+        })
+        .await;
+    let network = world.start.profile.network.clone();
+    let mut written = Vec::new();
+    for day in 0..3_u64 {
+        if day > 0 {
+            height += 3;
+            world.serve(height);
+            status_until(address, &mut samples, "following", target_at(height)).await;
+            // The next day, a minute after the file's time.
+            world
+                .clock
+                .jump_to(midnight + day * 86_400 + 3 * 3_600 + 60);
+        }
+        let target = height - K;
+        let document = status_until(address, &mut samples, "the day's file", |document| {
+            document["integrity"]["snapshot"]["target"] == json!(target)
+        })
+        .await;
+        written.push(
+            document["integrity"]["snapshot"]["file"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let last = status_until(address, &mut samples, "the rebuilt index", |document| {
+        document["database"]["index_rebuilds"]["idx_tx_out_tx_id"]["bytes"]
+            .as_i64()
+            .is_some_and(|bytes| bytes > 1)
+    })
+    .await;
+    assert!(
+        last["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| !warning.as_str().unwrap().starts_with("upkeep_failed")),
+        "{}",
+        last["warnings"]
+    );
+    stopper.send(true)?;
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(
+        daily_files(dir.path(), &network),
+        written[1..].iter().cloned().collect(),
+        "the newest two of {written:?}"
+    );
+    let rows = upkeep_rows(&config).await?;
+    assert_eq!(rows["snapshot"]["file"], json!(written[2]));
+    let rebuilt = &rows["index:idx_tx_out_tx_id"];
+    assert!(
+        rebuilt.get("before").is_some() && rebuilt.get("baseline").is_none(),
+        "{rebuilt}"
+    );
+    println!(
+        "{}",
+        json!({"event":"service_upkeep","files":written,"rebuild":rebuilt})
+    );
+    world.start.cleanup().await?;
+
+    // The command: a bloated index above the floor of 8 MiB and a file at
+    // start, each logged at its start and end.
+    let p = Preprod::new(89, 1, 0, false).await?;
+    let fake = p.fake(p.t0 + p.k()).await;
+    let owner = common::connect(&p.converted.config).await?;
+    owner
+        .batch_execute(
+            "INSERT INTO serve.tx_out(id,tx_id,index,address,value)
+             SELECT t*4096,t,0,'planted_'||t,1 FROM generate_series(100000000::bigint,100399999) t;
+             DELETE FROM serve.tx_out WHERE tx_id>=100000000",
+        )
+        .await?;
+    owner.batch_execute("VACUUM serve.tx_out").await?;
+    plant_index_record(&p.converted.config, "idx_tx_out_address").await?;
+    let files = tempfile::tempdir()?;
+    let extra = [
+        "--snapshot-dir",
+        &files.path().to_string_lossy(),
+        "--snapshot-keep",
+        "2",
+        "--snapshot-at",
+        "00:00",
+    ]
+    .map(str::to_owned);
+    let child = Child::start(
+        &run_arguments(&p.converted, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let ended = |events: &[Value], name: &str| {
+        events
+            .iter()
+            .any(|line| line["event"] == format!("{name}_finished"))
+    };
+    while !(ended(&child.events(), "index_rebuild") && ended(&child.events(), "snapshot_file")) {
+        assert!(Instant::now() < deadline, "{:?}", child.events());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    child.signal("TERM");
+    let (code, _, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let events = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    for name in ["index_rebuild", "snapshot_file"] {
+        assert!(
+            events
+                .iter()
+                .any(|line| line["event"] == format!("{name}_started")),
+            "{name}: {lines:?}"
+        );
+        let end = events
+            .iter()
+            .find(|line| line["event"] == format!("{name}_finished"))
+            .unwrap();
+        assert_eq!(end["outcome"], "success", "{end}");
+    }
+    let rebuild = events
+        .iter()
+        .find(|line| line["event"] == "index_rebuild_finished")
+        .unwrap();
+    assert_eq!(rebuild["detail"]["name"], "idx_tx_out_address", "{rebuild}");
+    let file = events
+        .iter()
+        .find(|line| line["event"] == "snapshot_file_finished")
+        .unwrap()["detail"]["file"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        daily_files(files.path(), "preprod"),
+        std::collections::BTreeSet::from([file])
+    );
+    drop(owner);
+    p.cleanup().await
 }
 
 /// Review of what ends the service: a database that stays unreachable, and

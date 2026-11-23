@@ -153,8 +153,6 @@ provider's; a code that stays for one block points at that block.
 | `transaction_count` | A block's transaction list is shorter or longer than its header says. |
 | `cbor_body_hash_mismatch` | A transaction's bytes do not hash to its ID. |
 | `duplicate_transaction` | A transaction appears twice in one block. |
-| `header_height` | A block header is not at the height that follows the previous one. |
-| `header_parent` | A header does not link to the one before it. |
 | `provider_header_link_mismatch` | A page of headers does not link to the stored tip. |
 | `provider_page_missing` | A page of a block's transactions is missing. |
 | `provider_block_unknown` | The provider does not know a block it listed. |

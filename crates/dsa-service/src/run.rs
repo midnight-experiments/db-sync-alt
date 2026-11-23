@@ -733,27 +733,36 @@ impl Upkeep {
     }
 
     /// Looks at the index sizes, records the missing ones and rebuilds the
-    /// index the policy names; only a rebuild is logged as an operation.
+    /// index the policy names (`upkeep::rebuild_indexes`); only a rebuild is
+    /// logged as an operation.
     async fn indexes(&self) {
-        let looked = async {
+        let mut began = None;
+        let result = async {
             let store = self.connect().await?;
-            let sizes = store.index_sizes().await?;
-            store.record_index_baselines(&sizes).await?;
-            let rebuild = upkeep::index_decision(&sizes, &self.policy).rebuild;
-            Ok::<_, dsa_store::Error>((store, rebuild))
+            upkeep::rebuild_indexes(&store, &self.policy, |_| {
+                began = Some(started("index_rebuild", json!({})));
+            })
+            .await
         }
         .await;
-        match looked {
-            Ok((store, Some(name))) => {
-                self.job("index_rebuild", async { store.rebuild_index(&name).await })
-                    .await;
-            }
-            Ok((_, None)) => {
-                *lock(&self.current) = None;
+        *lock(&self.current) = None;
+        match (result, began) {
+            (Ok(Some(rebuild)), Some(began)) => {
+                finished(
+                    "index_rebuild",
+                    began,
+                    Ok(serde_json::to_value(rebuild).unwrap_or(Value::Null)),
+                );
                 self.shared.note_upkeep("index_rebuild", None);
             }
-            Err(error) => {
-                *lock(&self.current) = None;
+            (Ok(_), _) => self.shared.note_upkeep("index_rebuild", None),
+            (Err(error), Some(began)) => {
+                let report = error.report();
+                finished("index_rebuild", began, Err(report.clone()));
+                self.shared
+                    .note_upkeep("index_rebuild", Some(code(&report)));
+            }
+            (Err(error), None) => {
                 let report = error.report();
                 eprintln!("{}", json!({"event":"index_sizes_failed","error":report}));
                 self.shared
