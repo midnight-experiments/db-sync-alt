@@ -27,7 +27,7 @@ use dsa_store::{
 };
 use harness::{
     Follower, K, Plan, Random, Result, Setup, Source, WEEK, advance, build, chain, convert, derive,
-    diff, dump, epoch_params, header, logical, named, plan, profile, replace, same,
+    diff, dump, epoch_params, fill, header, logical, named, plan, profile, replace, same,
 };
 use serde_json::{Value, json};
 
@@ -786,77 +786,6 @@ async fn first_served_rows_follow_the_window() -> Result {
     assert_eq!(candidate, target + 1);
     assert!(candidate <= setup.follower.target.height);
     setup.cleanup().await
-}
-
-/// Rows outside every update's range that a store keeps: old unspent outputs
-/// with their transactions and cNIGHT rows (every tenth at the mapping
-/// address, with its datum), and every fourth of them spent by transactions
-/// at the `window` height.
-async fn fill(
-    config: &tokio_postgres::Config,
-    profile: &dsa_chain::profiles::Profile,
-    first: i32,
-    blocks: i32,
-    window: u32,
-) -> Result {
-    let cnight = &profile.assets.cnight;
-    let last = first + blocks - 1;
-    let client = connect(config).await?;
-    client
-        .execute(
-            "INSERT INTO serve.tx(id,hash,block_id,block_index,valid_contract)
-             SELECT b::bigint*4096+i,decode(md5('f'||b||'/'||i)||md5('g'||b||'/'||i),'hex'),b,i,true
-             FROM generate_series($1::integer,$2::integer) b,generate_series(0,99) i",
-            &[&first, &last],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO serve.tx_out(id,tx_id,index,address,value,data_hash,consumed_by_tx_id)
-             SELECT t.id*4096+j,t.id,j,CASE WHEN t.id%10=0 THEN $3 ELSE 'addr_filler_'||(t.id%997) END,1000000,
-              CASE WHEN t.id%10=0 THEN decode(md5('d'||t.id||'/'||j)||md5('e'||t.id||'/'||j),'hex') END,NULL
-             FROM serve.tx t,generate_series(0,1) j WHERE t.block_id BETWEEN $1 AND $2 AND (j=0 OR t.id%2=0)",
-            &[&i64::from(first), &i64::from(last), &profile.addresses.mapping],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO serve.datum(id,hash,value)
-             SELECT nextval('dsa.datum_id_seq'),o.data_hash,jsonb_build_object('int',o.id)
-             FROM serve.tx_out o WHERE o.tx_id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.data_hash IS NOT NULL",
-            &[&i64::from(first), &i64::from(last)],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO serve.ma_tx_out(id,quantity,tx_out_id,ident)
-             SELECT o.id*4096,5,o.id,m.id FROM serve.tx_out o
-             JOIN serve.multi_asset m ON m.policy=decode($3,'hex') AND m.name=decode($4,'hex')
-             WHERE o.tx_id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095",
-            &[
-                &i64::from(first),
-                &i64::from(last),
-                &cnight.policy,
-                &cnight.name,
-            ],
-        )
-        .await?;
-    // Spending transactions at the window height, 4,000 inputs each.
-    let base = i64::from(window) * 4096 + 1000 + i64::from(first);
-    client
-        .execute(
-            "WITH spent AS (SELECT row_number() OVER (ORDER BY o.id)-1 AS n,o.tx_id,o.index FROM serve.tx_out o
-              WHERE o.tx_id BETWEEN $1::bigint*4096 AND $2::bigint*4096+4095 AND o.index=0 AND o.tx_id%4=1),
-             spenders AS (INSERT INTO serve.tx(id,hash,block_id,block_index,valid_contract)
-              SELECT DISTINCT $3::bigint+n/4000,decode(md5('s'||($3::bigint+n/4000))||md5('t'||($3::bigint+n/4000)),'hex'),
-               $4::bigint,$3::bigint+n/4000-$4::bigint*4096,true FROM spent)
-             INSERT INTO serve.tx_in(id,tx_in_id,tx_out_id,tx_out_index)
-             SELECT ($3::bigint+n/4000)*4096+n%4000,$3::bigint+n/4000,tx_id,index FROM spent",
-            &[&i64::from(first), &i64::from(last), &base, &i64::from(window)],
-        )
-        .await?;
-    client.batch_execute("ANALYZE").await?;
-    Ok(())
 }
 
 fn buffers(plan: &Value) -> u64 {

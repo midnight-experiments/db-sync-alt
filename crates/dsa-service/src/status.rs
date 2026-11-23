@@ -42,7 +42,7 @@ impl Settings {
             network: network.into(),
             max_lag_blocks: 9,
             provider_observation_max_age_seconds: 120,
-            database_observation_max_age_seconds: 60,
+            database_observation_max_age_seconds: 120,
         }
     }
 }
@@ -96,6 +96,22 @@ pub struct FollowerView {
     pub last_refusal: Option<Refusal>,
     pub blocks_remaining: Option<u64>,
     pub blocks_per_hour: Option<f64>,
+}
+
+impl From<&crate::follow::Progress> for FollowerView {
+    fn from(progress: &crate::follow::Progress) -> Self {
+        Self {
+            state: progress.state.into(),
+            reason: progress.reason.clone(),
+            wait_until: progress.wait_until,
+            provider_tip: progress.provider_tip.clone(),
+            requests_per_second: progress.requests_per_second,
+            requests_in_flight: progress.requests_in_flight,
+            last_refusal: progress.last_refusal.clone(),
+            blocks_remaining: progress.blocks_remaining,
+            blocks_per_hour: progress.blocks_per_hour,
+        }
+    }
 }
 
 /// Whether the node reads data: the gate of the database.

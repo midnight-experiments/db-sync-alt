@@ -60,7 +60,7 @@
   },
   "generated_at": 1795003200,
   "health": {
-    "database_observation_max_age_seconds": 60,
+    "database_observation_max_age_seconds": 120,
     "max_lag_blocks": 9,
     "provider_observation_max_age_seconds": 120
   },

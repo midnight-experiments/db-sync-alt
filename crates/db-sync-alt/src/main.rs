@@ -2,6 +2,7 @@
 //! command to the store through the wrapper of `wrapper.rs`.
 
 mod follow_arguments;
+mod run_command;
 mod service_arguments;
 mod wrapper;
 
@@ -32,23 +33,28 @@ struct Arguments {
 #[derive(Args)]
 struct DatabaseArguments {
     /// PostgreSQL connection string. Read the password from --password-file.
-    #[arg(long)]
+    #[arg(long, env = "DSA_DATABASE", hide_env_values = true)]
     database: String,
-    #[arg(long)]
+    /// The network: mainnet, preprod or preview.
+    #[arg(long, env = "DSA_NETWORK")]
     network: String,
-    #[arg(long)]
+    /// A file holding the database password.
+    #[arg(long, env = "DSA_PASSWORD_FILE")]
     password_file: Option<PathBuf>,
     /// PEM roots for verified TLS, including server hostname verification.
-    #[arg(long)]
+    #[arg(long, env = "DSA_TLS_ROOT_CERT")]
     tls_root_cert: Option<PathBuf>,
     /// Explicit session statement limit; default preserves PostgreSQL settings.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, env = "DSA_STATEMENT_TIMEOUT_SECONDS",
+        value_parser = clap::value_parser!(u32).range(1..=86400))]
     statement_timeout_seconds: Option<u32>,
     /// Explicit idle transaction limit; default preserves PostgreSQL settings.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, env = "DSA_IDLE_TRANSACTION_TIMEOUT_SECONDS",
+        value_parser = clap::value_parser!(u32).range(1..=86400))]
     idle_transaction_timeout_seconds: Option<u32>,
     /// Stop the command after this many seconds (default: none; convert: 3600).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, env = "DSA_OVERALL_TIMEOUT_SECONDS",
+        value_parser = clap::value_parser!(u32).range(1..=86400))]
     overall_timeout_seconds: Option<u32>,
 }
 
@@ -193,6 +199,47 @@ enum Command {
         )]
         url: String,
     },
+    /// Serve the node: restore an empty database, follow the provider's
+    /// chain, answer /health and /status, and keep the database in shape.
+    ///
+    /// At start every flag is checked before anything connects. The HTTP
+    /// listener answers first: state `waiting` while PostgreSQL cannot be
+    /// reached, retried with backoff. Then the writer lock is taken (a second
+    /// writer is refused), an empty database is restored from --snapshot
+    /// (state `restoring`), --retention-seconds is compared with the stored
+    /// retention (a difference needs --change-retention), and the --reader
+    /// login is granted the node's rights and checked. The service then
+    /// follows: `catching_up` while behind, `following` at the tip, `waiting`
+    /// with its reason and the time the wait ends. A refusal with its own
+    /// resume time (402, 418, 429) is waited out; an answer the follower
+    /// refuses is retried without end and named in /status; a database or
+    /// transport condition ends the service after
+    /// --database-fatal-after-seconds. The database part of /status is read
+    /// every 20 seconds on a read-only connection of its own; /health answers
+    /// 503 once that read is older than 120 seconds.
+    ///
+    /// Upkeep: the supply check at start and every 6 hours, between two
+    /// updates on the writer's connection (a difference closes the gate);
+    /// every hour the index sizes, and the rebuild of an index larger than
+    /// twice its size after its last rebuild and larger than 8 MiB; with
+    /// --snapshot-dir a snapshot file every day at --snapshot-at. Rebuilds and
+    /// snapshot files use connections of their own. A failing job is logged,
+    /// named in the warnings of /status and tried at its next slot.
+    ///
+    /// Every flag is also read from DSA_ plus its name in upper case with
+    /// underscores (DSA_PROVIDER_KEY_FILE); a flag on the command line wins.
+    /// A variable that is set but empty is a value, refused when invalid.
+    #[command(after_help = run_command::EXIT_STATUSES)]
+    Run {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[command(flatten)]
+        provider: follow_arguments::ProviderArguments,
+        #[command(flatten)]
+        follower: follow_arguments::FollowerArguments,
+        #[command(flatten)]
+        service: service_arguments::ServiceArguments,
+    },
     /// Follow the provider's chain into a serving database.
     #[command(hide = true)]
     Follow {
@@ -219,6 +266,7 @@ impl Command {
             | Self::Restore { database, .. }
             | Self::Convert { database, .. }
             | Self::GrantReader { database, .. }
+            | Self::Run { database, .. }
             | Self::Follow { database, .. } => Some(database),
             Self::Profile { .. } | Self::Compare(_) | Self::Health { .. } => None,
         }
@@ -380,6 +428,12 @@ fn prepare(command: Command) -> Result<(Operation, Job), Usage> {
             follower,
             stop_at_target,
         } => follow_arguments::command(database, provider, follower, stop_at_target),
+        Command::Run {
+            database,
+            provider,
+            follower,
+            service,
+        } => run_command::command(database, provider, follower, service),
         command => database_command(command),
     }
 }
@@ -489,6 +543,7 @@ fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
         Command::Profile { .. }
         | Command::Compare(_)
         | Command::Follow { .. }
+        | Command::Run { .. }
         | Command::Health { .. } => {
             unreachable!("not a database command")
         }
@@ -649,6 +704,7 @@ async fn execute(
         Command::Profile { .. }
         | Command::Compare(_)
         | Command::Follow { .. }
+        | Command::Run { .. }
         | Command::Health { .. } => {
             unreachable!("not a database command")
         }

@@ -526,7 +526,9 @@ fn health_is_200_only_when_every_condition_holds() {
     let mut unchecked = serving_view();
     unchecked.reader_check = None;
     let mut old_view = serving_view();
-    old_view.observed_at = now() - 61;
+    old_view.observed_at = now() - 121;
+    let mut recent_view = serving_view();
+    recent_view.observed_at = now() - 120;
     let catching_up = FollowerView {
         state: State::CatchingUp,
         ..following()
@@ -577,6 +579,7 @@ fn health_is_200_only_when_every_condition_holds() {
             following(),
             vec!["database_observation_stale"],
         ),
+        ("database view 120 s old", recent_view, following(), vec![]),
     ];
     for (name, view, follower, expected) in cases {
         let status = compose(Some(&view), Some(&follower), &settings(), NOW);

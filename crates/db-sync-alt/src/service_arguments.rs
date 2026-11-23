@@ -12,10 +12,6 @@ use dsa_service::config::{Input, Settings};
 use crate::{Usage, usage};
 
 #[derive(Args, Clone, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "flattened into the command that runs the service")
-)]
 pub(crate) struct ServiceArguments {
     /// The address and port of /health and /status.
     #[arg(long, env = "DSA_LISTEN", default_value = "0.0.0.0:18080")]
@@ -49,16 +45,13 @@ pub(crate) struct ServiceArguments {
     /// provider's tip minus the security parameter.
     #[arg(long, env = "DSA_HEALTH_MAX_LAG_BLOCKS", default_value_t = 9)]
     pub(crate) health_max_lag_blocks: u32,
-    /// A database that stays unreachable this many seconds ends the service
+    /// A database that stays unreachable, or a provider whose transport
+    /// fails or that answers 5xx, for this many seconds ends the service
     /// with exit status 75 (at least 60).
     #[arg(long, env = "DSA_DATABASE_FATAL_AFTER_SECONDS", default_value_t = 1800)]
     pub(crate) database_fatal_after_seconds: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the command that runs the service")
-)]
 impl ServiceArguments {
     /// Every value checked before any connection.
     pub(crate) fn settings(&self) -> Result<Settings, Usage> {
