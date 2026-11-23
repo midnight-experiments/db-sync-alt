@@ -1,128 +1,57 @@
 # Glossary
 
+Terms the other pages use. Each page explains a term on first use or links
+here.
+
+## Chain and window
+
+| Term | Meaning |
+| --- | --- |
+| provider | The Blockfrost API of the network. db-sync-alt reads Cardano blocks from it with a key you give it ([provider](provider.md)). |
+| tip | The newest Cardano block the provider reports. |
+| k | Cardano's security parameter: 2,160 blocks on Mainnet and Preprod. A block k blocks below the tip is final. |
+| target | The newest block whose events are served: the tip minus k. The database stores the headers of the k blocks above the target too, because the node computes its stable block as the newest block minus k. |
+| relevant | An output at an address of the [profile](#profile), or holding one of its assets; a spend of such an output; a mint of a profile asset. |
+| event | A relevant output, spend or mint, with its transaction and block header. |
+| first served | The time this database first served a block's events. A restore or a conversion counts as first serving every block of its window at that moment. |
+| retention | How long a block's events stay after they are first served. Default 7 days, at least 24 hours. |
+| horizon | The oldest block whose events are all kept. Blocks below it are pruned. It moves when its first-served time is older than the retention. |
+| window | The blocks from the horizon to the target. |
+| unspent set | The relevant outputs created below the horizon and not spent below it. Pruning never removes them. |
+| governance records | The council, technical-committee and permissioned-candidates outputs a node can still read although they are old or spent. They are kept with their transaction, block and datum. |
+| keep rule | The definition of what the database keeps: the window, the unspent set, the governance records, the epoch values of the window, and the asset descriptors these rows refer to. It has a version (2) bound to Midnight node 2.1.101. Everything else is deleted. |
+| epoch parameters | The nonce and maximum transaction size of an epoch (`epoch_param`). The node reads them during import; they are stored before the first event of their epoch is served. |
+| stake distribution | The stake per pool of an epoch (`epoch_stake`, `pool_hash`). Only operator RPCs of the node read it; it is stored for recent epochs, in the background. |
+| update | One step of the follower: new headers, the events of the blocks that became final, and any horizon advance, written in one database transaction. |
+| catch-up | Following while the database is more than one batch behind the tip: updates follow each other without a pause. |
+
+## Database
+
+| Term | Meaning |
+| --- | --- |
+| served tables | The eleven tables the node reads, shaped as cardano-db-sync shapes them: `block`, `tx`, `tx_out`, `tx_in`, `ma_tx_out`, `multi_asset`, `datum`, `epoch_param`, `pool_hash`, `epoch_stake`, `tx_metadata`. They live in schema `serve`; the node reads them through views of the same names in schema `public`. |
+| gate | The check every view runs. While the database is not serving (empty, restoring, or closed by a check), every view raises SQLSTATE 55000 (`db_sync_alt_not_serving`), so the node never takes an empty answer for a real one. |
+| closed gate | The gate after a check found a fault: `canonical_conflict`, `asset_conservation` or `supply_mismatch`. The node keeps getting 55000 until the database is restored from a snapshot file ([operations](operations.md#a-closed-gate)). |
+| positional ID | The `id` of a row in `tx`, `tx_out`, `ma_tx_out` and `tx_in`, computed from the row's position on the chain, so that two databases at the same blocks hold the same IDs. |
+| owner login | The PostgreSQL login db-sync-alt runs as. It owns the database and has no superuser rights. |
+| reader login | The PostgreSQL login of the Midnight node. It may read the eleven views and call the gate, nothing else. |
+| writer lock | A PostgreSQL session lock. Only one process that writes may hold a database; a second one is refused (`writer_busy`). |
+| supply check | The comparison of the unspent amount of each fixed-supply asset with the supply recorded in the database. |
+
+## Files
+
+| Term | Meaning |
+| --- | --- |
+| snapshot file | One file holding a whole database and its description, for publishing and restoring ([snapshots](snapshots.md)). |
+| content digest | A SHA-256 over every row the node can read, by natural key. Two databases at the same horizon, target and tip have the same content digest, whether they were restored, converted or followed. |
+| state digest | A SHA-256 over the database's record of outputs spent below the horizon, which the node cannot read but the keep rule needs. |
+| capture file | The answers of a 0.4.x database to the node's queries, saved by `convert --capture-source` for a later `compare`. |
+
 ## Profile
 
-The pinned description of what Midnight needs from one Cardano network: six
-configuration files copied unchanged from a Midnight node release
-(`profiles/preprod-node-1.0.400/`, `profiles/mainnet-node-1.0.0/`,
-`profiles/preview-node-1.0.0/`) and `network.json` with the network's values
-([networks](networks.md)). The files name the Cardano assets, addresses and the
-start point that matter to Midnight; db-sync-alt keeps only data related to
-them. The SHA-256 of the files, the network and its Midnight genesis form the
-profile identity; it is stored in the database and in every backup, and anything
-built for another profile is refused.
-
-## Start cursor
-
-The first Cardano position Midnight reads, taken from the profile: block
-4,500,197, transaction 4 on Preprod; block 13,164,005, transaction 1 on Mainnet;
-block 0, transaction 0 on Preview. Events (transactions, outputs, mints) are kept
-from there on; older blocks appear only when a later event needs them.
-
-## Target
-
-The highest Cardano block whose events a generation covers. A target is always
-k blocks below the newest block the generation has seen, where k is the
-network's security parameter (2160 on Mainnet and Preprod, 432 on Preview), so it
-can no longer be rolled back.
-
-## Witness
-
-The newest block of a generation: its target + k. The generation stores every
-block header from the start cursor up to the witness, linked parent to child,
-which proves the target is k blocks deep. Headers above the target are
-provisional: a later generation may replace them after a Cardano fork.
-
-## Generation
-
-One verified, append-only step of the data: the facts up to a target, the
-headers up to the witness, and receipts of how they were obtained. Each new
-generation builds on its parent and is checked (block chain, anchors, receipts,
-fact digests, profile) before it is published. Exactly one generation is the
-*ready* generation that the database serves; the next one stays *pending* until it
-is complete and verified.
-
-## Publication
-
-Making a pending generation the ready one, in one database transaction under a
-lock that readers share, so a query never sees half of an update.
-
-## Coverage
-
-The range the ready generation answers for: events from the start cursor through
-the target, headers through the witness, the required epochs, and the profile's
-addresses and assets. A correctly configured node asks only inside it; the
-database cannot see a query's parameters, so a node whose k or addresses differ
-from the profile gets empty answers outside it
-([node requirements](connect-a-node.md#node-requirements)).
-
-## Bridge metadata coverage
-
-The Cardano blocks from which the database holds everything midnight-node's
-token bridge query reads: the `tx_metadata` (key 6500973) of every transaction
-with an output at the ICS address, and every asset of the ICS and reserve
-outputs. It starts with the first update acquired from Blockfrost after the
-newest update without metadata (from cardano-db-sync, or before an upgrade from
-0.3.x); `status` reports its first block as `bridge.coverage_start`
-([bridge readiness](connect-a-node.md#bridge-readiness)).
-
-## Schemas 1 to 5
-
-The layouts of a db-sync-alt database. A new database is created as schema 1;
-`db-sync-alt upgrade` turns it into schema 5, which the running service needs.
-Schema 2 adds a projection of the current block membership and lets the follower
-publish small certified updates instead of re-checking all history each time.
-Schema 3 serves the node directly: every node-facing relation calls the
-[serving gate](#serving-gate), and a reader role gets read access to those
-relations only (the service, `restore --reader-role`, `db-sync-alt grant-reader`).
-Schema 4 adds [integrity checkpoints](#integrity-checkpoint), so verification
-starts at the last one instead of the first generation. Schema 5 serves each
-epoch's `max_tx_size` in `epoch_param` and the [bridge metadata](#bridge-metadata-coverage)
-in `tx_metadata`; a database written before it (fact format
-`midnight-compact-cardano-v1`, nonces only, no bridge metadata) gets every stored
-epoch's size from an authoritative source when it is upgraded. Backups record their schema.
-
-## Integrity checkpoint
-
-A record, for one fully verified generation, of the digests of every fact family
-and of the generation's integrity root. Writing it moves the integrity base to
-that generation in the same transaction, under the same gate as a publication.
-Every later verification recomputes the base's digests and compares them with
-the checkpoint (it never trusts them), then verifies only the updates published
-after the base; a generation older than the base is not verified on its own.
-Checkpoints are never changed or removed, form a chain back to the first
-generation the base started from, and are not readable by the node's reader.
-The service writes one after each startup verification and periodically while
-it runs; `db-sync-alt upgrade` and the restore of a schema-3 backup write the
-first one.
-
-## Positional ID
-
-The ID of a served block, transaction, output, input or output asset, computed
-from its chain position with 12 bits per level: block = height (below 2^27),
-transaction = height · 4096 + index in the block, output = transaction · 4096 +
-output index, input = spending transaction · 4096 + [ledger ordinal](#ledger-ordinal),
-output asset = output · 4096 + ledger ordinal. A value outside its field is
-refused, never wrapped.
-
-## Ledger ordinal
-
-The position of an input among all ordinary inputs of its transaction (ordered by
-origin transaction hash, then index) and of an asset among all assets of its
-output (ordered by policy, then name, bytewise) — the order cardano-db-sync
-stores them in. Kept beside each stored input and output asset; not part of the
-fact digests.
-
-## Serving gate
-
-`chain.gate()`, called by every node-facing relation. It raises SQLSTATE 55000
-(`db_sync_alt_not_serving`) unless the database serves a ready, unrevoked
-canonical generation whose projection is current, so a query in any other state
-fails instead of answering with missing rows.
-
-## Snapshot
-
-A db-sync-alt backup (a PostgreSQL archive plus its manifest) used as initial
-data. The manifest records the archive's SHA-256, the profile, the verification
-result of the canonical generation (of every generation in formats v1 and v2) and
-the physical inventory; restoring checks all of them.
+The values of one network that db-sync-alt is built with: the Cardano
+addresses and asset units the node watches, k, the node's stability margin and
+the first block the node reads. They are generated from the configuration files
+of Midnight node 2.1.101 and compiled into the binary; `db-sync-alt profile
+--network <network>` prints them. A database records the hash of its profile
+and is refused by a binary with another one (`profile_hash_mismatch`).

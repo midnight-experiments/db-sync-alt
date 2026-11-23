@@ -15,8 +15,8 @@ services:
       - --ssl_key_file=/run/db-sync-alt/server.key
       - --ssl_min_protocol_version=TLSv1.2
       - --password_encryption=scram-sha-256
-      # Memory: the whole database is smaller than 0.5 GB, so the defaults of a
-      # small server suffice and the server stays under 0.5 GiB.
+      # Memory: settings of a small server, for a database of a few hundred
+      # megabytes (README.md gives the measured sizes).
       - --shared_buffers=128MB
       - --effective_cache_size=256MB
       - --work_mem=4MB

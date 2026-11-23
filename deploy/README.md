@@ -1,11 +1,34 @@
-# Compose deployment
+# Deployment
+
+## The image
+
+`ghcr.io/midnight-experiments/db-sync-alt:<version>` holds the release binary
+on a distroless Debian 12 base (the C library and its runtime libraries, CA
+certificates and time-zone data), without a shell, a package manager or
+PostgreSQL client tools. It runs as user 65532. Its
+entry point is `/usr/local/bin/db-sync-alt` and its default command is `run`;
+`/var/lib/db-sync-alt/snapshots` belongs to user 65532 for the daily snapshot
+files. The license texts are in `/usr/share/doc/db-sync-alt`. `Dockerfile`
+builds it from the repository root:
+
+```sh
+docker build -f deploy/Dockerfile -t db-sync-alt:local .
+```
+
+The service is configured through `DSA_` variables
+([configuration](../docs/configuration.md)); secrets are files mounted into the
+container. Any command runs the same way, for example
+`docker run --rm ghcr.io/midnight-experiments/db-sync-alt:0.5.0 verify …`.
+`db-sync-alt health` is the health check: it needs no HTTP client in the image.
+
+## Compose
 
 `compose.yaml` runs db-sync-alt next to its own PostgreSQL 17 server:
 
 | Service | What it does |
 | --- | --- |
 | `postgres` | PostgreSQL 17 over TLS. On its first start it creates the owner login `db_sync_alt_owner`, the node's reader login `db_sync_alt_reader` and the database `db_sync_alt` (`postgres/init.sh`). Nothing is published on the host; the node connects on the `node` network. |
-| `db-sync-alt` | The service (`db-sync-alt run`) as the owner login, configured through `DSA_*` environment variables. It restarts after an exit, has a read-only root file system and no capabilities, and answers `/health` and `/status` on port 18080, published on `127.0.0.1` only. Its health check is `db-sync-alt health`. |
+| `db-sync-alt` | The service (`db-sync-alt run`) as the owner login, configured through `DSA_` variables. It restarts after an exit, has a read-only root file system and no capabilities, and answers `/health` and `/status` on port 18080, published on `127.0.0.1` only. Its health check is `db-sync-alt health`. |
 
 Secrets are files, never environment values: Compose mounts them into the
 containers under `/run/secrets`. Both containers restart with the Docker daemon
@@ -14,7 +37,7 @@ containers under `/run/secrets`. Both containers restart with the Docker daemon
 Requirements: Docker Engine with Compose 2.24.4 or newer, `openssl`, and a
 Blockfrost key file for the network.
 
-## 1. Directories and secrets
+### 1. Directories and secrets
 
 Pick a directory you own, one per network (`/srv/db-sync-alt/mainnet` here):
 
@@ -31,11 +54,11 @@ cp <your Blockfrost key file> provider.key
 `postgres.password` is the server's superuser, `owner.password` the login
 db-sync-alt runs as, `reader.password` the Midnight node's login.
 
-## 2. TLS certificates
+### 2. TLS certificates
 
-Midnight node 2.1.101 connects to PostgreSQL over TLS only. Create a CA and a
-server certificate for the host name `postgres`, the name both the node and
-db-sync-alt use on the Compose networks:
+Midnight node 2.1.101 connects to PostgreSQL over TLS only. Create a
+certificate authority and a server certificate for the host name `postgres`,
+the name both the node and db-sync-alt use on the Compose networks:
 
 ```sh
 cd "$dir/secrets"
@@ -52,8 +75,8 @@ The containers need `root-ca.crt`, `server.crt` and `server.key`; keep
 `postgres/start.sh` copies the server's key into a private directory owned by
 the server's user at every start, so the files can stay owned by you.
 
-`DSA_TLS_ROOT_CERT` (the flag `--tls-root-cert` of every command) names the CA
-certificate that db-sync-alt checks the server against: Compose sets it to
+`DSA_TLS_ROOT_CERT` (the flag `--tls-root-cert`) names the certificate
+authority that db-sync-alt checks the server against: Compose sets it to
 `/run/secrets/root-ca.crt`. With it, db-sync-alt connects only over TLS and
 checks that the certificate is for the host name in the connection string. Give
 the node the same file as `SSL_ROOT_CERT`.
@@ -61,21 +84,24 @@ the node the same file as `SSL_ROOT_CERT`.
 To renew the server certificate, replace `server.crt` and `server.key` and
 restart the server: `docker compose … restart postgres`.
 
-## 3. Settings
+### 3. Settings
 
 ```sh
 cp deploy/compose.env.example deploy/compose.env
 ```
 
 Set `DSA_NETWORK`, `DSA_UID` and `DSA_GID` (the owner of the two directories,
-`id -u` and `id -g`), `DSA_SECRETS_DIR` and `DSA_SNAPSHOT_HOST_DIR`. Check the
-result without starting anything:
+`id -u` and `id -g`), `DSA_SECRETS_DIR` and `DSA_SNAPSHOT_HOST_DIR`. The other
+`DSA_` lines are optional and passed on only when set. Leave a setting out, or
+comment it out: a line such as `DSA_SNAPSHOT=` with nothing after it sets an
+empty value, which the service refuses. Check the result without starting
+anything:
 
 ```sh
 docker compose -f deploy/compose.yaml --env-file deploy/compose.env config --quiet
 ```
 
-## 4. First start
+### 4. First start
 
 On an empty database the service starts from a snapshot file. Put the file in
 `DSA_SNAPSHOT_HOST_DIR`, and set in `compose.env` its path as the service sees
@@ -93,41 +119,50 @@ docker compose -f deploy/compose.yaml --env-file deploy/compose.env up -d
 curl -s http://127.0.0.1:18080/status
 ```
 
-Remove the two lines from `compose.env` once the service serves.
+Once the service serves, remove the two lines from `compose.env`: the file is
+read only on an empty database, but must stay readable while `DSA_SNAPSHOT` is
+set.
 
-## 5. Connect a Midnight node
+### 5. Connect a Midnight node
 
 Attach the node's container to the network `<project>_node`, where `<project>`
 is `COMPOSE_PROJECT_NAME`: `docker network connect <project>_node <node
 container>`, or declare it in the node's Compose file as an external network.
 The node connects to host `postgres`, port 5432, database `db_sync_alt`, user
 `db_sync_alt_reader`, with the password in `reader.password`, and with
-`SSL_ROOT_CERT` set to `root-ca.crt` as mounted in the node's container.
+`SSL_ROOT_CERT` set to `root-ca.crt` as mounted in the node's container
+([connect a node](../docs/connect-a-node.md)).
 
-## PostgreSQL settings
+### PostgreSQL settings
 
-`compose.yaml` passes these settings to the server; the whole database is
-smaller than 0.5 GB.
+`compose.yaml` passes these settings to the server. The database is small: it
+measured 194 MB on Mainnet right after a restore
+([snapshots](../docs/snapshots.md#restore)).
 
 | Setting | Value | Why |
 | --- | --- | --- |
 | `ssl`, `ssl_cert_file`, `ssl_key_file` | `on`, the mounted certificate and key | The node requires TLS. |
 | `ssl_min_protocol_version` | `TLSv1.2` | No older protocol. |
 | `password_encryption` | `scram-sha-256` | Password hashes of the three logins. |
-| `shared_buffers` | `128MB` | The working set of a small database; keeps the server under 0.5 GiB. |
+| `shared_buffers` | `128MB` | The working set of a small database. |
 | `effective_cache_size` | `256MB` | Planner estimate of the file cache. |
 | `work_mem` | `4MB` | Enough for the keep rule's sorts and hashes. |
 | `maintenance_work_mem` | `64MB` | Index builds after a restore and index rebuilds. |
-| `max_connections` | `60` | Up to 32 from the node's pools, the reader's limit of 40, a few for db-sync-alt, the superuser's reserve. |
+| `max_connections` | `60` | Up to 32 from the node's pools within the reader's limit of 40, a few for db-sync-alt, the superuser's reserve. |
 
 The reader login has a connection limit of 40, statement and
-idle-in-transaction timeouts of 60 seconds, `search_path` `public` and read-only
-transactions. db-sync-alt grants it the node's relations when the database
-serves, and refuses a reader that can do more.
+idle-in-transaction timeouts of 60 seconds, `search_path` `public` and
+read-only transactions. db-sync-alt grants it the node's views at every start,
+and refuses a reader that can do more.
 
-## Stop and upgrade
+### Stop, back up and upgrade
 
 `docker compose -f deploy/compose.yaml --env-file deploy/compose.env stop db-sync-alt`
 stops only the service; PostgreSQL keeps serving the node the last update.
-`down` stops both and keeps the database volume and the snapshot files. To
-upgrade, set `DSA_IMAGE` to the new version and run `up -d` again.
+`down` stops both and keeps the database volume and the snapshot files.
+
+The daily snapshot files in `DSA_SNAPSHOT_HOST_DIR` are the database's backups:
+copy them off the host. To restore one, see
+[a closed gate](../docs/operations.md#a-closed-gate).
+
+To upgrade, set `DSA_IMAGE` to the new version and run `up -d` again.

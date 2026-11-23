@@ -1,69 +1,45 @@
 # Compatibility
 
-What db-sync-alt 0.4.9 supports. Anything not listed is refused at startup or
-treated as unsupported.
+What db-sync-alt 0.5.0 works with. Anything else is refused or unsupported.
 
 | Component | Supported | Notes |
 | --- | --- | --- |
-| Cardano network | Preprod (`--network preprod`): supported and tested end to end. Mainnet (`--network mainnet`): built from real data and followed; a node at the chain tip not tested. Preview: profile packaged, not tested on its chain | A Mainnet database built from a real Mainnet cardano-db-sync is followed through Blockfrost, and a Midnight node reads it; serving that node at the Mainnet chain tip is not tested. The Preview profile is checked by tests on synthetic data only ([networks](networks.md)) |
-| Midnight node | SQL queries of `node-2.1.101` | The query set is read from the unchanged upstream sources in `reference/` (commit `86774edf8cc76345a5c3a4221f3fe80c094b1c33`), including `MAX(epoch_param.max_tx_size)` of the cost-based cNIGHT observation; other node versions work only if they send the same queries |
-| Profile | `profiles/preprod-node-1.0.400`, `profiles/mainnet-node-1.0.0`, `profiles/preview-node-1.0.0` | Six configuration files of the network from one midnight-node release and the network's values (`network.json`); see the [glossary](glossary.md#profile) |
-| PostgreSQL server | 17, provided by you | Checked on every connection; other major versions are refused with `unsupported_postgres_version`. The Midnight node's reference environment runs its cardano-db-sync database on PostgreSQL 17 as well, so db-sync-alt's database can share that server; it needs a dedicated database closed to `PUBLIC`, a non-superuser owner login and a reader login, and creates no role ([provision PostgreSQL](operations.md#provision-postgresql)) |
-| PostgreSQL client tools | `pg_dump` / `pg_restore` 17 | Needed for backups and restores; the version must match the server |
-| Python | 3.11 or newer | The container image uses Python 3.12 |
-| Python packages | `psycopg[binary]` 3.2.13 | Pinned with hashes in `requirements.lock` |
-| cardano-db-sync (initial data only) | 13.7.1.0/schema 15.48.6 or 13.8.0.0/schema 16.52.6; `meta.network_name` of the selected network | Core full-history mode only; required types/domains/nullability (including `epoch_param.max_tx_size`), mode markers and epoch coverage checked; truthful retained `tx_in`/epoch-stake attestation |
-| Blockfrost | The selected network's API (`cardano-<network>.blockfrost.io`) | One project key of that network; requests are counted against a daily ceiling ([costs](costs.md)) |
-| Docker / Compose (optional) | Compose 2.24.4 or newer | Only for the [Compose deployment](docker.md) and the test lanes |
-| Operating system | Linux on amd64 | Tested there; other platforms are untested |
+| Midnight node | 2.1.101 | The SQL catalogue is extracted from the node's sources at tag `node-2.1.101` (commit `86774edf8cc76345a5c3a4221f3fe80c094b1c33`), kept unchanged under `reference/`. The keep rule (version 2) is derived from these queries. Another release works only if it sends the same queries and reads the same addresses and assets. |
+| PostgreSQL | 17 | Provided by you ([PostgreSQL](postgresql.md)). Every connection checks the major version; another one is refused (`postgresql_17_required`). The node connects over TLS only. |
+| PostgreSQL client tools | none | Restore, snapshot and conversion need no `psql`, `pg_dump` or `pg_restore`. |
+| Cardano networks | Mainnet, Preprod | `--network mainnet` or `--network preprod`. Other names are refused (`unsupported_network`). |
+| Provider | Blockfrost API v0 of the network | One key file. See [provider](provider.md). |
+| Operating system | Linux x86-64 with glibc 2.39 or newer | The release binary is built on Ubuntu 24.04. The image is based on Debian 12 (distroless) and runs as user 65532. |
+| Source for `convert` | A serving 0.4.x database (schema 5), read through its reader login | See [upgrade](upgrade.md). |
+| Database format | 1 | Stored in the database (`identity.database_format`); another format is refused (`unsupported_database_format`). |
+| Snapshot file format | 1 | Another format is refused (`unsupported_snapshot_format`). |
 
-## Database and backup identity
+## Networks and their profiles
 
-A database created by db-sync-alt is owned by the `db-sync-alt` identity and has
-a schema version (1 to 5) and a fact format. The service and the node's reader
-need schema 5 with fact format `midnight-compact-cardano-v2`, whose epoch facts
-carry `max_tx_size` and which holds bridge metadata (`tx_metadata`) from its
-coverage start. It holds a phase-2-invalid transaction as cardano-db-sync 13.8
-does: `valid_contract` false, its collateral inputs as `tx_in` and its
-collateral return as `tx_out` (at the index after the body outputs); its body
-inputs, outputs and mint never took effect and are not held. `db-sync-alt upgrade` brings an older database there
-([recovery](recovery.md#upgrade-to-schema-5)); a database of 0.3.x or earlier
-(fact format `midnight-compact-cardano-v1`) also needs each stored epoch's size
-from Blockfrost or a cardano-db-sync. db-sync-alt 0.3.x and earlier refuse an
-upgraded database. Only schema-5 databases are backed up, in the format
-`db-sync-alt-postgresql-backup-v4`. Backups of schemas 3 and 4
-(`db-sync-alt-postgresql-backup-v2` and `-v3`, such as the 0.1.0 Preprod
-snapshot) restore and are upgraded to schema 5 during the restore, with the
-same source; backups of schemas 1 and 2 (`db-sync-alt-postgresql-backup-v1`)
-restore, then need the upgrade. A manifest records the format, the PostgreSQL
-major version, the schema version, the profile, the verification result of the
-canonical generation (formats v3 and v4) or of every generation (formats v1 and
-v2), and the physical inventory. A backup is
-restored only into an empty PostgreSQL 17 database by the same profile; a
-manifest that records another major version is refused
-(`unsupported_backup_identity`).
+The values of each network are compiled into the binary as its profile,
+generated from the configuration files of Midnight node 2.1.101.
+`db-sync-alt profile --network mainnet` prints the whole profile: the
+addresses and asset units the node watches and where each value comes from.
 
+| | Mainnet | Preprod |
+| --- | --- | --- |
+| Security parameter k | 2,160 | 2,160 |
+| The node's block stability margin | 30 | 30 |
+| First block the node reads (block : transaction index) | 13,164,005 : 1 | 4,500,197 : 4 |
+| Provider URL (`--provider-url` default) | `https://cardano-mainnet.blockfrost.io/api/v0` | `https://cardano-preprod.blockfrost.io/api/v0` |
+| `/health` lag limit (`--health-max-lag-blocks` default) | 9 | 9 |
 
-## Source schema qualification
+On Preprod the cNIGHT unit, which the ICS and reserve inputs also use, has an
+empty asset name; the bridge unit is the same policy with the asset name
+`NIGHT`. Both are served.
 
-Source schema support is separate from the persisted compact fact contract.
-The adapter accepts only `(15,48,6)` as 13.7.1.0 and `(16,52,6)` as 13.8.0.0.
-The source manifest stores the actual tuple/version. The compact contract and
-packaged profiles are unchanged; 13.6, unfinished stage-three indexes and
-unknown schemas remain unsupported. `meta.version` describes the creating
-binary and is not used to label the current schema.
+A database records its network, its profile's hash and the keep-rule version
+when it is created or restored. A binary with another profile or keep rule
+refuses it (`network_mismatch`, `profile_hash_mismatch`,
+`keep_rule_version_mismatch`), and a snapshot file is refused the same way.
 
-Required core relations must retain their upstream column types, domains and
-nullability. Address-table, consumed-output, pruning and UTxO bootstrap modes
-are refused even if ordinary inputs remain. Unknown extra-migration tokens are
-refused; empty mode history and `StakeDistrEnded` are allowed. Required epochs
-need completed stake progress, a nonce, a valid `max_tx_size` in every
-`epoch_param` row (the fact is their maximum) and stake rows. Extraction and
-independent verification keep their full checks.
+## The node's reader
 
-The operator must truthfully attest retained `tx_in` and epoch-stake history,
-including the absence of ledger, asset or Plutus filtering. Schema/mode and
-nonempty epoch checks cannot prove all semantic history. Use these same source
-options with any packaged network profile; source and destination must still
-belong to the selected network. Real-source retention and node acceptance
-remain deployment qualifications.
+The node connects with its own login, which may only read the eleven
+node-facing views and call the gate function. db-sync-alt grants exactly this
+and refuses a login with more ([PostgreSQL](postgresql.md#the-reader-login)).

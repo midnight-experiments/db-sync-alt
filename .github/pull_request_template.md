@@ -1,17 +1,20 @@
 ## Change
 
-Describe the concrete problem and resulting behavior.
+Describe the concrete problem and the resulting behaviour.
 
 ## Validation
 
-List the commands you ran (`cargo test`, the PostgreSQL tests, the source check)
-and their results. Say what was tested with synthetic data only.
+List the commands you ran (format, clippy, the workspace tests, the PostgreSQL
+tests, the source checks) and their results. Say what was tested with
+synthetic data only and what on real data.
 
 ## Compatibility
 
-Describe schema, backup, provider-budget, query-profile or operational impact.
-Clearly flag breaking changes and the tested recovery path.
+Describe the effect on the database format, the snapshot file format, the
+keep rule, the provider requests, the node's queries, the flags or operations.
+Flag breaking changes clearly, with the upgrade path.
 
 ## Distribution
 
-Confirm source checks pass and no private data or credentials are included.
+Confirm that the source checks pass and that no private data or credentials
+are included.

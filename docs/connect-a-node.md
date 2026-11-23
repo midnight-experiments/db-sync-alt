@@ -1,9 +1,8 @@
 # Connect a Midnight node
 
 A Midnight node reads Cardano data with SQL through its db-sync settings. It
-connects to db-sync-alt's PostgreSQL database directly, exactly as it would to a
-cardano-db-sync database, with the reader login you created for it
-([provision PostgreSQL](operations.md#provision-postgresql)).
+connects to db-sync-alt's database directly, as it would to a cardano-db-sync
+database, with the reader login ([PostgreSQL](postgresql.md#the-reader-login)).
 
 ## Settings
 
@@ -15,220 +14,52 @@ CARDANO_SECURITY_PARAMETER=2160
 
 | Setting | Value |
 | --- | --- |
-| Host and port | Your PostgreSQL server as the node reaches it |
-| Database | db-sync-alt's database (`db_sync_alt` in the examples) |
-| User and password | The reader login and its password, never the owner login db-sync-alt runs as |
-| TLS | Required: midnight-node 2.1.101 connects only over TLS and refuses a server without it; `ALLOW_NON_SSL` has no effect. `SSL_ROOT_CERT` (the server's CA certificate) makes the node check the certificate and host name ([TLS](#tls)) |
-| `CARDANO_SECURITY_PARAMETER` | The network's security parameter k (2160 on Mainnet and Preprod, 432 on Preview); it must equal the profile's k (see below) |
+| Host and port | Your PostgreSQL server as the node reaches it. |
+| Database | db-sync-alt's database (`db_sync_alt` in the examples). |
+| User and password | The reader login and its password, never the owner login db-sync-alt runs as. |
+| `SSL_ROOT_CERT` | The certificate authority of the server's certificate. Midnight node 2.1.101 connects only over TLS and refuses a server without it; `ALLOW_NON_SSL` has no effect. With `SSL_ROOT_CERT` the node checks the certificate and the host name ([TLS](postgresql.md#tls)). |
+| `CARDANO_SECURITY_PARAMETER` | k of the network: 2160 on Mainnet and Preprod. |
 
-With the [Compose deployment](docker.md) PostgreSQL is not published on the
-host: attach the node's container to the deployment's `node` network and use
-host `postgres`, port 5432; the reader's password is
-`~/.local/share/db-sync-alt/private/operator/reader.password`. The bundled
-server has no TLS until you
-[turn it on](docker.md#tls-for-the-midnight-node).
-
-## TLS
-
-midnight-node 2.1.101 connects to its db-sync database only over TLS. It refuses
-a PostgreSQL server that does not offer TLS, and its `ALLOW_NON_SSL` setting has
-no effect. With `SSL_ROOT_CERT` set to the server's CA certificate, the node
-checks the server's certificate and host name; without it, the connection is
-encrypted but the certificate is not checked. db-sync-alt's own connections stay
-on loopback and need no TLS.
-
-To turn TLS on in a PostgreSQL 17 server you administer:
-
-1. Create a CA and a server certificate for the host name in the node's
-   connection string (`<host>`):
-
-   ```sh
-   host='<host>'
-   openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -subj '/CN=db-sync-alt PostgreSQL CA' \
-     -keyout root-ca.key -out root-ca.crt
-   openssl req -newkey rsa:3072 -nodes -subj "/CN=$host" -keyout server.key -out server.csr
-   printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$host" > server.ext
-   openssl x509 -req -in server.csr -CA root-ca.crt -CAkey root-ca.key -CAcreateserial \
-     -days 365 -extfile server.ext -out server.crt
-   ```
-
-   Keep `root-ca.key` private and off the server. A node that reaches the server
-   by IP address needs `subjectAltName=IP:<address>` instead. Renew
-   `server.crt` before it expires (365 days here); a reload picks up new files.
-2. Copy `server.crt` and `server.key` into a directory of the server, both owned
-   by the server's operating-system user and readable by it only (mode `600`).
-3. As the server's administrator, turn TLS on. A reload applies it; the server
-   keeps running:
-
-   ```sql
-   ALTER SYSTEM SET ssl = 'on';
-   ALTER SYSTEM SET ssl_cert_file = '<directory>/server.crt';
-   ALTER SYSTEM SET ssl_key_file = '<directory>/server.key';
-   SELECT pg_reload_conf();
-   ```
-
-4. Give the node the CA certificate: set `SSL_ROOT_CERT` to the path of
-   `root-ca.crt` as the node sees it (mount the file into the node's container).
-5. Check the connection as the reader, with the checks the node makes:
-
-   ```sh
-   psql 'postgresql://db_sync_alt_reader@<host>:5432/db_sync_alt?sslmode=verify-full&sslrootcert=root-ca.crt' \
-     -c '\conninfo'
-   ```
-
-   The answer reports an SSL connection and its protocol (for example TLSv1.3).
-   A certificate for another host name, or from another CA, is refused here as
-   it is by the node.
+With the [Compose deployment](../deploy/README.md#5-connect-a-midnight-node)
+PostgreSQL is not published on the host: the node joins the deployment's
+`node` network and uses host `postgres`.
 
 ## Node requirements
 
-db-sync-alt cannot see the node's settings; a node that does not match the
-profile gets empty answers where the database cannot tell its request apart
-from a valid one:
+db-sync-alt cannot see the node's settings. A node that does not match the
+profile gets empty answers where the database cannot tell its request from a
+valid one:
 
-- **k.** `CARDANO_SECURITY_PARAMETER` must equal the profile's k. db-sync-alt
-  publishes block headers up to k blocks above the newest block it serves events
-  for; a node with a smaller k treats younger blocks as stable and asks for
-  events db-sync-alt has not published yet. A larger k is harmless.
-- **Addresses and policies.** The node's Cardano addresses and policies (cNIGHT
-  mapping validator and asset, governance bodies, reserve and ICS)
-  must be the profile's ([networks](networks.md)). They come from the node's
-  network configuration, and Midnight governance can change some of them on
-  chain; when that happens, update db-sync-alt's profile before the change takes
-  effect, or the node reads an address db-sync-alt does not follow.
-
-Give the service the node's values (`node` in the service configuration,
-[operations](operations.md#node-requirements)) and `/status` and `/health` report
-any mismatch in `warnings`; they never refuse serving because of it.
+- **k.** `CARDANO_SECURITY_PARAMETER` must equal the profile's k. The database
+  stores headers up to k blocks above the newest block it serves events for; a
+  node with a smaller k takes younger blocks as stable and asks for events that
+  are not published yet. A larger k is harmless.
+- **Addresses and assets.** The node's Cardano addresses and policies (cNIGHT
+  mapping validator and asset, governance bodies, reserve and ICS) must be the
+  profile's (`db-sync-alt profile --network <network>`). They come from the
+  node's network configuration of release 2.1.101.
+- **Position.** The node's Cardano position must not be below the database's
+  horizon ([limitations](limitations.md#history-older-than-the-window)).
 
 ## What the node can read
 
-The reader login can connect to db-sync-alt's database, read the eleven
-db-sync-shaped relations the node's queries use (`block`, `tx`, `tx_out`,
+The reader login reads the eleven node-facing views (`block`, `tx`, `tx_out`,
 `tx_in`, `ma_tx_out`, `multi_asset`, `datum`, `epoch_param`, `epoch_stake`,
-`pool_hash`, `tx_metadata`) and run the serving check they call; nothing else.
-The node's SQL runs unchanged. `epoch_param` includes each epoch's
-`max_tx_size`: midnight-node 2.1.101 reads `MAX(epoch_param.max_tx_size)` of its
-cursor block's epoch once its runtime selects the cost-based cNIGHT observation,
-and stops cNIGHT observations without it. `tx_metadata` holds the bridge
-metadata of the [bridge coverage](#bridge-readiness). Each of those relations raises SQLSTATE 55000
-(`db_sync_alt_not_serving`) instead of answering while the database does not
-hold a verified, published update (empty, restoring, revoked, or an update not
-yet complete), so the node never accepts an empty answer from a database that is
-not serving. Every statement sees one published update, also while the next one
-is being published. The node keeps reading the last published update while
-db-sync-alt is stopped or restarting; `/health` then reports how far behind it
-is.
+`pool_hash`, `tx_metadata`) and nothing else. The node's SQL runs unchanged.
 
-The reader cannot connect at all until db-sync-alt has restored or verified the
-database and granted it access: a node connected to an empty database would
-find no `tx_in` relation and remember that until it restarts.
+Every view raises SQLSTATE 55000 (`db_sync_alt_not_serving`) instead of
+answering while the database is not serving: empty, restoring, or closed by a
+check. The node therefore never takes an empty answer for a real one. Every
+statement sees one complete update, also while the next one is written. While
+the service is stopped, the node keeps reading the last update; `/health` then
+fails, and `/status` shows how far behind the database is.
 
-## Registered candidates
+The reader can connect once `run` or `grant-reader` has granted it, which
+happens after the database first serves.
 
-db-sync-alt serves no candidate registrations. The registered-candidates
-address is not one of the profile's addresses: an output there is kept only when
-it carries one of the profile's assets, as at any other address, and a payment
-there never stops an update. midnight-node 2.1.101 selects committees without
-registrations (its committee selection passes an empty list), so no committee
-depends on them; db-sync-alt's tests check this in the packaged node sources.
+## Check the connection
 
-Only the node's queries for operators read registrations: the RPC methods
-`sidechain_getRegistrations`, `sidechain_getAriadneParameters` and
-`systemParameters_getAriadneParameters`, and the `registration-status` and
-`ariadne-parameters` subcommands. Against db-sync-alt they return no
-registrations. When an output at the address carries one of the profile's
-assets and its transaction spends no output db-sync-alt holds, they fail
-instead: the node cannot read that output's transaction inputs. Serving
-registrations as cardano-db-sync does is future work, for a node release that
-reads them again
-([midnight-node#1761](https://github.com/midnightntwrk/midnight-node/issues/1761)).
-
-## Bridge readiness
-
-midnight-node 2.1.101 builds and checks the token bridge's inherent data on every
-block import, also when it only follows the chain. While the bridge's on-chain
-data checkpoint (`Bridge.DataCheckpoint`) is unset, the bridge reads nothing; that
-is the state of Mainnet and Preprod from genesis. One governance call
-(`bridge.setMainChainScripts`) sets the scripts and the checkpoint, with no node
-or runtime release. From then on, every block import runs the node's bridge
-query from the checkpoint on: the transactions that send the bridge token to the
-ICS address, the token flows of the ICS and reserve addresses, and the
-`tx_metadata.json` of key 6500973 (the transfer's recipient) of those
-transactions. The answer must equal what the block's author computed; a
-different answer stops the node at that block.
-
-db-sync-alt serves that data forward only, from its **coverage start**:
-
-- Every update acquired from Blockfrost stores the metadata of key 6500973 of
-  each transaction with an output at the ICS address (one request per such
-  transaction), and every asset of the ICS and reserve outputs it stores.
-- A database built from cardano-db-sync has no bridge metadata: coverage starts
-  with the first update from Blockfrost after it. A database upgraded from 0.3.x
-  starts coverage after its upgraded update. Nothing before the coverage start is
-  fetched or guessed.
-- An update from cardano-db-sync (`acquire --source dbsync`, for example to
-  catch up after a provider outage) holds no metadata either: coverage then
-  starts again with the next update from Blockfrost, and `coverage_start` moves
-  past it. `acquire` says so when it publishes such an update after covered
-  blocks: its result carries `bridge_coverage_ended` (the previous and the new
-  coverage start) and the warning `bridge_metadata_coverage_restarted`, also
-  printed on stderr. Once the bridge is active, keep following from Blockfrost
-  and state the checkpoint (below), so that such a gap shows as an unsupported
-  checkpoint.
-
-`db-sync-alt status` and the service's `/status` report it under `bridge`:
-
-```json
-{"bridge": {"metadata_key": 6500973, "coverage_start": 4612001, "checkpoint": null, "checkpoint_supported": null, "reason": null}}
-```
-
-`coverage_start` is the first Cardano block from which the bridge query reads
-complete data. The node's checkpoint is supported when the query only reads
-covered blocks: `Block(n)` needs `n + 1 >= coverage_start` (the node reads the
-blocks after `n`); `Tx(h)` or `TxReserveTransfer(h)` needs transaction `h` served
-in a block at or after `coverage_start`.
-
-Check the checkpoint before the governance call takes effect, and again after:
-
-1. Read the storage item `Bridge.DataCheckpoint` from a Midnight node of the
-   network, for example over RPC:
-
-   ```sh
-   curl -s -H 'Content-Type: application/json' http://127.0.0.1:9944 \
-     -d '{"id":1,"jsonrpc":"2.0","method":"state_getStorage","params":["0x6bbd34f158a9e1a5e5600b03adee7932fd4cc2f0df8f898480e1be4bf3052e3e"]}'
-   ```
-
-   `"result": null` means the bridge is not active. Otherwise decode the value
-   with the node's metadata (for example the chain state view of a Polkadot
-   JavaScript client: `bridge.dataCheckpoint`); it names a Cardano block
-   number or a transaction hash.
-2. State it: `db-sync-alt status --service <name> --bridge-checkpoint block:<n>`
-   (or `tx:<hash>`), or permanently as `node.bridge_checkpoint` in the service
-   configuration (`db-sync-alt run --node-bridge-checkpoint`).
-3. `checkpoint_supported: true` means the node's bridge query reads covered data
-   only. `false` comes with `reason` `before_coverage` (the checkpoint is older
-   than the coverage start) or `transaction_not_served` (the checkpoint
-   transaction does not touch the profile's addresses or assets, so the node's
-   lookup of it finds no row). The service then answers `/health` with 503 and
-   `bridge_checkpoint_unsupported`. Serving continues, but the node's bridge
-   answer can then differ from the block author's: with `before_coverage`, a
-   transfer in an uncovered block reads without its recipient; with
-   `transaction_not_served`, the lookup fails. Either stops the node at that
-   block. This version has no backfill of earlier metadata.
-
-## Connections
-
-midnight-node 2.1.101 opens up to 32 connections to its cardano-db-sync database
-(six pools: candidates 5, sidechain 5, main chain hash 5, cNIGHT observation 10,
-federated authority 5, bridge 2); db-sync-alt's own serving check opens one more
-as the reader from time to time. db-sync-alt requires a reader connection limit
-of at least 36, which leaves 3 spare, plus your headroom (40 in the examples),
-and the server enough `max_connections` for every database on it.
-
-## Checking the connection
-
-With `psql`, as the reader, over TLS as the node connects:
+As the reader, over TLS as the node connects:
 
 ```sh
 psql 'postgresql://db_sync_alt_reader@<host>:5432/db_sync_alt?sslmode=verify-full&sslrootcert=root-ca.crt' \
@@ -237,6 +68,7 @@ psql 'postgresql://db_sync_alt_reader@<host>:5432/db_sync_alt?sslmode=verify-ful
 ```
 
 The first query is the node's own startup check and returns 1; the second
-returns the newest block db-sync-alt serves. `permission denied` means the
-reader was not granted (yet); SQLSTATE 55000 means the database is not serving
-right now: check [health](troubleshooting.md).
+returns the newest stored block, the stored tip. `permission
+denied` means the reader was not granted yet; SQLSTATE 55000 means the
+database is not serving right now: read `/status`
+([troubleshooting](troubleshooting.md)).

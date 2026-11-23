@@ -1,373 +1,345 @@
 # Operations
 
-The [README](../README.md) has the short path: install, first run, connect a
-node. This page has the details for running db-sync-alt directly on a host.
-For containers see [Docker / Compose](docker.md); for backups and failures see
-[backup and recovery](recovery.md).
+`db-sync-alt run` is the service: one process that follows Cardano through the
+provider into the database, keeps the database within its
+[retention](glossary.md#chain-and-window), and answers `/health` and `/status`
+over HTTP. This page explains what it does and how to watch it. Its flags are
+in [configuration](configuration.md#run).
 
-## Provision PostgreSQL
+## Start
 
-You provide the PostgreSQL server, as you would for cardano-db-sync. db-sync-alt
-needs PostgreSQL 17, the major version the Midnight node's reference environment
-runs its cardano-db-sync database on, so its database can live on the same
-PostgreSQL 17 server as the other databases of a Midnight deployment
-([share a server](#share-a-postgresql-17-server)). db-sync-alt never creates,
-alters or grants a role, and needs no superuser: you create, as the server's
-administrator,
+At start the service:
 
-- a **dedicated, empty database** that `PUBLIC` cannot connect to. db-sync-alt
-  never adopts a database with unrelated objects in it and never reads or
-  changes the server's other databases;
-- an **owner login** that owns the database: no superuser, no `CREATEROLE`, no
-  `CREATEDB`. db-sync-alt runs as this login. It must be allowed to execute
-  `pg_control_system()` (allowed to everyone by default);
-- a **reader login** for the Midnight node, with its own defaults: a statement
-  timeout, an idle-in-transaction timeout, `search_path` `public` and a
-  connection limit of at least 36 (node 2.1.101's pools of up to 32
-  connections, one for db-sync-alt's serving check and 3 spare) plus headroom.
-  Give it nothing else.
+1. Checks every flag, before anything connects. An invalid value ends it with
+   exit status 2.
+2. Opens the HTTP listener (`--listen`, default port 18080). From here on
+   `/status` answers in every state.
+3. Connects to PostgreSQL. While the database cannot be reached the state is
+   `waiting` with reason `database_unreachable`; it retries after 1, 2, 4, 8 and
+   16 seconds and then every 30 seconds, and ends with exit status 75 once the
+   database has stayed unreachable for `--database-fatal-after-seconds`.
+4. Takes the [writer lock](glossary.md#database). A second process that writes
+   to the same database is refused (`writer_busy`).
+5. On an empty database, restores the `--snapshot` file (state `restoring`).
+   Without `--snapshot` an empty database is refused (`snapshot_required`). A
+   database whose gate is closed is refused (`database_not_serving`): see
+   [a closed gate](#a-closed-gate).
+6. Compares `--retention-seconds`, when given, with the stored retention
+   ([change the retention](#change-the-retention)).
+7. Grants the `--reader` login the node's rights and checks that it has no
+   others ([PostgreSQL](postgresql.md#the-reader-login)).
+8. Follows the chain, reads the database part of the status every 20 seconds on
+   a read-only connection of its own, and runs the [upkeep](#upkeep).
 
-```sql
-CREATE ROLE db_sync_alt_owner LOGIN PASSWORD '<owner password>';
-CREATE ROLE db_sync_alt_reader LOGIN NOINHERIT CONNECTION LIMIT 40 PASSWORD '<reader password>';
-ALTER ROLE db_sync_alt_reader SET statement_timeout = '60s';
-ALTER ROLE db_sync_alt_reader SET idle_in_transaction_session_timeout = '60s';
-ALTER ROLE db_sync_alt_reader SET search_path = 'public';
--- Created closed: no role but the owner connects before db-sync-alt has prepared it.
-CREATE DATABASE db_sync_alt OWNER db_sync_alt_owner ALLOW_CONNECTIONS false;
-REVOKE ALL ON DATABASE db_sync_alt FROM PUBLIC;
-ALTER DATABASE db_sync_alt ALLOW_CONNECTIONS true;
-```
+A restart does the same. It reads no history: it continues from the stored
+target, and the node keeps reading the last update meanwhile.
 
-New roles get neither `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `REPLICATION` nor
-`BYPASSRLS` unless you add them; do not. Keep `PUBLIC` out of the database: a
-node that connected to an empty or half-restored database would find no `tx_in`
-relation and remember that until it restarts. db-sync-alt removes `PUBLIC`'s
-privileges on its database again whenever it creates or restores it.
+## States
 
-Once the database serves, db-sync-alt grants the reader `CONNECT`, `USAGE` on
-schema `public`, `SELECT` on the eleven node-facing relations and `EXECUTE` on the
-serving check; it does so at every service start and after every restore. It then
-verifies that the reader can do nothing more — no role membership, no `TEMP` or
-`CREATE`, no access to its internal schemas, no write, no other function — and
-refuses to start otherwise (`invalid_reader_role`). `/status` reports the
-reader's settings (`statement_timeout`, `idle_in_transaction_session_timeout`,
-`search_path`, `default_transaction_read_only`, connection limit) and names any
-that is missing in `warnings`, without failing health.
+`/status` names the state in `state` and its reason in `state_reason`. A
+waiting state also gives the time the wait ends in `wait_until`.
 
-For `db-sync-alt run` the server must also be reachable on a loopback TCP
-address (`127.0.0.1` or `::1`) of the machine that runs db-sync-alt: host names
-(including `localhost`), Unix sockets, remote hosts and URL query or TLS options
-are refused there. Port 18080 (HTTP status) must be free on loopback, or another port given with
-`--http-port`. Plan free space for the database, the snapshot or backups you
-restore from, and a 10 GiB reserve on the filesystem of the state directory,
-which db-sync-alt checks before writing. Watch the PostgreSQL data volume
-yourself.
-
-## Share a PostgreSQL 17 server
-
-db-sync-alt's database can sit on the server that holds the other databases of
-a Midnight deployment, for example the cardano-db-sync and midnight-indexer
-databases of the node's reference stack:
-
-- Everything it creates lives inside its own database: the schemas `chain`,
-  `serve` and `public`, their tables, views, functions and indexes. Relation and
-  index names (including the cardano-db-sync names `block`, `tx_in` or
-  `idx_tx_out_address` that the node checks) are per database, so a
-  cardano-db-sync database next to it keeps its own, and each database answers
-  the node's catalogue checks with its own relations only.
-- It needs no server-wide setting, no preload library and no extension beyond
-  `plpgsql`, creates no role and changes no other database.
-- It uses PostgreSQL advisory locks of its own database only (advisory locks
-  are local to a database): the two-integer keys (36, 1) for the writer and
-  (36, 2) for publication, plus one random key pair whose first integer is not
-  36 per running service. They cannot conflict with another database's locks.
-- Count the reader's connections (and the owner's few) into the server's
-  `max_connections` with everyone else's.
-
-## Node requirements
-
-The node's `CARDANO_SECURITY_PARAMETER` must equal the network's k, and its
-Cardano addresses and policies must be the profile's
-([connect a Midnight node](connect-a-node.md#node-requirements)). db-sync-alt
-cannot read the node's settings. If you give the service the node's values
-(`db-sync-alt run --node-security-parameter --node-configuration-dir`, or `node`
-in the service configuration), it compares them with the profile at start and
-reports a mismatch in `warnings` (`node_security_parameter_mismatch`,
-`node_configuration_mismatch`); serving continues:
-
-```json
-{"node": {"security_parameter": 2160, "configuration_dir": "/path/to/midnight-node/res/preprod", "bridge_checkpoint": "block:4612000"}}
-```
-
-`bridge_checkpoint` is the token bridge's on-chain data checkpoint, `block:<n>`
-or `tx:<hash>` ([bridge readiness](connect-a-node.md#bridge-readiness)). Unlike
-the other values it can make `/health` fail: while the bridge metadata coverage
-does not support it, `/health` answers 503 with `bridge_checkpoint_unsupported`.
-Leave it out while the bridge is not active.
-
-`configuration_dir` is the node's network configuration directory (the
-`res/<network>` directory of the midnight-node sources or image); db-sync-alt
-compares the profile's address and policy files with the files of the same name
-there. Without a `node` section, `/status` reports `node_requirements_unchecked`.
-
-## `db-sync-alt run`
-
-`db-sync-alt run` prepares private configuration in a state directory and runs
-the service in the foreground. Ctrl-C or SIGTERM stops it cleanly; running the
-same command again resumes. Nothing restarts it automatically.
-
-| Option | Default | Purpose |
+| `state` | Meaning | `state_reason` |
 | --- | --- | --- |
-| `--network NAME` | required | `mainnet`, `preprod` or `preview`; the packaged profile of that network ([networks](networks.md)) |
-| `--blockfrost-key-file PATH` | | Read the Blockfrost key of that network from a private file (mode `600`); a key of another network is refused |
-| `--blockfrost-key` | | Without a value: hidden prompt. Environment alternative: `DBSYNC_BLOCKFROST_KEY` |
-| `--database-url URL` | `postgresql://127.0.0.1:5432/db_sync_alt` | The database, as one loopback TCP URL (keep the password out of it) |
-| `--database-user NAME` | `db_sync_alt_owner` | The owner login |
-| `--database-password-file PATH` | | Read its password from a private file |
-| `--database-password` | | Without a value: hidden prompt. Environment alternative: `DBSYNC_DATABASE_PASSWORD` |
-| `--reader-role NAME` | `db_sync_alt_reader` | The reader login the Midnight node connects with |
-| `--reader-password-file PATH` | | Read its password from a private file (the service checks serving as this login) |
-| `--reader-password` | | Without a value: hidden prompt. Environment alternative: `DBSYNC_READER_PASSWORD` |
-| `--archive PATH`, `--manifest PATH` | | Initial data for an empty database: a snapshot or another db-sync-alt backup |
-| `--state-dir PATH` | `~/.local/share/db-sync-alt/native` | Private state; reuse it on every start |
-| `--http-port` | 18080 | Status port on loopback |
-| `--node-security-parameter K`, `--node-configuration-dir PATH` | | The Midnight node's k and network configuration directory, compared with the profile and reported in `warnings` ([node requirements](#node-requirements)) |
-| `--node-bridge-checkpoint block:N\|tx:HASH` | | The bridge's on-chain data checkpoint; `/health` fails while the bridge metadata coverage does not support it ([bridge readiness](connect-a-node.md#bridge-readiness)) |
+| `restoring` | A snapshot file is loaded into the empty database. The node gets SQLSTATE 55000 meanwhile. | `restoring_snapshot` |
+| `catching_up` | More final blocks are available: updates follow each other without a pause. | `starting`, `catching_up` |
+| `following` | The database holds every final block the provider has. One poll every `--poll-interval-seconds`. | `following` |
+| `waiting` | A condition that ends by itself, or a retry. | see below |
+| `stopped` | The service ended, or is not running. | `stop_requested`, the code that ended it, or `service_not_running` |
 
-For each secret, a file or prompt option wins over the environment variable,
-which wins over a value in the URL. Prefer files or prompts: values given on the
-command line end up in the process list and shell history. Errors print stable
-codes, never the secret or the connection details.
+Reasons of `waiting`:
 
-On an empty database without `--archive`/`--manifest`, an interactive run asks
-for the two paths. A database that is already ready is resumed, never restored
-over. An interrupted or incompatible database is refused; see
-[recovery](recovery.md).
+| `state_reason` | Meaning |
+| --- | --- |
+| `database_connecting` | The service is connecting to PostgreSQL. |
+| `database_unreachable` | PostgreSQL cannot be reached; retried with backoff. |
+| `quota_exhausted` | The provider answered 402: the key's daily allowance is spent. Waited out until 00:02 UTC of the next day ([provider](provider.md#refusals-and-outages)). |
+| `provider_rate_limited` | The provider answered 429. Waited out for the time the provider names. |
+| `provider_banned` | The provider answered 418. Waited out for the time the provider names, 1 to 24 hours. |
+| `epoch_parameters_pending` | The provider does not have the parameters of the next epoch yet. The update ends before that epoch's first block; asked again after 60 seconds. |
+| `target_contradicted` | The provider returned another block at the stored target's height. Read again after 60 seconds; a second contradiction closes the gate (`canonical_conflict`). |
+| `provider_chain_shorter` | The provider's chain is shorter than the stored tip, as after a provider-side rollback. Waited out. |
+| any other code | A failed step that is retried: a transport failure or 5xx of the provider (`provider_unavailable`, `provider_timeout`), an answer the follower refused (for example `transaction_count` or `cbor_body_hash_mismatch`), or a database condition. `wait_until` is the next attempt. |
 
-### The state directory
+A failed step writes nothing and is retried after 1, 2, 4, 8 and 16 seconds and
+then every 30 seconds. A database condition, a transport failure or a provider
+5xx that lasts longer than `--database-fatal-after-seconds` ends the service
+with exit status 75. An answer the follower refuses never ends the service: it
+is retried every 30 seconds, named in `state_reason`, `error_code` and
+`last_error`, and `/health` turns 503 once the database falls behind.
 
-It holds the copied Blockfrost key, the libpq service file and passfile of the
-owner and reader logins, the service configuration (`service.json`) and the
-Blockfrost request ledger (`accounting/`). Keep it, with mode `700`, and reuse
-it: db-sync-alt refuses changed identities, logins, passwords or ports against
-existing state, and a reader login that was dropped and created again. Do not
-edit `service.json`; the launch receipt binds it. Never delete the ledger to get
-past a quota.
+The database conditions that are retried: a lost connection, a server that is
+starting or stopping, too many connections and the other errors of SQLSTATE
+class 53 (for example a full disk), a lock timeout (55P03), a statement timeout
+(57014), a serialization failure (40001) and a deadlock (40P01). Any other
+database error ends the service at once with exit status 1, and its report
+names the server's message, table and constraint.
 
-## Initial data
-
-### From a snapshot or backup
-
-Give the archive and its manifest to `db-sync-alt run` (`--archive`,
-`--manifest`) on an empty database. Check the files first: compare their
-SHA-256 with the values published next to them (for the release snapshot,
-`sha256sum --check SHA256SUMS`). The manifest binds the archive's bytes; restore
-checks the profile, the identity and every generation before anything is served.
-`pg_restore` 17 must be on `PATH`. Restoring and verifying take a while on a
-large history.
-
-### Build initial data from your own db-sync
-
-An alternative that makes no Blockfrost requests. You need:
-
-- cardano-db-sync 13.7.1.0 (schema 15.48.6) or 13.8.0.0 (schema 16.52.6), for the same network (`meta.network_name`) with its full core history:
-  `tx_in` and epoch stake kept. It must be a different database from the
-  destination; db-sync-alt reads it in read-only transactions.
-- An empty PostgreSQL 17 destination, with a private libpq service entry for each
-  of the two databases (`PGSERVICEFILE`, `PGPASSFILE`).
-- A JSON file stating that the db-sync keeps the history db-sync-alt needs:
-
-  ```json
-  {"dbsync_version": "13.7.1.0", "tx_in_retained": true, "epoch_stake_retained": true, "operator_attested": true}
-  ```
-
-  For a 13.8.0.0 source, use `"dbsync_version": "13.8.0.0"` instead. It must
-  match actual schema 16.52.6. `meta.version` may name the older creating binary;
-  it is not the current source version. Check full-history settings, mode
-  markers and required history before attesting. Unsupported modes and
-  incomplete epochs refuse before publication.
-
-  This statement covers retained semantic history that schema inspection alone
-  cannot prove. The adapter checks its required fields and observable source
-  properties; unknown attestation fields are refused.
-
-The new generation records the network, the db-sync version and schema, the
-retention flags and an opaque fingerprint that binds the build to your source
-and destination databases (so an interrupted build never resumes from a
-different db-sync). It records no host name, cluster identifier, row ids or
-configuration details of your source.
-
-Then, with the service stopped:
+## /health
 
 ```sh
-db-sync-alt acquire --source db-sync --network preprod --create \
-  --destination-service db_sync_alt --source-service dbsync_readonly \
-  --source-attestation ~/.config/db-sync-alt/dbsync-attestation.json
-db-sync-alt upgrade --service db_sync_alt
+curl -i http://127.0.0.1:18080/health
 ```
 
-`--create` initialises the empty destination (never point it at a database in
-use); the two service names are your libpq entries. `--network` selects the
-packaged profile; `--profile-dir` may name a copy of it. `acquire` checks the
-source's schema, network, history and the confirmed anchors, selects the facts
-twice by independent queries, and publishes the first generation only if both
-agree. It picks the highest confirmed target unless `--target-height` is given,
-works in windows of `--window-blocks` (default 1,000) and checks free space
-(`--reserve PATH:BYTES`, BYTES a whole number of bytes, default
-`/:10737418240`, 10 GiB). `upgrade` turns the new schema-1
-database into schema 5 and builds the served tables. After that, `db-sync-alt
-run` with the same database resumes it and follows Blockfrost.
+`/health` answers 200 when all of these hold, and 503 otherwise:
 
-Measured on Preprod (a db-sync on the same machine, PostgreSQL 17 with 1 CPU and
-1 GiB, db-sync-alt with 1 CPU), building the 0.1.0 release snapshot: `acquire`
-up to block 5,366,232 (868,318 block headers) 17.8 minutes, of which about 5
-minutes reading the source; `upgrade` 1.1 minutes; `backup` 2.0 minutes,
-170 MB; `restore` with `--reader-role` into a new server 4.2 minutes and
-`verify` 1.7 minutes. The restored database is about 750 MB, 214 MB of it the
-served tables.
+- the gate is open;
+- the state is `following`;
+- the served target is at most `--health-max-lag-blocks` (default 9) behind the
+  provider's tip minus k;
+- the provider's tip was read less than 120 seconds ago;
+- the database part of the status was read less than 120 seconds ago;
+- the reader login has exactly the node's rights.
 
-### One update from Blockfrost
+The body is the `/status` document. Its `reason_codes` lists every condition
+that fails, each with its own code; the list is empty when the answer is 200.
 
-`db-sync-alt acquire --source blockfrost --network NAME --destination-service NAME
---target-height N` publishes one update of a ready database up to block `N`
-(at most 1,000 blocks above its target) and exits. The running service does this
-by itself; the command is for administration with the service stopped.
-
-## Status and stopping
-
-`GET /status` returns the full state (HTTP 200); `GET /health` returns 200 only
-when the lifecycle, PostgreSQL, the reader's serving check, the workers,
-freshness and lag are all within policy, otherwise 503 with reason codes
-([troubleshooting](troubleshooting.md)). After a restart, freshness is unknown
-until the first poll. Health requests never call the provider.
-
-`db-sync-alt status --service <name>` prints the same database facts offline,
-including `bridge` (the bridge metadata coverage start); add
-`--bridge-checkpoint block:<n>` or `tx:<hash>` to check the bridge's on-chain
-checkpoint against it ([bridge readiness](connect-a-node.md#bridge-readiness)).
-
-Stop the service before backups, upgrades and other administrative commands;
-they take the same writer lock and refuse to run next to it. Stopping the
-service does not stop serving: the node keeps reading the last published update
-from PostgreSQL, and only freshness falls behind.
-
-## Integrity checkpoints
-
-Every start verifies the database in full from its
-[integrity base](glossary.md#integrity-checkpoint): it recomputes the digests of
-all stored facts at the base, compares them with the base's checkpoint, and
-verifies every update published since the base. Once the start has verified the
-canonical generation, that generation becomes the new base, so the next start
-walks only what is published after it.
-
-While the service runs, it writes a checkpoint between publications every
-`integrity_checkpoint_interval_seconds` of the `sync` section in
-`service.json` (default 21,600, 6 hours; 600 to 604,800). It verifies the
-canonical generation in full and makes it the base; publication waits meanwhile
-(about 1.5 to 2 minutes on Preprod, a few blocks of lag) and `/status` shows
-`sync: checkpointing`. `/status` reports the base and when its checkpoint was
-written (`integrity`). A database whose base is still its first generation
-(right after a restore of the snapshot) has no checkpoint yet; the first one is
-written once a newer update is published and the interval has passed, or at the
-next start.
-
-Each verification statement whose work grows with the history runs under its
-own limit of one hour; every other statement of db-sync-alt keeps 30 seconds.
-One hour covers about 10 million rows per statement at 100 times the measured
-cost of these checks. The statements that sort or hash the whole history write
-temporary files while they run, for example about 440 bytes per block for the
-block-header check (375 MB for 890,000 blocks). Keep that much free space for
-PostgreSQL's temporary files, and do not set `temp_file_limit` below it. If
-PostgreSQL cancels a verification statement, db-sync-alt logs
-`verification_statement_canceled` with the statement's plan and its tables'
-estimated row counts before it stops.
-
-The served tables are written in ranges of block heights or ids, each in one
-statement under the 30-second limit. On a slow disk, or for very dense blocks or
-large datums, a range can take longer: db-sync-alt then rolls that statement
-back, logs `serve_range_split` with the table and the range, and writes the range
-as two halves, down to one block or one id. A publication whose new facts take
-longer than the limit in one statement (a long cardano-db-sync update) is
-written the same way, in the ranges that hold them, after a
-`serve_advance_ranged` log line. The rows are the same. Many such lines mean the
-disk is slower than the data needs.
-
-## Provider configuration
-
-`db-sync-alt run` configures the provider itself. The service reads these
-variables (the Compose deployment sets them):
-
-| Variable | Purpose |
+| Reason code | Condition that fails |
 | --- | --- |
-| `DBSYNC_PROVIDER_ADAPTER=portable` | Default: db-sync-alt's own client and request ledger |
-| `DBSYNC_PROVIDER_KEY_FILE` | Absolute path of the private key file |
-| `DBSYNC_PROVIDER_STATE` | Absolute directory of the request ledger |
-| `DBSYNC_PROVIDER_ADAPTER=shared` | Delegate requests and accounting to an external accounting client (not part of this repository) |
-| `DBSYNC_SHARED_ROOT`, `DBSYNC_SHARED_PROFILE` | Location of that client and its profile (default: the network name); its API host must be the network's |
+| `serving_unready` | The database has not served yet: empty, or restoring. |
+| `serving_revoked` | A check closed the gate ([a closed gate](#a-closed-gate)). |
+| `serving_unknown` | The database has not been read yet. |
+| `state_restoring` | The state is `restoring`. |
+| `state_catching_up` | The state is `catching_up`. |
+| `state_waiting` | The state is `waiting`. |
+| `state_stopped` | The state is `stopped`. |
+| `serving_block_lag_exceeded` | The served target is further behind than `--health-max-lag-blocks`. |
+| `serving_block_lag_unknown` | The provider's tip or the stored tip is not known yet. |
+| `provider_observation_stale` | The provider's tip was read too long ago. |
+| `provider_observation_unknown` | The provider's tip has not been read since the start. |
+| `database_observation_stale` | The database part of the status was read too long ago. |
+| `reader_check_failed` | The reader login has other rights than the node's, or lacks some ([PostgreSQL](postgresql.md#the-reader-login)). |
+| `reader_check_unknown` | The reader login has not been checked yet. |
 
-The portable client talks only to the Blockfrost HTTPS endpoint of the
-configured network, refuses a key whose prefix names another network, refuses
-redirects, reserves each attempt before sending it, keeps provider cooldowns,
-does not retry behind your back and refuses a corrupt ledger. All programs that
-use one key must share one ledger.
+`db-sync-alt health` asks `/health` and exits 0 on 200 and 1 otherwise, within
+3 seconds. The image's health check uses it.
 
-With either adapter, a request that fails in transport (a closed, reset or
-refused connection, an incomplete answer, a TLS or name-resolution failure, or
-a timeout) stays counted, and db-sync-alt sends it again after a wait
-(`provider_unavailable`, `provider_timeout`). The daily ceiling of the shared
-adapter is the limit its client reports for the profile, from 1 to 10,000,000
-requests; the built-in client's is 50,000.
+## /status
 
-### Requests in flight
+```sh
+curl -s http://127.0.0.1:18080/status
+```
 
-An update sends one Blockfrost request at a time by default. Two options of the
-`sync` section in `service.json` change that; the tip poll always sends one at a
-time.
+`/status` answers 200 in every state with one JSON document. It never calls the
+provider and never runs SQL: it answers from the last document the service
+composed. Times are Unix seconds unless stated. A position (`provider_head`,
+`stored_tip`, `served_target`, `horizon`) is an object with `height`, `hash`
+(lowercase hexadecimal) and `timestamp`. A field that is not known yet is
+`null`.
 
-| Option | Default | Values | Effect |
-| --- | --- | --- | --- |
-| `provider_concurrency` | 1 | 1 to 8 | Requests of an update in flight at once |
-| `provider_max_requests_per_hour` | absent: no pace of its own | 1 to 28,800 | The update's requests leave at least 3,600 / value seconds apart |
+| Field | Meaning |
+| --- | --- |
+| `service_version` | The version of db-sync-alt. |
+| `network` | `mainnet` or `preprod`. |
+| `node_release` | The Midnight node release the keep rule is bound to: `2.1.101`. |
+| `database_format` | The database format this version reads: `1`. |
+| `keep_rule_version` | The keep rule's version: `2`. |
+| `generated_at` | When the document was composed. |
+| `healthy` | Whether `/health` answers 200. |
+| `reason_codes` | Why `/health` answers 503 ([/health](#health)). |
+| `state` | `restoring`, `catching_up`, `following`, `waiting` or `stopped` ([states](#states)). |
+| `state_reason` | The reason of the state. |
+| `wait_until` | When the current wait or retry ends. |
+| `serving` | The gate: `ready` (open), `unready` (not served yet), `revoked` (closed by a check) or `unknown` (not read yet). |
+| `sync` | The follower's activity: `idle` (at the tip), `syncing` (catching up or restoring), `backoff` (retrying), `quota_wait` (waiting for the next UTC day), `halted` (stopped) or `unknown` (no follower runs). |
+| `error_code` | The condition that keeps the service from following: the reason of a `waiting` state, or of a `stopped` state other than a requested stop. |
+| `poll_error_code` | The provider's refusal (`quota_exhausted`, `provider_rate_limited`, `provider_banned`) while its wait lasts. |
+| `provider_head` | The provider's tip. |
+| `provider_observed_at` | When the provider's tip was read. |
+| `freshness` | `provider_observation_age_seconds`: seconds since the provider's tip was read. |
+| `stored_tip` | The newest stored header: the target plus k. |
+| `served_target` | The newest block whose events are served. |
+| `horizon` | The oldest block of the window. |
+| `lag` | How far the database is behind: the provider's tip minus the stored tip, in `blocks` and `seconds`. It equals how far the served target is behind the provider's tip minus k. |
+| `tip_lag` | The provider's tip minus the served target, in `blocks` and `seconds`; at the tip it is about k. |
+| `progress` | `blocks_remaining`, `blocks_per_hour` over the last 10 minutes, and `estimated_tip_at`, the expected time of reaching the tip. |
+| `last_update` | The last update: `at`, `duration_seconds`, `blocks` made final, `headers` stored, `events_written`, `rows_pruned`, and the `target` and `horizon` after it. |
+| `last_error` | The last error: `code`, `at` and `detail`, the full report. |
+| `retention` | `seconds`; `horizon_first_served_at`, when the horizon block was first served; `next_horizon_move_at`, the earliest time the horizon moves. |
+| `provider` | `utc_day`; `calls_today`; `calls_previous_days`, the seven UTC days before today with their `day` and `requests`; `pace_requests_per_second`; `requests_in_flight`; `last_refusal`, the provider's last 402, 418 or 429 with its `http_status`, `code`, `at` and `until`. |
+| `epochs` | `current_epoch`, the epoch of the stored tip; `newest_parameters_epoch`; `newest_stake_epoch`. |
+| `integrity` | `unspent_outputs`, as counted by the last supply check; `supply_check`, the last [supply check](#supply-check) with `at`, `passed`, `failure`, `supply` and `unspent_outputs`; `snapshot`, the last [daily snapshot file](#daily-snapshot-files) with `at`, `file`, `content_digest`, `target` and `bytes`; `unspent_at_profile_addresses`, the stored unspent outputs per profile address. |
+| `database` | `observed_at` and `observation_age_seconds` of the last read; `size_bytes`; `tls_available`, whether the server offers TLS; `reader_check`, with `role`, `passed`, `error`, `violations` and `warnings`; `index_rebuilds`, each index's size after its last rebuild. |
+| `identity` | The stored identity: `database_format`, `network`, `profile_hash`, `keep_rule_version`, `tool_version`, `node_release`, `origin` (where the data came from) and `created_at`. |
+| `position` | The stored position row: `serving`, `reason`, target, tip and horizon heights, hashes and times, `retention_seconds` and `updated_at`. |
+| `service_state` | The stored state row that the service writes on every state change and with every update: `state`, `reason`, `detail`, `last_update`, `last_error` and their times. |
+| `first_observations` | For each rare shape (`stored_pointer_address`, `stored_large_datum`, `stored_bridge_metadata`), the first one the follower stored on this database, with its block, transaction and the provider answers that held it; `null` until one is stored. |
+| `capabilities` | What the database serves to node 2.1.101's operator commands: registered-candidate results are `unsupported` ([limitations](limitations.md)). |
+| `limitations` | The [limitations](limitations.md), each with a `code` and a `description`. |
+| `unsupported_node_statements` | The node's SQL statements a pruned database does not answer completely: those of the node's genesis subcommands. |
+| `warnings` | Conditions that do not fail `/health`: `database_tls_unavailable`; the reader warnings `reader_statement_timeout_unset`, `reader_idle_in_transaction_timeout_unset`, `reader_search_path_not_public`, `reader_connection_limit_unset` and `reader_connection_limit_below_node_pool` ([PostgreSQL](postgresql.md#the-reader-login)); `status_read_failed:<code>` while the database part cannot be read; and `upkeep_failed:<job>:<code>` until an upkeep job succeeds again. |
+| `health` | The limits of `/health`: `max_lag_blocks`, `provider_observation_max_age_seconds` and `database_observation_max_age_seconds`. |
 
-Any other value stops the service at start with `invalid_sync_configuration`.
+`/status` and `/health` answer from memory: in a test, 1,000 requests in a row
+took 0.23 ms each on average and 1.03 ms at most, and the process's memory did
+not grow (2026-11-23, test build, one process in a 4-CPU container).
 
-With `provider_concurrency` above 1, an update still uses and checks the answers
-one by one, in the same order, and publishes the same data. Up to
-`provider_concurrency` − 1 requests whose paths it already knows go out ahead
-of their turn: the transaction pages of the blocks it sizes, the
-`/txs/{hash}/utxos` requests of the transactions a block's selection can take,
-the independent pass's pages and transactions, and the per-pool stake requests
-of an epoch. Each is counted, and the update's job attempt for it saved, before
-it is sent, under the same checks as any request (stop, wait, daily limit,
-cooldown, the update's budget). A request sent ahead that the update does not
-use stays counted and its answer is dropped: the pages of blocks after the last
-one that fits an update, a transaction the selection skips, and the requests
-after a failure, which are sent again after the wait. A stop abandons the
-requests in flight; they stay counted.
+## Status without the service
 
-The built-in client sends one request at a time whatever the setting: its
-ledger lock covers each whole request. With the shared adapter, requests overlap
-only if the external client lets several requests of one key be in flight.
+```sh
+db-sync-alt status --network mainnet --database '<connection string>' \
+  --password-file owner.password --reader db_sync_alt_reader
+```
 
-Each request in flight can hold an answer in memory. A `/txs/{hash}/utxos`
-answer is accepted up to 128 MiB, so leave the default on small containers.
+`status` prints the same document from the database alone, for example while
+the service is stopped. The fields only a running service knows (the
+provider's tip, the pace, the progress) are `null`, `healthy` is `false`, and
+`state` is `stopped`: with the stored reason when the service recorded a stop,
+otherwise `service_not_running`, because the command cannot tell whether a
+service runs. The stored row is printed as it is under `service_state`, with
+its time.
 
-To keep a whole day under the key's daily limit, set
-`provider_max_requests_per_hour` so that 24 times it, plus the day's polls
-(about 8,700 at the default 20-second poll), stays below the limit with room for
-the key's other users. Before starting an earlier release, remove both options:
-0.4.8 and earlier refuse them.
+## Logs
 
+Every line on standard error is one JSON object with an `event` field. Standard
+output carries only a command's result.
 
-### Older stores needing source ordinals
+- Every command logs `started` at its start and `finished` at its end, with
+  `outcome` (`success`, `difference`, `failed`, `temporary_failure`,
+  `interrupted` or `deadline_exceeded`), the exit status and
+  `duration_seconds`. A failure is reported on its own line before the end.
+- `run` logs `listening` with its address, `reader_checked` with the reader's
+  warnings, and `<operation>_started` and `<operation>_finished` around each
+  long operation: `restore`, `supply_check`, `index_rebuild`, `index_leftovers`
+  and `snapshot_file`, each end with its `outcome` and `seconds`.
+- While catching up, one `update` line at most every 10 seconds; each line
+  carries the update's report.
+- Conditions: `database_unreachable` and `database_reachable`,
+  `follower_retry` with the error and the time of the next attempt,
+  `follower_state` on a change of state, `gate_closed` with the check's report,
+  `retention_changed`, `status_read_failed` and `status_read_recovered`,
+  `stake_stored` and `stake_read_failed`, and `service_stopped` or
+  `follower_stopped` with the error that ended the run.
 
-When upgrading a store from before schema 3 whose ledger ordinals are absent,
-provide both `--source-service SOURCE` and
-`--source-attestation ATTESTATION.json`. The JSON has the same truthful
-version/retention fields as `acquire`. Ordinary upgrades whose ordinals already
-exist need neither option. Existing `upgrade --source-service SOURCE` commands
-must include the attestation; source schema, mode, type and version checks run
-before ordinal recovery. The same source options give the upgrade of a database
-of 0.3.x or earlier each stored epoch's `max_tx_size` without Blockfrost
-requests ([upgrade to schema 5](recovery.md#upgrade-to-schema-5)).
+No line holds a password, a provider key, a connection string or a provider
+URL.
+
+## Exit status
+
+Every command ends with one of these statuses. `db-sync-alt --help` prints the
+same list.
+
+| Status | Meaning |
+| --- | --- |
+| 0 | success |
+| 1 | the operation failed |
+| 2 | usage error: an invalid command line or flag value, found before any connection |
+| 3 | a check found a difference: compare did not match, or verify or grant-reader --check refused the database |
+| 75 | temporary failure: the database could not be reached or is restarting; the same command may succeed later |
+
+On SIGINT, SIGTERM or `--overall-timeout-seconds` a command cancels the
+statements of its own database sessions, removes its temporary files and
+exits with status 1. A command that changes the database reports
+`"published": false` when it stopped before the commit that publishes, and
+`"outcome": "unknown"` when that commit had been sent: run `status` and
+`verify` to see which state it reached.
+
+### Exit status of `run`
+
+| Status | Meaning |
+| --- | --- |
+| 0 | stopped by SIGINT or SIGTERM |
+| 1 | a condition that retrying cannot cure: a rejected provider key, a database of another network or format, a second writer, a retention that differs from the stored one, a reader with more rights than the node needs, an empty database without --snapshot, a closed gate found at start, or a check that closed it |
+| 2 | an invalid flag value, found before any connection |
+| 75 | the database stayed unreachable, or the provider's transport failed, for longer than --database-fatal-after-seconds |
+
+A provider answer of 5xx counts as a transport failure. A refusal that names
+its own end (402, 418, 429) never ends the service.
+
+## Stop and restart
+
+SIGINT or SIGTERM stops the service within 5 seconds: an update in progress is
+either committed or absent, never partly written. `docker stop` sends SIGTERM.
+The gate lives in the database, so the node keeps reading the last update
+while the service is stopped, and gets the same answers as before.
+
+## Upkeep
+
+The service keeps the database in shape by itself. No upkeep job holds the
+writer's transaction, and a failing job is logged, named in the `warnings` of
+`/status` and tried again at its next slot.
+
+### Supply check
+
+At start and every 6 hours, between two updates, the service compares the
+unspent amount of each fixed-supply asset (cNIGHT and the other fixed units of
+the profile) with the supply recorded in the database. The result is in
+`integrity.supply_check`. A difference closes the gate with `supply_mismatch`:
+see [a closed gate](#a-closed-gate). `restore`, `snapshot` and `verify` run the
+same comparison.
+
+### Index upkeep
+
+Deletes leave free space in the tables, which new rows reuse. Indexes on the
+positional IDs only grow at one end and keep sparse pages, so every hour the
+service looks at the index sizes and rebuilds the one index that is larger than
+twice its size after its last rebuild and larger than 8 MiB, with
+`REINDEX INDEX CONCURRENTLY` on a connection of its own. The node keeps
+reading meanwhile, and every index name the node checks exists at every
+moment. A rebuild interrupted by a stop leaves an invalid copy, which the next
+start removes. `database.index_rebuilds` shows each index's size after its last
+rebuild.
+
+In a test over thirty days of a generated chain (1,440 blocks a day, an update
+and a horizon advance every hour, a retention of one day, release build,
+2026-11-23), the database stayed at 1.234 times the size of a fresh restore of
+the same content, with no index rebuilt.
+
+### Daily snapshot files
+
+With `--snapshot-dir`, the service writes a snapshot file every day at
+`--snapshot-at` (UTC). The file is named
+`<network>-<target height>-<first 12 digits of the content digest>.snapshot`,
+written under a temporary name and then published. The newest
+`--snapshot-keep` files of the network are kept; older ones and leftovers of an
+interrupted write are removed. A failed write is tried again after 10 minutes
+without touching the older files. The last file is in `integrity.snapshot`.
+
+These files are the backups of a pruned database: a database cannot be rebuilt
+from the provider's history at a practical cost. Copy them off the host.
+Restoring one is described in [snapshots](snapshots.md#restore).
+
+## Change the retention
+
+The retention is stored in the database. `run` refuses a
+`--retention-seconds` that differs from it (`retention_mismatch`, exit status
+1), so a typo cannot delete a week of events. To change it, start once with
+both flags:
+
+```sh
+db-sync-alt run … --retention-seconds 172800 --change-retention
+```
+
+The new value is stored and logged (`retention_changed`). A smaller value
+moves the horizon at the next horizon advance, at most
+`--prune-interval-seconds` later. A larger value keeps more from then on: the
+horizon stays where it is until its block is older than the new retention.
+Events already deleted do not come back. The smallest value is 86,400 seconds
+(24 hours).
+
+## A closed gate
+
+Three checks close the gate when they find a fault. The node then gets
+SQLSTATE 55000 for every query instead of an answer, `serving` is `revoked`,
+and `state_reason` and `last_error` name the check:
+
+| Check | What it found |
+| --- | --- |
+| `canonical_conflict` | The provider contradicted the stored target twice, 60 seconds apart: a final block the database serves is not on the provider's chain. |
+| `asset_conservation` | In a transaction of a new block, the inputs the database holds plus the mint do not equal the outputs for a profile asset: the database misses an output. The report names the transaction and the unit. |
+| `supply_mismatch` | The unspent amount of a fixed-supply asset differs from the recorded supply. The report names the unit and both amounts. |
+
+The service stops, and refuses to start on that database
+(`database_not_serving`). Nothing in it is repaired in place. Recover by
+restoring a snapshot file into an empty database:
+
+1. Keep the closed database for diagnosis, or drop it.
+2. Create an empty database for the same owner
+   ([PostgreSQL](postgresql.md#the-database-and-its-logins)).
+3. Start `run` on it with `--snapshot` set to the newest daily file or a
+   published file, and `--expect-content-digest` set to its digest.
+4. Point the node at the new database if its name changed
+   ([connect a node](connect-a-node.md)).
+
+The restored database catches up from the file's target. Report the fault with
+the `last_error` of the closed database.
