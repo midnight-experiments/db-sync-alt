@@ -48,13 +48,13 @@ ID. A file from a followed database and a restore of that file give the same
 content digest at the same horizon, target and tip. The
 state digest covers the outputs spent before the horizon.
 
-Measured sizes, from conversions of the real databases with a pre-release
-build:
+Measured sizes of real files (2026-11-23, release builds):
 
-| File | Horizon | Target | Size |
-| --- | ---: | ---: | ---: |
-| Mainnet, converted 2026-11-21 | 14,130,822 | 14,160,893 | 32,877,530 bytes |
-| Preprod, converted 2026-11-22 | 5,414,627 | 5,441,843 | 1,516,541 bytes |
+| File | Size |
+| --- | ---: |
+| Mainnet, a 7-day window | 32.9 MB |
+| Mainnet, 24 days of blocks | 44.1 MB |
+| Preprod, a 7-day window | 1.5 to 1.6 MB |
 
 ## Restore
 
@@ -100,14 +100,17 @@ reports `"published": false` before its publishing commit was sent and
 `"outcome": "unknown"` after: run `status` and `verify` to see which state it
 reached.
 
-Measured restores, with the content digest equal to the recorded one each
-time. PostgreSQL 17 ran in a container with 4 CPUs, 4 GiB and NVMe writes
-capped at 48 MiB/s, on a 16-core x86-64 Linux host:
+Measured restores (2026-11-23, release builds), with the content digest equal
+to the recorded one each time. PostgreSQL 17 ran in a container with 4 CPUs,
+4 GiB and NVMe writes capped at 48 MiB/s, on a 16-core x86-64 Linux host:
 
-| File | Build | Date | Restore | Database after the restore |
-| --- | --- | --- | ---: | ---: |
-| Mainnet, target 14,160,893 | release, pre-release commit | 2026-11-23 | 19.9 s | 194 MB |
-| Preprod, target 5,397,924 | release, pre-release commit | 2026-11-23 | 0.70 s | 18 MB |
+| File | Restore |
+| --- | ---: |
+| Mainnet, a 7-day window, target 14,160,893 | 19.9 s |
+| Preprod, a 7-day window | 0.5 to 0.7 s |
+
+The database sizes after a restore are in
+[PostgreSQL](postgresql.md#size-and-connections).
 
 After a restore the database follows from the file's target: a file that is a
 day old costs a day of catching up ([provider](provider.md#catching-up)).
@@ -128,6 +131,9 @@ and removes its temporary files on any error. If the file was published but its
 directory could not be synced, the report is
 `snapshot_published_durability_uncertain` with `"published": true`: the file
 exists; do not write over it.
+
+Measured on 2026-11-23 with release builds: writing the Mainnet file of 24 days
+(44.1 MB) took 13.0 s, a Preprod file 0.4 s.
 
 ## Verify
 

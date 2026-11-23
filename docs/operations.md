@@ -32,7 +32,9 @@ At start the service:
    a read-only connection of its own, and runs the [upkeep](#upkeep).
 
 A restart does the same. It reads no history: it continues from the stored
-target, and the node keeps reading the last update meanwhile.
+target, and the node keeps reading the last update meanwhile. In a test on a
+185 MB database (2026-11-23, test build), a restart reached `following` in
+0.19 s.
 
 ## States
 
@@ -266,7 +268,8 @@ unspent amount of each fixed-supply asset (cNIGHT and the other fixed units of
 the profile) with the supply recorded in the database. The result is in
 `integrity.supply_check`. A difference closes the gate with `supply_mismatch`:
 see [a closed gate](#a-closed-gate). `restore`, `snapshot` and `verify` run the
-same comparison.
+same comparison. On Mainnet it took 1.1 s for 247,986 unspent outputs
+(2026-11-23, release build).
 
 ### Index upkeep
 

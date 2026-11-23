@@ -115,10 +115,18 @@ db-sync-alt's own connections use TLS too unless the connection string says
 
 ## Size and connections
 
-Measured database sizes, right after a restore of a converted file: Mainnet
-194 MB, Preprod 18 MB (2026-11-23). After following 43,919 Preprod blocks, the
-Preprod database measured 36 MB. Plan room for the daily snapshot files
-([snapshots](snapshots.md#what-a-file-contains)).
+Measured database sizes (2026-11-23, release builds, PostgreSQL 17 in a
+container):
+
+| Database | Mainnet | Preprod |
+| --- | --- | --- |
+| Right after restoring a file of a 7-day window | 194 MB | 18 MB |
+| While following | 376 MB, holding 25 days of blocks before its first pruning (tables 177 MB, indexes 174 MB) | 20 MB after following for three hours |
+
+The retention counts from when this database first served a block, so a
+database that catches up keeps every block it caught up for a whole retention
+before it prunes: plan room for that peak. Plan room for the daily snapshot
+files too ([snapshots](snapshots.md#what-a-file-contains)).
 
 `run` holds up to three connections as the owner login: one that writes, one
 that reads the status every 20 seconds, and one for the running upkeep job.

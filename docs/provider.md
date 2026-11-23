@@ -40,33 +40,37 @@ survive a restart.
 
 ## Catching up
 
-Measured on Preprod on 2026-11-23: a database restored from a real snapshot
-file followed 43,919 real blocks to the target of a later conversion.
+Measured on 2026-11-23: a database restored from a real snapshot file followed
+real blocks, on Preprod to the target of a database built later from the full
+history, on Mainnet to the tip.
 
-| Measure | Value |
-| --- | ---: |
-| Blocks | 43,919 |
-| Requests | 35,071 |
-| Requests per block | 0.80 |
-| Of them, transaction pages | 32,877 |
-| Of them, header requests | 891 |
-| Of them, pool requests (the stake of three epochs) | 1,178 |
-| Of them, epoch requests | 122 |
-| Time | 2 h 08 min |
-| Blocks per second | 5.7 |
-| Peak resident memory of the process | 42,064 KiB |
-| Processor time of the process | 39 s |
+| Measure | Preprod | Mainnet |
+| --- | ---: | ---: |
+| Blocks | 43,919 | about 75,000 |
+| Requests | 35,071 | 68,961 |
+| Requests per block | 0.80 | 0.92 |
+| Of them, transaction pages | 32,877 | — |
+| Of them, header requests | 891 | — |
+| Of them, pool requests (the stake of three epochs) | 1,178 | — |
+| Of them, epoch requests | 122 | — |
+| Time | 2 h 08 min | 4 h 30 min |
+| Requests per second | 5 | 4 to 5 |
+| Provider timeouts, retried | 2 | 6 |
+| Blocks per second | 5.7 | — |
+| Peak resident memory of the process | 42,064 KiB | 42 MB |
+| Processor time of the process | 39 s | — |
 
-Conditions: `--requests-per-second 5`, `--max-in-flight 4`, a release build of
-a pre-release commit, PostgreSQL 17 in a container with 4 CPUs and 4 GiB on
-NVMe storage. The four counts cover the follower's first run of 35,068
-requests; a final run for the last block sent 3 more. Two provider timeouts
-were retried. The range needed no datum, metadata or output request. The
-database then had the content digest of a database built from the full history
-at the same horizon, target and tip.
+Conditions: release builds, PostgreSQL 17 in a container with 4 CPUs and 4 GiB
+on NVMe storage; on Preprod `--max-in-flight 4`. A dash is a value that was not
+measured. On Preprod the four counts cover the follower's first run of 35,068
+requests; a final run for the last block sent 3 more. The range needed no
+datum, metadata or output request. The database then had the content digest of
+a database built from the full history at the same horizon, target and tip.
 
 At the tip the follower sends one request per poll and one page request per
-block with transactions, plus the epoch requests.
+block with transactions, plus the epoch requests. Measured on Preprod on
+2026-11-23: 498 requests in 2 h 08 min at the tip, which is 233 an hour or
+about 5,600 a day.
 
 ## Refusals and outages
 
