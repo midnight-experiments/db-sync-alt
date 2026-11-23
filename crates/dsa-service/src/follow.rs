@@ -1516,10 +1516,13 @@ impl<'a> Follower<'a> {
         let provider = self.provider.clone();
         let requests = self.requests.clone();
         let network = self.profile.network.clone();
-        let task =
-            tokio::spawn(
-                async move { epoch::read_stake(&provider, &requests, first, &network).await },
-            );
+        let waits = epoch::Waits {
+            time: Arc::clone(&self.time),
+            stop: self.stop.clone(),
+        };
+        let task = tokio::spawn(async move {
+            epoch::read_stake(&provider, &requests, &waits, first, &network).await
+        });
         self.stake.task = Some((first, task));
         StakeStatus::Busy
     }
