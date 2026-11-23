@@ -9,9 +9,12 @@ for the next day.
 
 ## The requests
 
-Every stored value comes from a block's transaction CBOR, whose hashes the
-follower checks; spends are matched to the outputs the database holds, without
-a request.
+Events come from a block's transaction CBOR, whose hashes the follower checks;
+spends are matched to the outputs the database holds, without a request. Block
+headers, epoch parameters and stake distributions are the provider's answers,
+checked for consistency: headers by their links, a stake distribution by its
+sum and by the epoch not moving during the read
+([limitations](limitations.md#one-provider)).
 
 | Request | When |
 | --- | --- |

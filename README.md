@@ -26,8 +26,10 @@ flowchart LR
     node["Midnight node"] -- "cardano-db-sync SQL<br/>(reader login)" --> postgres
 ```
 
-- **Never silently wrong.** Every stored value comes from transaction bytes
-  whose hashes are checked. While the database is not serving, the node's
+- **Never silently wrong.** Events come from transaction bytes whose hashes
+  are checked; block headers, epoch parameters and stake distributions are
+  the provider's answers, checked for consistency (links, sums, the epoch not
+  moving during the read). While the database is not serving, the node's
   queries fail with SQLSTATE 55000 instead of returning empty answers.
 - **Keeps serving.** The node reads the last update while db-sync-alt is
   stopped or restarting.
