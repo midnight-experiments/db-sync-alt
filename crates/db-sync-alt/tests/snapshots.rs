@@ -604,8 +604,7 @@ async fn snapshot_verify_named_corruptions() -> Result {
         client.batch_execute(&sql).await?;
         let result = db.cli_raw("verify", &f.profile.network, &[]).await?;
         assert!(!result.status.success(), "{expected}");
-        let lines = String::from_utf8(result.stderr)?;
-        let error: Value = serde_json::from_str(lines.lines().last().unwrap())?;
+        let error = last_error(&result);
         assert_eq!(error["error"], expected, "{sql}");
         if expected == "supply_mismatch" {
             // The mismatch names the unit and both amounts.

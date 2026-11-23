@@ -147,10 +147,15 @@ impl Database {
     }
 }
 
+/// The error report: the JSON line with an `error`, before the end line.
 fn refusal(output: &std::process::Output) -> Value {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    serde_json::from_str(stderr.lines().last().unwrap()).unwrap()
+    stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line.get("error").is_some())
+        .expect("an error report")
 }
 
 #[tokio::test]
