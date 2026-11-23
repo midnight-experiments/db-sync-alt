@@ -231,12 +231,15 @@ pub struct Built {
 pub struct Tx {
     inputs: Vec<Input>,
     collateral: Vec<Input>,
+    references: Vec<Input>,
     outputs: Vec<Output>,
     collateral_return: Option<Output>,
     fee: u64,
     mint: Vec<Token>,
     datums: Vec<Vec<u8>>,
+    witness_set: Option<Vec<u8>>,
     metadata: Vec<(u64, Vec<u8>)>,
+    auxiliary_data: Option<Vec<u8>>,
     valid: bool,
 }
 
@@ -251,12 +254,15 @@ impl Tx {
         Self {
             inputs: Vec::new(),
             collateral: Vec::new(),
+            references: Vec::new(),
             outputs: Vec::new(),
             collateral_return: None,
             fee: 170_000,
             mint: Vec::new(),
             datums: Vec::new(),
+            witness_set: None,
             metadata: Vec::new(),
+            auxiliary_data: None,
             valid: true,
         }
     }
@@ -271,6 +277,15 @@ impl Tx {
 
     pub fn collateral(mut self, hash: &str, index: u16) -> Self {
         self.collateral.push(Input {
+            hash: hash.to_owned(),
+            index,
+        });
+        self
+    }
+
+    /// A reference input (body key 18): read by scripts, never spent.
+    pub fn reference(mut self, hash: &str, index: u16) -> Self {
+        self.references.push(Input {
             hash: hash.to_owned(),
             index,
         });
@@ -304,9 +319,23 @@ impl Tx {
         self
     }
 
+    /// The whole witness set as its CBOR bytes, in place of the one built
+    /// from the witness datums.
+    pub fn witness_set(mut self, raw: Vec<u8>) -> Self {
+        self.witness_set = Some(raw);
+        self
+    }
+
     /// One auxiliary metadatum, as the CBOR bytes of its value.
     pub fn metadata(mut self, label: u64, value: Vec<u8>) -> Self {
         self.metadata.push((label, value));
+        self
+    }
+
+    /// The whole auxiliary data as its CBOR bytes, in place of the map built
+    /// from the metadata; the body binds its hash.
+    pub fn auxiliary_data(mut self, raw: Vec<u8>) -> Self {
+        self.auxiliary_data = Some(raw);
         self
     }
 
@@ -346,6 +375,9 @@ impl Tx {
         if let Some(output) = &self.collateral_return {
             field(16, &|out| output.encode(out));
         }
+        if !self.references.is_empty() {
+            field(18, &|out| inputs(out, &self.references));
+        }
         let mut body = Vec::new();
         head(&mut body, 5, fields.len() as u64);
         for (key, value) in fields {
@@ -356,6 +388,9 @@ impl Tx {
     }
 
     fn auxiliary(&self) -> Option<Vec<u8>> {
+        if let Some(raw) = &self.auxiliary_data {
+            return Some(raw.clone());
+        }
         if self.metadata.is_empty() {
             return None;
         }
@@ -373,7 +408,9 @@ impl Tx {
         let mut cbor = Vec::with_capacity(body.len() + 64);
         head(&mut cbor, 4, 4);
         cbor.extend_from_slice(&body);
-        if self.datums.is_empty() {
+        if let Some(raw) = &self.witness_set {
+            cbor.extend_from_slice(raw);
+        } else if self.datums.is_empty() {
             head(&mut cbor, 5, 0);
         } else {
             head(&mut cbor, 5, 1);
