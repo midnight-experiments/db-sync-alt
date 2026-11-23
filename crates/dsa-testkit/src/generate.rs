@@ -187,6 +187,8 @@ struct Draft {
     collateral_return: Option<Utxo>,
     witness: Vec<Vec<u8>>,
     ics_metadata: Option<Vec<u8>>,
+    /// Net mint per unit: a mint map holds each unit once.
+    mint: BTreeMap<Unit, i128>,
 }
 
 impl Draft {
@@ -198,6 +200,7 @@ impl Draft {
             collateral_return: None,
             witness: Vec::new(),
             ics_metadata: None,
+            mint: BTreeMap::new(),
         }
     }
 }
@@ -321,14 +324,7 @@ impl Generator<'_> {
     }
 
     fn mint(&mut self, draft: &mut Draft, unit: &Unit, quantity: i128) {
-        draft.tx = std::mem::take(&mut draft.tx).mint(&unit.0, &unit.1, quantity);
-        if self.eligible(unit) {
-            if quantity > 0 {
-                self.counts.mints += 1;
-            } else {
-                self.counts.burns += 1;
-            }
-        }
+        *draft.mint.entry(unit.clone()).or_default() += quantity;
     }
 
     /// Relevant plain outputs, optionally only those created in this block.
@@ -468,7 +464,7 @@ impl Generator<'_> {
             special: Special::Plain,
         });
         let unit = self.unit("auth");
-        draft.tx = std::mem::take(&mut draft.tx).mint(&unit.0, &unit.1, 5);
+        self.mint(draft, &unit, 5);
         let place = self.place();
         draft.collateral_return = Some(self.utxo(place, utxo.tokens));
     }
@@ -644,6 +640,19 @@ impl Generator<'_> {
     fn finish(&mut self, mut draft: Draft) -> Built {
         let invalid = draft.collateral_return.is_some();
         let mut tx = std::mem::take(&mut draft.tx);
+        for (unit, quantity) in std::mem::take(&mut draft.mint) {
+            if quantity == 0 {
+                continue;
+            }
+            tx = tx.mint(&unit.0, &unit.1, quantity);
+            if !invalid && self.eligible(&unit) {
+                if quantity > 0 {
+                    self.counts.mints += 1;
+                } else {
+                    self.counts.burns += 1;
+                }
+            }
+        }
         let mut ics = false;
         for utxo in &draft.outputs {
             tx = tx.output(self.output(utxo));

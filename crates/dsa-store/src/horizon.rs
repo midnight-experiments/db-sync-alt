@@ -113,14 +113,47 @@ pub async fn advance_horizon(
             &[&new],
         )
         .await?;
-    let selection = Selection::new(
+    let deleted = apply_keep(
+        transaction,
         profile,
         Bounds {
             horizon,
             target,
             tip,
         },
-    )?;
+    )
+    .await?;
+    transaction
+        .execute(
+            "DELETE FROM dsa.first_served WHERE height<$1",
+            &[&(horizon as i32)],
+        )
+        .await?;
+    transaction
+        .execute(
+            "UPDATE dsa.position p SET horizon_height=b.id,horizon_hash=b.hash,horizon_time=b.time AT TIME ZONE 'UTC',updated_at=now()
+             FROM serve.block b WHERE p.id=1 AND b.id=$1",
+            &[&new],
+        )
+        .await?;
+    Ok(Advance {
+        horizon,
+        deleted,
+        markers_added,
+    })
+}
+
+/// Deletes from every served table the rows the pruned form of the keep rule
+/// does not select at `bounds`, and the markers of deleted outputs. A whole
+/// store operation: the horizon advance runs it, and so does an update that
+/// brings the window's first spend, because the newest spend below the
+/// horizon is kept only while the window has none.
+pub(crate) async fn apply_keep(
+    transaction: &Transaction<'_>,
+    profile: &Profile,
+    bounds: Bounds,
+) -> Result<BTreeMap<String, u64>, Error> {
+    let selection = Selection::new(profile, bounds)?;
     // One statement: every keep set is evaluated once on the same snapshot.
     let deletes = NODE_RELATIONS
         .iter()
@@ -149,26 +182,9 @@ pub async fn advance_horizon(
             &[],
         )
         .await?;
-    transaction
-        .execute(
-            "DELETE FROM dsa.first_served WHERE height<$1",
-            &[&(horizon as i32)],
-        )
-        .await?;
-    transaction
-        .execute(
-            "UPDATE dsa.position p SET horizon_height=b.id,horizon_hash=b.hash,horizon_time=b.time AT TIME ZONE 'UTC',updated_at=now()
-             FROM serve.block b WHERE p.id=1 AND b.id=$1",
-            &[&new],
-        )
-        .await?;
-    Ok(Advance {
-        horizon,
-        deleted: NODE_RELATIONS
-            .iter()
-            .zip(counts)
-            .map(|(table, count)| (table.to_string(), count as u64))
-            .collect(),
-        markers_added,
-    })
+    Ok(NODE_RELATIONS
+        .iter()
+        .zip(counts)
+        .map(|(table, count)| (table.to_string(), count as u64))
+        .collect())
 }

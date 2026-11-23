@@ -138,10 +138,15 @@ pub struct UpdateReport {
     pub headers: u32,
     /// Rows inserted per table.
     pub inserted: BTreeMap<String, u64>,
-    /// Rows deleted per table: replaced headers and the horizon advance.
+    /// Rows deleted per table: replaced headers, the horizon advance and the
+    /// keep rule applied again at the same horizon.
     pub deleted: BTreeMap<String, u64>,
     pub insert_seconds: f64,
     pub advance_seconds: Option<f64>,
+    /// The update brought the window's first spend, so the keep rule was
+    /// applied again at the same horizon: the newest spend below the horizon
+    /// is kept only while the window holds none.
+    pub keep_reapplied_seconds: Option<f64>,
     /// Shapes recorded as a first observation by this update.
     pub observations_stored: Vec<String>,
     /// Candidates that could not be recorded; the update committed anyway.
@@ -465,7 +470,8 @@ const UPSERT_CALLS: &str =
     "INSERT INTO dsa.calls(day,requests) SELECT * FROM unnest($1::date[],$2::bigint[])
  ON CONFLICT(day) DO UPDATE SET requests=greatest(dsa.calls.requests,EXCLUDED.requests)";
 const INSERT_OBSERVATION: &str = "INSERT INTO dsa.first_observation(shape,block_height,transaction_hash,output_index,datum_hash,raw_datum_bytes,sources,answers)
- VALUES($1,$2::integer,$3,$4::smallint,$5,$6::integer,$7,$8) ON CONFLICT(shape) DO NOTHING";
+ VALUES($1::text,$2::integer,$3::bytea,$4::integer::smallint,$5::bytea,$6::integer,$7::text[],$8::bytea[])
+ ON CONFLICT(shape) DO NOTHING";
 const UPDATE_POSITION: &str = "UPDATE dsa.position p SET target_height=t.id,target_hash=t.hash,target_time=t.time AT TIME ZONE 'UTC',
  tip_height=e.id,tip_hash=e.hash,tip_time=e.time AT TIME ZONE 'UTC',updated_at=clock_timestamp()
  FROM serve.block t,serve.block e WHERE p.id=1 AND t.id=$1::bigint AND e.id=$2::bigint";
@@ -735,7 +741,7 @@ impl Store {
         let transaction = self.writer_transaction().await?;
         let row = transaction
             .query_one(
-                "SELECT EXISTS(SELECT 1 FROM serve.epoch_stake WHERE epoch_no=$1),
+                "SELECT EXISTS(SELECT 1 FROM serve.epoch_stake WHERE epoch_no=$1::integer),
                  (SELECT b.epoch_no::integer FROM dsa.position p JOIN serve.block b ON b.id=p.horizon_height WHERE p.id=1)",
                 &[&epoch],
             )
@@ -758,7 +764,7 @@ impl Store {
         transaction
             .execute(
                 "INSERT INTO serve.epoch_stake(id,pool_id,amount,epoch_no)
-                 SELECT nextval('dsa.epoch_stake_id_seq'),p.id,u.amount::numeric,$3
+                 SELECT nextval('dsa.epoch_stake_id_seq'),p.id,u.amount::numeric,$3::integer
                  FROM unnest($1::bytea[],$2::text[]) u(hash,amount) JOIN serve.pool_hash p ON p.hash_raw=u.hash",
                 &[&hashes, &amounts, &epoch],
             )
@@ -906,6 +912,20 @@ async fn apply(
         }
     }
 
+    // Whether the window already holds a spend; see `keep_reapplied_seconds`.
+    let window_spent = if columns.input.0.is_empty() || update.prune_to.is_some() {
+        true
+    } else {
+        steps
+            .query(
+                transaction,
+                "window_spend",
+                "SELECT EXISTS(SELECT 1 FROM serve.tx_in WHERE id BETWEEN $1::bigint*16777216 AND $2::bigint*16777216+16777215)",
+                &[&i64::from(horizon), &i64::from(update.target.height)],
+            )
+            .await?[0]
+            .get(0)
+    };
     let mut inserted = BTreeMap::new();
     let mut deleted = BTreeMap::new();
     if update.fork_point < update.tip.height {
@@ -1137,7 +1157,21 @@ async fn apply(
     }
     let insert_seconds = started.elapsed().as_secs_f64();
     let mut advance_seconds = None;
+    let mut keep_reapplied_seconds = None;
     let mut new_horizon = horizon;
+    if !window_spent {
+        let began = Instant::now();
+        let bounds = dsa_chain::keep::Bounds {
+            horizon,
+            target: shape.target,
+            tip: shape.tip,
+        };
+        for (table, rows) in horizon::apply_keep(transaction, profile, bounds).await? {
+            count(&mut deleted, &table, rows);
+        }
+        steps.step()?;
+        keep_reapplied_seconds = Some(began.elapsed().as_secs_f64());
+    }
     if let Some(target) = update.prune_to {
         let began = Instant::now();
         let Advance {
@@ -1163,6 +1197,7 @@ async fn apply(
         deleted,
         insert_seconds,
         advance_seconds,
+        keep_reapplied_seconds,
         observations_stored: stored,
         observation_failures: failures,
         statements: 0,

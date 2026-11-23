@@ -191,6 +191,11 @@ impl Database {
         }
     }
     pub(crate) async fn legacy(&self, f: &Fixture) -> Result {
+        self.legacy_rows(&f.rows(), f.bounds.target, f.bounds.tip)
+            .await
+    }
+    /// A ready schema-5 source holding `rows`, granted to the reader.
+    pub(crate) async fn legacy_rows(&self, rows: &Rows, target: u32, tip: u32) -> Result {
         let client = connect(&self.config).await?;
         for ddl in [
             include_str!("../../../../src/db_sync_alt/store/schema.sql"),
@@ -202,12 +207,44 @@ impl Database {
         ] {
             client.batch_execute(ddl).await?;
         }
-        client.batch_execute(&format!("INSERT INTO chain.generations VALUES(1,NULL,'ready','generated',0,0,{},{},'{{}}');INSERT INTO chain.service_state VALUES(1,'db-sync-alt',5,1,false,0,'importing');INSERT INTO chain.integrity_state(id,base_generation,revision,projection_generation,serve_generation) VALUES(1,1,0,1,1)",f.bounds.target,f.bounds.tip)).await?;
-        let rows = f.rows();
+        client.batch_execute(&format!("INSERT INTO chain.generations VALUES(1,NULL,'ready','generated',0,0,{target},{tip},'{{}}');INSERT INTO chain.service_state VALUES(1,'db-sync-alt',5,1,false,0,'importing');INSERT INTO chain.integrity_state(id,base_generation,revision,projection_generation,serve_generation) VALUES(1,1,0,1,1)")).await?;
         for table in TABLES {
             client.execute(&format!("INSERT INTO serve.{table} SELECT * FROM jsonb_populate_recordset(NULL::serve.{table},$1)"),&[&json!(rows[table])]).await?;
         }
         client.batch_execute(&format!("UPDATE chain.service_state SET migration_state='ready';REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA chain FROM PUBLIC;REVOKE ALL ON DATABASE {} FROM PUBLIC;GRANT CONNECT ON DATABASE {} TO {};GRANT USAGE ON SCHEMA public TO {};GRANT SELECT ON {} TO {};GRANT EXECUTE ON FUNCTION chain.gate() TO {}",self.name,self.name,self.reader,self.reader,TABLES.iter().map(|t|format!("public.{t}")).collect::<Vec<_>>().join(","),self.reader,self.reader)).await?;
+        Ok(())
+    }
+    /// Writes to a ready source as its writer does: deletes every served row
+    /// (`clear`) or the headers above `above`, then inserts `rows`.
+    pub(crate) async fn write_legacy(
+        &self,
+        clear: bool,
+        above: Option<u32>,
+        rows: &Rows,
+    ) -> Result {
+        let mut client = connect(&self.config).await?;
+        let transaction = client.transaction().await?;
+        transaction
+            .batch_execute(
+                "SELECT pg_advisory_xact_lock(36,1);SET LOCAL db_sync_alt.projection_write=on",
+            )
+            .await?;
+        if clear {
+            for table in TABLES {
+                transaction
+                    .batch_execute(&format!("DELETE FROM serve.{table}"))
+                    .await?;
+            }
+        }
+        if let Some(above) = above {
+            transaction
+                .execute("DELETE FROM serve.block WHERE id>$1", &[&i64::from(above)])
+                .await?;
+        }
+        for (table, values) in rows.iter().filter(|(_, values)| !values.is_empty()) {
+            transaction.execute(&format!("INSERT INTO serve.{table} SELECT * FROM jsonb_populate_recordset(NULL::serve.{table},$1)"),&[&json!(values)]).await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
     pub(crate) async fn rows(&self) -> Result<Rows> {
