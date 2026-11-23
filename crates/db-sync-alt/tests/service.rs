@@ -168,6 +168,25 @@ fn shape(document: &Value) -> BTreeSet<String> {
     keys
 }
 
+/// The JSON pointers of the string values that start with `\x`, the bytea
+/// text of PostgreSQL: every hash of the document is plain hexadecimal.
+fn bytea_text(value: &Value, at: &str, found: &mut Vec<String>) {
+    match value {
+        Value::String(text) if text.starts_with("\\x") => found.push(at.to_owned()),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                bytea_text(item, &format!("{at}/{index}"), found);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, item) in fields {
+                bytea_text(item, &format!("{at}/{key}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A follower at the stored tip whose provider tip was read `now`.
 fn at_tip(view: &dsa_store::service_view::DatabaseView, now: u64) -> FollowerView {
     let tip = view.tip.as_ref().unwrap();
@@ -260,6 +279,33 @@ async fn the_status_command_prints_the_document_of_a_stopped_service() -> Result
         "../../dsa-service/tests/status/service_not_running.json"
     ))?;
     assert_eq!(shape(&document), shape(&golden));
+    // Every hash is plain hexadecimal, the stored position's too.
+    let mut bytea = Vec::new();
+    bytea_text(&document, "", &mut bytea);
+    assert!(bytea.is_empty(), "bytea text at {bytea:?}: {document}");
+    let hex = |text: &Value| {
+        text.as_str().is_some_and(|text| {
+            text.len() == 64
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+    };
+    for key in ["target_hash", "tip_hash", "horizon_hash"] {
+        assert!(hex(&document["position"][key]), "{key}: {document}");
+    }
+    assert_eq!(
+        document["position"]["target_hash"],
+        document["served_target"]["hash"]
+    );
+    assert_eq!(
+        document["position"]["tip_hash"],
+        document["stored_tip"]["hash"]
+    );
+    assert_eq!(
+        document["position"]["horizon_hash"],
+        document["horizon"]["hash"]
+    );
     // The reader comes from DSA_READER too.
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
         .args([

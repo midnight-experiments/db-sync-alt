@@ -43,7 +43,8 @@ pub struct Identity {
     pub created_at: String,
 }
 
-/// The stored position row, as PostgreSQL renders it.
+/// The stored position row; hashes in lowercase hexadecimal, times as
+/// PostgreSQL renders them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredPosition {
     pub serving: bool,
