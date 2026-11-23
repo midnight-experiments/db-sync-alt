@@ -201,11 +201,12 @@ async fn fetch(
     }
     let provider = context.provider;
     let requests = context.requests;
-    let mut answers = futures_util::stream::iter(wanted.into_iter().map(|(index, hash, page)| {
-        requests.count("transactions");
-        async move { (index, provider.block_transactions(&hash, page).await) }
-    }))
-    .buffered(context.max_in_flight.max(1));
+    let mut answers =
+        futures_util::stream::iter(wanted.into_iter().map(|(index, hash, page)| async move {
+            requests.count("transactions");
+            (index, provider.block_transactions(&hash, page).await)
+        }))
+        .buffered(context.max_in_flight.max(1));
     let mut lists = Vec::new();
     let mut cbor = 0;
     for (index, header) in finals.iter().enumerate() {

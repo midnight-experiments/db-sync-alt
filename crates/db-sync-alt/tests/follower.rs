@@ -1024,13 +1024,18 @@ async fn the_follow_command_catches_up_stops_and_is_stopped() -> Result {
         )
         .await?
         .get(0);
-    let sent = report["requests"]
+    // The stored counts are the requests the client sent.
+    assert_eq!(Some(calls), report["sent"].as_i64());
+    let started = report["requests"]
         .as_object()
         .unwrap()
         .values()
         .map(|count| count.as_i64().unwrap())
         .sum::<i64>();
-    assert!(calls >= sent - 8, "calls {calls}, requests {sent}");
+    assert!(
+        started >= calls && started <= calls + 4 * 100,
+        "started {started}, sent {calls}"
+    );
 
     // SIGTERM during a run: it ends within 5 seconds, the store holds a
     // whole update, and a new run continues to the end.

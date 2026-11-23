@@ -166,8 +166,11 @@ pub struct Report {
     pub stopped: &'static str,
     pub position: Position,
     pub updates: u64,
-    /// Requests per endpoint family.
+    /// Requests started per endpoint family; a page requested ahead and
+    /// dropped when a batch ends at a limit is counted.
     pub requests: BTreeMap<String, u64>,
+    /// Requests the provider client sent during the run.
+    pub sent: i64,
     pub seconds: f64,
 }
 
@@ -313,6 +316,11 @@ async fn load(store: &Store, profile: &Profile) -> Result<Stored, Error> {
     })
 }
 
+/// Requests the client has counted, over the days it keeps.
+fn sent(provider: &Provider) -> i64 {
+    provider.counts().iter().map(|(_, count)| count).sum()
+}
+
 fn hash32(hash: &str) -> Result<Hash32, Error> {
     hash.parse()
         .map_err(|_| Error::answer("invalid_block_hash", json!({"hash":hash})))
@@ -395,6 +403,7 @@ struct Follower<'a> {
     last_counts: u64,
     last_update_log: Option<Instant>,
     updates: u64,
+    sent_before: i64,
     recorded: Option<(State, String)>,
     samples: VecDeque<(u64, u32)>,
     stake: Stake,
@@ -431,6 +440,7 @@ impl<'a> Follower<'a> {
         provider.seed_counts(&store.calls(since).await?);
         // Takes the writer lock: a second writer is refused here.
         store.record_calls(&provider.counts()).await?;
+        let sent_before = sent(&provider);
         let mut follower = Self {
             selection: Selection::new(profile),
             profile,
@@ -446,6 +456,7 @@ impl<'a> Follower<'a> {
             last_counts: now,
             last_update_log: None,
             updates: 0,
+            sent_before,
             recorded: None,
             samples: VecDeque::from([(now, stored.target.height)]),
             stored,
@@ -623,6 +634,7 @@ impl<'a> Follower<'a> {
             },
             updates: self.updates,
             requests: self.requests.get(),
+            sent: sent(&self.provider) - self.sent_before,
             seconds: started.elapsed().as_secs_f64(),
         })
     }
