@@ -69,6 +69,36 @@ def recorded_fixture_text(raw):
         json.loads(text)
     return '\n'.join(files.values())
 
+# Codes in the first column of these tables must exist as string literals in
+# the crates' sources, so that the page names no code the software lacks.
+TROUBLESHOOTING='docs/troubleshooting.md'
+
+def heading_anchors(text):
+    """GitHub's anchors of a Markdown file's headings, outside code fences."""
+    anchors=set();seen={};fenced=False
+    for line in text.split('\n'):
+        if line.lstrip().startswith('```'):fenced=not fenced;continue
+        match=None if fenced else re.match(r'(#{1,6})\s+(.*?)\s*$',line)
+        if not match:continue
+        slug=re.sub(r'[^\w\- ]','',match.group(2).lower()).replace(' ','-')
+        count=seen.get(slug,0);seen[slug]=count+1
+        anchors.add(slug if count==0 else f'{slug}-{count}')
+    return anchors
+
+def source_literals(root):
+    found=set()
+    for path in sorted((root/'crates').glob('*/src/**/*.rs')):
+        found.update(re.findall(r'"([a-z][a-z0-9_]*)"',path.read_text(errors='replace')))
+    return found
+
+def troubleshooting_errors(root):
+    page=root/TROUBLESHOOTING
+    if not page.exists():return []
+    known=source_literals(root)
+    codes=re.findall(r'^\| `([a-z][a-z0-9_]*)` \|',page.read_text(),re.MULTILINE)
+    if not codes:return [(TROUBLESHOOTING,'no_codes')]
+    return [(TROUBLESHOOTING,'unknown_code:'+code) for code in codes if code not in known]
+
 def check(root):
     errors=[]; hashes={}
     tracked=set()
@@ -113,11 +143,15 @@ def check(root):
             if matches:errors.append((str(rel),label))
         if p.suffix=='.md':
             for link in re.findall(r'\[[^\]]*\]\(([^)]+)\)',text):
-                target=link.split('#',1)[0]
-                if not target or re.match(r'[a-zA-Z][a-zA-Z0-9+.-]*:',target):continue
-                destination=(p.parent/target).resolve()
+                target,_,fragment=link.partition('#')
+                if re.match(r'[a-zA-Z][a-zA-Z0-9+.-]*:',target):continue
+                destination=(p.parent/target).resolve() if target else p.resolve()
                 if not destination.is_relative_to(root):errors.append((str(rel),'external_local_link'))
                 elif not destination.exists():errors.append((str(rel),'broken_link:'+target))
+                elif fragment and destination.suffix=='.md' and fragment not in heading_anchors(
+                        destination.read_text(errors='replace')):
+                    errors.append((str(rel),'broken_anchor:'+link))
+    errors+=troubleshooting_errors(root)
     try:
         profiles=sorted(p.parent for p in (root/'profiles').glob('*/source-manifest.json'))
         if not profiles:raise ValueError('no_profiles')
