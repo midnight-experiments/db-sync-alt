@@ -2,7 +2,7 @@ name: a7-capture-pages-tools
 on:
   push:
     branches: [00072-a7-capture-pagination]
-    paths: [crates/dsa-store/examples/a7_capture_pages.rs, .github/workflows/a7-capture-pages.yml]
+    paths: [crates/**, .github/workflows/a7-capture-pages.yml]
 permissions:
   contents: read
 jobs:
@@ -18,11 +18,16 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           rustup show active-toolchain
           cargo fmt --all
-          git diff -- crates/dsa-store/examples/a7_capture_pages.rs > "$RUNNER_TEMP/format.patch"
+          cp "$(rustup which rustfmt)" "$RUNNER_TEMP/rustfmt"
+          sha256sum "$RUNNER_TEMP/rustfmt" > "$RUNNER_TEMP/rustfmt.sha256"
+          git diff -- crates > "$RUNNER_TEMP/format.patch"
       - uses: actions/upload-artifact@v4
         with:
           name: native-capture-format-patch
-          path: ${{ runner.temp }}/format.patch
+          path: |
+            ${{ runner.temp }}/format.patch
+            ${{ runner.temp }}/rustfmt
+            ${{ runner.temp }}/rustfmt.sha256
           retention-days: 3
       - name: Require committed formatter output
         run: git diff --exit-code
@@ -34,8 +39,11 @@ jobs:
           cargo fmt --all -- --check
           cargo test --locked -p dsa-store --example a7_capture_pages
           CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --locked --release -p dsa-store --example a7_capture_pages
+          CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --locked --release -p db-sync-alt --bin db-sync-alt
           mkdir -p "$RUNNER_TEMP/tool"
           cp "$CARGO_TARGET_DIR/release/examples/a7_capture_pages" "$RUNNER_TEMP/tool/"
+          cp "$CARGO_TARGET_DIR/release/db-sync-alt" "$RUNNER_TEMP/tool/"
+          "$RUNNER_TEMP/tool/db-sync-alt" convert --help > "$RUNNER_TEMP/tool/convert-help.txt"
           "$RUNNER_TEMP/tool/a7_capture_pages" --self-test > "$RUNNER_TEMP/tool/self-test.json"
           rustc -Vv > "$RUNNER_TEMP/tool/rustc.txt"
           ldd "$RUNNER_TEMP/tool/a7_capture_pages" > "$RUNNER_TEMP/tool/ldd.txt"
@@ -43,7 +51,7 @@ jobs:
           git status --porcelain > "$RUNNER_TEMP/tool/source-status.txt"
           sha256sum crates/dsa-store/src/compare.rs > "$RUNNER_TEMP/tool/native-path.sha256"
           cd "$RUNNER_TEMP/tool"
-          sha256sum a7_capture_pages self-test.json rustc.txt ldd.txt source-head.txt source-status.txt native-path.sha256 > SHA256SUMS
+          sha256sum db-sync-alt convert-help.txt a7_capture_pages self-test.json rustc.txt ldd.txt source-head.txt source-status.txt native-path.sha256 > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: a7-native-capture-pages

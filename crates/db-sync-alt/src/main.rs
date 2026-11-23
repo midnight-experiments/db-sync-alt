@@ -70,6 +70,9 @@ struct CompareArguments {
     statement_timeout_seconds: Option<u32>,
     #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
     idle_transaction_timeout_seconds: Option<u32>,
+    /// Internal event scan chunks; literal query probe limits stay unchanged.
+    #[arg(long,value_parser=clap::value_parser!(i32).range(1..=10000))]
+    event_page_rows: Option<i32>,
     /// Scratch verification: repeat events with bounds0..i64::MAX.
     #[arg(long)]
     verify_unbounded: bool,
@@ -140,6 +143,9 @@ enum Command {
         /// Save literal source answers in the conversion's own RR snapshot.
         #[arg(long)]
         capture_source: Option<PathBuf>,
+        /// Internal chunks for the source observation; literal probes stay unchanged.
+        #[arg(long,requires="capture_source",value_parser=clap::value_parser!(i32).range(1..=10000))]
+        capture_event_page_rows: Option<i32>,
         #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
         overall_timeout_seconds: u32,
         /// Preserve the reader's limit unless explicitly overridden.
@@ -342,6 +348,7 @@ async fn database_command(
             batch_bytes,
             snapshot,
             capture_source,
+            capture_event_page_rows,
             source_statement_timeout_seconds,
             source_idle_transaction_timeout_seconds,
             ..
@@ -392,8 +399,12 @@ async fn database_command(
                     500,
                 )
                 .await?;
+                let capture_options = dsa_store::compare::Options {
+                    event_page_rows: *capture_event_page_rows,
+                    ..Default::default()
+                };
                 let captured =
-                    dsa_store::compare::capture(&tx, profile, &positions, &Default::default())
+                    dsa_store::compare::capture(&tx, profile, &positions, &capture_options)
                         .await?;
                 tx.commit().await?;
                 eprintln!(
@@ -542,6 +553,7 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
         let mut options = Options {
             check_chain_order: true,
             verify_unbounded: args.verify_unbounded,
+            event_page_rows: args.event_page_rows,
             missing_policy: Some(hex_bytes(&left.missing_policy, 28)?),
             missing_tx_hash: Some(hex_bytes(&left.missing_tx_hash, 32)?),
             candidate_address: left.candidate_address.clone(),
@@ -625,6 +637,7 @@ async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result
     };
     let mut options = Options {
         verify_unbounded: args.verify_unbounded,
+        event_page_rows: args.event_page_rows,
         missing_policy: Some(missing_policy),
         missing_tx_hash: Some(missing_tx_hash),
         ..Default::default()

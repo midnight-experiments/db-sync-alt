@@ -307,6 +307,8 @@ pub struct Options {
     pub verify_unbounded: bool,
     pub check_chain_order: bool,
     pub page_rows: i32,
+    /// Internal event scans only; literal one-shot probe limits remain page_rows.
+    pub event_page_rows: Option<i32>,
     pub max_rows: usize,
     pub max_bytes: usize,
     pub candidate_address: String,
@@ -320,6 +322,7 @@ impl Default for Options {
             verify_unbounded: false,
             check_chain_order: false,
             page_rows: 256,
+            event_page_rows: None,
             max_rows: 1_000_000,
             max_bytes: 512 * 1024 * 1024,
             candidate_address: "__untracked_candidates__".to_owned(),
@@ -1130,6 +1133,28 @@ struct Context {
     options: Options,
 }
 impl Context {
+    fn event_values(
+        &self,
+        s: &Statement,
+        low: IdBounds,
+        high: IdBounds,
+        pair: &Pair,
+        offset: i32,
+    ) -> Result<Vec<Bind>, Error> {
+        let mut values = self.values(s, true, low, high, pair, offset)?;
+        let limit = match s.name.as_str() {
+            "get_registrations" => 6,
+            "get_deregistrations" | "get_asset_creates" | "get_asset_spends" => 5,
+            _ => return Err(Error::Refusal("comparison_unclassified_event_query")),
+        };
+        match values.get_mut(limit) {
+            Some(Bind::I32(value)) => {
+                *value = self.options.event_page_rows.unwrap_or(self.options.page_rows);
+            }
+            _ => return Err(Error::Refusal("comparison_invalid_event_limit")),
+        }
+        Ok(values)
+    }
     fn id(&self, role: &str) -> Result<i64, Error> {
         self.units
             .get(role)
@@ -1430,9 +1455,12 @@ pub async fn capture(
 ) -> Result<Capture, Error> {
     tx.batch_execute("SET LOCAL search_path=public; SET LOCAL bytea_output=hex; SET LOCAL DateStyle=ISO; SET LOCAL TimeZone=UTC").await?;
     positions.validate()?;
-    if !(1..=10000).contains(&options.page_rows) {
+    if !(1..=10000).contains(&options.page_rows)
+        || options.event_page_rows.is_some_and(|n| !(1..=10000).contains(&n))
+    {
         return Err(Error::Refusal("invalid_comparison_page_size"));
     }
+    let event_page_rows = options.event_page_rows.unwrap_or(options.page_rows);
     let settings = preflight(tx).await?;
     let mut effective = options.clone();
     let missing = match &options.missing_policy {
@@ -1820,7 +1848,7 @@ pub async fn capture(
                 let mut page_bytes = 0usize;
                 let mut offset = 0;
                 loop {
-                    let mut values = context.values(s, true, low, high, pair, offset)?;
+                    let mut values = context.event_values(s, low, high, pair, offset)?;
                     if s.name.starts_with("get_asset_") {
                         values[0] = Bind::I64(context.id(role)?);
                     }
@@ -1836,20 +1864,19 @@ pub async fn capture(
                     let count = page.len();
                     page_bytes += page.iter().map(String::len).sum::<usize>();
                     pages.extend(page);
-                    if count < options.page_rows as usize {
+                    if count < event_page_rows as usize {
                         break;
                     }
                     offset = offset
-                        .checked_add(options.page_rows)
+                        .checked_add(event_page_rows)
                         .ok_or(Error::Refusal("comparison_page_limit"))?;
                 }
                 if options.verify_unbounded {
                     let mut compared = 0usize;
                     let mut offset = 0;
                     loop {
-                        let mut values = context.values(
+                        let mut values = context.event_values(
                             s,
-                            true,
                             IdBounds::full(false),
                             IdBounds::full(true),
                             pair,
@@ -1867,11 +1894,11 @@ pub async fn capture(
                             return Err(Error::Refusal("comparison_bounds_exclude_events"));
                         }
                         compared += count;
-                        if count < options.page_rows as usize {
+                        if count < event_page_rows as usize {
                             break;
                         }
                         offset = offset
-                            .checked_add(options.page_rows)
+                            .checked_add(event_page_rows)
                             .ok_or(Error::Refusal("comparison_page_limit"))?;
                     }
                     if compared != pages.len() {
@@ -2423,4 +2450,34 @@ mod tests {
         assert!(!ordered("SELECT array_agg(x ORDER BY y) FROM x"));
         assert!(!ordered("SELECT 'ORDER BY' FROM x"));
     }
+    #[test]
+    fn internal_event_chunks_preserve_literal_probe_limits_and_bounds() {
+        let positions = registered_capture().positions;
+        let time = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        let header = |height| Header { height, hash: vec![0; 32], epoch: 3, slot: i64::from(height), time };
+        let mut context = Context {
+            horizon: header(6), target: header(8), first_epoch: 1,
+            units: BTreeMap::from([("cnight".to_owned(),1),("auth".to_owned(),2)]),
+            profile: Profile::load("mainnet").unwrap(), positions: positions.clone(),
+            options: Options { event_page_rows: Some(4096), ..Default::default() },
+        };
+        let cat = catalogue::catalogue();
+        for s in cat.entries.iter().filter(|s| ["get_registrations","get_deregistrations","get_asset_creates","get_asset_spends"].contains(&s.name.as_str())) {
+            let limit = if s.name == "get_registrations" { 6 } else { 5 };
+            for (low, high) in [(IdBounds {tx:1,output:2,asset:3,input:4},IdBounds {tx:11,output:12,asset:13,input:14}),(IdBounds::full(false),IdBounds::full(true))] {
+                let probe = context.values(s,true,low,high,&positions.pairs[0],0).unwrap();
+                assert!(matches!(probe[limit],Bind::I32(256)));
+                let miss = context.values(s,false,low,high,&positions.pairs[0],0).unwrap();
+                assert!(matches!(miss[limit],Bind::I32(256)));
+                let mut wanted = probe;
+                wanted[limit] = Bind::I32(4096);wanted[limit+1] = Bind::I32(512);
+                let scan = context.event_values(s,low,high,&positions.pairs[0],512).unwrap();
+                assert_eq!(format!("{scan:?}"),format!("{wanted:?}"));
+            }
+        }
+        context.options.event_page_rows = None;context.options.page_rows = 1;
+        let s = cat.entries.iter().find(|s|s.name=="get_asset_creates").unwrap();
+        assert!(matches!(context.event_values(s,IdBounds::full(false),IdBounds::full(true),&positions.pairs[0],0).unwrap()[5],Bind::I32(1)));
+    }
+
 }

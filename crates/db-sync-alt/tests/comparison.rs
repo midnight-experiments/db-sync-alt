@@ -2096,3 +2096,59 @@ async fn compare_q19_compatible_b683_observation_without_reconversion() -> Resul
     target.cleanup().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL17"]
+async fn internal_event_chunks_keep_all_literal_probes_exact_and_bounded() -> Result {
+    for n in [512usize,769] {
+        let mut f = fixture(411);
+        let asset = f.asset_id("cnight");
+        let creates = f.chain.output_assets.values().filter(|a|a.asset==asset && (6..=8).contains(&f.chain.transactions[&f.chain.outputs[&a.output].transaction].block)).count();
+        for j in 0..n-creates { f.output(6,0,1000+j as u16,"other","cnight",None); }
+        let spends = f.chain.inputs.values().filter(|i|(6..=8).contains(&f.chain.transactions[&i.transaction].block) && f.chain.output_assets.values().any(|a|a.output==i.output&&a.asset==asset)).count();
+        for j in 0..n-spends { let out=f.output(5,0,2000+j as u16,"other","cnight",None);f.spend(8,0,1000+j as u16,out); }
+        f.reindex_ordinals();
+        let source = Database::new().await?;source.legacy(&f).await?;
+        let positions:Positions=serde_json::from_value(json!({"horizon":6,"target":8,"pairs":[{"cursor":{"block":6,"tx_index":0},"reference":{"block":8,"tx_index":4096}},{"cursor":{"block":6,"tx_index":0},"reference":{"block":6,"tx_index":0}}]}))?;
+        let mut reader=Reader::connect(source.reader_config(),None).await?;let tx=reader.snapshot().await?;
+        let options=Options{verify_unbounded:true,check_chain_order:true,..Default::default()};
+        let baseline=compare::capture(&tx,&f.profile,&positions,&options).await?;
+        for size in [512,4096] {
+            let changed=Options{event_page_rows:Some(size),..options.clone()};
+            let candidate=compare::capture(&tx,&f.profile,&positions,&changed).await?;
+            let report=compare::compare(&baseline,&candidate)?;assert!(report.matched);
+            assert_eq!(baseline.cases.keys().collect::<Vec<_>>(),candidate.cases.keys().collect::<Vec<_>>());
+            for (key,a) in &baseline.cases {let b=&candidate.cases[key];assert_eq!(a.rows,b.rows,"{key}");assert_eq!(a.label,b.label);assert_eq!(a.sql_sha256,b.sql_sha256);assert_eq!(a.ordered,b.ordered);}
+            for name in ["get_asset_creates","get_asset_spends"] {
+                let hit=candidate.cases.values().find(|c|c.label=="hit"&&c.query.starts_with(name)).unwrap();assert_eq!(hit.rows.len(),256,"one-shot literal probe changed");
+                let wide=candidate.cases.values().find(|c|c.label=="pair/0/cnight"&&c.query.starts_with(name)).unwrap();assert_eq!(wide.rows.len(),n);
+                let empty=candidate.cases.values().find(|c|c.label=="pair/1/cnight"&&c.query.starts_with(name)).unwrap();assert!(empty.rows.is_empty());
+            }
+            assert_eq!(baseline.executions-candidate.executions,4*((n/256+1)-(n/size as usize+1)),"full/partial/empty termination cost");
+            let total_rows=baseline.cases.values().map(|c|c.rows.len()).sum::<usize>();let total_bytes=baseline.cases.values().flat_map(|c|c.rows.iter()).map(String::len).sum::<usize>();
+            for limited in [Options{max_rows:total_rows-1,..changed.clone()},Options{max_bytes:total_bytes-1,..changed.clone()}] {
+                assert!(matches!(compare::capture(&tx,&f.profile,&positions,&limited).await,Err(dsa_store::Error::Refusal("comparison_capture_limit"))));
+            }
+        }
+        tx.commit().await?;
+        // The actual CLI must retain its literal probe limits too.
+        let dir=tempfile::tempdir()?;let path=dir.path().join("positions.json");std::fs::write(&path,serde_json::to_vec(&positions)?)?;
+        let out=Command::new(env!("CARGO_BIN_EXE_db-sync-alt")).args(["compare","--a",&source.dsn(true),"--b",&source.dsn(true),"--network",&f.profile.network,"--positions",path.to_str().unwrap(),"--event-page-rows","4096","--verify-unbounded"]).output().await?;
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let r:Value=serde_json::from_slice(&out.stdout)?;assert_eq!(r["matched"],true);
+        for (key,count)in r["probe_rows"].as_object().unwrap(){if key.ends_with("/hit")&&(key.starts_with("get_asset_creates")||key.starts_with("get_asset_spends")){assert_eq!(*count,json!([256,256]));}}
+        if n==512 {let target=Database::new().await?;let file=dir.path().join("source.json");let v=target.cli("convert",&f.profile.network,&["--source",&source.dsn(true),"--horizon-block","6","--capture-source",file.to_str().unwrap(),"--capture-event-page-rows","4096"]).await?;assert!(v.get("verified").is_some()&&file.exists());target.cleanup().await?;}
+        drop(reader);source.cleanup().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_page_cli_bounds_and_capture_dependency_refuse_before_connect() -> Result {
+    for command in ["compare","convert"] {
+        for value in ["0","10001","-1"] {
+            let mut args=if command=="compare" {vec!["compare","--a","host=remote.invalid","--b","host=remote.invalid","--network","mainnet","--event-page-rows"]}else{vec!["convert","--database","host=remote.invalid","--source","host=remote.invalid","--network","mainnet","--capture-source","unused.json","--capture-event-page-rows"]};args.push(value);
+            let out=Command::new(env!("CARGO_BIN_EXE_db-sync-alt")).args(args).output().await?;assert_eq!(out.status.code(),Some(2));
+        }
+    }
+    let out=Command::new(env!("CARGO_BIN_EXE_db-sync-alt")).args(["convert","--database","host=remote.invalid","--source","host=remote.invalid","--network","mainnet","--capture-event-page-rows","4096"]).output().await?;assert_eq!(out.status.code(),Some(2));assert!(String::from_utf8_lossy(&out.stderr).contains("--capture-source"));Ok(())
+}
