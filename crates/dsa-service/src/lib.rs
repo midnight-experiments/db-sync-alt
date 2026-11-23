@@ -2,6 +2,7 @@
 //! status and HTTP.
 
 pub mod block;
+pub mod config;
 pub mod epoch;
 pub mod follow;
 pub mod http;

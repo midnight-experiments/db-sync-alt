@@ -2,6 +2,7 @@
 //! command to the store through the wrapper of `wrapper.rs`.
 
 mod follow_arguments;
+mod service_arguments;
 mod wrapper;
 
 use std::{
