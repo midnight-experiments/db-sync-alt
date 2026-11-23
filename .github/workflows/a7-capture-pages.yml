@@ -1,0 +1,51 @@
+name: a7-capture-pages-tools
+on:
+  push:
+    branches: [00072-a7-capture-pagination]
+    paths: [crates/dsa-store/examples/a7_capture_pages.rs, .github/workflows/a7-capture-pages.yml]
+permissions:
+  contents: read
+jobs:
+  tools:
+    runs-on: ubuntu-24.04
+    container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - name: Format candidate and preserve exact patch
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rustup show active-toolchain
+          cargo fmt --all
+          git diff -- crates/dsa-store/examples/a7_capture_pages.rs > format.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-capture-format-patch
+          path: format.patch
+          retention-days: 3
+      - name: Require committed formatter output
+        run: git diff --exit-code
+      - name: Build and qualify isolated native measurement tool
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          export DSA_BENCH_SOURCE_SHA="$(git rev-parse HEAD)"
+          cargo fmt --all -- --check
+          cargo test --locked -p dsa-store --example a7_capture_pages
+          CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --locked --release -p dsa-store --example a7_capture_pages
+          mkdir -p tool
+          cp "$CARGO_TARGET_DIR/release/examples/a7_capture_pages" tool/
+          tool/a7_capture_pages --self-test > tool/self-test.json
+          rustc -Vv > tool/rustc.txt
+          ldd tool/a7_capture_pages > tool/ldd.txt
+          git rev-parse HEAD > tool/source-head.txt
+          git status --porcelain > tool/source-status.txt
+          sha256sum crates/dsa-store/src/compare.rs > tool/native-path.sha256
+          cd tool
+          sha256sum a7_capture_pages self-test.json rustc.txt ldd.txt source-head.txt source-status.txt native-path.sha256 > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a7-native-capture-pages
+          path: tool
+          retention-days: 3
