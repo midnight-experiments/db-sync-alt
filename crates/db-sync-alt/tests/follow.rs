@@ -921,9 +921,12 @@ async fn costed(setup: &mut Setup, plan: &Plan) -> Result<Costs> {
     Ok(costs)
 }
 
-/// Test 6: every statement of an update and the held-output lookup use
-/// indexes and read no more buffers when the store holds ten times more rows
-/// outside the update; the horizon advance is timed on a Mainnet-size store.
+/// Every statement of an update and the held-output lookup use indexes, and
+/// their buffer count does not follow the size of the store: with ten times
+/// more rows outside the update an index can be one level deeper and a page
+/// can split, which costs a few buffers per row, while a statement that read
+/// the other rows would cost ten times more. The horizon advance is timed on
+/// a Mainnet-size store.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn update_cost_is_bounded_by_the_update() -> Result {
@@ -958,7 +961,7 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
                 "step {step} {label}: sequential scans {scans:?}"
             );
             assert!(
-                *large_buffers <= small_buffers * 3 / 2 + 16,
+                *large_buffers <= small_buffers * 2 + 32,
                 "step {step} {label}: {small_buffers} buffers grew to {large_buffers}: small {} large {}",
                 serde_json::to_string(&small_plans)?,
                 serde_json::to_string(large_plans)?
