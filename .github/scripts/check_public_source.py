@@ -10,11 +10,10 @@ import re
 import sys
 import subprocess
 
-ROOT_FILES = {'README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','CONTRIBUTING.md',
+ROOT_FILES = {'README.md','LICENSE','NOTICE','THIRD_PARTY_NOTICES.md','THIRD_PARTY_LICENSES.txt','CONTRIBUTING.md',
               'SECURITY.md','CHANGELOG.md','CODE_OF_CONDUCT.md','.gitignore','.dockerignore',
-              'pyproject.toml','requirements.lock','.env.example',
-              'Cargo.toml','Cargo.lock','rust-toolchain.toml'}
-ROOT_DIRS = {'src','tests','profiles','reference','deploy','tools','docs','.github','crates'}
+              '.env.example','Cargo.toml','Cargo.lock','rust-toolchain.toml'}
+ROOT_DIRS = {'profiles','reference','deploy','tools','docs','.github','crates'}
 PATTERNS = {
     'personal_absolute_path': re.compile(r'/(?:home|Users|media)/[A-Za-z0-9_.-]+/'),
     'private_key': re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'),
@@ -42,13 +41,6 @@ NODE_CONNECTION_EXAMPLE = 'postgresql://db_sync_alt_reader:<password>@<host>:543
 REDACTION_FIXTURES = {
     'README.md': {NODE_CONNECTION_EXAMPLE},
     'docs/connect-a-node.md': {NODE_CONNECTION_EXAMPLE},
-    'tests/unit/test_cli_run.py': {'postgres://urluser:urlpassword@127.0.0.1:5432/test',
-                                      'postgres://u:p@127.0.0.1/test'},
-    'tests/unit/test_sync_diagnostics.py': {'postgres://user:secret@private/key'},
-    'tests/unit/test_service.py': {'postgres://alice:do-not-print@private-secret-directory'},
-    'tests/fixtures/service.py': {'postgres://username:secret@private-directory'},
-    'tests/unit/test_health.py': {'postgres://alice:password@private.example/secret-directory',
-                              'postgres://alice:secret@hostname/private-directory'},
     # Upstream unit-test constant in the pinned (hash-checked) node source.
     'reference/node/src/main_chain_follower.rs': {'postgres://user:pass@localhost:5432/testdb'},
 }
@@ -76,6 +68,36 @@ def recorded_fixture_text(raw):
             raise ValueError('fixture_member_hash')
         json.loads(text)
     return '\n'.join(files.values())
+
+# Codes in the first column of these tables must exist as string literals in
+# the crates' sources, so that the page names no code the software lacks.
+TROUBLESHOOTING='docs/troubleshooting.md'
+
+def heading_anchors(text):
+    """GitHub's anchors of a Markdown file's headings, outside code fences."""
+    anchors=set();seen={};fenced=False
+    for line in text.split('\n'):
+        if line.lstrip().startswith('```'):fenced=not fenced;continue
+        match=None if fenced else re.match(r'(#{1,6})\s+(.*?)\s*$',line)
+        if not match:continue
+        slug=re.sub(r'[^\w\- ]','',match.group(2).lower()).replace(' ','-')
+        count=seen.get(slug,0);seen[slug]=count+1
+        anchors.add(slug if count==0 else f'{slug}-{count}')
+    return anchors
+
+def source_literals(root):
+    found=set()
+    for path in sorted((root/'crates').glob('*/src/**/*.rs')):
+        found.update(re.findall(r'"([a-z][a-z0-9_]*)"',path.read_text(errors='replace')))
+    return found
+
+def troubleshooting_errors(root):
+    page=root/TROUBLESHOOTING
+    if not page.exists():return []
+    known=source_literals(root)
+    codes=re.findall(r'^\| `([a-z][a-z0-9_]*)` \|',page.read_text(),re.MULTILINE)
+    if not codes:return [(TROUBLESHOOTING,'no_codes')]
+    return [(TROUBLESHOOTING,'unknown_code:'+code) for code in codes if code not in known]
 
 def check(root):
     errors=[]; hashes={}
@@ -121,11 +143,15 @@ def check(root):
             if matches:errors.append((str(rel),label))
         if p.suffix=='.md':
             for link in re.findall(r'\[[^\]]*\]\(([^)]+)\)',text):
-                target=link.split('#',1)[0]
-                if not target or re.match(r'[a-zA-Z][a-zA-Z0-9+.-]*:',target):continue
-                destination=(p.parent/target).resolve()
+                target,_,fragment=link.partition('#')
+                if re.match(r'[a-zA-Z][a-zA-Z0-9+.-]*:',target):continue
+                destination=(p.parent/target).resolve() if target else p.resolve()
                 if not destination.is_relative_to(root):errors.append((str(rel),'external_local_link'))
                 elif not destination.exists():errors.append((str(rel),'broken_link:'+target))
+                elif fragment and destination.suffix=='.md' and fragment not in heading_anchors(
+                        destination.read_text(errors='replace')):
+                    errors.append((str(rel),'broken_anchor:'+link))
+    errors+=troubleshooting_errors(root)
     try:
         profiles=sorted(p.parent for p in (root/'profiles').glob('*/source-manifest.json'))
         if not profiles:raise ValueError('no_profiles')

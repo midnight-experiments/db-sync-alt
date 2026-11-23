@@ -61,4 +61,28 @@ class CompressedFixtureChecks(unittest.TestCase):
         raw=gzip.compress(b' '*(64*1024*1024+1),mtime=0)
         with self.assertRaises(ValueError):checker.recorded_fixture_text(raw)
 
+class DocumentationChecks(unittest.TestCase):
+    def errors(self,files):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name,text in files.items():
+                (root/name).parent.mkdir(parents=True,exist_ok=True);(root/name).write_text(text)
+            errors,_=checker.check(root)
+        return sorted(code for name,code in errors if name.startswith('docs/'))
+
+    def test_a_link_to_a_missing_heading_is_refused(self):
+        page='# Page\n\n## The `run` command\n\n```sh\n# Not a heading\n```\n'
+        self.assertEqual(self.errors({'docs/a.md':page,'docs/b.md':'[x](a.md#the-run-command) [y](#here)\n\n## Here\n'}),[])
+        self.assertEqual(self.errors({'docs/a.md':page,'docs/b.md':'[x](a.md#not-a-heading)\n'}),
+                         ['broken_anchor:a.md#not-a-heading'])
+        self.assertEqual(self.errors({'docs/b.md':'[y](#elsewhere)\n'}),['broken_anchor:#elsewhere'])
+
+    def test_every_troubleshooting_code_exists_in_the_sources(self):
+        source={'crates/x/src/lib.rs':'const A: &str = "known_code";\n'}
+        page='| Code | Cause |\n| --- | --- |\n| `known_code` | x |\n'
+        self.assertEqual(self.errors({**source,checker.TROUBLESHOOTING:page}),[])
+        self.assertEqual(self.errors({**source,checker.TROUBLESHOOTING:page+'| `invented_code` | y |\n'}),
+                         ['unknown_code:invented_code'])
+        self.assertEqual(self.errors({**source,checker.TROUBLESHOOTING:'No table.\n'}),['no_codes'])
+
 if __name__=='__main__':unittest.main()

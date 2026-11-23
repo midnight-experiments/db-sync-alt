@@ -1,94 +1,86 @@
 # Limitations
 
-- **One query set; one fully qualified network.** The SQL queries of Midnight
-  node 2.1.101 only. Cardano Mainnet, Preprod and Preview have network profiles.
-  Preprod has been built, followed, served to a Midnight node and checked
-  against cardano-db-sync end to end. A Mainnet database built from a real
-  Mainnet cardano-db-sync is followed through Blockfrost. An archive Midnight
-  node 2.1.101, started from an official Midnight Mainnet snapshot and reading
-  its Cardano data only from this database, followed the chain to the tip and
-  held it in a 60-minute check: not syncing, with its finalized block at the
-  same height and hash as on Midnight's public Mainnet RPC. Preview is tested on
-  synthetic data only ([networks](networks.md)). Other networks have no profile
-  and are refused.
-- **Node configuration must match the profile.** The node's
-  `CARDANO_SECURITY_PARAMETER` must equal the profile's k, and its Cardano
-  addresses and policies must be the profile's. db-sync-alt cannot see the
-  node's settings: a mismatch gives the node empty answers. Given the node's
-  values, the service reports a mismatch as a warning
-  ([node requirements](connect-a-node.md#node-requirements)); it cannot see
-  on-chain governance changes of those addresses.
-- **Not a db-sync replacement.** db-sync-alt keeps only the Cardano data the
-  profile selects in the relations the pinned Midnight queries read. Other
-  assets or addresses and ranges outside the [coverage](glossary.md#coverage)
-  are not held; the reader login can read nothing else. A phase-2-invalid
-  transaction is held as cardano-db-sync holds it: its collateral inputs and
-  collateral return, with `valid_contract` false.
-- **No candidate registrations.** The node's registration queries for
-  operators, the RPC methods `sidechain_getRegistrations`,
-  `sidechain_getAriadneParameters` and `systemParameters_getAriadneParameters`
-  and the `registration-status` and `ariadne-parameters` subcommands, return no
-  registrations. They fail instead when an output at the registered-candidates
-  address carries one of the profile's assets and its transaction spends no
-  output db-sync-alt holds. Committee selection in midnight-node 2.1.101 does
-  not read registrations
-  ([registered candidates](connect-a-node.md#registered-candidates)). Serving
-  them as cardano-db-sync does is future work.
-- **No genesis subcommands of the node.** `generate-ics-genesis`,
-  `generate-reserve-genesis`, `generate-genesis-config`,
-  `verify-cardano-tip-finalized` and the `verify-*-auth-script` commands read
-  headers and unspent outputs at a reference block. Below the horizon a pruned
-  database answers them incompletely and without an error. Run them against a
-  cardano-db-sync database; `db-sync-alt status` lists the statements under
-  `unsupported_node_statements`.
-- **Bridge data from the coverage start only.** The token bridge's metadata is
-  stored forward only, from the first update acquired from Blockfrost after the
-  newest update without it (a cardano-db-sync bootstrap or catch-up, or an
-  upgrade from 0.3.x); nothing older is fetched.
-  A bridge checkpoint older than the coverage start, or a checkpoint transaction
-  outside the profile's addresses and assets, is reported as unsupported
-  ([bridge readiness](connect-a-node.md#bridge-readiness)). Large integers in
-  metadata are stored as Blockfrost returns them (rounded beyond 2^53), not as
-  cardano-db-sync stores them; the node's reading of a recipient is the same.
-  ICS and reserve outputs stored before the coverage start hold only the
-  profile's assets: the bridge token of every packaged profile is one of them,
-  but if governance named a token outside the profile, a covered spend of such
-  an older output would be counted without it.
-- **Deeply nested provider answers.** Arrays and objects nested deeper than
-  4,000 levels are cut from a Blockfrost answer instead of failing the request:
-  by db-sync-alt's own client, and by the external accounting client of
-  `DBSYNC_PROVIDER_ADAPTER=shared`, whose `json.loads` db-sync-alt replaces with
-  the same bounded decoder. Bridge metadata that deep is stored as NULL, as
-  cardano-db-sync stores nesting beyond 2,000. An external client that decodes
-  answers without the standard `json` module's `loads` keeps its own limits.
-- **Datums db-sync-alt cannot see.** A datum row is added when db-sync-alt reads
-  a transaction that carries the preimage: the output's own transaction or a
-  spend of it. cardano-db-sync also adds the row when the preimage appears only in
-  an unrelated transaction while the output is unspent; db-sync-alt does not.
-  The node reads such rows only for registration, governance and D-parameter
-  outputs, which carry tokens only their minting policies create. Through
-  Blockfrost, a datum hash that matches only some redeemer's data also gets a
-  row (Blockfrost answers both kinds), and a preimage already on chain when the
-  output is read is stored with it. From a cardano-db-sync source, datums are
-  copied as that source stores them.
-- **PostgreSQL 17 only**, server and client tools.
-- **Initial data is required.** An empty database is filled from a snapshot or
-  backup, or from your own db-sync; a Blockfrost key alone cannot fill it.
-- **Polling is a target, not a promise.** The 20-second tip poll can be delayed
-  by provider rate limits, the request ceiling and local load. A provider pause
-  makes `/health` stale without losing the coverage already served; `/status`
-  stays 200 while `/health` is 503.
-- **Verification costs time.** Startup, backups and `db-sync-alt verify` read
-  every stored fact once and the updates published since the last integrity
-  checkpoint; their time grows with the amount of stored data. The periodic
-  checkpoint pauses publication for that long every 6 hours by default. Backups
-  need the writer lock, so the service must be stopped.
-- **TLS is your PostgreSQL server's.** db-sync-alt's launcher connects over
-  loopback without TLS. midnight-node 2.1.101 connects only over TLS, so the
-  server must offer it ([TLS](connect-a-node.md#tls)); the Compose deployment's
-  bundled server starts without it.
-- **Growing history.** Every update adds its receipts and block membership to
-  the database; there is no pruning yet ([costs](costs.md#disk)).
-- **What the tests cover.** The test suite uses synthetic data and disposable
-  PostgreSQL; it does not run a live Blockfrost key, a real Midnight node, a
-  long soak or host reboots ([development](development.md)).
+What a db-sync-alt database does not serve, and what that means for a node.
+`/status` lists the first three under `limitations`, each with a code.
+
+## History older than the window
+
+The database keeps the events of the window and the unspent set, and deletes
+the rest (`history_below_horizon`). It cannot answer queries about history
+older than the horizon:
+
+- A node whose Cardano position is below the horizon (an old node snapshot, a
+  sync from Midnight's genesis, a node stopped for longer than the retention)
+  fails with its own "missing block" or "reference invalid" error. Start it from
+  a newer node snapshot. The horizon is in `/status` (`horizon`,
+  `retention.next_horizon_move_at`); db-sync-alt cannot see the node's
+  position.
+- A node whose position is exactly on one of the old governance blocks the
+  database keeps finds that block, reads an incomplete range, and rejects the
+  block by its own check: it stalls instead of following a wrong chain.
+- A bridge checkpoint below the horizon, given as a block number, makes the
+  node's bridge query read only from the horizon on. The bridge checkpoint is
+  not set on Mainnet or Preprod.
+
+There is no full-history mode. Whoever needs history keeps a 0.4.x database or
+a cardano-db-sync.
+
+## Registered candidates
+
+The registered-candidate results of the node's operator RPCs and CLI commands
+are not supported (`registered_candidates_unsupported`): the RPC methods
+`sidechain_getRegistrations`, `sidechain_getAriadneParameters` and
+`systemParameters_getAriadneParameters`, and the `registration-status` and
+`ariadne-parameters` subcommands. Their answers can differ from those of a
+cardano-db-sync database. Midnight node 2.1.101 does not read registrations for block
+import or production: its committee selection uses the permissioned
+candidates, which are served in full. A node release that reads registrations
+again needs a new keep rule.
+
+## The node's genesis subcommands
+
+The node's genesis subcommands read headers and unspent outputs at an
+arbitrary reference block (`genesis_subcommands_incomplete`):
+`generate-genesis-config`, `generate-ics-genesis`, `generate-reserve-genesis`,
+`verify-cardano-tip-finalized`, `verify-auth-script`,
+`verify-federated-authority-auth-script`, `verify-ics-auth-script`,
+`verify-permissioned-candidates-auth-script` and `verify-reserve-auth-script`.
+For a reference below the horizon a pruned database answers incompletely, and
+without an error. Run them against a cardano-db-sync database. `/status` lists
+their statements under `unsupported_node_statements`.
+
+## Stake distributions for recent epochs only
+
+The stake distribution of an epoch (`epoch_stake`, `pool_hash`) is read in the
+background once the database is at the tip, and kept from two epochs before
+the horizon's epoch on. The three Ariadne and registration RPCs above are the
+only readers of it; block import and production do not read it. They have no
+stake for older epochs, and none for a new epoch until its distribution is
+stored after the epoch starts. `epochs.newest_stake_epoch` in `/status` shows
+the newest epoch with stake.
+
+## Byron addresses in a non-canonical form
+
+A Byron (bootstrap) address whose payload is not written in canonical CBOR is
+valid on the ledger when its checksum matches the bytes as written.
+db-sync-alt stores such an address as written, while cardano-db-sync stores the
+canonical form, so the two texts differ. An output at an address is stored
+only when it carries an asset the node reads, such as cNIGHT, and such an
+address has to be made by hand: none occurs in the real transactions the tests
+record. If one occurs, a node served by db-sync-alt reads another holder
+address text for that output than a node served by cardano-db-sync, and the
+content digest of a followed database differs from a conversion's.
+
+## Networks and node release
+
+Mainnet and Preprod only. The keep rule and the profiles are bound to Midnight
+node 2.1.101's queries and configuration; another node release works only if
+it sends the same queries and reads the same addresses and assets
+([compatibility](compatibility.md)).
+
+## One provider
+
+Blockfrost is the only provider, read once per block. A provider that answers
+a wrong but self-consistent list of transactions for a final block is not
+detected; the hash, count, link and conservation checks catch any answer that
+contradicts itself or the chain.

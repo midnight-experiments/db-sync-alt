@@ -180,12 +180,12 @@ async fn catalogue_matches_legacy_and_node_reader_probes() -> Result {
     legacy_config.dbname(&legacy_database);
     let legacy = connect(&legacy_config).await?;
     for ddl in [
-        include_str!("../../../src/db_sync_alt/store/schema.sql"),
-        include_str!("../../../src/db_sync_alt/store/schema_v2.sql"),
-        include_str!("../../../src/db_sync_alt/store/schema_v3.sql"),
-        include_str!("../../../src/db_sync_alt/store/schema_v3_after_load.sql"),
-        include_str!("../../../src/db_sync_alt/store/schema_v4.sql"),
-        include_str!("../../../src/db_sync_alt/store/schema_v5.sql"),
+        include_str!("fixtures/legacy-schema/schema.sql"),
+        include_str!("fixtures/legacy-schema/schema_v2.sql"),
+        include_str!("fixtures/legacy-schema/schema_v3.sql"),
+        include_str!("fixtures/legacy-schema/schema_v3_after_load.sql"),
+        include_str!("fixtures/legacy-schema/schema_v4.sql"),
+        include_str!("fixtures/legacy-schema/schema_v5.sql"),
     ] {
         legacy.batch_execute(ddl).await?;
     }
