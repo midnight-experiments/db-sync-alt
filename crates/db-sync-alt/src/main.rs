@@ -111,10 +111,14 @@ enum Command {
         #[command(flatten)]
         database: DatabaseArguments,
     },
-    /// Read identity, serving position and capabilities.
+    /// Print the status document from the database alone. Fields only a
+    /// running service knows are null, and the state is never `following`.
     Status {
         #[command(flatten)]
         database: DatabaseArguments,
+        /// The node's reader login to check, as `grant-reader --check` does.
+        #[arg(long, env = "DSA_READER")]
+        reader: Option<String>,
     },
     /// Verify logical content, supply, references and positional integrity.
     Verify {
@@ -197,7 +201,7 @@ impl Command {
     fn database(&self) -> Option<&DatabaseArguments> {
         match self {
             Self::Create { database }
-            | Self::Status { database }
+            | Self::Status { database, .. }
             | Self::Verify { database }
             | Self::Snapshot { database, .. }
             | Self::Restore { database, .. }
@@ -510,6 +514,25 @@ async fn open(
     Ok(store)
 }
 
+/// The status document composed from the database alone.
+async fn stored_status(
+    store: &mut Store,
+    profile: &Profile,
+    reader: Option<&str>,
+) -> Result<Value, Error> {
+    use dsa_service::status::{Settings, compose};
+    let view = store.service_view(profile, reader).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    Ok(serde_json::to_value(compose(
+        Some(&view),
+        None,
+        &Settings::new(&profile.network),
+        now,
+    ))?)
+}
+
 async fn execute(
     command: Command,
     profile: Profile,
@@ -522,15 +545,10 @@ async fn execute(
     match &command {
         Command::Create { .. } => {
             store.create(&profile).await?;
-            Ok(serde_json::to_value(store.service_view(&profile, None).await?)?)
+            stored_status(&mut store, &profile, None).await
         }
-        Command::Status { .. } => {
-            let mut value = serde_json::to_value(store.service_view(&profile, None).await?)?;
-            value["capabilities"] =
-                serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?;
-            value["unsupported_node_statements"] =
-                serde_json::to_value(dsa_store::catalogue::unsupported().collect::<Vec<_>>())?;
-            Ok(value)
+        Command::Status { reader, .. } => {
+            stored_status(&mut store, &profile, reader.as_deref()).await
         }
         Command::Verify { .. } => Ok(serde_json::to_value(store.verify(&profile).await?)?),
         Command::Snapshot { file, .. } => {

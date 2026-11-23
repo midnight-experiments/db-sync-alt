@@ -1,0 +1,368 @@
+{
+  "capabilities": {
+    "registered_candidates": {
+      "enabled_in_block_production_and_import": false,
+      "future_support_requires_full_address_coverage": true,
+      "future_support_requires_new_keep_rule_version": true,
+      "node_release": "2.1.101",
+      "operator_rpc_cli": "unsupported",
+      "unsupported_scope_includes_ariadne_registrations": true
+    }
+  },
+  "database": {
+    "index_rebuilds": {
+      "idx_tx_out_address": {
+        "at": 1794916800,
+        "bytes": 8388608
+      }
+    },
+    "observation_age_seconds": 5,
+    "observed_at": 1795003195,
+    "reader_check": {
+      "error": null,
+      "passed": true,
+      "role": "db_sync_alt_reader",
+      "violations": [],
+      "warnings": []
+    },
+    "size_bytes": 250000000,
+    "tls_available": true
+  },
+  "database_format": 1,
+  "epochs": {
+    "current_epoch": 667,
+    "newest_parameters_epoch": 667,
+    "newest_stake_epoch": 666
+  },
+  "error_code": "supply_mismatch",
+  "first_observations": {
+    "stored_bridge_metadata": null,
+    "stored_large_datum": {
+      "answers": [
+        {
+          "bytes": 30000,
+          "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+          "source": "block_page:1"
+        }
+      ],
+      "block_height": 14100000,
+      "datum_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+      "observed_at": 1794103200,
+      "output_index": 0,
+      "raw_datum_bytes": 10240,
+      "shape": "stored_large_datum",
+      "transaction": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "stored_pointer_address": null
+  },
+  "freshness": {
+    "provider_observation_age_seconds": 2
+  },
+  "generated_at": 1795003200,
+  "health": {
+    "database_observation_max_age_seconds": 60,
+    "max_lag_blocks": 9,
+    "provider_observation_max_age_seconds": 120
+  },
+  "healthy": false,
+  "horizon": {
+    "hash": "3333333333333333333333333333333333333333333333333333333333333333",
+    "height": 14177840,
+    "timestamp": 1794359970
+  },
+  "identity": {
+    "created_at": "2026-11-10T00:00:00.000000+00:00",
+    "database_format": 1,
+    "keep_rule_version": 2,
+    "network": "mainnet",
+    "node_release": "2.1.101",
+    "origin": {
+      "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "restore"
+    },
+    "profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tool_version": "0.5.0"
+  },
+  "integrity": {
+    "snapshot": {
+      "at": 1794963200,
+      "bytes": 80000000,
+      "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "file": "mainnet-14200000-bbbbbbbbbbbb.snapshot",
+      "target": 14200000
+    },
+    "supply_check": {
+      "at": 1794999600,
+      "failure": {
+        "error": "supply_mismatch",
+        "recorded": "24000000000000000",
+        "unit": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "unspent": "23999999999999999"
+      },
+      "passed": false,
+      "supply": {
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc": "24000000000000000"
+      },
+      "unspent_outputs": 250000
+    },
+    "unspent_at_profile_addresses": {
+      "addr_ics": 40,
+      "addr_test": 12
+    },
+    "unspent_outputs": 250000
+  },
+  "keep_rule_version": 2,
+  "lag": {
+    "blocks": 1,
+    "seconds": 20
+  },
+  "last_error": {
+    "at": 1794992400,
+    "code": "provider_rate_limited",
+    "detail": {
+      "at": "2026-11-18T09:00:00+00:00",
+      "error": "provider_rate_limited"
+    }
+  },
+  "last_update": {
+    "at": 1795003190,
+    "blocks": 1,
+    "duration_seconds": 0.75,
+    "events_written": 5,
+    "headers": 1,
+    "horizon": 14177840,
+    "rows_pruned": 3,
+    "target": 14207840
+  },
+  "limitations": [
+    {
+      "code": "registered_candidates_unsupported",
+      "description": "The registered-candidate results of the node's operator RPCs and CLI commands, including the registrations of the Ariadne-parameter calls, are not supported. Block import and production use the permissioned candidates, which are served in full."
+    },
+    {
+      "code": "genesis_subcommands_incomplete",
+      "description": "The node's genesis subcommands read history that a pruned database does not keep; their statements are listed in unsupported_node_statements."
+    },
+    {
+      "code": "history_below_horizon",
+      "description": "Events below the horizon are not served. A node whose position is below the horizon starts from a newer node snapshot."
+    }
+  ],
+  "network": "mainnet",
+  "node_release": "2.1.101",
+  "poll_error_code": null,
+  "position": {
+    "horizon_hash": "\\x3333333333333333333333333333333333333333333333333333333333333333",
+    "horizon_height": 14177840,
+    "horizon_time": "2026-11-11T07:20:00+00:00",
+    "reason": "supply_mismatch",
+    "retention_seconds": 604800,
+    "serving": false,
+    "target_hash": "\\x2222222222222222222222222222222222222222222222222222222222222222",
+    "target_height": 14207840,
+    "target_time": "2026-11-18T00:00:00+00:00",
+    "tip_hash": "\\x1111111111111111111111111111111111111111111111111111111111111111",
+    "tip_height": 14210000,
+    "tip_time": "2026-11-18T11:59:30+00:00",
+    "updated_at": "2026-11-18T11:59:50.000000+00:00"
+  },
+  "progress": {
+    "blocks_per_hour": 180.0,
+    "blocks_remaining": 1,
+    "estimated_tip_at": 1795003220
+  },
+  "provider": {
+    "calls_previous_days": [
+      {
+        "day": "2026-11-17",
+        "requests": 9006
+      },
+      {
+        "day": "2026-11-16",
+        "requests": 9005
+      },
+      {
+        "day": "2026-11-15",
+        "requests": 9004
+      },
+      {
+        "day": "2026-11-14",
+        "requests": 9003
+      },
+      {
+        "day": "2026-11-13",
+        "requests": 9002
+      },
+      {
+        "day": "2026-11-12",
+        "requests": 9001
+      },
+      {
+        "day": "2026-11-11",
+        "requests": 9000
+      }
+    ],
+    "calls_today": 9007,
+    "last_refusal": null,
+    "pace_requests_per_second": 8.0,
+    "requests_in_flight": 0,
+    "utc_day": "2026-11-18"
+  },
+  "provider_head": {
+    "hash": "7777777777777777777777777777777777777777777777777777777777777777",
+    "height": 14210001,
+    "timestamp": 1795003190
+  },
+  "provider_observed_at": 1795003198,
+  "reason_codes": [
+    "serving_revoked",
+    "state_stopped"
+  ],
+  "retention": {
+    "horizon_first_served_at": 1794403200,
+    "next_horizon_move_at": 1795008000,
+    "seconds": 604800
+  },
+  "served_target": {
+    "hash": "2222222222222222222222222222222222222222222222222222222222222222",
+    "height": 14207840,
+    "timestamp": 1794959970
+  },
+  "service_state": {
+    "detail": {
+      "unit": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "last_error": {
+      "at": "2026-11-18T09:00:00+00:00",
+      "error": "provider_rate_limited"
+    },
+    "last_error_at": 1794992400,
+    "last_update": {
+      "advance_seconds": 0.5,
+      "at": "2026-11-18T11:59:50.000000+00:00",
+      "blocks": 1,
+      "deleted": {
+        "tx": 1,
+        "tx_out": 2
+      },
+      "headers": 1,
+      "horizon": 14177840,
+      "insert_seconds": 0.25,
+      "inserted": {
+        "block": 1,
+        "first_served": 1,
+        "tx": 2,
+        "tx_out": 3
+      },
+      "keep_reapplied_seconds": null,
+      "observation_failures": [],
+      "observations_stored": [],
+      "statements": 21,
+      "target": 14207840,
+      "tip": 14210000
+    },
+    "last_update_at": 1795003190,
+    "reason": "supply_mismatch",
+    "state": "stopped",
+    "updated_at": 1795003190
+  },
+  "service_version": "0.5.0",
+  "serving": "revoked",
+  "state": "stopped",
+  "state_reason": "supply_mismatch",
+  "stored_tip": {
+    "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "height": 14210000,
+    "timestamp": 1795003170
+  },
+  "sync": "halted",
+  "tip_lag": {
+    "blocks": 2161,
+    "seconds": 43220
+  },
+  "unsupported_node_statements": [
+    {
+      "class": "unsupported",
+      "file": "node/src/command.rs",
+      "line": 1154,
+      "reason": "The newest stored header. The subcommand also reads the header of an arbitrary Cardano block by its hash, which a pruned database does not hold below the horizon.",
+      "sha256": "aa03a10525c70b8f9783cbdf63886cddcd262fc7e4912b9df167f6d005db1edd",
+      "subcommands": [
+        "verify-cardano-tip-finalized"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/ics_genesis.rs",
+      "line": 62,
+      "reason": "The header of the reference block by its hash. A pruned database holds no header below the horizon.",
+      "sha256": "580ca78c4698cb0c06ae7ea811ddbf6bba8f59e40acddbff50b1dc293a3afb9a",
+      "subcommands": [
+        "generate-ics-genesis"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/ics_genesis.rs",
+      "line": 93,
+      "reason": "The unspent outputs at the ICS address at the reference block. Outputs created and spent before the horizon are not stored, so the set is incomplete without an error.",
+      "sha256": "5cc44f140f6f95b681e41801c3cadd20c3765152c40c9b778cf5f041b75b8764",
+      "subcommands": [
+        "generate-ics-genesis"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/reserve_genesis.rs",
+      "line": 58,
+      "reason": "The header of the reference block by its hash. A pruned database holds no header below the horizon.",
+      "sha256": "580ca78c4698cb0c06ae7ea811ddbf6bba8f59e40acddbff50b1dc293a3afb9a",
+      "subcommands": [
+        "generate-reserve-genesis",
+        "generate-genesis-config"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/reserve_genesis.rs",
+      "line": 83,
+      "reason": "The unspent outputs at the reserve address at the reference block. Outputs created and spent before the horizon are not stored, so the set is incomplete without an error.",
+      "sha256": "5cc44f140f6f95b681e41801c3cadd20c3765152c40c9b778cf5f041b75b8764",
+      "subcommands": [
+        "generate-reserve-genesis",
+        "generate-genesis-config"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/verification/verify_auth_script_common.rs",
+      "line": 126,
+      "reason": "The governance output and its datum at a reference block. An output spent before the horizon is not stored.",
+      "sha256": "c160d2dc16f302e6bcd86aa0dc6348c5842a0eab7b98cb74d9dd8c3e6d496cd6",
+      "subcommands": [
+        "verify-auth-script",
+        "verify-federated-authority-auth-script",
+        "verify-ics-auth-script",
+        "verify-permissioned-candidates-auth-script",
+        "verify-reserve-auth-script"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/verification/verify_auth_script_common.rs",
+      "line": 203,
+      "reason": "The block number of a Cardano block by its hash. A pruned database holds no header below the horizon.",
+      "sha256": "a28fab3c9f04711c1621ef4b5d316c655bd075910e4bffe1a365bb71e650df9b",
+      "subcommands": [
+        "verify-cardano-tip-finalized",
+        "verify-auth-script",
+        "verify-federated-authority-auth-script",
+        "verify-ics-auth-script",
+        "verify-permissioned-candidates-auth-script",
+        "verify-reserve-auth-script"
+      ]
+    }
+  ],
+  "wait_until": null,
+  "warnings": []
+}

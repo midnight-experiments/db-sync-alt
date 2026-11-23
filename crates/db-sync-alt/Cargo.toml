@@ -29,4 +29,3 @@ tempfile = "3"
 
 chrono.workspace = true
 sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "bigdecimal"] }
-jsonschema = { version = "0.61.2", default-features = false }

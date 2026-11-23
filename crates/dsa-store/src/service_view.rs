@@ -1,7 +1,7 @@
 //! The read behind the service's status document: what the database says
 //! about itself, in one read-only snapshot with a statement limit of five
 //! seconds. Every statement is index-bound, over a single-row table or over a
-//! table bounded by the profile or the layout (FR-027); the number of
+//! table bounded by the profile or the layout; the number of
 //! unspent outputs comes from the last supply check, never from a count.
 
 use std::collections::BTreeMap;
@@ -264,10 +264,8 @@ impl Store {
             .read_only(true)
             .start()
             .await?;
-        tx.batch_execute(&format!(
-            "SET LOCAL statement_timeout='{STATEMENT_LIMIT}'"
-        ))
-        .await?;
+        tx.batch_execute(&format!("SET LOCAL statement_timeout='{STATEMENT_LIMIT}'"))
+            .await?;
         let value: Value = tx.query_one(include_str!("status.sql"), &[]).await?.get(0);
         let reader_check = match reader {
             Some(role) => Some(reader_check(&tx, role).await?),

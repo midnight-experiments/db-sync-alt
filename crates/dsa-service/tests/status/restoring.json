@@ -1,0 +1,258 @@
+{
+  "capabilities": {
+    "registered_candidates": {
+      "enabled_in_block_production_and_import": false,
+      "future_support_requires_full_address_coverage": true,
+      "future_support_requires_new_keep_rule_version": true,
+      "node_release": "2.1.101",
+      "operator_rpc_cli": "unsupported",
+      "unsupported_scope_includes_ariadne_registrations": true
+    }
+  },
+  "database": {
+    "index_rebuilds": {},
+    "observation_age_seconds": 5,
+    "observed_at": 1795003195,
+    "reader_check": {
+      "error": null,
+      "passed": true,
+      "role": "db_sync_alt_reader",
+      "violations": [],
+      "warnings": []
+    },
+    "size_bytes": 250000000,
+    "tls_available": true
+  },
+  "database_format": 1,
+  "epochs": {
+    "current_epoch": null,
+    "newest_parameters_epoch": null,
+    "newest_stake_epoch": null
+  },
+  "error_code": null,
+  "first_observations": {
+    "stored_bridge_metadata": null,
+    "stored_large_datum": null,
+    "stored_pointer_address": null
+  },
+  "freshness": {
+    "provider_observation_age_seconds": null
+  },
+  "generated_at": 1795003200,
+  "health": {
+    "database_observation_max_age_seconds": 60,
+    "max_lag_blocks": 9,
+    "provider_observation_max_age_seconds": 120
+  },
+  "healthy": false,
+  "horizon": null,
+  "identity": {
+    "created_at": "2026-11-10T00:00:00.000000+00:00",
+    "database_format": 1,
+    "keep_rule_version": 2,
+    "network": "mainnet",
+    "node_release": "2.1.101",
+    "origin": {
+      "kind": "restore_failed"
+    },
+    "profile_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tool_version": "0.5.0"
+  },
+  "integrity": {
+    "snapshot": null,
+    "supply_check": null,
+    "unspent_at_profile_addresses": {},
+    "unspent_outputs": null
+  },
+  "keep_rule_version": 2,
+  "lag": {
+    "blocks": null,
+    "seconds": null
+  },
+  "last_error": null,
+  "last_update": null,
+  "limitations": [
+    {
+      "code": "registered_candidates_unsupported",
+      "description": "The registered-candidate results of the node's operator RPCs and CLI commands, including the registrations of the Ariadne-parameter calls, are not supported. Block import and production use the permissioned candidates, which are served in full."
+    },
+    {
+      "code": "genesis_subcommands_incomplete",
+      "description": "The node's genesis subcommands read history that a pruned database does not keep; their statements are listed in unsupported_node_statements."
+    },
+    {
+      "code": "history_below_horizon",
+      "description": "Events below the horizon are not served. A node whose position is below the horizon starts from a newer node snapshot."
+    }
+  ],
+  "network": "mainnet",
+  "node_release": "2.1.101",
+  "poll_error_code": null,
+  "position": {
+    "horizon_hash": null,
+    "horizon_height": null,
+    "horizon_time": null,
+    "reason": "restore_failed",
+    "retention_seconds": 604800,
+    "serving": false,
+    "target_hash": null,
+    "target_height": null,
+    "target_time": null,
+    "tip_hash": null,
+    "tip_height": null,
+    "tip_time": null,
+    "updated_at": "2026-11-18T11:00:00.000000+00:00"
+  },
+  "progress": {
+    "blocks_per_hour": null,
+    "blocks_remaining": null,
+    "estimated_tip_at": null
+  },
+  "provider": {
+    "calls_previous_days": [
+      {
+        "day": "2026-11-17",
+        "requests": 9006
+      },
+      {
+        "day": "2026-11-16",
+        "requests": 9005
+      },
+      {
+        "day": "2026-11-15",
+        "requests": 9004
+      },
+      {
+        "day": "2026-11-14",
+        "requests": 9003
+      },
+      {
+        "day": "2026-11-13",
+        "requests": 9002
+      },
+      {
+        "day": "2026-11-12",
+        "requests": 9001
+      },
+      {
+        "day": "2026-11-11",
+        "requests": 9000
+      }
+    ],
+    "calls_today": 9007,
+    "last_refusal": null,
+    "pace_requests_per_second": 8.0,
+    "requests_in_flight": 0,
+    "utc_day": "2026-11-18"
+  },
+  "provider_head": null,
+  "provider_observed_at": null,
+  "reason_codes": [
+    "serving_unready",
+    "state_restoring",
+    "serving_block_lag_unknown",
+    "provider_observation_unknown"
+  ],
+  "retention": {
+    "horizon_first_served_at": null,
+    "next_horizon_move_at": null,
+    "seconds": 604800
+  },
+  "served_target": null,
+  "service_state": null,
+  "service_version": "0.5.0",
+  "serving": "unready",
+  "state": "restoring",
+  "state_reason": "snapshot_file",
+  "stored_tip": null,
+  "sync": "syncing",
+  "tip_lag": {
+    "blocks": null,
+    "seconds": null
+  },
+  "unsupported_node_statements": [
+    {
+      "class": "unsupported",
+      "file": "node/src/command.rs",
+      "line": 1154,
+      "reason": "The newest stored header. The subcommand also reads the header of an arbitrary Cardano block by its hash, which a pruned database does not hold below the horizon.",
+      "sha256": "aa03a10525c70b8f9783cbdf63886cddcd262fc7e4912b9df167f6d005db1edd",
+      "subcommands": [
+        "verify-cardano-tip-finalized"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/ics_genesis.rs",
+      "line": 62,
+      "reason": "The header of the reference block by its hash. A pruned database holds no header below the horizon.",
+      "sha256": "580ca78c4698cb0c06ae7ea811ddbf6bba8f59e40acddbff50b1dc293a3afb9a",
+      "subcommands": [
+        "generate-ics-genesis"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/ics_genesis.rs",
+      "line": 93,
+      "reason": "The unspent outputs at the ICS address at the reference block. Outputs created and spent before the horizon are not stored, so the set is incomplete without an error.",
+      "sha256": "5cc44f140f6f95b681e41801c3cadd20c3765152c40c9b778cf5f041b75b8764",
+      "subcommands": [
+        "generate-ics-genesis"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/reserve_genesis.rs",
+      "line": 58,
+      "reason": "The header of the reference block by its hash. A pruned database holds no header below the horizon.",
+      "sha256": "580ca78c4698cb0c06ae7ea811ddbf6bba8f59e40acddbff50b1dc293a3afb9a",
+      "subcommands": [
+        "generate-reserve-genesis",
+        "generate-genesis-config"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/creation/reserve_genesis.rs",
+      "line": 83,
+      "reason": "The unspent outputs at the reserve address at the reference block. Outputs created and spent before the horizon are not stored, so the set is incomplete without an error.",
+      "sha256": "5cc44f140f6f95b681e41801c3cadd20c3765152c40c9b778cf5f041b75b8764",
+      "subcommands": [
+        "generate-reserve-genesis",
+        "generate-genesis-config"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/verification/verify_auth_script_common.rs",
+      "line": 126,
+      "reason": "The governance output and its datum at a reference block. An output spent before the horizon is not stored.",
+      "sha256": "c160d2dc16f302e6bcd86aa0dc6348c5842a0eab7b98cb74d9dd8c3e6d496cd6",
+      "subcommands": [
+        "verify-auth-script",
+        "verify-federated-authority-auth-script",
+        "verify-ics-auth-script",
+        "verify-permissioned-candidates-auth-script",
+        "verify-reserve-auth-script"
+      ]
+    },
+    {
+      "class": "unsupported",
+      "file": "node/src/genesis/verification/verify_auth_script_common.rs",
+      "line": 203,
+      "reason": "The block number of a Cardano block by its hash. A pruned database holds no header below the horizon.",
+      "sha256": "a28fab3c9f04711c1621ef4b5d316c655bd075910e4bffe1a365bb71e650df9b",
+      "subcommands": [
+        "verify-cardano-tip-finalized",
+        "verify-auth-script",
+        "verify-federated-authority-auth-script",
+        "verify-ics-auth-script",
+        "verify-permissioned-candidates-auth-script",
+        "verify-reserve-auth-script"
+      ]
+    }
+  ],
+  "wait_until": null,
+  "warnings": []
+}
