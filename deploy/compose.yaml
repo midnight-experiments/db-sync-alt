@@ -3,7 +3,7 @@
 # See README.md in this directory.
 services:
   postgres:
-    image: postgres:17.11-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea5649807491a0545b5eeeb8f0b8bb11857a5
+    image: postgres:19.0-bookworm@sha256:f4859caf96de494e38efa69ed703b08a5bbd9605e152e604f2daec8841c87c41
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/opt/db-sync-alt/start.sh"]
     command:
