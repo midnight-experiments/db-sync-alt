@@ -4,5 +4,6 @@
 pub mod block;
 pub mod epoch;
 pub mod follow;
+pub mod http;
 pub mod retry;
 pub mod status;

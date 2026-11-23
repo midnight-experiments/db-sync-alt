@@ -20,7 +20,7 @@ hex = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
 dsa-testkit = { path = "../dsa-testkit" }

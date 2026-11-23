@@ -181,6 +181,17 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Ask a running service's /health; exit 0 when it answers 200 and 1
+    /// otherwise, within 3 seconds.
+    Health {
+        /// The address of the service's /health.
+        #[arg(
+            long,
+            env = "DSA_HEALTH_URL",
+            default_value = "http://127.0.0.1:18080/health"
+        )]
+        url: String,
+    },
     /// Follow the provider's chain into a serving database.
     #[command(hide = true)]
     Follow {
@@ -208,7 +219,7 @@ impl Command {
             | Self::Convert { database, .. }
             | Self::GrantReader { database, .. }
             | Self::Follow { database, .. } => Some(database),
-            Self::Profile { .. } | Self::Compare(_) => None,
+            Self::Profile { .. } | Self::Compare(_) | Self::Health { .. } => None,
         }
     }
 }
@@ -361,6 +372,7 @@ fn prepare(command: Command) -> Result<(Operation, Job), Usage> {
             ))
         }
         Command::Compare(args) => compare(args),
+        Command::Health { url } => health(url),
         Command::Follow {
             database,
             provider,
@@ -430,6 +442,29 @@ fn compare(args: CompareArguments) -> Result<(Operation, Job), Usage> {
     ))
 }
 
+/// `health`: one request to a running service, answered within 3 seconds.
+fn health(url: String) -> Result<(Operation, Job), Usage> {
+    use dsa_service::http::{Target, probe};
+    let target = Target::parse(&url).map_err(|error| usage(error, "--url"))?;
+    Ok((
+        Operation::new("health", Effect::Reads, Some(3)),
+        Box::new(move |_| {
+            Box::pin(async move {
+                match probe(&target, std::time::Duration::from_millis(2500)).await {
+                    Ok(200) => Ok(json!({"url": url, "http_status": 200, "healthy": true})),
+                    Ok(code) => Err(Error::Mismatch {
+                        error: "service_unhealthy",
+                        item: "http_status".to_owned(),
+                        expected: "200".to_owned(),
+                        actual: code.to_string(),
+                    }),
+                    Err(error) => Err(Error::Refusal(error.code())),
+                }
+            })
+        }),
+    ))
+}
+
 fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
     use Effect::{Changes, Checks, Reads};
     let database = command.database().expect("a database command");
@@ -450,7 +485,10 @@ fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
         Command::Convert { .. } => ("convert", Changes, deadline.or(Some(3600))),
         Command::GrantReader { check: true, .. } => ("grant-reader", Checks, deadline),
         Command::GrantReader { .. } => ("grant-reader", Changes, deadline),
-        Command::Profile { .. } | Command::Compare(_) | Command::Follow { .. } => {
+        Command::Profile { .. }
+        | Command::Compare(_)
+        | Command::Follow { .. }
+        | Command::Health { .. } => {
             unreachable!("not a database command")
         }
     };
@@ -607,7 +645,10 @@ async fn execute(
             role, check: true, ..
         } => store.check_reader(&profile, role).await,
         Command::GrantReader { role, .. } => store.grant_reader(&profile, role).await,
-        Command::Profile { .. } | Command::Compare(_) | Command::Follow { .. } => {
+        Command::Profile { .. }
+        | Command::Compare(_)
+        | Command::Follow { .. }
+        | Command::Health { .. } => {
             unreachable!("not a database command")
         }
     }
