@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
@@ -2390,6 +2390,206 @@ fn candidate_input(capture: &Capture, case: &Case) -> Option<CandidateInput> {
         reference_block: i32::try_from(row["block_no"].as_i64()?).ok()?,
     })
 }
+/// Side A of a comparison: a database, or a capture file of one.
+pub enum SideA {
+    Database {
+        config: Box<Config>,
+        root: Option<PathBuf>,
+    },
+    Capture(PathBuf),
+}
+
+/// One `compare` run.
+pub struct Request {
+    pub profile: Profile,
+    pub a: SideA,
+    pub b: Config,
+    pub b_root: Option<PathBuf>,
+    /// Explicit positions; otherwise generated from side A (`horizon_block`)
+    /// or taken from the capture file.
+    pub positions: Option<Positions>,
+    pub horizon_block: Option<u32>,
+    pub max_pairs: usize,
+    pub statement_timeout_seconds: Option<u32>,
+    pub idle_transaction_timeout_seconds: Option<u32>,
+    pub a_verify_unbounded: bool,
+    pub candidate_address: Option<String>,
+    pub max_differing_rows: usize,
+}
+
+fn side(side: &'static str) -> impl Fn(Error) -> Error {
+    move |error| Error::ComparisonSource {
+        side,
+        error: Box::new(error),
+    }
+}
+
+fn probe_bytes(value: &str, bytes: usize) -> Result<Vec<u8>, Error> {
+    match hex::decode(value) {
+        Ok(decoded) if decoded.len() == bytes => Ok(decoded),
+        _ => Err(Error::Refusal("comparison_probe_policy_invalid")),
+    }
+}
+
+async fn open_reader(
+    config: Config,
+    root: Option<&Path>,
+    request: &Request,
+    watch: &impl Fn(crate::Cancellation),
+) -> Result<Reader, Error> {
+    let reader = Reader::connect(config, root).await?;
+    watch(reader.cancellation());
+    reader
+        .limits(
+            request.statement_timeout_seconds,
+            request.idle_transaction_timeout_seconds,
+        )
+        .await?;
+    Ok(reader)
+}
+
+/// Captures both sides and compares them. `watch` receives every database
+/// session as it opens, so that a stopped run can cancel its statements.
+pub async fn compare_databases(
+    request: Request,
+    watch: impl Fn(crate::Cancellation),
+) -> Result<Report, Error> {
+    let profile = &request.profile;
+    let left_file = match &request.a {
+        SideA::Capture(file) => Some(crate::source_capture::read(file, profile)?),
+        SideA::Database { .. } => None,
+    };
+    if let Some(left) = left_file {
+        if request
+            .candidate_address
+            .as_ref()
+            .is_some_and(|a| a != &left.candidate_address)
+        {
+            return Err(Error::Refusal("comparison_capture_context_mismatch"));
+        }
+        let positions = match &request.positions {
+            Some(positions) if *positions != left.positions => {
+                return Err(Error::Refusal("comparison_capture_context_mismatch"));
+            }
+            _ => left.positions.clone(),
+        };
+        if request
+            .horizon_block
+            .is_some_and(|h| h != positions.horizon)
+        {
+            return Err(Error::Refusal("comparison_horizon_mismatch"));
+        }
+        let mut b = open_reader(
+            request.b.clone(),
+            request.b_root.as_deref(),
+            &request,
+            &watch,
+        )
+        .await
+        .map_err(side("b"))?;
+        let tx = b.snapshot().await.map_err(side("b"))?;
+        let options = Options {
+            check_chain_order: true,
+            verify_unbounded: true,
+            probe_plan: left.probe_plan,
+            missing_policy: Some(probe_bytes(&left.missing_policy, 28)?),
+            missing_tx_hash: Some(probe_bytes(&left.missing_tx_hash, 32)?),
+            candidate_address: request
+                .candidate_address
+                .clone()
+                .unwrap_or_else(|| left.candidate_address.clone()),
+            ..Default::default()
+        };
+        let right = capture(&tx, profile, &positions, &options)
+            .await
+            .map_err(side("b"))?;
+        tx.commit()
+            .await
+            .map_err(|e| side("b")(Error::Postgres(e)))?;
+        return compare(&left, &right, request.max_differing_rows);
+    }
+    let SideA::Database { config, root } = &request.a else {
+        unreachable!("a capture file is compared above")
+    };
+    let mut a = open_reader((**config).clone(), root.as_deref(), &request, &watch)
+        .await
+        .map_err(side("a"))?;
+    let mut b = open_reader(
+        request.b.clone(),
+        request.b_root.as_deref(),
+        &request,
+        &watch,
+    )
+    .await
+    .map_err(side("b"))?;
+    let left_tx = a.snapshot().await.map_err(side("a"))?;
+    let right_tx = b.snapshot().await.map_err(side("b"))?;
+    let missing_policy = choose_missing_policy(&[&left_tx, &right_tx]).await?;
+    let missing_tx_hash = choose_missing_transaction_hash(&[&left_tx, &right_tx]).await?;
+    let positions = match &request.positions {
+        Some(positions) => positions.clone(),
+        None => {
+            let horizon = request
+                .horizon_block
+                .ok_or(Error::Refusal("comparison_horizon_required"))?;
+            let newest: i64 = left_tx
+                .query_one("SELECT id FROM public.block ORDER BY id DESC LIMIT 1", &[])
+                .await
+                .map_err(|e| {
+                    side("a")(if e.code().is_some_and(|c| c.code() == "55000") {
+                        Error::Refusal("comparison_not_serving")
+                    } else {
+                        Error::Postgres(e)
+                    })
+                })?
+                .get(0);
+            let target = u32::try_from(newest)
+                .ok()
+                .and_then(|p| p.checked_sub(profile.cardano.security_parameter))
+                .ok_or(Error::Refusal("comparison_target_not_final"))?;
+            Positions::generate_with_events(&left_tx, profile, horizon, target, request.max_pairs)
+                .await
+                .map_err(side("a"))?
+        }
+    };
+    let mut options = Options {
+        verify_unbounded: request.a_verify_unbounded,
+        missing_policy: Some(missing_policy),
+        missing_tx_hash: Some(missing_tx_hash),
+        ..Default::default()
+    };
+    if let Some(address) = &request.candidate_address {
+        options.candidate_address = address.clone();
+    }
+    let mut right_options = options.clone();
+    right_options.check_chain_order = true;
+    right_options.verify_unbounded = true;
+    // Both snapshots pin the same absence probe. They are read concurrently so
+    // that one idle snapshot cannot expire while the other is captured.
+    let left_read = async {
+        let value = capture(&left_tx, profile, &positions, &options)
+            .await
+            .map_err(side("a"))?;
+        left_tx
+            .commit()
+            .await
+            .map_err(|e| side("a")(Error::Postgres(e)))?;
+        Ok::<_, Error>(value)
+    };
+    let right_read = async {
+        let value = capture(&right_tx, profile, &positions, &right_options)
+            .await
+            .map_err(side("b"))?;
+        right_tx
+            .commit()
+            .await
+            .map_err(|e| side("b")(Error::Postgres(e)))?;
+        Ok::<_, Error>(value)
+    };
+    let (left, right) = tokio::try_join!(left_read, right_read)?;
+    compare(&left, &right, request.max_differing_rows)
+}
+
 /// The rows that differ: positions of an ordered answer, or the rows of an
 /// unordered answer present on one side only (as multisets).
 fn row_differences<'r>(

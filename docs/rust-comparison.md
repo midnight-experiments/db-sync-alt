@@ -78,7 +78,9 @@ Acceptance requires destination B's chain-order check. Source A remains
 unscanned globally. A pruned asset table may have leading/interior ordinal gaps;
 order verification does not infer dense rank from filtered facts. Row previews
 are capped at 4,096 characters, with full-row SHA256 and an explicit truncation
-flag. Whole rows are still compared exactly. Exit 0 means supported-query parity, 2 means a supported answer mismatch and 1 means a refusal or query failure.
+flag. Whole rows are still compared exactly. Exit 0 means supported-query parity, 3
+means a difference, 1 a refusal or query failure, 2 a usage error and 75 a
+database that could not be reached ([exit status](exit-status.md)).
 Rule 1 pruned stores and mismatched rule declarations/identity are refused.
 Genuine legacy schema 5 readers remain supported. Preprod's empty-name cNIGHT
 and named NIGHT bridge unit are reported separately.

@@ -898,6 +898,19 @@ impl Store {
                 return Err(error);
             }
         };
+        self.snapshot_converted(profile, &mut converted, options)
+            .await?;
+        Ok(converted)
+    }
+
+    /// Writes the snapshot file a conversion asked for. The database already
+    /// serves; a failure names the converted digests.
+    pub(crate) async fn snapshot_converted(
+        &mut self,
+        profile: &Profile,
+        converted: &mut Conversion,
+        options: &ConvertOptions,
+    ) -> Result<(), Error> {
         if let Some(path) = &options.snapshot {
             converted.snapshot = Some(self.snapshot(profile, path).await.map_err(|error| {
                 Error::ConvertedSnapshot {
@@ -907,6 +920,6 @@ impl Store {
                 }
             })?);
         }
-        Ok(converted)
+        Ok(())
     }
 }

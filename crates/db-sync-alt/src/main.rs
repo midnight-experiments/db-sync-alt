@@ -1,17 +1,27 @@
+//! The command line: argument parsing and checking, and the dispatch of each
+//! command to the store through the wrapper of `wrapper.rs`.
+
+mod wrapper;
+
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::ExitCode,
     str::FromStr,
-    sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use clap::{Args, Parser, Subcommand};
 use dsa_chain::profiles::Profile;
-use dsa_store::{Error, Store};
+use dsa_store::{Error, Store, compare::Positions};
 use serde_json::{Value, json};
+use tokio_postgres::config::SslMode;
+use wrapper::{EXIT_STATUSES, Effect, Exit, Job, Operation, Session, run};
 
 #[derive(Parser)]
-#[command(version = dsa_chain::VERSION, about = "Cardano data for Midnight nodes")]
+#[command(
+    version = dsa_chain::VERSION,
+    about = "Cardano data for Midnight nodes",
+    after_help = EXIT_STATUSES
+)]
 struct Arguments {
     #[command(subcommand)]
     command: Command,
@@ -30,11 +40,14 @@ struct DatabaseArguments {
     #[arg(long)]
     tls_root_cert: Option<PathBuf>,
     /// Explicit session statement limit; default preserves PostgreSQL settings.
-    #[arg(long, value_parser=clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
     statement_timeout_seconds: Option<u32>,
     /// Explicit idle transaction limit; default preserves PostgreSQL settings.
-    #[arg(long, value_parser=clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
     idle_transaction_timeout_seconds: Option<u32>,
+    /// Stop the command after this many seconds (default: none; convert: 3600).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
+    overall_timeout_seconds: Option<u32>,
 }
 
 #[derive(Args)]
@@ -45,7 +58,7 @@ struct CompareArguments {
         conflicts_with = "a_capture"
     )]
     a: Option<String>,
-    #[arg(long, conflicts_with = "a")]
+    #[arg(long, conflicts_with_all = ["a", "a_password_file", "a_tls_root_cert"])]
     a_capture: Option<PathBuf>,
     #[arg(long)]
     b: String,
@@ -56,7 +69,7 @@ struct CompareArguments {
     positions: String,
     #[arg(long)]
     horizon_block: Option<u32>,
-    #[arg(long,default_value_t=500,value_parser=clap::value_parser!(u32).range(1..=5000))]
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..=5000))]
     max_pairs: u32,
     #[arg(long)]
     a_password_file: Option<PathBuf>,
@@ -66,9 +79,9 @@ struct CompareArguments {
     a_tls_root_cert: Option<PathBuf>,
     #[arg(long)]
     b_tls_root_cert: Option<PathBuf>,
-    #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
     statement_timeout_seconds: Option<u32>,
-    #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
     idle_transaction_timeout_seconds: Option<u32>,
     /// Also repeat side A's event queries with bounds 0..i64::MAX (side B always
     /// does). This reads A's whole event history.
@@ -79,7 +92,7 @@ struct CompareArguments {
     max_differing_rows: u32,
     #[arg(long)]
     candidate_address: Option<String>,
-    #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(1..=86400))]
     overall_timeout_seconds: u32,
 }
 
@@ -136,23 +149,21 @@ enum Command {
         source_tls_root_cert: Option<PathBuf>,
         #[arg(long)]
         horizon_block: Option<u32>,
-        #[arg(long,default_value_t=604800,value_parser=clap::value_parser!(i64).range(86400..))]
+        #[arg(long, default_value_t = 604800, value_parser = clap::value_parser!(i64).range(86400..))]
         retention_seconds: i64,
-        #[arg(long,default_value_t=4096,value_parser=clap::value_parser!(u32).range(1..=65536))]
+        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=65536))]
         batch_rows: u32,
-        #[arg(long,default_value_t=4194304,value_parser=clap::value_parser!(u32).range(1024..=67108864))]
+        #[arg(long, default_value_t = 4194304, value_parser = clap::value_parser!(u32).range(1024..=67108864))]
         batch_bytes: u32,
         #[arg(long)]
         snapshot: Option<PathBuf>,
         /// Save literal source answers in the conversion's own RR snapshot.
         #[arg(long)]
         capture_source: Option<PathBuf>,
-        #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
-        overall_timeout_seconds: u32,
         /// Preserve the reader's limit unless explicitly overridden.
-        #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
         source_statement_timeout_seconds: Option<u32>,
-        #[arg(long,value_parser=clap::value_parser!(u32).range(1..=86400))]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=86400))]
         source_idle_transaction_timeout_seconds: Option<u32>,
     },
     /// Grant and check an existing node reader's exact privileges.
@@ -167,6 +178,21 @@ enum Command {
     },
 }
 
+impl Command {
+    fn database(&self) -> Option<&DatabaseArguments> {
+        match self {
+            Self::Create { database }
+            | Self::Status { database }
+            | Self::Verify { database }
+            | Self::Snapshot { database, .. }
+            | Self::Restore { database, .. }
+            | Self::Convert { database, .. }
+            | Self::GrantReader { database, .. } => Some(database),
+            Self::Profile { .. } | Self::Compare(_) => None,
+        }
+    }
+}
+
 fn content_digest(value: &str) -> Result<String, String> {
     if value.len() == 64
         && value
@@ -179,175 +205,272 @@ fn content_digest(value: &str) -> Result<String, String> {
     }
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
-    match execute(Arguments::parse().command).await {
-        Ok(value) => {
-            println!("{value}");
-            if value.get("matched") == Some(&Value::Bool(false)) {
-                std::process::ExitCode::from(2)
-            } else {
-                std::process::ExitCode::SUCCESS
-            }
-        }
-        Err(error) => {
-            eprintln!("{}", error.report());
-            std::process::ExitCode::FAILURE
-        }
-    }
+/// An invalid flag value, found before any connection.
+#[derive(Debug)]
+struct Usage {
+    error: &'static str,
+    flag: &'static str,
 }
 
-#[derive(Clone, Default)]
-struct CancelGroup(Arc<Mutex<Vec<dsa_store::Cancellation>>>);
-impl CancelGroup {
-    fn add(&self, value: dsa_store::Cancellation) {
-        self.0.lock().expect("cancellation registry").push(value);
-    }
-    /// Whether a load sent the commit that publishes it.
-    fn commit_sent(&self) -> bool {
-        self.0
-            .lock()
-            .expect("cancellation registry")
-            .iter()
-            .any(dsa_store::Cancellation::commit_sent)
-    }
-    async fn cancel(&self) {
-        let handles = self.0.lock().expect("cancellation registry").clone();
-        let mut pending = tokio::task::JoinSet::new();
-        for (index, handle) in handles.into_iter().enumerate() {
-            pending.spawn(async move {let result=tokio::time::timeout(Duration::from_secs(5),handle.cancel()).await; eprintln!("{}",json!({"event":"cancel_request","connection":index,"sent":matches!(result,Ok(Ok(())))}));});
-        }
-        while pending.join_next().await.is_some() {}
-    }
-}
-async fn stopped() -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .map_err(|_| Error::Refusal("signal_listener_failed"))?;
-        tokio::select! {r=tokio::signal::ctrl_c()=>r.map_err(|_|Error::Refusal("signal_listener_failed")),_=terminate.recv()=>Ok(())}
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|_| Error::Refusal("signal_listener_failed"))
-    }
-}
-async fn execute(command: Command) -> Result<Value, Error> {
-    let load = match &command {
-        Command::Convert { .. } => Some("convert"),
-        Command::Restore { .. } => Some("restore"),
-        _ => None,
-    };
-    let group = CancelGroup::default();
-    // A stopped load is unknown only once its publishing commit was sent.
-    let interrupted = |reason| match load {
-        Some(operation) if group.commit_sent() => Error::OutcomeUnknown { operation, reason },
-        Some(operation) => Error::Interrupted { operation, reason },
-        None => Error::Refusal(reason),
-    };
-    let seconds = match &command {
-        Command::Compare(args) => Some(args.overall_timeout_seconds),
-        Command::Convert {
-            overall_timeout_seconds,
-            ..
-        } => Some(*overall_timeout_seconds),
-        _ => None,
-    };
-    if let Some(seconds) = seconds {
-        let work = execute_inner(command, &group);
-        tokio::pin!(work);
-        let result = tokio::select! {
-            result=&mut work=>result,
-            signal=stopped()=>match signal {Ok(())=>Err(interrupted("operation_interrupted")),Err(error)=>Err(error)},
-            _=tokio::time::sleep(Duration::from_secs(u64::from(seconds)))=>Err(interrupted("operation_deadline_exceeded"))
-        };
-        if result.is_err() {
-            group.cancel().await;
-        }
-        result
-    } else if load.is_some() {
-        let work = execute_inner(command, &group);
-        tokio::pin!(work);
-        let result = tokio::select! {
-            result=&mut work=>result,
-            signal=stopped()=>match signal {Ok(())=>Err(interrupted("operation_interrupted")),Err(error)=>Err(error)},
-        };
-        if result.is_err() {
-            group.cancel().await;
-        }
-        result
-    } else {
-        execute_inner(command, &group).await
-    }
+fn usage(error: &'static str, flag: &'static str) -> Usage {
+    Usage { error, flag }
 }
 
-async fn execute_inner(command: Command, group: &CancelGroup) -> Result<Value, Error> {
-    let (database, operation) = match &command {
-        Command::Compare(args) => return compare_command(args, group).await,
-        Command::Profile { network } => return Ok(serde_json::to_value(profile(network)?)?),
-        Command::Create { database } => (database, "create"),
-        Command::Status { database } => (database, "status"),
-        Command::Verify { database } => (database, "verify"),
-        Command::Snapshot { database, .. } => (database, "snapshot"),
-        Command::Restore { database, .. } => (database, "restore"),
-        Command::Convert { database, .. } => (database, "convert"),
-        Command::GrantReader { database, .. } => (database, "grant-reader"),
-    };
-    let profile = profile(&database.network)?;
-    let mut config = tokio_postgres::Config::from_str(&database.database)
-        .map_err(|_| Error::Refusal("invalid_database_configuration"))?;
+/// The flags that name one connection.
+struct Flags {
+    connection: &'static str,
+    password: &'static str,
+    root: &'static str,
+}
+
+const DATABASE: Flags = Flags {
+    connection: "--database",
+    password: "--password-file",
+    root: "--tls-root-cert",
+};
+const SOURCE: Flags = Flags {
+    connection: "--source",
+    password: "--source-password-file",
+    root: "--source-tls-root-cert",
+};
+const SIDE_A: Flags = Flags {
+    connection: "--a",
+    password: "--a-password-file",
+    root: "--a-tls-root-cert",
+};
+const SIDE_B: Flags = Flags {
+    connection: "--b",
+    password: "--b-password-file",
+    root: "--b-tls-root-cert",
+};
+
+/// A connection named on the command line, checked before connecting: the
+/// connection string parses and holds no password, the password file holds
+/// one line, and the TLS root file is readable while TLS is not disabled.
+struct Connection {
+    config: tokio_postgres::Config,
+    root: Option<PathBuf>,
+}
+
+fn connection(
+    flags: &Flags,
+    text: &str,
+    password_file: Option<&Path>,
+    root: Option<&Path>,
+) -> Result<Connection, Usage> {
+    let mut config = tokio_postgres::Config::from_str(text)
+        .map_err(|_| usage("invalid_connection_string", flags.connection))?;
     if config.get_password().is_some() {
-        return Err(Error::Refusal("database_password_requires_file"));
+        return Err(usage("password_requires_file", flags.connection));
     }
-    if let Some(path) = &database.password_file {
-        let password =
-            std::fs::read_to_string(path).map_err(|_| Error::Refusal("invalid_password_file"))?;
+    if let Some(path) = password_file {
+        let password = std::fs::read_to_string(path)
+            .map_err(|_| usage("invalid_password_file", flags.password))?;
         let password = password.trim_end_matches(['\r', '\n']);
         if password.contains(['\r', '\n', '\0']) {
-            return Err(Error::Refusal("invalid_password_file"));
+            return Err(usage("invalid_password_file", flags.password));
         }
         config.password(password);
     }
+    if let Some(path) = root {
+        if config.get_ssl_mode() == SslMode::Disable {
+            return Err(usage("conflicting_tls_configuration", flags.root));
+        }
+        std::fs::File::open(path).map_err(|_| usage("invalid_tls_root_certificate", flags.root))?;
+    }
     config.application_name("db-sync-alt");
-    eprintln!("{}", json!({"operation":operation,"event":"started"}));
-    let result = database_command(
-        &command,
+    Ok(Connection {
         config,
-        &profile,
+        root: root.map(Path::to_owned),
+    })
+}
+
+fn profile(network: &str) -> Result<Profile, Usage> {
+    Profile::load(network).map_err(|_| usage("unsupported_network", "--network"))
+}
+
+fn positions_file(path: &str) -> Result<Positions, Usage> {
+    use std::io::Read;
+    let invalid = || usage("invalid_comparison_positions_file", "--positions");
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| invalid())?
+        .take(1_048_577)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() > 1_048_576 {
+        return Err(usage("comparison_positions_file_too_large", "--positions"));
+    }
+    let positions: Positions = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    positions.validate().map_err(|_| invalid())?;
+    Ok(positions)
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let arguments = match Arguments::try_parse() {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            let _ = error.print();
+            let exit = if error.use_stderr() {
+                Exit::Usage
+            } else {
+                Exit::Success
+            };
+            return ExitCode::from(exit as u8);
+        }
+    };
+    match prepare(arguments.command) {
+        Ok((operation, command)) => run(operation, command).await,
+        Err(usage) => {
+            eprintln!("{}", json!({"error": usage.error, "flag": usage.flag}));
+            ExitCode::from(Exit::Usage as u8)
+        }
+    }
+}
+
+/// Checks every flag before anything connects, and returns the operation with
+/// its command.
+fn prepare(command: Command) -> Result<(Operation, Job), Usage> {
+    match command {
+        Command::Profile { network } => {
+            let profile = profile(&network)?;
+            Ok((
+                Operation::new("profile", Effect::Reads, None),
+                Box::new(move |_| Box::pin(async move { Ok(serde_json::to_value(profile)?) })),
+            ))
+        }
+        Command::Compare(args) => compare(args),
+        command => database_command(command),
+    }
+}
+
+fn compare(args: CompareArguments) -> Result<(Operation, Job), Usage> {
+    use dsa_store::compare::{Request, SideA, compare_databases};
+    let profile = profile(&args.network)?;
+    let positions = if args.positions == "auto" {
+        None
+    } else {
+        let positions = positions_file(&args.positions)?;
+        if args.horizon_block.is_some_and(|h| h != positions.horizon) {
+            return Err(usage("comparison_horizon_mismatch", "--horizon-block"));
+        }
+        Some(positions)
+    };
+    let a = match (&args.a, &args.a_capture) {
+        (_, Some(file)) => SideA::Capture(file.clone()),
+        (Some(a), None) => {
+            let a = connection(
+                &SIDE_A,
+                a,
+                args.a_password_file.as_deref(),
+                args.a_tls_root_cert.as_deref(),
+            )?;
+            SideA::Database {
+                config: Box::new(a.config),
+                root: a.root,
+            }
+        }
+        (None, None) => return Err(usage("comparison_source_required", "--a")),
+    };
+    let b = connection(
+        &SIDE_B,
+        &args.b,
+        args.b_password_file.as_deref(),
+        args.b_tls_root_cert.as_deref(),
+    )?;
+    let request = Request {
+        profile,
+        a,
+        b: b.config,
+        b_root: b.root,
+        positions,
+        horizon_block: args.horizon_block,
+        max_pairs: args.max_pairs as usize,
+        statement_timeout_seconds: args.statement_timeout_seconds,
+        idle_transaction_timeout_seconds: args.idle_transaction_timeout_seconds,
+        a_verify_unbounded: args.a_verify_unbounded,
+        candidate_address: args.candidate_address,
+        max_differing_rows: args.max_differing_rows as usize,
+    };
+    Ok((
+        Operation::new("compare", Effect::Reads, Some(args.overall_timeout_seconds)),
+        Box::new(move |session: Session| {
+            Box::pin(async move {
+                let report = compare_databases(request, |c| session.watch(c)).await?;
+                Ok(serde_json::to_value(report)?)
+            })
+        }),
+    ))
+}
+
+fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
+    use Effect::{Changes, Checks, Reads};
+    let database = command.database().expect("a database command");
+    let profile = profile(&database.network)?;
+    let destination = connection(
+        &DATABASE,
+        &database.database,
+        database.password_file.as_deref(),
         database.tls_root_cert.as_deref(),
-        database,
-        group,
-    )
-    .await;
-    eprintln!(
-        "{}",
-        json!({"operation":operation,"event":"finished","success":result.is_ok()})
-    );
-    result
+    )?;
+    let deadline = database.overall_timeout_seconds;
+    let (name, effect, deadline) = match &command {
+        Command::Create { .. } => ("create", Changes, deadline),
+        Command::Status { .. } => ("status", Reads, deadline),
+        Command::Verify { .. } => ("verify", Checks, deadline),
+        Command::Snapshot { .. } => ("snapshot", Changes, deadline),
+        Command::Restore { .. } => ("restore", Changes, deadline),
+        Command::Convert { .. } => ("convert", Changes, deadline.or(Some(3600))),
+        Command::GrantReader { check: true, .. } => ("grant-reader", Checks, deadline),
+        Command::GrantReader { .. } => ("grant-reader", Changes, deadline),
+        Command::Profile { .. } | Command::Compare(_) => unreachable!("not a database command"),
+    };
+    let source = match &command {
+        Command::Convert {
+            source,
+            source_password_file,
+            source_tls_root_cert,
+            capture_source,
+            ..
+        } => {
+            if let Some(path) = capture_source {
+                dsa_store::source_capture::preflight(path).map_err(|error| match error {
+                    Error::Refusal(code) => usage(code, "--capture-source"),
+                    _ => usage("invalid_source_capture_path", "--capture-source"),
+                })?;
+            }
+            Some(connection(
+                &SOURCE,
+                source,
+                source_password_file.as_deref(),
+                source_tls_root_cert.as_deref(),
+            )?)
+        }
+        _ => None,
+    };
+    Ok((
+        Operation::new(name, effect, deadline),
+        Box::new(move |session: Session| {
+            Box::pin(async move { execute(command, profile, destination, source, session).await })
+        }),
+    ))
 }
 
-fn profile(network: &str) -> Result<Profile, Error> {
-    Profile::load(network).map_err(|_| Error::Refusal("unsupported_network"))
-}
-
-async fn database_command(
-    command: &Command,
-    config: tokio_postgres::Config,
-    profile: &Profile,
-    root: Option<&std::path::Path>,
-    limits: &DatabaseArguments,
-    group: &CancelGroup,
-) -> Result<Value, Error> {
-    let mut store = Store::connect(config, root).await?;
-    group.add(store.cancellation());
+/// Connects the destination, registers it for cancellation and applies the
+/// session limits.
+async fn open(
+    connection: Connection,
+    database: &DatabaseArguments,
+    session: &Session,
+) -> Result<Store, Error> {
+    let store = Store::connect(connection.config, connection.root.as_deref()).await?;
+    session.watch(store.cancellation());
     for (name, seconds) in [
-        ("statement_timeout", limits.statement_timeout_seconds),
+        ("statement_timeout", database.statement_timeout_seconds),
         (
             "idle_in_transaction_session_timeout",
-            limits.idle_transaction_timeout_seconds,
+            database.idle_transaction_timeout_seconds,
         ),
     ] {
         if let Some(seconds) = seconds {
@@ -360,22 +483,34 @@ async fn database_command(
                 .await?;
         }
     }
-    match command {
+    Ok(store)
+}
+
+async fn execute(
+    command: Command,
+    profile: Profile,
+    destination: Connection,
+    source: Option<Connection>,
+    session: Session,
+) -> Result<Value, Error> {
+    let database = command.database().expect("a database command");
+    let mut store = open(destination, database, &session).await?;
+    match &command {
         Command::Create { .. } => {
-            store.create(profile).await?;
-            store.status(profile).await
+            store.create(&profile).await?;
+            store.status(&profile).await
         }
         Command::Status { .. } => {
-            let mut value = store.status(profile).await?;
+            let mut value = store.status(&profile).await?;
             value["capabilities"] =
                 serde_json::to_value(dsa_chain::capabilities::NodeCapabilities::pinned())?;
             value["unsupported_node_statements"] =
                 serde_json::to_value(dsa_store::catalogue::unsupported().collect::<Vec<_>>())?;
             Ok(value)
         }
-        Command::Verify { .. } => Ok(serde_json::to_value(store.verify(profile).await?)?),
+        Command::Verify { .. } => Ok(serde_json::to_value(store.verify(&profile).await?)?),
         Command::Snapshot { file, .. } => {
-            Ok(serde_json::to_value(store.snapshot(profile, file).await?)?)
+            Ok(serde_json::to_value(store.snapshot(&profile, file).await?)?)
         }
         Command::Restore {
             file,
@@ -383,13 +518,10 @@ async fn database_command(
             ..
         } => Ok(serde_json::to_value(
             store
-                .restore(profile, file, expect_content_digest.as_deref())
+                .restore(&profile, file, expect_content_digest.as_deref())
                 .await?,
         )?),
         Command::Convert {
-            source,
-            source_password_file,
-            source_tls_root_cert,
             horizon_block,
             retention_seconds,
             batch_rows,
@@ -400,27 +532,11 @@ async fn database_command(
             source_idle_transaction_timeout_seconds,
             ..
         } => {
-            if let Some(path) = capture_source {
-                dsa_store::source_capture::preflight(path)?;
-            }
-            let mut config = tokio_postgres::Config::from_str(source)
-                .map_err(|_| Error::Refusal("invalid_source_configuration"))?;
-            if config.get_password().is_some() {
-                return Err(Error::Refusal("source_password_requires_file"));
-            }
-            if let Some(path) = source_password_file {
-                let password = std::fs::read_to_string(path)
-                    .map_err(|_| Error::Refusal("invalid_source_password_file"))?;
-                let password = password.trim_end_matches(['\r', '\n']);
-                if password.contains(['\r', '\n', '\0']) {
-                    return Err(Error::Refusal("invalid_source_password_file"));
-                }
-                config.password(password);
-            }
+            let source = source.expect("convert names its source");
             let mut source =
-                dsa_store::convert::LegacySource::connect(config, source_tls_root_cert.as_deref())
+                dsa_store::convert::LegacySource::connect(source.config, source.root.as_deref())
                     .await?;
-            group.add(source.cancellation());
+            session.watch(source.cancellation());
             source
                 .limits(
                     *source_statement_timeout_seconds,
@@ -434,288 +550,75 @@ async fn database_command(
                 batch_bytes: *batch_bytes as usize,
                 snapshot: snapshot.clone(),
             };
-            if let Some(path) = capture_source {
-                let tx = source.snapshot().await?;
-                let staged = store.stage_conversion(profile, &tx, &options).await?;
-                let state = &staged.source().state;
-                let positions = dsa_store::compare::Positions::generate_with_events(
-                    &tx,
-                    profile,
-                    state.horizon.height,
-                    state.target.height,
-                    500,
-                )
-                .await?;
-                let captured =
-                    dsa_store::compare::capture(&tx, profile, &positions, &Default::default())
-                        .await?;
-                tx.commit().await?;
-                // The capture file is written before the conversion publishes;
-                // a file failure drops the staged conversion with its gate closed.
-                let path = path.clone();
-                let published = tokio::task::spawn_blocking(move || {
-                    dsa_store::source_capture::write(&path, &captured)
-                })
-                .await
-                .map_err(|_| Error::Refusal("source_capture_io_error"))??;
-                let mut converted = staged.finish(profile).await?;
-                if let Some(snapshot) = &options.snapshot {
-                    converted.snapshot =
-                        Some(store.snapshot(profile, snapshot).await.map_err(|error| {
-                            Error::ConvertedSnapshot {
-                                error: Box::new(error),
-                                content_digest: converted.verified.content_digest.clone(),
-                                state_digest: converted.verified.state_digest.clone(),
-                            }
-                        })?);
-                }
-                let mut value = serde_json::to_value(converted)?;
-                value["source_capture"] = serde_json::to_value(published)?;
-                Ok(value)
-            } else {
-                Ok(serde_json::to_value(
-                    store.convert(profile, &mut source, &options).await?,
-                )?)
+            match capture_source {
+                Some(path) => Ok(serde_json::to_value(
+                    store
+                        .convert_with_capture(&profile, &mut source, &options, path)
+                        .await?,
+                )?),
+                None => Ok(serde_json::to_value(
+                    store.convert(&profile, &mut source, &options).await?,
+                )?),
             }
         }
         Command::GrantReader {
             role, check: true, ..
-        } => store.check_reader(profile, role).await,
-        Command::GrantReader {
-            role, check: false, ..
-        } => store.grant_reader(profile, role).await,
-        Command::Profile { .. } | Command::Compare(_) => {
-            unreachable!("handled before database commands")
-        }
+        } => store.check_reader(&profile, role).await,
+        Command::GrantReader { role, .. } => store.grant_reader(&profile, role).await,
+        Command::Profile { .. } | Command::Compare(_) => unreachable!("not a database command"),
     }
 }
 
-fn hex_bytes(value: &str, bytes: usize) -> Result<Vec<u8>, Error> {
-    if value.len() != bytes * 2 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::Refusal("comparison_probe_policy_invalid"));
-    }
-    (0..bytes * 2)
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&value[i..i + 2], 16)
-                .map_err(|_| Error::Refusal("comparison_probe_policy_invalid"))
-        })
-        .collect()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn compare_command(args: &CompareArguments, group: &CancelGroup) -> Result<Value, Error> {
-    use dsa_store::compare::{Options, Positions, Reader, capture, compare};
-    fn config(
-        text: &str,
-        password: Option<&std::path::Path>,
-    ) -> Result<tokio_postgres::Config, Error> {
-        let mut config = tokio_postgres::Config::from_str(text)
-            .map_err(|_| Error::Refusal("invalid_comparison_configuration"))?;
-        if config.get_password().is_some() {
-            return Err(Error::Refusal("comparison_password_requires_file"));
+    #[test]
+    fn flags_are_checked_before_any_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let two_lines = dir.path().join("password");
+        std::fs::write(&two_lines, "one\ntwo\n").unwrap();
+        let missing = dir.path().join("missing.pem");
+        for (text, password, root, error, flag) in [
+            (
+                "not a connection = string = x",
+                None,
+                None,
+                "invalid_connection_string",
+                "--database",
+            ),
+            (
+                "host=h user=u password=p",
+                None,
+                None,
+                "password_requires_file",
+                "--database",
+            ),
+            (
+                "host=h user=u",
+                Some(two_lines.as_path()),
+                None,
+                "invalid_password_file",
+                "--password-file",
+            ),
+            (
+                "host=h user=u",
+                None,
+                Some(missing.as_path()),
+                "invalid_tls_root_certificate",
+                "--tls-root-cert",
+            ),
+            (
+                "host=h user=u sslmode=disable",
+                None,
+                Some(two_lines.as_path()),
+                "conflicting_tls_configuration",
+                "--tls-root-cert",
+            ),
+        ] {
+            let refused = connection(&DATABASE, text, password, root).err().unwrap();
+            assert_eq!((refused.error, refused.flag), (error, flag), "{text}");
         }
-        if let Some(path) = password {
-            let value = std::fs::read_to_string(path)
-                .map_err(|_| Error::Refusal("invalid_comparison_password_file"))?;
-            let value = value.trim_end_matches(['\r', '\n']);
-            if value.contains(['\r', '\n', '\0']) {
-                return Err(Error::Refusal("invalid_comparison_password_file"));
-            }
-            config.password(value);
-        }
-        Ok(config)
+        assert_eq!(profile("preview").err().unwrap().flag, "--network");
     }
-    let wrap = |side, error| Error::ComparisonSource {
-        side,
-        error: Box::new(error),
-    };
-    let profile = profile(&args.network)?;
-    let explicit = if args.positions == "auto" {
-        None
-    } else {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(&args.positions)
-            .map_err(|_| Error::Refusal("invalid_comparison_positions_file"))?
-            .take(1_048_577)
-            .read_to_end(&mut bytes)
-            .map_err(|_| Error::Refusal("invalid_comparison_positions_file"))?;
-        if bytes.len() > 1_048_576 {
-            return Err(Error::Refusal("comparison_positions_file_too_large"));
-        }
-        let positions: Positions = serde_json::from_slice(&bytes)
-            .map_err(|_| Error::Refusal("invalid_comparison_positions_file"))?;
-        positions.validate()?;
-        if args.horizon_block.is_some_and(|h| h != positions.horizon) {
-            return Err(Error::Refusal("comparison_horizon_mismatch"));
-        }
-        Some(positions)
-    };
-    eprintln!("{}", json!({"operation":"compare","event":"started"}));
-    if let Some(file) = &args.a_capture {
-        if args.a_password_file.is_some() || args.a_tls_root_cert.is_some() {
-            return Err(Error::Refusal("source_capture_has_no_connection"));
-        }
-        let left = dsa_store::source_capture::read(file, &profile)?;
-        if args
-            .candidate_address
-            .as_ref()
-            .is_some_and(|a| a != &left.candidate_address)
-        {
-            return Err(Error::Refusal("comparison_capture_context_mismatch"));
-        }
-        let positions = if let Some(positions) = explicit {
-            if positions != left.positions {
-                return Err(Error::Refusal("comparison_capture_context_mismatch"));
-            }
-            positions
-        } else {
-            left.positions.clone()
-        };
-        if args.horizon_block.is_some_and(|h| h != positions.horizon) {
-            return Err(Error::Refusal("comparison_horizon_mismatch"));
-        }
-        let mut b = Reader::connect(
-            config(&args.b, args.b_password_file.as_deref()).map_err(|e| wrap("b", e))?,
-            args.b_tls_root_cert.as_deref(),
-        )
-        .await
-        .map_err(|e| wrap("b", e))?;
-        group.add(b.cancellation());
-        b.limits(
-            args.statement_timeout_seconds,
-            args.idle_transaction_timeout_seconds,
-        )
-        .await
-        .map_err(|e| wrap("b", e))?;
-        let tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
-        let mut options = Options {
-            check_chain_order: true,
-            verify_unbounded: true,
-            probe_plan: left.probe_plan,
-            missing_policy: Some(hex_bytes(&left.missing_policy, 28)?),
-            missing_tx_hash: Some(hex_bytes(&left.missing_tx_hash, 32)?),
-            candidate_address: left.candidate_address.clone(),
-            ..Default::default()
-        };
-        if let Some(address) = &args.candidate_address {
-            options.candidate_address = address.clone();
-        }
-        let right = capture(&tx, &profile, &positions, &options)
-            .await
-            .map_err(|e| wrap("b", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| wrap("b", Error::Postgres(e)))?;
-        return Ok(serde_json::to_value(compare(
-            &left,
-            &right,
-            args.max_differing_rows as usize,
-        )?)?);
-    }
-    let mut a = Reader::connect(
-        config(
-            args.a
-                .as_deref()
-                .ok_or(Error::Refusal("comparison_source_required"))?,
-            args.a_password_file.as_deref(),
-        )
-        .map_err(|e| wrap("a", e))?,
-        args.a_tls_root_cert.as_deref(),
-    )
-    .await
-    .map_err(|e| wrap("a", e))?;
-    let mut b = Reader::connect(
-        config(&args.b, args.b_password_file.as_deref()).map_err(|e| wrap("b", e))?,
-        args.b_tls_root_cert.as_deref(),
-    )
-    .await
-    .map_err(|e| wrap("b", e))?;
-    group.add(a.cancellation());
-    group.add(b.cancellation());
-    a.limits(
-        args.statement_timeout_seconds,
-        args.idle_transaction_timeout_seconds,
-    )
-    .await
-    .map_err(|e| wrap("a", e))?;
-    b.limits(
-        args.statement_timeout_seconds,
-        args.idle_transaction_timeout_seconds,
-    )
-    .await
-    .map_err(|e| wrap("b", e))?;
-    let tx = a.snapshot().await.map_err(|e| wrap("a", e))?;
-    let right_tx = b.snapshot().await.map_err(|e| wrap("b", e))?;
-    let missing_policy = dsa_store::compare::choose_missing_policy(&[&tx, &right_tx]).await?;
-    let missing_tx_hash =
-        dsa_store::compare::choose_missing_transaction_hash(&[&tx, &right_tx]).await?;
-    let positions = if let Some(p) = explicit {
-        p
-    } else {
-        let h = args
-            .horizon_block
-            .ok_or(Error::Refusal("comparison_horizon_required"))?;
-        let p: i64 = tx
-            .query_one("SELECT id FROM public.block ORDER BY id DESC LIMIT 1", &[])
-            .await
-            .map_err(|e| {
-                wrap(
-                    "a",
-                    if e.code().is_some_and(|c| c.code() == "55000") {
-                        Error::Refusal("comparison_not_serving")
-                    } else {
-                        Error::Postgres(e)
-                    },
-                )
-            })?
-            .get(0);
-        let t = u32::try_from(p)
-            .ok()
-            .and_then(|p| p.checked_sub(profile.cardano.security_parameter))
-            .ok_or(Error::Refusal("comparison_target_not_final"))?;
-        Positions::generate_with_events(&tx, &profile, h, t, args.max_pairs as usize)
-            .await
-            .map_err(|e| wrap("a", e))?
-    };
-    let mut options = Options {
-        verify_unbounded: args.a_verify_unbounded,
-        missing_policy: Some(missing_policy),
-        missing_tx_hash: Some(missing_tx_hash),
-        ..Default::default()
-    };
-    if let Some(address) = &args.candidate_address {
-        options.candidate_address = address.clone();
-    }
-    let mut right_options = options.clone();
-    right_options.check_chain_order = true;
-    right_options.verify_unbounded = true;
-    // Both snapshots pin the same absence probe. Execute independently so one
-    // idle snapshot cannot expire merely while the other endpoint is captured.
-    let left_read = async {
-        let value = capture(&tx, &profile, &positions, &options)
-            .await
-            .map_err(|e| wrap("a", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| wrap("a", Error::Postgres(e)))?;
-        Ok::<_, Error>(value)
-    };
-    let right_read = async {
-        let value = capture(&right_tx, &profile, &positions, &right_options)
-            .await
-            .map_err(|e| wrap("b", e))?;
-        right_tx
-            .commit()
-            .await
-            .map_err(|e| wrap("b", Error::Postgres(e)))?;
-        Ok::<_, Error>(value)
-    };
-    let (left, right) = tokio::try_join!(left_read, right_read)?;
-    let report = compare(&left, &right, args.max_differing_rows as usize)?;
-    eprintln!(
-        "{}",
-        json!({"operation":"compare","event":"finished","matched":report.matched,"differing_cases":report.supported_difference_count,"unsupported_differences":report.unsupported_difference_count,"helper_id_differences":report.helper_id_differences})
-    );
-    Ok(serde_json::to_value(report)?)
 }

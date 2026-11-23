@@ -13,7 +13,7 @@ workspace = true
 clap.workspace = true
 dsa-chain.workspace = true
 dsa-store.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tokio-postgres.workspace = true
 serde_json.workspace = true
 

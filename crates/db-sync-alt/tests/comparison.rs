@@ -275,7 +275,7 @@ async fn compare_detects_removed_unspent_governance_changed_header_and_ident() -
         let out = cli(&source, &target, &f.profile, &[]).await?;
         assert_eq!(
             out.status.code(),
-            Some(2),
+            Some(3),
             "{mutation}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -427,7 +427,7 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
         ])
         .output()
         .await?;
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     let report: Value = serde_json::from_slice(&out.stdout)?;
     assert!(report["differences"].as_array().unwrap().iter().any(|d| {
         d["query"]
@@ -1072,7 +1072,7 @@ async fn compare_optional_governance_descriptors_both_absent_and_one_sided() -> 
         ))
         .await?;
     let out = cli(&source, &target, &f.profile, &[]).await?;
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(3));
     let report: Value = serde_json::from_slice(&out.stdout)?;
     assert!(report["differences"].as_array().unwrap().iter().any(|v| {
         v["query"].as_str().unwrap().starts_with("resolve_ident:") && v["informational"] == false
@@ -1189,7 +1189,7 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
         ])
         .output()
         .await?;
-    assert_eq!(fresh.status.code(), Some(2));
+    assert_eq!(fresh.status.code(), Some(3));
     let fresh_report: Value = serde_json::from_slice(&fresh.stdout)?;
     let latest_difference = fresh_report["differences"]
         .as_array()
@@ -1326,7 +1326,7 @@ async fn compare_preserves_json_numeric_spelling_but_normalizes_scalar_amounts()
     let hash = f.chain.outputs[&output].datum_hash.as_ref().unwrap();
     target.write(&format!("UPDATE serve.datum SET value=jsonb_build_object('constructor',0,'fields',jsonb_build_array(jsonb_build_object('int',108.0::numeric))) WHERE hash=decode('{hash}','hex')")).await?;
     let actual = cli(&source, &target, &f.profile, &[]).await?;
-    assert_eq!(actual.status.code(), Some(2));
+    assert_eq!(actual.status.code(), Some(3));
     let report: Value = serde_json::from_slice(&actual.stdout)?;
     assert!(report["differences"].as_array().unwrap().iter().any(|v| {
         v["query"]
@@ -1681,7 +1681,8 @@ async fn compare_peer_backend_failure_cancels_the_other_active_query() -> Result
             .get::<_, bool>(0)
     );
     let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await??;
-    assert_eq!(output.status.code(), Some(1));
+    // A terminated backend (57P01, as at a server shutdown) is a temporary failure.
+    assert_eq!(output.status.code(), Some(75));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cancel_request"));
     loop {
         let left:i64=source.admin.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=ANY($1::text[]) AND application_name='db-sync-alt-compare'",&[&vec![source.name.clone(),target.name.clone()]]).await?.get(0);
@@ -1941,7 +1942,7 @@ async fn compare_q19_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result
         let output = cli(&source, &target, &f.profile, &args).await?;
         assert_eq!(
             output.status.code(),
-            Some(2),
+            Some(3),
             "{mutation}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -2053,7 +2054,6 @@ async fn compare_q19_compatible_b683_observation_without_reconversion() -> Resul
             file.to_str().unwrap(),
             "--b",
             &target.dsn(true),
-            "--a-verify-unbounded",
         ]);
         c
     };
@@ -2205,7 +2205,7 @@ async fn compare_fails_on_a_type_only_difference() -> Result {
     let output = cli(&source, &target, &f.profile, &[]).await?;
     assert_eq!(
         output.status.code(),
-        Some(2),
+        Some(3),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

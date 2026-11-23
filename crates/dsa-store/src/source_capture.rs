@@ -1,4 +1,4 @@
-//! Development source-answer file, format2 with an enforced keep-rule version.
+//! The source capture file: format 2, with an enforced keep-rule version.
 //!
 //! A conversion captures the literal node answers in its source RR/RO snapshot,
 //! commits that source, then publishes this independently useful observation
@@ -13,7 +13,11 @@
 //! streams to a sink, so serializing a capture does not clone all retained rows.
 //! Loading is bounded, verifies format/hash/rule/profile/catalogue and never runs
 //! SQL from the file. This checksum detects accidental changes, not authorship.
-use crate::{Error, KEEP_RULE_VERSION, catalogue, compare::Capture};
+use crate::{
+    Error, KEEP_RULE_VERSION, Store, catalogue,
+    compare::{self, Capture, Positions},
+    convert::{Conversion, ConvertOptions, LegacySource},
+};
 use dsa_chain::profiles::Profile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +26,8 @@ use std::{
     io::{self, BufReader, Read, Write},
     path::Path,
 };
+/// The uniform position pairs of a conversion's capture.
+const CAPTURE_MAX_PAIRS: usize = 500;
 const FORMAT: u32 = 2;
 const MAX_BYTES: u64 = 1 << 30;
 #[derive(Serialize)]
@@ -165,4 +171,61 @@ pub fn read(path: &Path, profile: &Profile) -> Result<Capture, Error> {
     }
     capture.positions.validate()?;
     Ok(capture)
+}
+
+/// A conversion and the capture of its source's node answers.
+#[derive(Debug, Serialize)]
+pub struct CapturedConversion {
+    #[serde(flatten)]
+    pub conversion: Conversion,
+    pub source_capture: Published,
+}
+
+impl Store {
+    /// Converts the source and captures the node's answers in the same source
+    /// snapshot. The capture file is written before the conversion publishes;
+    /// a file failure drops the staged conversion with its gate closed.
+    pub async fn convert_with_capture(
+        &mut self,
+        profile: &Profile,
+        source: &mut LegacySource,
+        options: &ConvertOptions,
+        path: &Path,
+    ) -> Result<CapturedConversion, Error> {
+        preflight(path)?;
+        let result = async {
+            let tx = source.snapshot().await?;
+            let staged = self.stage_conversion(profile, &tx, options).await?;
+            let state = &staged.source().state;
+            let positions = Positions::generate_with_events(
+                &tx,
+                profile,
+                state.horizon.height,
+                state.target.height,
+                CAPTURE_MAX_PAIRS,
+            )
+            .await?;
+            let captured = compare::capture(&tx, profile, &positions, &Default::default()).await?;
+            tx.commit().await?;
+            let path = path.to_owned();
+            let published = tokio::task::spawn_blocking(move || write(&path, &captured))
+                .await
+                .map_err(|_| Error::Refusal("source_capture_io_error"))??;
+            Ok((staged.finish(profile).await?, published))
+        }
+        .await;
+        let (mut conversion, source_capture) = match result {
+            Ok(done) => done,
+            Err(error) => {
+                self.release_writer().await;
+                return Err(error);
+            }
+        };
+        self.snapshot_converted(profile, &mut conversion, options)
+            .await?;
+        Ok(CapturedConversion {
+            conversion,
+            source_capture,
+        })
+    }
 }

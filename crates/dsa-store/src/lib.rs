@@ -154,7 +154,14 @@ impl Error {
                 json!({"error":"conversion_completed_snapshot_failed","converted":true,"content_digest":content_digest,"state_digest":state_digest,"recovery":"The database is serving. Run snapshot with this destination and a new writable --file path; do not repeat convert.","snapshot_error":error.report()})
             }
             Self::Interrupted { operation, reason } => {
-                json!({"error":reason,"operation":operation,"published":false,"recovery":"Nothing was published and the database is not serving. Run the command again."})
+                let recovery = match *operation {
+                    "restore" | "convert" => {
+                        "Nothing was published and the database is not serving. Run the command again."
+                    }
+                    "snapshot" => "No snapshot file was written. Run the command again.",
+                    _ => "Nothing was changed. Run the command again.",
+                };
+                json!({"error":reason,"operation":operation,"published":false,"recovery":recovery})
             }
             Self::OutcomeUnknown { operation, reason } => {
                 let phase = if *operation == "convert" {
@@ -178,6 +185,67 @@ impl Error {
             _ => json!({"error": self.to_string()}),
         }
     }
+}
+
+impl Error {
+    /// The database could not be reached, closed the connection or is
+    /// starting or stopping: the same command may succeed later.
+    pub fn temporary(&self) -> bool {
+        match self {
+            Self::Postgres(error) | Self::SourceRead { error, .. } => postgres_temporary(error),
+            Self::ComparisonQuery { sqlstate, .. } => {
+                sqlstate.as_deref().is_some_and(temporary_state)
+            }
+            Self::ComparisonSource { error, .. } | Self::InFamily { error, .. } => {
+                error.temporary()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Connection exceptions, administrator or crash shutdown, a server that is
+/// starting, and too many connections.
+fn temporary_state(code: &str) -> bool {
+    code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03" | "53300")
+}
+
+fn postgres_temporary(error: &tokio_postgres::Error) -> bool {
+    if let Some(code) = error.code() {
+        return temporary_state(code.code());
+    }
+    if error.as_db_error().is_some() {
+        return false;
+    }
+    if error.is_closed() {
+        return true;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    for _ in 0..16 {
+        let Some(cause) = current else { break };
+        if cause.downcast_ref::<rustls::Error>().is_some() {
+            return false;
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            if matches!(
+                io.kind(),
+                ConnectionRefused
+                    | ConnectionReset
+                    | ConnectionAborted
+                    | NotConnected
+                    | BrokenPipe
+                    | TimedOut
+                    | HostUnreachable
+                    | NetworkUnreachable
+                    | UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        current = cause.source();
+    }
+    false
 }
 
 // Error strings and Debug output of IO errors can carry paths or context.
@@ -441,7 +509,11 @@ impl Store {
     pub async fn create(&mut self, profile: &Profile) -> Result<(), Error> {
         self.lock_writer().await?;
         match self.destination(profile).await? {
-            load::Destination::Blank => self.create_layout(profile).await,
+            load::Destination::Blank => {
+                // From here a stop cannot tell whether the layout committed.
+                self.cancellation.commit_sent.store(true, Ordering::SeqCst);
+                self.create_layout(profile).await
+            }
             _ => Err(Error::Refusal("destination_not_empty")),
         }
     }
@@ -483,6 +555,7 @@ impl Store {
 
     pub async fn grant_reader(&mut self, profile: &Profile, role: &str) -> Result<Value, Error> {
         self.open(profile).await?;
+        let commit_sent = self.cancellation.commit_sent.clone();
         let transaction = self.writer_transaction().await?;
         reader_attributes(&transaction, role).await?;
         let database: String = transaction
@@ -500,6 +573,7 @@ impl Store {
              GRANT SELECT ON {relations} TO {role_name}; GRANT EXECUTE ON FUNCTION dsa.gate() TO {role_name}", identifier(&database)
         )).await?;
         let report = verify_reader(&transaction, role).await?;
+        commit_sent.store(true, Ordering::SeqCst);
         transaction.commit().await?;
         Ok(report)
     }
