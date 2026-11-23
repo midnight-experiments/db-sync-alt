@@ -25,13 +25,13 @@ command: each flag, its variable and its default.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `--database` | — | required | PostgreSQL connection string, as `key=value` pairs (`host=db.example port=5432 dbname=db_sync_alt user=db_sync_alt_owner`) or as a URI (`postgresql://db_sync_alt_owner@db.example:5432/db_sync_alt`). It must not hold a password. |
-| `--network` | — | required | `mainnet` or `preprod`. The database must belong to this network. |
-| `--password-file` | — | none | A file holding the login's password on one line; a final line break is ignored. |
-| `--tls-root-cert` | — | none | PEM certificates of the authorities that signed the server's certificate. With it, the connection uses TLS and checks the certificate and the host name in `--database`. |
-| `--statement-timeout-seconds` | — | PostgreSQL's setting | `statement_timeout` of this connection, 1 to 86,400 seconds. |
-| `--idle-transaction-timeout-seconds` | — | PostgreSQL's setting | `idle_in_transaction_session_timeout` of this connection, 1 to 86,400 seconds. |
-| `--overall-timeout-seconds` | — | none; `convert`: 3600 | Stop the command after this many seconds, 1 to 86,400. |
+| `--database` | `DSA_DATABASE` | required | PostgreSQL connection string, as `key=value` pairs (`host=db.example port=5432 dbname=db_sync_alt user=db_sync_alt_owner`) or as a URI (`postgresql://db_sync_alt_owner@db.example:5432/db_sync_alt`). It must not hold a password. |
+| `--network` | `DSA_NETWORK` | required | `mainnet` or `preprod`. The database must belong to this network. |
+| `--password-file` | `DSA_PASSWORD_FILE` | none | A file holding the login's password on one line; a final line break is ignored. |
+| `--tls-root-cert` | `DSA_TLS_ROOT_CERT` | none | PEM certificates of the authorities that signed the server's certificate. With it, the connection uses TLS and checks the certificate and the host name in `--database`. |
+| `--statement-timeout-seconds` | `DSA_STATEMENT_TIMEOUT_SECONDS` | PostgreSQL's setting | `statement_timeout` of this connection, 1 to 86,400 seconds. |
+| `--idle-transaction-timeout-seconds` | `DSA_IDLE_TRANSACTION_TIMEOUT_SECONDS` | PostgreSQL's setting | `idle_in_transaction_session_timeout` of this connection, 1 to 86,400 seconds. |
+| `--overall-timeout-seconds` | `DSA_OVERALL_TIMEOUT_SECONDS` | none; `convert`: 3600 | Stop the command after this many seconds, 1 to 86,400. |
 
 TLS: without `--tls-root-cert` the connection still requires TLS and checks
 the server's certificate against the public certificate authorities. Put
