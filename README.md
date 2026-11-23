@@ -53,7 +53,7 @@ PostgreSQL 17 in a container:
 | [Snapshot file](docs/snapshots.md#what-a-file-contains) | 32.9 MB for a 7-day window; 44.1 MB for 24 days | 1.5 to 1.6 MB |
 | [Restore](docs/snapshots.md#restore); [writing a file](docs/snapshots.md#write-a-file) | 19.9 s; 13.0 s for 24 days | 0.5 to 0.7 s; 0.4 s |
 | [Supply check](docs/operations.md#supply-check) | 1.1 s (247,986 unspent outputs) | — |
-| [Provider requests](docs/provider.md#catching-up) | 0.92 a block catching up | 0.80 a block catching up; 233 an hour at the tip, about 5,600 a day |
+| [Provider requests](docs/provider.md#catching-up) | 0.92 a block catching up | 0.80 a block catching up; 319 an hour at the tip, about 7,700 a day |
 | [Compose](deploy/README.md#postgresql-settings), two minutes after a first start | — | service container 4.8 MiB, PostgreSQL container 67 MiB |
 
 The binary is 9.1 MB and the image 33 MB ([deployment](deploy/README.md#the-image)).
