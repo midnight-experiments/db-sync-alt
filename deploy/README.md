@@ -155,7 +155,7 @@ idle-in-transaction timeouts of 60 seconds, `search_path` `public` and
 read-only transactions. db-sync-alt grants it the node's views at every start,
 and refuses a reader that can do more.
 
-### Stop, back up and upgrade
+### Stop and back up
 
 `docker compose -f deploy/compose.yaml --env-file deploy/compose.env stop db-sync-alt`
 stops only the service; PostgreSQL keeps serving the node the last update.
@@ -164,5 +164,3 @@ stops only the service; PostgreSQL keeps serving the node the last update.
 The daily snapshot files in `DSA_SNAPSHOT_HOST_DIR` are the database's backups:
 copy them off the host. To restore one, see
 [a closed gate](../docs/operations.md#a-closed-gate).
-
-To upgrade, set `DSA_IMAGE` to the new version and run `up -d` again.

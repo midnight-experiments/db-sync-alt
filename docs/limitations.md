@@ -22,8 +22,7 @@ older than the horizon:
   node's bridge query read only from the horizon on. The bridge checkpoint is
   not set on Mainnet or Preprod.
 
-There is no full-history mode. Whoever needs history keeps a 0.4.x database or
-a cardano-db-sync.
+There is no full-history mode. Whoever needs history runs cardano-db-sync.
 
 ## Registered candidates
 
@@ -68,8 +67,7 @@ canonical form, so the two texts differ. An output at an address is stored
 only when it carries an asset the node reads, such as cNIGHT, and such an
 address has to be made by hand: none occurs in the real transactions the tests
 record. If one occurs, a node served by db-sync-alt reads another holder
-address text for that output than a node served by cardano-db-sync, and the
-content digest of a followed database differs from a conversion's.
+address text for that output than a node served by cardano-db-sync.
 
 ## Networks and node release
 

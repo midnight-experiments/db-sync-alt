@@ -13,7 +13,7 @@ here.
 | target | The newest block whose events are served: the tip minus k. The database stores the headers of the k blocks above the target too, because the node computes its stable block as the newest block minus k. |
 | relevant | An output at an address of the [profile](#profile), or holding one of its assets; a spend of such an output; a mint of a profile asset. |
 | event | A relevant output, spend or mint, with its transaction and block header. |
-| first served | The time this database first served a block's events. A restore or a conversion counts as first serving every block of its window at that moment. |
+| first served | The time this database first served a block's events. A restore counts as first serving every block of its window at that moment. |
 | retention | How long a block's events stay after they are first served. Default 7 days, at least 24 hours. |
 | horizon | The oldest block whose events are all kept. Blocks below it are pruned. It moves when its first-served time is older than the retention. |
 | window | The blocks from the horizon to the target. |
@@ -43,9 +43,8 @@ here.
 | Term | Meaning |
 | --- | --- |
 | snapshot file | One file holding a whole database and its description, for publishing and restoring ([snapshots](snapshots.md)). |
-| content digest | A SHA-256 over every row the node can read, by natural key. Two databases at the same horizon, target and tip have the same content digest, whether they were restored, converted or followed. |
+| content digest | A SHA-256 over every row the node can read, by natural key. Two databases at the same horizon, target and tip have the same content digest, whether they were restored or followed. |
 | state digest | A SHA-256 over the database's record of outputs spent below the horizon, which the node cannot read but the keep rule needs. |
-| capture file | The answers of a 0.4.x database to the node's queries, saved by `convert --capture-source` for a later `compare`. |
 
 ## Profile
 

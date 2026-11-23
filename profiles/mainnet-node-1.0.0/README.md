@@ -11,8 +11,11 @@ profile and its network. `network.json` holds the network's values with the prov
 - cNIGHT unit: policy `0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa`,
   asset name `NIGHT` (`4e49474854`); ICS and reserve use the same unit.
 
-These are the configuration files that db-sync-alt 0.4.x databases of
-Mainnet were built with. db-sync-alt 0.5.0 compiles its own profile from
-Midnight node 2.1.101
-([compatibility](../../docs/compatibility.md#networks-and-their-profiles));
-a test compares the two where converting a 0.4.x database depends on them.
+db-sync-alt compiles its own profile from Midnight node 2.1.101
+([compatibility](../../docs/compatibility.md#networks-and-their-profiles)).
+These files are test input. `crates/dsa-chain/tests/legacy_profiles.rs` checks
+that the compiled Mainnet profile names the same addresses and asset units, the
+same start cursor and the same Cardano epoch values as these files: the
+full-history source layout that `convert` reads holds rows selected with them.
+`crates/db-sync-alt/tests/ledger_content.rs` reads the registered-candidates
+address from `registered-candidates-addresses.json`.

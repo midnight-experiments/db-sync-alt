@@ -12,7 +12,7 @@ synthetic data only and what on real data.
 
 Describe the effect on the database format, the snapshot file format, the
 keep rule, the provider requests, the node's queries, the flags or operations.
-Flag breaking changes clearly, with the upgrade path.
+Flag breaking changes clearly.
 
 ## Distribution
 

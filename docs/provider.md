@@ -62,8 +62,8 @@ a pre-release commit, PostgreSQL 17 in a container with 4 CPUs and 4 GiB on
 NVMe storage. The four counts cover the follower's first run of 35,068
 requests; a final run for the last block sent 3 more. Two provider timeouts
 were retried. The range needed no datum, metadata or output request. The
-database then held exactly the content of a conversion of the 0.4.x database at
-the same horizon, target and tip.
+database then had the content digest of a database built from the full history
+at the same horizon, target and tip.
 
 At the tip the follower sends one request per poll and one page request per
 block with transactions, plus the epoch requests.

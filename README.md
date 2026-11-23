@@ -31,7 +31,7 @@ flowchart LR
   queries fail with SQLSTATE 55000 instead of returning empty answers.
 - **Keeps serving.** The node reads the last update while db-sync-alt is
   stopped or restarting.
-- **One binary.** No Python, no PostgreSQL client tools, no configuration file.
+- **One binary.** No PostgreSQL client tools, no configuration file.
 
 ## Requirements
 
@@ -39,8 +39,7 @@ flowchart LR
 - PostgreSQL 17 with TLS, which you provide: a dedicated database, an owner
   login and a reader login for the node ([PostgreSQL](docs/postgresql.md)).
 - A Blockfrost key for the network, in a file.
-- A snapshot file of the network to start from, or a 0.4.x database to convert
-  ([upgrade](docs/upgrade.md)).
+- A snapshot file of the network to start from.
 - Disk: right after a restore the database held 194 MB on Mainnet and 18 MB
   on Preprod, and the snapshot files are 32.9 MB and 1.5 MB
   ([measured](docs/snapshots.md)). Memory: the follower peaked at 42,064 KiB
@@ -118,20 +117,13 @@ Midnight node 2.1.101 connects only over TLS. The reader login can read the
 node's eleven views and nothing else. Details and checks:
 [connect a node](docs/connect-a-node.md).
 
-## Upgrade from 0.4.x
-
-`db-sync-alt convert` builds a new 0.5.0 database from a serving 0.4.x
-database, which it only reads and which stays as it was. Verify it, start
-`run` on it, and point the node at it: [upgrade](docs/upgrade.md). This is a
-breaking release ([changelog](CHANGELOG.md)).
-
 ## Documentation
 
 - [Configuration](docs/configuration.md): every flag and variable.
 - [Operations](docs/operations.md): states, `/health`, `/status`, logs, exit
   statuses, upkeep, the retention, a closed gate.
 - [Snapshot files](docs/snapshots.md): restore, write, verify.
-- [Upgrade from 0.4.x](docs/upgrade.md) and [comparison](docs/comparison.md).
+- [Comparison](docs/comparison.md): the node's queries against two databases.
 - [Provider](docs/provider.md): requests, pace, refusals, measured costs.
 - [PostgreSQL](docs/postgresql.md) and [connect a node](docs/connect-a-node.md).
 - [Compatibility](docs/compatibility.md) and [limitations](docs/limitations.md).

@@ -15,6 +15,6 @@ profile and its network. `network.json` holds the network's values with the prov
 - `cnight-config.json` also names a `redemption_validator_address`, which the
   node's queries never read.
 
-These are the configuration files that db-sync-alt 0.4.x used for Preview.
-db-sync-alt 0.5.0 does not serve Preview; the files stay as test input and
-are pinned by `source-manifest.json`.
+db-sync-alt does not serve Preview. No test reads these files; the
+public-source check (`.github/scripts/check_public_source.py`) compares them
+with the hashes in `source-manifest.json`.

@@ -118,8 +118,7 @@ db-sync-alt's own connections use TLS too unless the connection string says
 Measured database sizes, right after a restore of a converted file: Mainnet
 194 MB, Preprod 18 MB (2026-11-23). After following 43,919 Preprod blocks, the
 Preprod database measured 36 MB. Plan room for the daily snapshot files
-([snapshots](snapshots.md#what-a-file-contains)) and, for an upgrade, for the
-temporary space of `convert` ([upgrade](upgrade.md#3-convert)).
+([snapshots](snapshots.md#what-a-file-contains)).
 
 `run` holds up to three connections as the owner login: one that writes, one
 that reads the status every 20 seconds, and one for the running upkeep job.

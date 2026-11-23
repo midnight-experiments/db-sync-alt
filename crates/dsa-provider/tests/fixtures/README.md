@@ -1,5 +1,6 @@
-The compressed corpora pair intact finalized block responses with independently
-exported schema-5 SQL rows and spent-output origins. Each bundle has an external
+The compressed corpora pair intact finalized block responses with the SQL rows
+of the same blocks, exported independently from a full-history database, and
+spent-output origins. Each bundle has an external
 compressed SHA256, exact byte/member/count assertions, and a SHA256 per member.
 The test decodes each block once and processes it with the block function,
 then compares rows and available Pallas facts. Original positional IDs and asset
@@ -27,3 +28,8 @@ The pagination input contains 103 intact finalized transactions from several
 actual Preprod blocks. It is used to form controlled 100+3 transport pages; it
 does not claim a genuine 103-transaction block. Its separate manifest binds its
 bytes and original response-file hashes, block heights and transaction indices.
+
+Readers: `tests/corpus.rs` replays `mainnet-corpus.json.gz` and
+`preprod-corpus.json.gz` with their manifests; `tests/pages.rs` reads
+`pagination-finalized.json` and its manifest; `tests/supplements.rs` reads
+`collateral-omission-cbor.json` and `collateral-omission-utxos.json`.

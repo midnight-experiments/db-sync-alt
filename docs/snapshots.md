@@ -12,9 +12,7 @@ practical cost.
   day and keeps the newest few ([operations](operations.md#daily-snapshot-files)).
 - **The releases.** One file per network is attached to each release, with its
   content digest in the release notes.
-- **`db-sync-alt snapshot`** on any serving database, and
-  **`db-sync-alt convert --snapshot`** when a 0.4.x database is converted
-  ([upgrade](upgrade.md)).
+- **`db-sync-alt snapshot`** on any serving database.
 
 Anyone with a database of the same network can check a file: restore it and
 compare its content digest with the digest of their own database at the same
@@ -32,8 +30,8 @@ The description holds:
 - the network, the profile hash, the keep-rule version (2), the node release
   (`2.1.101`), the database format (1) and the version of db-sync-alt that
   wrote it;
-- the origin of the data: a conversion, a restore or a followed database, with
-  the target and tip of the source;
+- the origin of the data, with the target and tip of the database it came
+  from;
 - the horizon, target and tip, each with height, hash and time, and the
   retention;
 - a digest per table, the content digest, the state digest, and the recorded
@@ -46,8 +44,8 @@ in the file: a restore counts every block of the window as first served at the
 restore.
 
 The content digest covers what the node can read, by natural key, never by row
-ID. A file from a conversion, a file from a followed database and a restore of
-either give the same content digest at the same horizon, target and tip. The
+ID. A file from a followed database and a restore of that file give the same
+content digest at the same horizon, target and tip. The
 state digest covers the outputs spent before the horizon.
 
 Measured sizes, from conversions of the real databases with a pre-release
@@ -81,7 +79,7 @@ start. A restore:
    every section's SHA-256. A wrong path or a file of another network, format
    or rule version leaves the database as it was.
 2. Takes the writer lock. The database must be blank (the layout is created)
-   or hold the empty layout that a failed restore or conversion leaves. A
+   or hold the empty layout that a failed restore leaves. A
    database that serves, holds a row, or has an object of its own in schema
    `serve` is refused unchanged (`destination_not_empty`).
 3. Builds the tables in one transaction: loads every section, re-hashing the
