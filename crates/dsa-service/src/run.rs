@@ -493,6 +493,20 @@ async fn refresh(
     let mut store: Option<Store> = None;
     let mut failing: Option<Instant> = None;
     loop {
+        // A restore builds and publishes the tables: no read holds a lock
+        // its publication would wait for.
+        let restoring = shared
+            .phase
+            .borrow()
+            .as_ref()
+            .is_some_and(|view| view.state == State::Restoring);
+        if restoring {
+            store = None;
+            tokio::select! {
+                () = tokio::time::sleep(interval) => continue,
+                _ = halt.wait_for(|halt| *halt) => return,
+            }
+        }
         let read = tokio::time::timeout(
             REFRESH_DEADLINE,
             read_view(&mut store, &open, &profile, &reader, &*time),
@@ -630,6 +644,36 @@ impl Upkeep {
         }
     }
 
+    /// Looks at the index sizes, records the missing ones and rebuilds the
+    /// index the policy names; only a rebuild is logged as an operation.
+    async fn indexes(&self) {
+        let looked = async {
+            let store = self.connect().await?;
+            let sizes = store.index_sizes().await?;
+            store.record_index_baselines(&sizes).await?;
+            let rebuild = upkeep::index_decision(&sizes, &self.policy).rebuild;
+            Ok::<_, dsa_store::Error>((store, rebuild))
+        }
+        .await;
+        match looked {
+            Ok((store, Some(name))) => {
+                self.job("index_rebuild", async { store.rebuild_index(&name).await })
+                    .await;
+            }
+            Ok((_, None)) => {
+                *lock(&self.current) = None;
+                self.shared.note_upkeep("index_rebuild", None);
+            }
+            Err(error) => {
+                *lock(&self.current) = None;
+                let report = error.report();
+                eprintln!("{}", json!({"event":"index_sizes_failed","error":report}));
+                self.shared
+                    .note_upkeep("index_rebuild", Some(code(&report)));
+            }
+        }
+    }
+
     async fn run(self, mut halt: watch::Receiver<bool>) {
         self.job("index_leftovers", async {
             let store = self.connect().await?;
@@ -652,11 +696,7 @@ impl Upkeep {
                     Job::Supply => {}
                     Job::Indexes => {
                         lock(&self.schedule).indexes_checked = Some(now);
-                        self.job("index_rebuild", async {
-                            let store = self.connect().await?;
-                            upkeep::rebuild_indexes(&store, &self.policy).await
-                        })
-                        .await;
+                        self.indexes().await;
                     }
                     // The time of the last file comes from the database.
                     Job::Snapshot if view.is_some() => {
@@ -696,19 +736,25 @@ struct Tasks {
 }
 
 impl Tasks {
-    /// Cancels a running upkeep statement and ends every task.
+    /// Cancels a running upkeep statement and ends every task: each ends at
+    /// its next step, and what still runs after half a second is aborted.
     async fn end(self) {
         let _ = self.halt.send(true);
         let running = lock(&self.current).take();
         if let Some(cancellation) = running {
             let _ = tokio::time::timeout(Duration::from_secs(1), cancellation.cancel()).await;
         }
-        for handle in self.handles {
-            let abort = handle.abort_handle();
-            if tokio::time::timeout(Duration::from_millis(500), handle)
-                .await
-                .is_err()
-            {
+        let aborts = self
+            .handles
+            .iter()
+            .map(JoinHandle::abort_handle)
+            .collect::<Vec<_>>();
+        let ended = futures_util::future::join_all(self.handles);
+        if tokio::time::timeout(Duration::from_millis(500), ended)
+            .await
+            .is_err()
+        {
+            for abort in aborts {
                 abort.abort();
             }
         }
