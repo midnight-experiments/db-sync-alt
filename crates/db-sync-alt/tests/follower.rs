@@ -264,11 +264,10 @@ async fn following_through_the_provider_equals_a_conversion() -> Result {
 async fn progress_until(view: &mut watch::Receiver<Progress>, done: impl Fn(&Progress) -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while !done(&view.borrow()) {
-        if tokio::time::timeout_at(deadline, view.changed())
-            .await
-            .is_err()
-        {
-            panic!("progress never reached the condition: {:?}", *view.borrow());
+        match tokio::time::timeout_at(deadline, view.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("the loop ended first: {:?}", *view.borrow()),
+            Err(_) => panic!("progress never reached the condition: {:?}", *view.borrow()),
         }
     }
 }
@@ -375,6 +374,22 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
                 "depth {depth}: header {height}"
             );
         }
+        // The update replaced exactly the headers above the fork point.
+        let update: Value = common::connect(&start.database.config)
+            .await?
+            .query_one("SELECT last_update FROM dsa.service_state", &[])
+            .await?
+            .get(0);
+        assert_eq!(
+            update["headers"],
+            json!(i64::from(tip + 1) - fork_point),
+            "depth {depth}: {update}"
+        );
+        assert_eq!(
+            update["deleted"]["block"],
+            json!(i64::from(tip) - fork_point),
+            "depth {depth}: {update}"
+        );
         // The target is checked, then a binary search over the k stored headers.
         let used = height_requests(&fake) - searches;
         assert!(

@@ -136,6 +136,9 @@ mod tests {
             let stop = stop.clone();
             async move { pause(&WallTime, &stop, Duration::from_secs(3_600)).await }
         });
+        // The wait has begun before the stop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
         sender.send(true).unwrap();
         let finished = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
