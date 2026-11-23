@@ -99,6 +99,37 @@ def troubleshooting_errors(root):
     if not codes:return [(TROUBLESHOOTING,'no_codes')]
     return [(TROUBLESHOOTING,'unknown_code:'+code) for code in codes if code not in known]
 
+# The prose of the repository describes the software as it is, from its first
+# version on: no earlier db-sync-alt version, upgrade or comparison with before.
+# Pinned upstream files under reference/ and generated notices are not prose.
+PROSE_FILES = {'README.md','CHANGELOG.md','SECURITY.md','CONTRIBUTING.md','CODE_OF_CONDUCT.md','NOTICE',
+               '.github/pull_request_template.md'}
+PROSE_DIRS = ('docs/','deploy/','.github/ISSUE_TEMPLATE/')
+HISTORY = {
+    # 0.1.x to 0.4.x, also as v0.4.9; not part of a longer number or address.
+    'earlier_version': re.compile(r'(?<![\w.])v?0\.[0-4]\.(?:\d+|x)(?![\w]|\.\d)'),
+    'upgrade': re.compile(r'\bupgrad(?:e|es|ed|ing)\b',re.IGNORECASE),
+    'migration': re.compile(r'\bmigrat(?:e|es|ed|ing|ion|ions)\b',re.IGNORECASE),
+    'earlier_release': re.compile(r'\b(?:earlier|previous|prior|older|former)\s+(?:db-sync-alt\s+)?'
+                                  r'(?:release|version|implementation|format)s?\b',re.IGNORECASE),
+    'python_implementation': re.compile(r'\bPython\s+(?:implementation|package|release|version)s?\b',re.IGNORECASE),
+    'breaking_release': re.compile(r'\*\*Breaking\b|\bbreaking\s+release\b',re.IGNORECASE),
+    'compared_with_before': re.compile(r'\bno longer\b|\b(?:is|are)\s+gone\b',re.IGNORECASE),
+}
+
+def is_prose(rel):
+    name=rel.as_posix()
+    if name.startswith('reference/'):return False
+    if name in PROSE_FILES or rel.name=='README.md':return True
+    return name.startswith(PROSE_DIRS) and (not name.startswith('docs/') or rel.suffix=='.md')
+
+def history_errors(rel,text):
+    found=[]
+    for number,line in enumerate(text.split('\n'),1):
+        for label,regex in HISTORY.items():
+            if regex.search(line):found.append((str(rel),f'{label}:line {number}'))
+    return found
+
 def check(root):
     errors=[]; hashes={}
     tracked=set()
@@ -141,6 +172,7 @@ def check(root):
                 allowed=REDACTION_FIXTURES.get(str(rel),set())
                 matches=[m for m in matches if not any(text[m.start():].startswith(v) and text[m.start()+len(v):m.start()+len(v)+1] in {chr(39),chr(34)} for v in allowed)]
             if matches:errors.append((str(rel),label))
+        if is_prose(rel):errors+=history_errors(rel,text)
         if p.suffix=='.md':
             for link in re.findall(r'\[[^\]]*\]\(([^)]+)\)',text):
                 target,_,fragment=link.partition('#')
