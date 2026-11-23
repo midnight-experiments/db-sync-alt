@@ -14,7 +14,10 @@ use std::{
 };
 
 use chrono::{DateTime, Days, NaiveDateTime};
-use dsa_chain::{block::Selection, profiles::Profile};
+use dsa_chain::{
+    block::Selection,
+    profiles::{Profile, network_magic},
+};
 use dsa_provider::{
     Kind, Provider, Refusal,
     pages::PAGE_SIZE,
@@ -40,6 +43,9 @@ pub const RECHECK: Duration = Duration::from_secs(60);
 /// While no update happens, call counts are stored at least this often
 /// (seconds).
 pub const COUNTS_INTERVAL: u64 = 600;
+/// At the tip, while a poll finds nothing after the stored tip, the
+/// provider's head is read this often.
+pub const HEAD_INTERVAL: Duration = Duration::from_secs(60);
 /// The window of the blocks-per-hour figure (seconds).
 const RATE_WINDOW: u64 = 600;
 /// While catching up, at most one update line per this many seconds.
@@ -64,6 +70,9 @@ pub struct Settings {
     /// `fatal_after`. Otherwise it is retried without end and named in the
     /// state.
     pub refused_answers_end_the_run: bool,
+    /// How long a reconnect waits for the writer lock that another session
+    /// holds before the run ends with `writer_busy`; `None` ends it at once.
+    pub writer_busy_after: Option<Duration>,
     /// Make no block above this height final, complete the stake of the
     /// epochs up to it and return once the stored target equals it.
     pub stop_at_target: Option<u32>,
@@ -78,6 +87,7 @@ impl Default for Settings {
             max_in_flight: 4,
             fatal_after: Duration::from_secs(1_800),
             refused_answers_end_the_run: true,
+            writer_busy_after: None,
             stop_at_target: None,
         }
     }
@@ -137,6 +147,14 @@ pub struct ProviderTip {
     pub observed_at: u64,
 }
 
+/// The target's epoch without a stored stake distribution while the
+/// follower is at the tip, and since when (Unix seconds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct StakeMissing {
+    pub epoch: u32,
+    pub since: u64,
+}
+
 /// What only the running loop knows, published after every step.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Progress {
@@ -158,6 +176,10 @@ pub struct Progress {
     pub last_error: Option<Value>,
     /// The stored target as the loop knows it.
     pub target: Option<u32>,
+    /// The last failed stake read: its epoch, when it failed, when it is
+    /// tried again, its failures in a row and the error with its cause.
+    pub stake_failure: Option<Value>,
+    pub stake_missing: Option<StakeMissing>,
 }
 
 /// Where a run left the database.
@@ -305,6 +327,9 @@ enum Condition {
     Temporary,
     /// An answer the follower refuses.
     Answer,
+    /// Another session holds the writer lock at a reconnect: retried, and
+    /// ends the run once it has lasted `writer_busy_after`.
+    WriterBusy,
 }
 
 /// The SQLSTATE of a store error, if the server gave one.
@@ -403,10 +428,6 @@ fn block_row(header: &Header) -> BlockRow {
     }
 }
 
-fn unix(time: NaiveDateTime) -> u64 {
-    u64::try_from(time.and_utc().timestamp()).unwrap_or(0)
-}
-
 /// The position of the first header that does not follow the one before it,
 /// starting from (`height`, `hash`).
 fn first_break(height: u32, hash: &str, headers: &[Header]) -> Option<usize> {
@@ -434,12 +455,29 @@ enum Outcome {
     },
 }
 
-/// The background stake read: one epoch at a time, oldest first.
+/// The waits after a stake read the provider's answers made fail, for one
+/// epoch, in seconds; the last repeats. A transport failure waits by
+/// [`crate::retry::BACKOFF`].
+pub const STAKE_REFUSED_BACKOFF: [u64; 9] = [1, 2, 4, 8, 16, 30, 60, 300, 600];
+
+/// The next attempt at one epoch's stake.
+#[derive(Clone, Copy, Debug, Default)]
+struct StakeRetry {
+    failures: usize,
+    at: u64,
+}
+
+/// The background stake read: one epoch at a time, the oldest without stake
+/// whose own retry time has passed, so that an epoch that cannot be read
+/// does not hold back newer ones.
 #[derive(Default)]
 struct Stake {
     task: Option<(u32, JoinHandle<Result<Distribution, StakeError>>)>,
-    retry_at: u64,
-    failures: Backoff,
+    /// Epochs whose read failed.
+    retries: BTreeMap<u32, StakeRetry>,
+    /// A failed read of the stored stake epochs waits until then.
+    window_retry_at: u64,
+    window_failures: Backoff,
 }
 
 enum StakeStatus {
@@ -462,6 +500,11 @@ struct Follower<'a> {
     store: Option<Store>,
     stored: Stored,
     provider_tip: Option<ProviderTip>,
+    /// When `/blocks/latest` was last read.
+    head_read_at: Option<u64>,
+    /// Reads of the head in a row that stood above the stored tip while
+    /// nothing followed the stored tip.
+    head_above: u32,
     last_prune_check: Option<u64>,
     last_counts: u64,
     last_update_log: Option<Instant>,
@@ -474,6 +517,8 @@ struct Follower<'a> {
     /// The condition the current failures belong to.
     condition: Option<Condition>,
     between: Option<Box<dyn Between + 'a>>,
+    /// The provider's `/genesis` named the profile's network.
+    network_checked: bool,
 }
 
 impl<'a> Follower<'a> {
@@ -518,6 +563,8 @@ impl<'a> Follower<'a> {
             progress,
             store: Some(store),
             provider_tip: None,
+            head_read_at: None,
+            head_above: 0,
             last_prune_check: None,
             last_counts: now,
             last_update_log: None,
@@ -530,6 +577,7 @@ impl<'a> Follower<'a> {
             backoff: Backoff::default(),
             condition: None,
             between: None,
+            network_checked: false,
             time,
         };
         follower
@@ -679,8 +727,18 @@ impl<'a> Follower<'a> {
                     self.persist_counts_if_due().await;
                     return Ok(until);
                 }
-                Kind::Retry { until } => (Condition::Temporary, until),
+                // A transport failure, a timeout or a 5xx counts towards the
+                // fatal time; an answer the client refused is one the
+                // follower refuses.
+                Kind::Retry { until } if provider.transport() => (Condition::Temporary, until),
+                Kind::Retry { until } => (Condition::Answer, until),
             },
+            Error::Store(dsa_store::Error::Refusal("writer_busy"))
+                if self.settings.writer_busy_after.is_some() =>
+            {
+                self.store = None;
+                (Condition::WriterBusy, now)
+            }
             Error::Store(store) => match retried(store) {
                 Some(reconnect) => {
                     if reconnect {
@@ -699,16 +757,34 @@ impl<'a> Follower<'a> {
             self.backoff.reset();
             self.condition = Some(condition);
         }
-        let until = not_before.max(now + self.backoff.failed(now).as_secs());
+        let mut until = not_before.max(now + self.backoff.failed(now).as_secs());
         let lasted = self.backoff.lasted(now);
-        let ends = condition == Condition::Temporary || self.settings.refused_answers_end_the_run;
-        if ends && lasted > self.settings.fatal_after.as_secs() {
-            return Err(self
-                .fatal(Error::Lasting {
+        let limit = match condition {
+            Condition::Temporary => Some(self.settings.fatal_after),
+            Condition::Answer => self
+                .settings
+                .refused_answers_end_the_run
+                .then_some(self.settings.fatal_after),
+            Condition::WriterBusy => self.settings.writer_busy_after,
+        };
+        if let (Condition::WriterBusy, Some(limit)) = (condition, limit) {
+            // The last attempt falls within the wait.
+            until = until.min(now + limit.as_secs().saturating_sub(lasted));
+        }
+        if limit.is_some_and(|limit| lasted > limit.as_secs()) {
+            // A writer lock held too long is refused as at start, not as a
+            // temporary condition.
+            let ending = match condition {
+                Condition::WriterBusy => Error::Refusal {
+                    code: "writer_busy",
+                    detail: json!({"lasted_seconds": lasted}),
+                },
+                _ => Error::Lasting {
                     seconds: lasted,
                     error: Box::new(error),
-                })
-                .await);
+                },
+            };
+            return Err(self.fatal(ending).await);
         }
         let report = error.report();
         eprintln!(
@@ -919,7 +995,42 @@ impl<'a> Follower<'a> {
         self.requests.count("headers");
         let latest = guarded(&self.stop, self.provider.latest_block()).await?;
         self.observe(&latest);
+        self.head_read_at = Some(self.now());
         Ok(latest)
+    }
+
+    /// At the tip, when nothing follows the stored tip: reads the provider's
+    /// own head once a minute, so that its age shows a provider whose chain
+    /// stands still. A head above the stored tip on two such reads in a row
+    /// means that the stored tip left the provider's chain although its
+    /// `/next` stays empty: the head is returned, and the fork search runs.
+    async fn head_at_tip(&mut self, tip: u32) -> Result<Option<Header>, Error> {
+        let now = self.now();
+        if self
+            .head_read_at
+            .is_some_and(|at| now.saturating_sub(at) < HEAD_INTERVAL.as_secs())
+        {
+            // The provider answered; its head is the one read last.
+            if let Some(head) = self.provider_tip.as_mut() {
+                head.observed_at = now;
+            }
+            return Ok(None);
+        }
+        let head = self.latest().await?;
+        if head.height <= tip {
+            self.head_above = 0;
+            return Ok(None);
+        }
+        self.head_above += 1;
+        if self.head_above < 2 {
+            return Ok(None);
+        }
+        self.head_above = 0;
+        eprintln!(
+            "{}",
+            json!({"event":"next_empty_below_head","tip":tip,"provider_head":head.height})
+        );
+        Ok(Some(head))
     }
 
     /// The hash the provider returns for `height`, if any.
@@ -930,8 +1041,34 @@ impl<'a> Follower<'a> {
             .map(|header| header.hash.to_string()))
     }
 
-    /// One iteration: poll, then at most one update.
+    /// The provider serves the profile's network: its `/genesis` names the
+    /// network's magic. A provider of another network contradicts the stored
+    /// chain without anything being wrong with it, so the run ends with
+    /// `provider_network_mismatch` and the gate untouched. A `/genesis` that
+    /// cannot be read is retried as any other request.
+    async fn check_network(&mut self) -> Result<(), Error> {
+        let Some(expected) = network_magic(&self.profile.network) else {
+            return Ok(());
+        };
+        self.requests.count("genesis");
+        let genesis = guarded(&self.stop, self.provider.genesis()).await?;
+        if genesis.network_magic != expected {
+            return Err(Error::Refusal {
+                code: "provider_network_mismatch",
+                detail: json!({"network":self.profile.network,"expected_magic":expected,
+                    "received_magic":genesis.network_magic}),
+            });
+        }
+        Ok(())
+    }
+
+    /// One iteration: poll, then at most one update. The first one checks
+    /// the provider's network.
     async fn step(&mut self) -> Result<Outcome, Error> {
+        if !self.network_checked {
+            self.check_network().await?;
+            self.network_checked = true;
+        }
         self.connect_if_needed().await?;
         if self.provider_tip.is_none() {
             self.latest().await?;
@@ -951,18 +1088,10 @@ impl<'a> Follower<'a> {
         let linked = page.as_ref().is_some_and(|rows| {
             rows.is_empty() || first_break(tip, &tip_hash, &rows[..1]).is_none()
         });
-        let (fork_point, fetched) = match page {
-            Some(rows) if linked => {
-                if rows.is_empty() {
-                    let row = self.stored.tip();
-                    self.provider_tip = Some(ProviderTip {
-                        height: row.height,
-                        hash: row.hash.clone(),
-                        time: unix(row.time),
-                        observed_at: self.now(),
-                    });
-                    return Ok(Outcome::AtTip);
-                }
+        let rows = page.filter(|_| linked);
+        let (fork_point, fetched) = match rows {
+            Some(rows) if !rows.is_empty() => {
+                self.head_above = 0;
                 if let Some(index) = first_break(tip, &tip_hash, &rows) {
                     return Err(Error::answer(
                         "provider_header_link_mismatch",
@@ -976,9 +1105,16 @@ impl<'a> Follower<'a> {
                 }
                 (tip, rows)
             }
-            // The stored tip left the provider's chain.
-            _ => {
-                let latest = self.latest().await?;
+            rows => {
+                let latest = match rows {
+                    // Nothing follows the stored tip.
+                    Some(_) => match self.head_at_tip(tip).await? {
+                        Some(head) => head,
+                        None => return Ok(Outcome::AtTip),
+                    },
+                    // The stored tip left the provider's chain.
+                    None => self.latest().await?,
+                };
                 if latest.height < tip {
                     return Ok(Outcome::Wait {
                         reason: "provider_chain_shorter",
@@ -1184,6 +1320,9 @@ impl<'a> Follower<'a> {
             }
             let second = self.hash_at(target.height).await?.ok_or_else(missing)?;
             if second != target.hash {
+                // Only a provider of this network can contradict a final
+                // block.
+                self.check_network().await?;
                 return Err(Error::Check {
                     code: "canonical_conflict",
                     detail: json!({"height":target.height,"stored":target.hash,"provider":[first,second]}),
@@ -1268,77 +1407,140 @@ impl<'a> Follower<'a> {
         result: Result<Result<Distribution, StakeError>, tokio::task::JoinError>,
     ) {
         let now = self.now();
-        let failure = match result {
+        let (failure, refusal) = match result {
             Ok(Ok(distribution)) => {
                 let Some(store) = self.store.as_mut() else {
                     // Read again once the connection is back.
-                    self.stake.retry_at = now;
+                    self.stake.retries.entry(epoch).or_default().at = now;
                     return;
                 };
                 match store.put_epoch_stake(epoch, &distribution.rows()).await {
                     Ok(_) | Err(dsa_store::Error::Refusal("stake_epoch_below_window")) => {
-                        self.stake.failures.reset();
+                        self.stake.retries.remove(&epoch);
                         eprintln!(
                             "{}",
                             json!({"event":"stake_stored","epoch":epoch,"method":distribution.method,
                                 "pools":distribution.pools.len(),"active_stake":distribution.active_stake.to_string()})
                         );
+                        self.progress.send_modify(|progress| {
+                            if progress
+                                .stake_failure
+                                .as_ref()
+                                .is_some_and(|failure| failure["epoch"] == epoch)
+                            {
+                                progress.stake_failure = None;
+                            }
+                        });
                         return;
                     }
                     Err(error) => {
                         if error.temporary() {
                             self.store = None;
                         }
-                        error.report()
+                        (error.report(), false)
                     }
                 }
             }
-            Ok(Err(error)) => error.report(),
-            Err(_) => json!({"error":"stake_task_failed"}),
+            Ok(Err(error)) => (error.report(), error.refusal()),
+            Err(_) => (json!({"error":"stake_task_failed"}), false),
         };
-        let wait = self.stake.failures.failed(now).as_secs();
-        self.stake.retry_at = now + wait;
+        let retry = self.stake.retries.entry(epoch).or_default();
+        let wait = if refusal {
+            STAKE_REFUSED_BACKOFF[retry.failures.min(STAKE_REFUSED_BACKOFF.len() - 1)]
+        } else {
+            crate::retry::BACKOFF[retry.failures.min(crate::retry::BACKOFF.len() - 1)]
+        };
+        retry.failures += 1;
+        retry.at = now + wait;
+        let report = json!({"epoch":epoch,"at":now,"retry_at":retry.at,"failures":retry.failures,
+            "error":failure});
         eprintln!(
             "{}",
-            json!({"event":"stake_read_failed","epoch":epoch,"error":failure,"retry_at":self.stake.retry_at})
+            json!({"event":"stake_read_failed","epoch":epoch,"error":report["error"],
+                "retry_at":retry.at,"failures":retry.failures})
         );
+        self.progress
+            .send_modify(|progress| progress.stake_failure = Some(report));
     }
 
     /// Starts the read of the oldest epoch up to the target's that has no
-    /// distribution, unless one runs or waits.
+    /// distribution and whose own retry time has passed, unless a read runs.
+    /// At the tip it notes since when the target's epoch has no stake.
     async fn start_stake(&mut self) -> StakeStatus {
-        if self.stake.task.is_some() || self.now() < self.stake.retry_at {
+        let now = self.now();
+        if self.stake.task.is_some() || now < self.stake.window_retry_at {
             return StakeStatus::Busy;
         }
         let Some(store) = self.store.as_ref() else {
             return StakeStatus::Busy;
         };
-        let window = match store.stake_window().await {
+        let through = self.stored.target.epoch;
+        let window = match store.stake_window(through).await {
             Ok(window) => window,
             Err(error) => {
                 if error.temporary() {
                     self.store = None;
                 }
-                let now = self.now();
-                self.stake.retry_at = now + self.stake.failures.failed(now).as_secs();
+                self.stake.window_retry_at = now + self.stake.window_failures.failed(now).as_secs();
                 return StakeStatus::Busy;
             }
         };
-        let first = window
-            .newest
-            .map_or(window.first, |newest| (newest + 1).max(window.first));
-        if first > self.stored.target.epoch {
+        self.stake.window_failures.reset();
+        self.stake
+            .retries
+            .retain(|epoch, _| window.missing.contains(epoch));
+        let missing = window.missing.contains(&through).then(|| {
+            self.progress
+                .borrow()
+                .stake_missing
+                .filter(|missing| missing.epoch == through)
+                .unwrap_or(StakeMissing {
+                    epoch: through,
+                    since: now,
+                })
+        });
+        self.progress
+            .send_modify(|progress| progress.stake_missing = missing);
+        if window.missing.is_empty() {
             return StakeStatus::Done;
         }
+        let due = window.missing.iter().copied().find(|epoch| {
+            self.stake
+                .retries
+                .get(epoch)
+                .is_none_or(|retry| retry.at <= now)
+        });
+        let Some(first) = due else {
+            return StakeStatus::Busy;
+        };
         let provider = self.provider.clone();
         let requests = self.requests.clone();
         let network = self.profile.network.clone();
-        let task =
-            tokio::spawn(
-                async move { epoch::read_stake(&provider, &requests, first, &network).await },
-            );
+        let waits = epoch::Waits {
+            time: Arc::clone(&self.time),
+            stop: self.stop.clone(),
+        };
+        let task = tokio::spawn(async move {
+            epoch::read_stake(&provider, &requests, &waits, first, &network).await
+        });
         self.stake.task = Some((first, task));
         StakeStatus::Busy
+    }
+
+    /// When the next stake read may start: the window's retry, otherwise the
+    /// earliest retry of an epoch.
+    fn next_stake_attempt(&self) -> u64 {
+        let now = self.now();
+        if now < self.stake.window_retry_at {
+            return self.stake.window_retry_at;
+        }
+        self.stake
+            .retries
+            .values()
+            .map(|retry| retry.at)
+            .min()
+            .unwrap_or(now)
+            .max(now)
     }
 
     /// Reads and stores the stake of every epoch up to the target's.
@@ -1368,7 +1570,7 @@ impl<'a> Follower<'a> {
                     self.stake_result(epoch, result).await;
                 }
                 None => {
-                    let until = self.stake.retry_at;
+                    let until = self.next_stake_attempt().max(self.now() + 1);
                     self.set_state(State::Waiting, "stake_pending", Some(until), None)
                         .await;
                     if !pause_until(&*self.time, &self.stop, until).await {

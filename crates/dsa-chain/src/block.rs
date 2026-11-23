@@ -146,10 +146,6 @@ pub enum Outcome {
 pub enum BlockError {
     #[error("unsupported_position at block {height}")]
     Position { height: u32 },
-    #[error("header_height at block {height}, expected {expected}")]
-    HeaderHeight { height: u32, expected: u32 },
-    #[error("header_parent at block {height}")]
-    HeaderParent { height: u32 },
     #[error("transaction_count at block {height}, header {expected}, decoded {actual}")]
     TransactionCount {
         height: u32,
@@ -187,8 +183,6 @@ impl BlockError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Position { .. } => "unsupported_position",
-            Self::HeaderHeight { .. } => "header_height",
-            Self::HeaderParent { .. } => "header_parent",
             Self::TransactionCount { .. } => "transaction_count",
             Self::DuplicateTransaction { .. } => "duplicate_transaction",
             Self::AssetBalance { .. } => "asset_conservation",
@@ -196,22 +190,6 @@ impl BlockError {
             Self::Invalid { source, .. } => source.code,
         }
     }
-}
-
-/// Check that `header` follows `previous` by height and hash.
-pub fn check_header(previous: &Header, header: &Header) -> Result<(), BlockError> {
-    let height = header.height;
-    if ids::block_id(height).is_err() {
-        return Err(BlockError::Position { height });
-    }
-    let expected = previous.height.saturating_add(1);
-    if height != expected {
-        return Err(BlockError::HeaderHeight { height, expected });
-    }
-    if header.previous_hash.as_ref() != Some(&previous.hash) {
-        return Err(BlockError::HeaderParent { height });
-    }
-    Ok(())
 }
 
 /// What the profile selects: outputs at its addresses or holding an eligible

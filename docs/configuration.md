@@ -31,7 +31,7 @@ command: each flag, its variable and its default.
 | `--tls-root-cert` | `DSA_TLS_ROOT_CERT` | none | PEM certificates of the authorities that signed the server's certificate. With it, the connection uses TLS and checks the certificate and the host name in `--database`. |
 | `--statement-timeout-seconds` | `DSA_STATEMENT_TIMEOUT_SECONDS` | PostgreSQL's setting | `statement_timeout` of this connection, 1 to 86,400 seconds. |
 | `--idle-transaction-timeout-seconds` | `DSA_IDLE_TRANSACTION_TIMEOUT_SECONDS` | PostgreSQL's setting | `idle_in_transaction_session_timeout` of this connection, 1 to 86,400 seconds. |
-| `--overall-timeout-seconds` | `DSA_OVERALL_TIMEOUT_SECONDS` | none; `convert`: 3600 | Stop the command after this many seconds, 1 to 86,400. |
+| `--overall-timeout-seconds` | `DSA_OVERALL_TIMEOUT_SECONDS` | none; `convert`: 3600 | Stop the command after this many seconds, 1 to 86,400. `run` refuses it, also as the variable, with exit status 2: the service runs until it is stopped. |
 
 TLS: without `--tls-root-cert` the connection still requires TLS and checks
 the server's certificate against the public certificate authorities. Put
@@ -44,7 +44,7 @@ server on the same host; `--tls-root-cert` is then refused.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `--provider-url` | `DSA_PROVIDER_URL` | Blockfrost for `--network` | The provider's base URL: `https://cardano-mainnet.blockfrost.io/api/v0` or `https://cardano-preprod.blockfrost.io/api/v0` unless given. |
+| `--provider-url` | `DSA_PROVIDER_URL` | Blockfrost for `--network` | The provider's base URL: `https://cardano-mainnet.blockfrost.io/api/v0` or `https://cardano-preprod.blockfrost.io/api/v0` unless given. The provider must serve `--network`: the network magic of its `/genesis` is checked, and another one ends `run` with exit status 1 (`provider_network_mismatch`). |
 | `--provider-key-file` | `DSA_PROVIDER_KEY_FILE` | required | A file holding the provider key. |
 | `--provider-root-cert` | `DSA_PROVIDER_ROOT_CERT` | none | PEM certificates trusted for the provider in addition to the public authorities. |
 | `--requests-per-second` | `DSA_REQUESTS_PER_SECOND` | `8` | Requests sent per second at most; above 0 and at most 10. |
@@ -70,7 +70,7 @@ server on the same host; `--tls-root-cert` is then refused.
 | --- | --- | --- | --- |
 | `--listen` | `DSA_LISTEN` | `0.0.0.0:18080` | Address and port of `/health` and `/status`. |
 | `--reader` | `DSA_READER` | required | The Midnight node's PostgreSQL login. It is granted the node's rights at every start and checked ([PostgreSQL](postgresql.md#the-reader-login)). |
-| `--snapshot` | `DSA_SNAPSHOT` | none | A snapshot file to restore when the database is empty. Read only on an empty database; the file must be readable at every start while the flag is set. |
+| `--snapshot` | `DSA_SNAPSHOT` | none | A snapshot file to restore when the database is empty, or when an interrupted restore left its build. Read only then: on a serving database the file need not exist, so the flag may stay set after the first start. A missing or unreadable file when a restore is needed ends `run` with exit status 1 (`snapshot_file_unreadable`). |
 | `--expect-content-digest` | `DSA_EXPECT_CONTENT_DIGEST` | none | Refuse the `--snapshot` file unless its content digest is this one (64 lowercase hexadecimal characters). Only with `--snapshot`. |
 | `--retention-seconds` | `DSA_RETENTION_SECONDS` | the stored value | Seconds an event stays after it is first served, at least 86,400. A value that differs from the stored one is refused unless `--change-retention` is given. |
 | `--change-retention` | `DSA_CHANGE_RETENTION` | off | Store `--retention-seconds` when it differs from the stored value ([operations](operations.md#change-the-retention)). Only with `--retention-seconds`. |
@@ -85,7 +85,9 @@ server on the same host; `--tls-root-cert` is then refused.
 The service ([operations](operations.md)). It takes the
 [database flags](#database-flags), the [provider flags](#provider-flags), the
 [follower flags](#follower-flags) and the [service flags](#service-flags), and
-no others.
+no others. It refuses `--overall-timeout-seconds` and
+`DSA_OVERALL_TIMEOUT_SECONDS` with exit status 2
+(`overall_timeout_not_supported`): the service runs until it is stopped.
 
 ## `create`
 

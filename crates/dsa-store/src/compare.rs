@@ -2337,7 +2337,7 @@ fn is_registered_query(s: &Statement) -> bool {
         ]
         .contains(&s.name.as_str())
 }
-/// Format2 observations from b683466 omit input metadata. Their two original
+/// Format-2 captures omit input metadata. Their two original
 /// call sites are fixed: initial hit/miss and an epoch-end header witness.
 /// Recover only those known inputs; an unknown case is never exempted.
 fn candidate_input(capture: &Capture, case: &Case) -> Option<CandidateInput> {

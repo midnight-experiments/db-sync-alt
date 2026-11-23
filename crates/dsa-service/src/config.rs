@@ -1,7 +1,9 @@
 //! The service's own settings. Every value is checked before anything
 //! connects, and a refusal names the flag that carries the value. There is
 //! no configuration file: values come from flags or their `DSA_`
-//! environment variables, and secrets only ever as file paths.
+//! environment variables, and secrets only ever as file paths. The
+//! `--snapshot` file is not opened here: it is read only when a restore is
+//! needed, so a start on a serving database does not need it.
 
 use std::{
     net::SocketAddr,
@@ -17,6 +19,10 @@ pub const MIN_RETENTION_SECONDS: i64 = 86_400;
 /// The shortest time a database may stay unreachable before the service
 /// ends.
 pub const MIN_DATABASE_FATAL_AFTER_SECONDS: u64 = 60;
+/// How long the service waits for the writer lock that another session
+/// holds, at start and on a reconnect, before it refuses to run: a session of
+/// a process that is gone keeps the lock until the server ends it.
+pub const WRITER_BUSY_AFTER_SECONDS: u64 = 120;
 
 /// The values as given, before they are checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +73,8 @@ pub struct Settings {
     pub snapshots: Option<Snapshots>,
     pub health_max_lag_blocks: u32,
     pub database_fatal_after: Duration,
+    /// See [`WRITER_BUSY_AFTER_SECONDS`].
+    pub writer_busy_after: Duration,
 }
 
 /// A refused value: the error code and the flag that carries the value.
@@ -110,11 +118,6 @@ impl Settings {
             .map_err(|_| invalid("invalid_listen_address", "--listen"))?;
         if input.reader.is_empty() || input.reader.len() > 63 || input.reader.contains('\0') {
             return Err(invalid("invalid_reader_role", "--reader"));
-        }
-        if let Some(file) = &input.snapshot
-            && !(file.is_file() && std::fs::File::open(file).is_ok())
-        {
-            return Err(invalid("invalid_snapshot_file", "--snapshot"));
         }
         if let Some(digest) = &input.expect_content_digest {
             if input.snapshot.is_none() {
@@ -173,6 +176,7 @@ impl Settings {
             }),
             health_max_lag_blocks: input.health_max_lag_blocks,
             database_fatal_after: Duration::from_secs(input.database_fatal_after_seconds),
+            writer_busy_after: Duration::from_secs(WRITER_BUSY_AFTER_SECONDS),
         })
     }
 
@@ -242,19 +246,6 @@ mod tests {
                 Box::new(|i| i.reader = "r".repeat(64)),
                 "invalid_reader_role",
                 "--reader",
-            ),
-            (
-                Box::new(|i| i.snapshot = Some("/nonexistent/file.snapshot".into())),
-                "invalid_snapshot_file",
-                "--snapshot",
-            ),
-            (
-                Box::new({
-                    let dir = dir.path().to_owned();
-                    move |i| i.snapshot = Some(dir.clone())
-                }),
-                "invalid_snapshot_file",
-                "--snapshot",
             ),
             (
                 Box::new({
@@ -338,6 +329,17 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    /// The snapshot file is needed only for a restore: the check does not
+    /// open it.
+    #[test]
+    fn a_missing_snapshot_file_passes_the_check() {
+        let mut value = input();
+        value.snapshot = Some("/nonexistent/file.snapshot".into());
+        value.expect_content_digest = Some("a".repeat(64));
+        let restore = Settings::check(value).unwrap().restore.unwrap();
+        assert_eq!(restore.file, PathBuf::from("/nonexistent/file.snapshot"));
     }
 
     #[test]

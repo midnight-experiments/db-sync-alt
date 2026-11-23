@@ -222,6 +222,16 @@ pub enum ProfileError {
     Invalid(#[from] serde_json::Error),
 }
 
+/// The Cardano network magic of a supported network, as a provider's
+/// `/genesis` names it.
+pub fn network_magic(network: &str) -> Option<u32> {
+    match network {
+        "mainnet" => Some(764_824_073),
+        "preprod" => Some(1),
+        _ => None,
+    }
+}
+
 impl Profile {
     /// Only networks supported by the released service are selectable.
     pub fn load(network: &str) -> Result<Self, ProfileError> {
@@ -277,6 +287,13 @@ mod tests {
             changed.cardano.block_stability_margin += 1;
             assert_ne!(profile.hash().unwrap(), changed.hash().unwrap());
         }
+    }
+
+    #[test]
+    fn each_supported_network_has_its_magic() {
+        assert_eq!(network_magic("mainnet"), Some(764_824_073));
+        assert_eq!(network_magic("preprod"), Some(1));
+        assert_eq!(network_magic("preview"), None);
     }
 
     /// The profile hash is bound into every database and snapshot file; the

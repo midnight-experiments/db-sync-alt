@@ -117,6 +117,10 @@ struct Shared {
     database: watch::Sender<Option<Arc<DatabaseView>>>,
     /// Failures of the status read and of the upkeep jobs, as warnings.
     notes: Mutex<Notes>,
+    /// Requests for a status read now, numbered; and the last request a
+    /// finished read served.
+    refresh_wanted: watch::Sender<u64>,
+    refresh_done: watch::Sender<u64>,
     documents: watch::Sender<Documents>,
     settings: status::Settings,
 }
@@ -178,6 +182,8 @@ fn phase(provider: &Provider, state: State, reason: &str, wait_until: Option<u64
         last_refusal: status.last_refusal,
         blocks_remaining: None,
         blocks_per_hour: None,
+        stake_failure: None,
+        stake_missing: None,
     }
 }
 
@@ -308,10 +314,11 @@ impl Service {
             .send_replace(Some(phase(&self.provider, state, reason, wait_until)));
     }
 
-    /// Prepares the database, retrying while it cannot be reached; a
-    /// condition that lasts longer than `database_fatal_after` ends the
-    /// service.
+    /// Prepares the database, retrying while it cannot be reached and while
+    /// another session holds the writer lock; a condition that lasts longer
+    /// than its stated time ends the service.
     async fn start(&self, backoff: &mut Backoff) -> Result<Prepared, Error> {
+        let mut busy = Backoff::default();
         loop {
             match self.prepare().await {
                 Ok(prepared) => {
@@ -322,13 +329,53 @@ impl Service {
                                 "lasted_seconds":backoff.lasted(self.now())})
                         );
                     }
+                    if busy.failures() > 0 {
+                        eprintln!(
+                            "{}",
+                            json!({"event":"writer_lock_taken","failures":busy.failures(),
+                                "lasted_seconds":busy.lasted(self.now())})
+                        );
+                    }
                     return Ok(prepared);
                 }
                 Err(Error::Store(error)) if error.temporary() => {
                     self.unreachable(backoff, Error::Store(error)).await?;
                 }
+                Err(Error::Store(dsa_store::Error::Refusal("writer_busy"))) => {
+                    self.writer_busy(&mut busy).await?;
+                }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    /// Waits after another session was found holding the writer lock, or
+    /// refuses the start once it has held it for `writer_busy_after`: a
+    /// session whose process is gone keeps the lock until the server ends it.
+    async fn writer_busy(&self, busy: &mut Backoff) -> Result<(), Error> {
+        let now = self.now();
+        let wait = busy.failed(now).as_secs();
+        let lasted = busy.lasted(now);
+        let limit = self.settings.writer_busy_after.as_secs();
+        if lasted >= limit {
+            return Err(Error::Refusal {
+                code: "writer_busy",
+                detail: json!({"lasted_seconds": lasted}),
+            });
+        }
+        // The last attempt falls within the wait.
+        let wait = wait.min(limit - lasted);
+        if busy.failures() == 1 {
+            eprintln!(
+                "{}",
+                json!({"event":"writer_busy","refused_after_seconds":self.settings.writer_busy_after.as_secs()})
+            );
+        }
+        self.show(State::Waiting, "writer_busy", Some(now + wait));
+        if pause_until(&*self.time, &self.stop, now + wait).await {
+            Ok(())
+        } else {
+            Err(Error::Stopped)
         }
     }
 
@@ -356,8 +403,9 @@ impl Service {
         }
     }
 
-    /// One attempt: connect, take the writer lock, restore an empty
-    /// database, check the retention and grant and check the reader.
+    /// One attempt: connect, take the writer lock, restore an empty database
+    /// or the build an interrupted restore left, check the retention and
+    /// grant and check the reader.
     async fn prepare(&self) -> Result<Prepared, Error> {
         self.show(State::Waiting, "database_connecting", None);
         let mut store = (self.open)(Role::Writer).await?;
@@ -376,11 +424,16 @@ impl Service {
         };
         let restored = match state {
             Some(state) if state.serving => None,
+            // The build of an interrupted restore, or an empty layout, is
+            // restored again; a database that served is refused.
             Some(state) => {
-                return Err(Error::Refusal {
-                    code: "database_not_serving",
-                    detail: json!({"reason": state.reason}),
-                });
+                if self.settings.restore.is_none() || !store.loadable(&self.profile).await? {
+                    return Err(Error::Refusal {
+                        code: "database_not_serving",
+                        detail: json!({"reason": state.reason}),
+                    });
+                }
+                Some(self.restore(&mut store).await?)
             }
             None => Some(self.restore(&mut store).await?),
         };
@@ -449,7 +502,9 @@ impl Service {
         error
     }
 
-    /// The first start on an empty database: restore `--snapshot`.
+    /// The first start on an empty database, or after an interrupted
+    /// restore: restore `--snapshot`. The file is needed only here; a missing
+    /// or unreadable one refuses the start and names the flag.
     async fn restore(&self, store: &mut Store) -> Result<Value, Error> {
         let Some(restore) = &self.settings.restore else {
             return Err(Error::Refusal {
@@ -457,6 +512,17 @@ impl Service {
                 detail: json!({"database": "empty", "flag": "--snapshot"}),
             });
         };
+        let unreadable = match std::fs::File::open(&restore.file).and_then(|file| file.metadata()) {
+            Ok(metadata) if metadata.is_file() => None,
+            Ok(_) => Some("not_a_file".to_owned()),
+            Err(error) => Some(format!("{:?}", error.kind())),
+        };
+        if let Some(kind) = unreadable {
+            return Err(Error::Refusal {
+                code: "snapshot_file_unreadable",
+                detail: json!({"flag": "--snapshot", "kind": kind}),
+            });
+        }
         let description = dsa_store::snapshot::describe(&restore.file, &self.profile)?;
         let in_file = description.verified.state.retention_seconds;
         if let Some(retention) = self.settings.retention
@@ -518,18 +584,22 @@ async fn refresh(
 ) {
     let mut store: Option<Store> = None;
     let mut failing: Option<Instant> = None;
+    let mut wanted = shared.refresh_wanted.subscribe();
+    let mut served = 0;
     loop {
+        let requested = *wanted.borrow_and_update();
         // A restore builds and publishes the tables: no read holds a lock
-        // its publication would wait for.
+        // its publication would wait for. A request comes once it is done.
         let restoring = shared
             .phase
             .borrow()
             .as_ref()
             .is_some_and(|view| view.state == State::Restoring);
-        if restoring {
+        if restoring && requested == served {
             store = None;
             tokio::select! {
                 () = tokio::time::sleep(interval) => continue,
+                _ = wanted.changed() => continue,
                 _ = halt.wait_for(|halt| *halt) => return,
             }
         }
@@ -572,8 +642,11 @@ async fn refresh(
                 lock(&shared.notes).refresh = Some(code(&report));
             }
         }
+        served = requested;
+        shared.refresh_done.send_replace(requested);
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
+            _ = wanted.changed() => {}
             _ = halt.wait_for(|halt| *halt) => return,
         }
     }
@@ -671,27 +744,36 @@ impl Upkeep {
     }
 
     /// Looks at the index sizes, records the missing ones and rebuilds the
-    /// index the policy names; only a rebuild is logged as an operation.
+    /// index the policy names (`upkeep::rebuild_indexes`); only a rebuild is
+    /// logged as an operation.
     async fn indexes(&self) {
-        let looked = async {
+        let mut began = None;
+        let result = async {
             let store = self.connect().await?;
-            let sizes = store.index_sizes().await?;
-            store.record_index_baselines(&sizes).await?;
-            let rebuild = upkeep::index_decision(&sizes, &self.policy).rebuild;
-            Ok::<_, dsa_store::Error>((store, rebuild))
+            upkeep::rebuild_indexes(&store, &self.policy, |_| {
+                began = Some(started("index_rebuild", json!({})));
+            })
+            .await
         }
         .await;
-        match looked {
-            Ok((store, Some(name))) => {
-                self.job("index_rebuild", async { store.rebuild_index(&name).await })
-                    .await;
-            }
-            Ok((_, None)) => {
-                *lock(&self.current) = None;
+        *lock(&self.current) = None;
+        match (result, began) {
+            (Ok(Some(rebuild)), Some(began)) => {
+                finished(
+                    "index_rebuild",
+                    began,
+                    Ok(serde_json::to_value(rebuild).unwrap_or(Value::Null)),
+                );
                 self.shared.note_upkeep("index_rebuild", None);
             }
-            Err(error) => {
-                *lock(&self.current) = None;
+            (Ok(_), _) => self.shared.note_upkeep("index_rebuild", None),
+            (Err(error), Some(began)) => {
+                let report = error.report();
+                finished("index_rebuild", began, Err(report.clone()));
+                self.shared
+                    .note_upkeep("index_rebuild", Some(code(&report)));
+            }
+            (Err(error), None) => {
                 let report = error.report();
                 eprintln!("{}", json!({"event":"index_sizes_failed","error":report}));
                 self.shared
@@ -813,6 +895,8 @@ pub async fn run(context: Context) -> Result<Report, Error> {
         .0,
         database: watch::channel(None).0,
         notes: Mutex::new(Notes::default()),
+        refresh_wanted: watch::channel(0).0,
+        refresh_done: watch::channel(0).0,
         documents: watch::channel(Documents {
             healthy: false,
             body: "{}".into(),
@@ -869,6 +953,7 @@ pub async fn run(context: Context) -> Result<Report, Error> {
     let mut follower_settings = follower;
     follower_settings.fatal_after = settings.database_fatal_after;
     follower_settings.refused_answers_end_the_run = false;
+    follower_settings.writer_busy_after = Some(settings.writer_busy_after);
     let mut backoff = Backoff::default();
     let mut restored = None;
     let mut upkeep_started = false;
@@ -878,6 +963,21 @@ pub async fn run(context: Context) -> Result<Report, Error> {
             Err(error) => break Err(error),
         };
         restored = restored.or(prepared.restored);
+        // The database part of the status is read once the database is
+        // prepared (restored, reader granted), so that the first document
+        // of the follower is current.
+        let mut generation = 0;
+        shared.refresh_wanted.send_modify(|wanted| {
+            *wanted += 1;
+            generation = *wanted;
+        });
+        let mut done = shared.refresh_done.subscribe();
+        let read =
+            tokio::time::timeout(REFRESH_DEADLINE, done.wait_for(|done| *done >= generation));
+        tokio::select! {
+            _ = read => {}
+            () = stop.wait() => {}
+        }
         if !upkeep_started {
             upkeep_started = true;
             let upkeep = Upkeep {

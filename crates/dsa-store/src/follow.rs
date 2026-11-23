@@ -823,11 +823,14 @@ impl Store {
 }
 
 /// The epochs whose stake distribution the window keeps: from `first` (the
-/// horizon's epoch minus two) on; `newest` is the newest one stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// horizon's epoch minus two) on; `newest` is the newest one stored, and
+/// `missing` the epochs without stake from the oldest one stored in the
+/// window (`first` when none is) through the asked one, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StakeWindow {
     pub first: u32,
     pub newest: Option<u32>,
+    pub missing: Vec<u32>,
 }
 
 impl Store {
@@ -876,22 +879,33 @@ impl Store {
             .collect()
     }
 
-    /// The epochs the window keeps stake for and the newest one stored.
-    pub async fn stake_window(&self) -> Result<StakeWindow, Error> {
+    /// The epochs the window keeps stake for, the newest one stored, and the
+    /// ones without stake after the oldest one stored in the window through
+    /// `through`: one index probe per epoch.
+    pub async fn stake_window(&self, through: u32) -> Result<StakeWindow, Error> {
         let row = self
             .client
             .query_one(
-                "SELECT (SELECT b.epoch_no::bigint FROM dsa.position p JOIN serve.block b ON b.id=p.horizon_height WHERE p.id=1),
-                 (SELECT max(epoch_no)::bigint FROM serve.epoch_stake)",
-                &[],
+                "WITH h AS (SELECT (SELECT greatest(b.epoch_no::bigint-2,0) FROM dsa.position p JOIN serve.block b ON b.id=p.horizon_height WHERE p.id=1) AS first)
+                 SELECT h.first,(SELECT max(epoch_no)::bigint FROM serve.epoch_stake),
+                 ARRAY(SELECT e FROM generate_series(coalesce((SELECT min(epoch_no)::bigint FROM serve.epoch_stake WHERE epoch_no>=h.first),h.first),$1::bigint) e
+                       WHERE NOT EXISTS(SELECT 1 FROM serve.epoch_stake s WHERE s.epoch_no=e) ORDER BY e)
+                 FROM h",
+                &[&i64::from(through)],
             )
             .await?;
-        let horizon: i64 = row
+        let first: i64 = row
             .get::<_, Option<i64>>(0)
             .ok_or(Error::Refusal("missing_horizon_epoch"))?;
+        let missing = row
+            .get::<_, Vec<i64>>(2)
+            .into_iter()
+            .map(height_of)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(StakeWindow {
-            first: height_of(horizon.saturating_sub(2).max(0))?,
+            first: height_of(first)?,
             newest: row.get::<_, Option<i64>>(1).map(height_of).transpose()?,
+            missing,
         })
     }
 }

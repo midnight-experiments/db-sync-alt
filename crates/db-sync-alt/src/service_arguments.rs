@@ -19,7 +19,8 @@ pub(crate) struct ServiceArguments {
     /// The node's PostgreSQL login: granted its rights at start and checked.
     #[arg(long, env = "DSA_READER")]
     pub(crate) reader: String,
-    /// A snapshot file to restore when the database is empty.
+    /// A snapshot file to restore when the database is empty; read only when
+    /// a restore is needed.
     #[arg(long, env = "DSA_SNAPSHOT")]
     pub(crate) snapshot: Option<PathBuf>,
     /// Refuse the --snapshot file unless its content digest is this one.
@@ -130,7 +131,6 @@ mod tests {
         assert_eq!(result["flag"], "--reader", "{result}");
         for (arguments, flag) in [
             (vec!["--listen", "nowhere"], "--listen"),
-            (vec!["--snapshot", "/nonexistent/f.snapshot"], "--snapshot"),
             (
                 vec!["--expect-content-digest", &digest],
                 "--expect-content-digest",
@@ -285,7 +285,6 @@ mod tests {
         // An invalid value from a variable is named by its flag.
         for (name, value, flag) in [
             ("DSA_LISTEN", "nowhere", "--listen"),
-            ("DSA_SNAPSHOT", "/nonexistent/f", "--snapshot"),
             ("DSA_RETENTION_SECONDS", "10", "--retention-seconds"),
             ("DSA_SNAPSHOT_DIR", "/nonexistent/d", "--snapshot-dir"),
             ("DSA_SNAPSHOT_KEEP", "0", "--snapshot-keep"),

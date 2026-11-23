@@ -97,6 +97,9 @@ pub struct Pools {
     pub reported_total: BTreeMap<u32, u64>,
     /// The prefix of the stake addresses in `/epochs/{n}/stakes/{pool}`.
     pub stake_prefix: String,
+    /// Epoch -> pool -> the delegator count of its history row, 1 unless
+    /// named here.
+    pub delegators: BTreeMap<u32, BTreeMap<String, u64>>,
 }
 
 /// The Bech32 pool ID of a 28-byte pool hash in hexadecimal.
@@ -138,6 +141,8 @@ pub struct Chain {
     /// epoch is not known yet.
     pub parameters: BTreeMap<u32, (String, u32)>,
     pub pools: Pools,
+    /// The network magic `/genesis` names; without one it answers 404.
+    pub network_magic: Option<u32>,
 }
 
 /// A distinct ordinary transaction, for filling blocks.
@@ -338,9 +343,15 @@ impl Chain {
                         .iter()
                         .rev()
                         .filter_map(|(epoch, stake)| {
+                            let delegators = pools
+                                .delegators
+                                .get(epoch)
+                                .and_then(|counts| counts.get(&pool))
+                                .copied()
+                                .unwrap_or(1);
                             stake.get(&pool).map(|amount| {
                                 json!({"epoch": epoch, "blocks": 0, "active_stake": amount.to_string(),
-                                    "active_size": 0.0, "delegators_count": 1, "rewards": "0", "fees": "0"})
+                                    "active_size": 0.0, "delegators_count": delegators, "rewards": "0", "fees": "0"})
                             })
                         })
                         .collect(),
@@ -428,6 +439,15 @@ impl Chain {
         let parts: Vec<_> = route.trim_start_matches('/').split('/').collect();
         let missing = || Behavior::status(404);
         match parts.as_slice() {
+            ["genesis"] => self.network_magic.map_or_else(missing, |magic| {
+                Behavior::json(json!({
+                    "active_slots_coefficient": 0.05, "update_quorum": 5,
+                    "max_lovelace_supply": "45000000000000000", "network_magic": magic,
+                    "epoch_length": 432000, "system_start": 1654041600,
+                    "slots_per_kes_period": 129600, "slot_length": 1,
+                    "max_kes_evolutions": 62, "security_param": 2160
+                }))
+            }),
             ["blocks", "latest"] => self
                 .tip()
                 .map_or_else(missing, |tip| Behavior::json(tip.header())),

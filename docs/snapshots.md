@@ -73,7 +73,11 @@ or `integrity.snapshot` of the database that wrote it), not from the file
 itself.
 
 `run --snapshot FILE --expect-content-digest DIGEST` does the same on its first
-start. A restore:
+start. The file is read only when a restore is needed, so the two flags may
+stay set after the first start, also when the file is gone. When the file lies
+in `--snapshot-dir` under the daily name pattern of the network, it belongs to
+the daily rotation and is removed once `--snapshot-keep` newer files exist
+([operations](operations.md#daily-snapshot-files)). A restore:
 
 1. Opens the file and checks it before the database changes: the description,
    the format, the network, the profile hash, the keep-rule version, the node
@@ -96,8 +100,9 @@ start. A restore:
    seconds.
 
 If a restore stops after the build and before publication, the database is not
-serving and still answers 55000; the next restore, with the same or another
-valid file, undoes the build and loads again. A restore stopped by a signal
+serving and still answers 55000; the next restore, or the next start of `run`
+with `--snapshot`, undoes the build and loads again, with the same or another
+valid file. A restore stopped by a signal
 reports `"published": false` before its publishing commit was sent and
 `"outcome": "unknown"` after: run `status` and `verify` to see which state it
 reached.
@@ -118,7 +123,8 @@ day old costs a day of catching up ([provider](provider.md#catching-up)).
 
 ```sh
 db-sync-alt snapshot --network mainnet --database '<connection string>' \
-  --password-file owner.password --file mainnet.snapshot
+  --password-file owner.password --tls-root-cert root-ca.crt \
+  --file mainnet.snapshot
 ```
 
 `snapshot` reads one consistent state of a serving database in a single
@@ -135,7 +141,7 @@ exists; do not write over it.
 
 ```sh
 db-sync-alt verify --network mainnet --database '<connection string>' \
-  --password-file owner.password
+  --password-file owner.password --tls-root-cert root-ca.crt
 ```
 
 `verify` checks a serving database in one consistent read: the positional IDs,

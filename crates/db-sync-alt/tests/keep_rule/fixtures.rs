@@ -391,7 +391,7 @@ impl Fixture {
     }
 
     /// Every generated proof includes foreign units around eligible original
-    /// ordinals at all address classes, plus the distinct Q4 datum boundary.
+    /// ordinals at all address classes, plus the distinct boundary of the datums the node reads.
     pub fn token_rule_edges(&mut self) {
         for (id, policy, name) in [
             (9010, "00".repeat(28), "".to_owned()),
@@ -485,7 +485,7 @@ impl Fixture {
             );
             self.chain.output_assets.retain(|_, a| a.output != out);
             self.add_asset(out, id, 0);
-            // Wrong names cannot acquire Q4's permissioned-unit datum reason.
+            // Wrong names cannot acquire the permissioned unit's datum reason.
             self.tags.insert(format!("v2_wrong_name_{role}"), out);
         }
         for (index, role) in [

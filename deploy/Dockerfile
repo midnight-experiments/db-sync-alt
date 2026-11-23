@@ -8,7 +8,6 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY tools ./tools
-COPY reference ./reference
 RUN cargo build --release --locked -p db-sync-alt \
     && install -D -m 0755 target/release/db-sync-alt /out/usr/local/bin/db-sync-alt \
     && install -d -m 0755 /out/var/lib/db-sync-alt/snapshots

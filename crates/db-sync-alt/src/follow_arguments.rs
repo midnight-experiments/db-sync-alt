@@ -42,7 +42,6 @@ fn default_url(network: &str) -> Option<&'static str> {
     match network {
         "mainnet" => Some("https://cardano-mainnet.blockfrost.io/api/v0"),
         "preprod" => Some("https://cardano-preprod.blockfrost.io/api/v0"),
-        "preview" => Some("https://cardano-preview.blockfrost.io/api/v0"),
         _ => None,
     }
 }

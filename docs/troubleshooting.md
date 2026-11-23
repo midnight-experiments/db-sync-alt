@@ -29,7 +29,6 @@ exit status.
 | `invalid_provider_configuration` | A provider value is out of range, or the key or certificate file cannot be read. | Check `--requests-per-second` (at most 10), `--max-in-flight` and the files. |
 | `invalid_listen_address` | `--listen` is not an address and port. | For example `0.0.0.0:18080`. |
 | `invalid_reader_role` | `--reader` is empty or too long. | |
-| `invalid_snapshot_file` | The `--snapshot` file cannot be read. | It must be readable at every start while the flag is set; remove the flag once the database serves. |
 | `expect_content_digest_requires_snapshot` | `--expect-content-digest` without `--snapshot`. | |
 | `invalid_content_digest` | The digest is not 64 lowercase hexadecimal characters. | |
 | `invalid_retention` | `--retention-seconds` below 86,400. | |
@@ -38,9 +37,11 @@ exit status.
 | `invalid_snapshot_keep` | `--snapshot-keep` is 0. | |
 | `invalid_snapshot_at` | `--snapshot-at` is not `HH:MM`. | |
 | `invalid_database_fatal_after` | `--database-fatal-after-seconds` below 60. | |
+| `overall_timeout_not_supported` | `run` was given `--overall-timeout-seconds` or `DSA_OVERALL_TIMEOUT_SECONDS`. | Remove it: the service runs until it is stopped. |
 
-An empty `DSA_` variable is a value: `DSA_SNAPSHOT=` is refused as
-`invalid_snapshot_file`. Leave unused variables out.
+An empty `DSA_` variable is a value: the command-line parser refuses
+`DSA_SNAPSHOT=` because `--snapshot` needs a value, and `DSA_MAX_IN_FLIGHT=` as
+not a number. Leave unused variables out.
 
 ## Connecting to PostgreSQL
 
@@ -59,7 +60,24 @@ connection, is starting or stopping, or has too many connections.
 | `tls_error` | Another TLS failure, for example a server without TLS. | Turn TLS on ([PostgreSQL](postgresql.md#tls)) or use `sslmode=disable` for a local server. |
 | `postgresql_17_required` | The server is not PostgreSQL 17. | |
 | `invalid_owner_role` | The login does not own the database, or has superuser or other role attributes. | [PostgreSQL](postgresql.md#the-database-and-its-logins). |
-| `writer_busy` | Another process holds the writer lock: a running service, or a restore or conversion. | Stop the other one, or wait for it. |
+| `writer_busy` | Another session holds the writer lock: a running service, a restore or a conversion, or the session of a db-sync-alt process that is gone, whose host lost power or whose network to the server was cut. `run` waits for the lock, at start and when its writer reconnects, with the state `waiting` and the reason `writer_busy`, and ends with exit status 1 after 120 seconds; the other commands refuse at once. | Stop the other process, or wait for it. A session left by a process that is gone ends by itself within about a minute; to end it at once, see below. |
+
+Every session of db-sync-alt sets the server-side TCP keepalive
+(`tcp_keepalives_idle` 30 seconds, `tcp_keepalives_interval` 10 seconds,
+`tcp_keepalives_count` 3), so the server notices a client that is gone within
+about a minute and ends its session, which releases the writer lock. To find
+the session that holds the lock, and its client, run as the owner login or a
+superuser in the database:
+
+```sql
+SELECT a.pid, a.client_addr, a.backend_start, a.state, a.state_change
+FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory' AND l.classid = 6583137 AND l.objid = 1
+  AND l.granted AND a.datname = current_database();
+```
+
+If no db-sync-alt process runs on that client any more, end the session with
+`SELECT pg_terminate_backend(<pid>);`.
 
 ## The database
 
@@ -74,9 +92,12 @@ connection, is starting or stopping, or has too many connections.
 | `stored_headers_incomplete` | The headers between the target and the tip are not all stored. | Run `verify`; restore a snapshot file into a new database. |
 
 `run` also refuses an empty database without `--snapshot`
-(`snapshot_required`), a `--retention-seconds` that differs from the stored
-one (`retention_mismatch`, [change the retention](operations.md#change-the-retention)),
-and a `--listen` address that is in use (`listen_address_unavailable`).
+(`snapshot_required`), a `--snapshot` file that is missing or unreadable when a
+restore is needed (`snapshot_file_unreadable`, with the flag and the kind of
+failure; the file is not read when the database serves), a
+`--retention-seconds` that differs from the stored one (`retention_mismatch`,
+[change the retention](operations.md#change-the-retention)), and a `--listen`
+address that is in use (`listen_address_unavailable`).
 
 ## The reader login
 
@@ -105,6 +126,7 @@ and a `--listen` address that is in use (`listen_address_unavailable`).
 | Code | Cause | What to do |
 | --- | --- | --- |
 | `provider_key_rejected` | The provider answered 401 or 403: the key is wrong, revoked, or for another network. The service stops. | Fix the key file. |
+| `provider_network_mismatch` | The provider's `/genesis` names another network's magic (`expected_magic` and `received_magic` in the detail): `--provider-url` points at a provider of another network. Checked when the follower starts and again before a contradiction of a final block would close the gate. The service stops with exit status 1; the gate is not touched and no update is written. | Fix `--provider-url`. |
 | `quota_exhausted` | 402: the key's daily allowance is spent. Waited out until the next UTC day. | Nothing; a larger plan if it repeats ([provider](provider.md#refusals-and-outages)). |
 | `provider_rate_limited` | 429. Waited out. | Lower `--requests-per-second` if another program shares the key. |
 | `provider_banned` | 418. Waited out, 1 to 24 hours. | Check what else uses the key. |
@@ -113,19 +135,24 @@ and a `--listen` address that is in use (`listen_address_unavailable`).
 
 ## Answers the follower refuses
 
-The follower checks every answer against the chain before it writes anything.
-When an answer fails a check, nothing is written and the step is retried every
-30 seconds without end; `/status` shows the state `waiting` with the code, and
+The provider client reads every answer into the endpoint's type, and the
+follower checks it against the chain before it writes anything. When an
+answer fails either, nothing is written and the step is retried every 30
+seconds without end; `/status` shows the state `waiting` with the code, and
 `/health` fails once the database falls behind. A short spell is usually the
 provider's; a code that stays for one block points at that block.
 
 | Code | What did not match |
 | --- | --- |
+| `provider_invalid_response` | An answer is not valid for its endpoint: not JSON of the expected shape, or a header of another height or epoch than asked for. |
+| `provider_bad_page` | A list holds more rows than one page. |
+| `provider_not_found` | The provider answered 404 where the endpoint must answer, for example `/blocks/latest` or a transaction's metadata. |
+| `provider_response_size_limit` | An answer is larger than the limit of its endpoint. |
+| `provider_json_depth_limit` | A `/txs/{hash}/utxos` answer nests deeper than the client reads. |
+| `provider_request_rejected` | The provider answered another 4xx or a 3xx status. |
 | `transaction_count` | A block's transaction list is shorter or longer than its header says. |
 | `cbor_body_hash_mismatch` | A transaction's bytes do not hash to its ID. |
 | `duplicate_transaction` | A transaction appears twice in one block. |
-| `header_height` | A block header is not at the height that follows the previous one. |
-| `header_parent` | A header does not link to the one before it. |
 | `provider_header_link_mismatch` | A page of headers does not link to the stored tip. |
 | `provider_page_missing` | A page of a block's transactions is missing. |
 | `provider_block_unknown` | The provider does not know a block it listed. |
@@ -137,6 +164,25 @@ provider's; a code that stays for one block points at that block.
 Codes starting with `cbor_` name what the decoder refused in a transaction's
 bytes. If one stays, report it with the block height from `last_error.detail`:
 content the ledger accepts must never stop the follower.
+
+## Stake distributions
+
+A stake read that fails is logged as `stake_read_failed` and shown in
+`epochs.stake_failure` of `/status`; it never stops following. The epoch is
+tried again at growing waits, and newer epochs are read meanwhile
+([provider](provider.md#stake-distributions)).
+
+| Code | Cause | What to do |
+| --- | --- | --- |
+| `provider_epoch_total_mismatch` | The pools' stake does not sum to the epoch's active stake; `active_stake` and `sum` are in the error. | Nothing while it is short; if it stays for one epoch, report it with both numbers. |
+| `provider_duplicate_pool` | A pool appears twice in one list; `pool` and `list` name them. | As above. |
+| `provider_invalid_pool_id` | A pool ID is not the form of a pool hash; `pool` names it. | As above. |
+| `provider_invalid_stake_row` | An answer about one pool fails a check: `retired_pool_unknown` (the provider does not know a pool it lists as retired) or `stake_address_of_another_network`; `pool` and `check` name them. | As above. |
+| `provider_epoch_not_ready` | The provider has no active stake for the epoch yet. | Nothing. |
+| `provider_epoch_changed` | The latest block's epoch moved during the read. | Nothing; read again. |
+| `provider_empty_epoch` | The epoch's active stake is zero. | Report it. |
+| `provider_epoch_size_limit` | A list holds more pools than one distribution may. | Report it. |
+| `provider_page_limit` | A list has more pages than the client reads. | Report it. |
 
 ## Checks that close the gate
 

@@ -209,7 +209,7 @@ async fn equivalence(
     Ok(())
 }
 
-/// Test 1: following through the provider equals a conversion of the full
+/// Following through the provider equals a conversion of the full
 /// history at the same position, with random batch limits, poll timing,
 /// branches at the tip, horizon advances and a restart every round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -317,7 +317,7 @@ fn times_of(fake: &Fake, exact: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Test 2: forks of depth 1, 10 and k − 1 replace only the headers above
+/// Forks of depth 1, 10 and k − 1 replace only the headers above
 /// the fork point; a target contradicted once is read again a minute later
 /// and following goes on; contradicted twice, the gate closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -461,6 +461,9 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
     let times = times_of(&twice, &format!("/api/v0/blocks/{target}"));
     assert_eq!(times.len(), 2, "{times:?}");
     assert!(times[1] - times[0] >= 60, "{times:?}");
+    // The provider's network was read at the start and before the gate
+    // closed.
+    assert_eq!(twice.requests("/genesis"), 2);
     let state = start
         .store()
         .await?
@@ -489,6 +492,188 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
         service,
         ("stopped".to_owned(), "canonical_conflict".to_owned())
     );
+    start.cleanup().await
+}
+
+/// A provider that keeps answering an empty page after a stored tip that left
+/// its chain, while its head moves on: two reads of the head a minute apart
+/// that stand above the stored tip lead to the fork search, and following
+/// goes on on the provider's chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn an_empty_next_below_a_higher_head_leads_to_the_fork_search() -> Result {
+    let mut start = Start::new(31, 80, 20).await?;
+    let target = start.target;
+    let tip = start.g.block(target + K).unwrap().hash.clone();
+    let empty = format!("/blocks/{tip}/next");
+    let fake = Fake::with_chain(
+        Chain::from_generated(
+            &start.g,
+            dsa_service::epoch::stake_prefix(&start.profile.network),
+        ),
+        Some(Arc::new(move |path, _, _| {
+            path.contains(&empty).then(|| Behavior::json(json!([])))
+        })),
+    )
+    .await;
+    // The top two stored headers are replaced, and the chain is longer.
+    let mut blocks = served(&start.g, target + K + 3);
+    let keep = blocks.len() - 5;
+    let branch = generate::branch(&blocks[keep..], 31);
+    blocks.truncate(keep);
+    blocks.extend(branch);
+    let provider: BTreeMap<i64, String> = blocks
+        .iter()
+        .map(|block| (i64::from(block.height), block.hash.clone()))
+        .collect();
+    fake.serve(blocks);
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        follow_to(
+            &start.profile,
+            &fake,
+            &start.database.config,
+            until(target + 1),
+        ),
+    )
+    .await
+    .map_err(|_| "the follower stayed at the stored tip")?
+    .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.position.target.height, target + 1);
+    let polls = times_of(
+        &fake,
+        &format!("/api/v0/blocks/{tip}/next?count=100&page=1"),
+    );
+    let heads = times_of(&fake, "/api/v0/blocks/latest");
+    assert!(polls.len() >= 3, "{polls:?}");
+    assert!(heads.len() >= 3, "{heads:?}");
+    assert!(
+        heads[2] - heads[1] >= 60,
+        "two reads of the head a minute apart: {heads:?}"
+    );
+    // The fork search read the target and the stored headers by height.
+    assert!(height_requests(&fake) >= 1);
+    for (height, hash) in block_rows(&start.database.config).await? {
+        if let Some(expected) = provider.get(&height) {
+            assert_eq!(&hash, expected, "header {height}");
+        }
+    }
+    start.check("after the fork search").await?;
+    start.cleanup().await
+}
+
+/// A `/genesis` of the network with this magic.
+fn genesis(magic: u32) -> Behavior {
+    Behavior::json(json!({
+        "active_slots_coefficient": 0.05, "update_quorum": 5,
+        "max_lovelace_supply": "45000000000000000", "network_magic": magic,
+        "epoch_length": 432000, "system_start": 1654041600,
+        "slots_per_kes_period": 129600, "slot_length": 1,
+        "max_kes_evolutions": 62, "security_param": 2160
+    }))
+}
+
+/// A provider of another network ends the run with
+/// `provider_network_mismatch` and leaves the gate open and the stored
+/// position as it was: found at the start, before any other request, and
+/// found before a contradiction of the target would close the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_provider_of_another_network_never_closes_the_gate() -> Result {
+    let start = Start::new(29, 80, 20).await?;
+    let target = start.target;
+    let (expected, other) = if start.profile.network == "mainnet" {
+        (764_824_073, 1)
+    } else {
+        (1, 764_824_073)
+    };
+    let unchanged = |state: &dsa_store::follow::FollowState, context: &str| {
+        assert!(state.serving, "{context}: {}", state.reason);
+        assert_eq!(state.target.height, target, "{context}");
+    };
+    let refused = |error: follow::Error, context: &str| {
+        let report = error.report();
+        assert!(
+            matches!(
+                error,
+                follow::Error::Refusal {
+                    code: "provider_network_mismatch",
+                    ..
+                }
+            ),
+            "{context}: {report}"
+        );
+        assert_eq!(report["detail"]["expected_magic"], expected, "{report}");
+        assert_eq!(report["detail"]["received_magic"], other, "{report}");
+    };
+    // At the start.
+    let fake = Fake::start(&start.g, &start.profile).await;
+    fake.chain.lock().unwrap().network_magic = Some(other);
+    fake.serve(served(&start.g, target + K + 5));
+    let error = follow_to(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        until(target + 1),
+    )
+    .await
+    .unwrap_err();
+    refused(error, "at the start");
+    assert_eq!(fake.paths(), vec!["/api/v0/genesis".to_owned()]);
+    let state = start
+        .store()
+        .await?
+        .follow_state(&start.profile)
+        .await
+        .map_err(named)?;
+    unchanged(&state, "at the start");
+    // At the moment of a conflict: the right network at the start, another
+    // one once the target is contradicted twice.
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let conflict = contradiction(target, false);
+    let hook: Hook = {
+        let reads = reads.clone();
+        Arc::new(move |path, chain: &mut Chain, now| {
+            if path == "/api/v0/genesis" {
+                let first = reads.fetch_add(1, Ordering::SeqCst) == 0;
+                return (!first).then(|| genesis(other));
+            }
+            conflict(path, chain, now)
+        })
+    };
+    let fake = Fake::with_chain(
+        Chain::from_generated(
+            &start.g,
+            dsa_service::epoch::stake_prefix(&start.profile.network),
+        ),
+        Some(hook),
+    )
+    .await;
+    let mut blocks = served(&start.g, target + K + 1);
+    let keep = blocks.len() - 2;
+    let branch = generate::branch(&blocks[keep..], 77);
+    blocks.truncate(keep);
+    blocks.extend(branch);
+    fake.serve(blocks);
+    let error = follow_to(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        until(target + 1),
+    )
+    .await
+    .unwrap_err();
+    refused(error, "at the conflict");
+    let times = times_of(&fake, &format!("/api/v0/blocks/{target}"));
+    assert_eq!(times.len(), 2, "the target was read twice: {times:?}");
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    let state = start
+        .store()
+        .await?
+        .follow_state(&start.profile)
+        .await
+        .map_err(named)?;
+    unchanged(&state, "at the conflict");
     start.cleanup().await
 }
 
@@ -621,7 +806,7 @@ async fn a_missing_target_is_retried_and_only_another_hash_twice_closes_the_gate
     start.cleanup().await
 }
 
-/// Test 3: answers that contradict themselves or the chain and every fault
+/// Answers that contradict themselves or the chain and every fault
 /// of the fake provider write nothing; the loop retries and continues. A
 /// spent allowance is waited out until the next UTC day without an exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -709,7 +894,7 @@ async fn faulty_answers_write_nothing_and_are_retried() -> Result {
     start.cleanup().await
 }
 
-/// Test 4: at an epoch change the parameters are stored before the epoch's
+/// At an epoch change the parameters are stored before the epoch's
 /// first block is served; while the provider does not have them the batch
 /// ends before that block. The stake arrives later, and a failing stake read
 /// never delays an update.
@@ -801,9 +986,104 @@ async fn epoch_parameters_come_first_and_stake_never_delays_an_update() -> Resul
     start.cleanup().await
 }
 
-/// Test 6: at the tip each poll costs one request and each block with
-/// transactions one page request. DSA_FOLLOW_TIP_BLOCKS sets the number of
-/// followed blocks (default 200).
+/// An ended epoch whose stake cannot sum to its active stake is retried at
+/// growing waits for that epoch (1, 2, 4, 8, 16, 30, 60, 300, then 600
+/// seconds), while the next epoch's stake is read and stored; the last
+/// failure names the epoch and both numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
+    let start = Start::new(37, 100, 15).await?;
+    let g = start.g.known_from_start();
+    let end = 100;
+    let boundaries = (start.target + 1..=end - K)
+        .filter(|height| g.block(*height).unwrap().epoch != g.block(height - 1).unwrap().epoch)
+        .collect::<Vec<_>>();
+    assert!(boundaries.len() >= 2, "{boundaries:?}");
+    let refused = g.block(boundaries[0]).unwrap().epoch;
+    let next = g.block(boundaries[1]).unwrap().epoch;
+    let fake = Fake::start(&g, &start.profile).await;
+    fake.chain
+        .lock()
+        .unwrap()
+        .pools
+        .reported_total
+        .insert(refused, 1);
+    fake.serve(served(&g, end));
+    let (stopper, stop) = Stop::new();
+    let (progress, mut view) = watch::channel(Progress::default());
+    let run = follow::follow(context(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        Settings::default(),
+        stop,
+        progress,
+    ));
+    let stored = |config: tokio_postgres::Config| async move {
+        let epochs: Vec<i32> = common::connect(&config)
+            .await?
+            .query("SELECT DISTINCT epoch_no FROM serve.epoch_stake", &[])
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        Result::<Vec<i32>>::Ok(epochs)
+    };
+    let drive = async {
+        // Every failure of the refused epoch as published: its count and the
+        // wait before the next attempt.
+        let mut waits = BTreeMap::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        while waits.keys().next_back().is_none_or(|last| *last < 10) {
+            let failure = view.borrow().stake_failure.clone();
+            if let Some(failure) = failure.filter(|failure| failure["epoch"] == refused) {
+                assert_eq!(failure["error"]["error"], "provider_epoch_total_mismatch");
+                assert_eq!(failure["error"]["active_stake"], "1");
+                assert!(
+                    failure["error"]["sum"]
+                        .as_str()
+                        .is_some_and(|sum| sum != "1")
+                );
+                let count = failure["failures"].as_u64().unwrap();
+                let wait = failure["retry_at"].as_u64().unwrap() - failure["at"].as_u64().unwrap();
+                waits.insert(count, wait);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ten failures never published: {waits:?}"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(200), view.changed()).await;
+        }
+        let epochs = stored(start.database.config.clone()).await;
+        let _ = stopper.send(true);
+        (waits, epochs)
+    };
+    let (report, (waits, epochs)) = tokio::join!(run, drive);
+    report.map_err(|error| error.report().to_string())?;
+    let epochs = epochs?;
+    let schedule = [1, 2, 4, 8, 16, 30, 60, 300, 600];
+    for (count, wait) in &waits {
+        let expected = schedule[(*count as usize - 1).min(schedule.len() - 1)];
+        assert_eq!(*wait, expected, "failure {count}: {waits:?}");
+    }
+    assert!(
+        epochs.contains(&(next as i32)),
+        "the next epoch's stake: {epochs:?}"
+    );
+    assert!(!epochs.contains(&(refused as i32)), "{epochs:?}");
+    println!(
+        "{}",
+        json!({"event":"refused_stake_epoch","refused":refused,"next":next,"waits":waits,
+            "summary_requests":fake.requests(&format!("/epochs/{refused}"))})
+    );
+    start.cleanup().await
+}
+
+/// At the tip each poll costs one request, a poll that finds nothing new
+/// reads the provider's head at most once a minute, and each block with
+/// transactions costs one page request. DSA_FOLLOW_TIP_BLOCKS sets the number
+/// of followed blocks (default 200).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
@@ -813,20 +1093,25 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     g.lengthen_epochs(100);
     let mut start = Start::from_chain(profile, g, 20).await?;
     let stop_at = start.target + blocks;
-    // One new block appears with every poll.
+    // One new block appears with every second poll; the poll between finds
+    // nothing new.
     let canonical = start.g.blocks.clone();
     let last = stop_at + K;
-    let hook: Hook = Arc::new(move |path, chain: &mut Chain, _| {
-        if path.contains("/next") {
-            let height = chain.tip().map_or(0, |tip| tip.height) + 1;
-            if height <= last
-                && let Some(block) = canonical.iter().find(|block| block.height == height)
-            {
-                chain.blocks_mut().push(block.clone());
+    let polled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let hook: Hook = {
+        let polled = polled.clone();
+        Arc::new(move |path, chain: &mut Chain, _| {
+            if path.contains("/next") && polled.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                let height = chain.tip().map_or(0, |tip| tip.height) + 1;
+                if height <= last
+                    && let Some(block) = canonical.iter().find(|block| block.height == height)
+                {
+                    chain.blocks_mut().push(block.clone());
+                }
             }
-        }
-        None
-    });
+            None
+        })
+    };
     let fake = Fake::with_chain(
         Chain::from_generated(
             &start.g,
@@ -837,6 +1122,7 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     .await;
     fake.serve(served(&start.g, start.target + K));
     let began = Instant::now();
+    let simulated = fake.clock.now();
     let report = follow_to(
         &start.profile,
         &fake,
@@ -845,19 +1131,14 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     )
     .await
     .map_err(|error| error.report().to_string())?;
+    let simulated = fake.clock.now() - simulated;
     let busy = (start.target + 1..=stop_at)
         .filter(|height| !start.g.block(*height).unwrap().transactions.is_empty())
         .count();
     let polls = fake.requests("/next");
     let pages = fake.requests("/txs/cbor");
-    println!(
-        "{}",
-        json!({"event":"follow_at_the_tip","blocks":blocks,"blocks_with_transactions":busy,"polls":polls,
-            "page_requests":pages,"requests":report.requests,"all_requests":fake.paths().len(),
-            "updates":report.updates,"seconds":began.elapsed().as_secs_f64()})
-    );
-    assert_eq!(polls, blocks as usize, "one poll per block");
-    // `/blocks/latest` only for the first status and twice per stake read.
+    // `/blocks/latest` for the first status, twice per stake read, and the
+    // reads of the head while the polls find nothing new.
     let summaries = fake
         .paths()
         .iter()
@@ -866,14 +1147,27 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
                 .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
         })
         .count();
-    assert_eq!(fake.requests("/blocks/latest"), 1 + 2 * summaries);
+    let head_reads = fake.requests("/blocks/latest") - 1 - 2 * summaries;
+    println!(
+        "{}",
+        json!({"event":"follow_at_the_tip","blocks":blocks,"blocks_with_transactions":busy,"polls":polls,
+            "head_reads":head_reads,"simulated_seconds":simulated,
+            "page_requests":pages,"requests":report.requests,"all_requests":fake.paths().len(),
+            "updates":report.updates,"seconds":began.elapsed().as_secs_f64()})
+    );
+    assert_eq!(polls, 2 * blocks as usize - 1, "two polls per block");
+    assert!(head_reads > 0, "the head is read while nothing new comes");
+    assert!(
+        head_reads as u64 <= simulated / 60 + 1,
+        "{head_reads} reads of the head in {simulated} s"
+    );
     assert_eq!(pages, busy, "one page request per block with transactions");
     assert_eq!(report.updates, u64::from(blocks));
     start.check("at the tip").await?;
     start.cleanup().await
 }
 
-/// Test 7: a datum already held is not asked for again, also across a
+/// A datum already held is not asked for again, also across a
 /// restart; a block of 201 transactions is read in three pages; an output the
 /// decoder cannot classify is resolved through the provider's outputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -16,6 +16,7 @@ use crate::{
     follow_arguments::{FollowerArguments, ProviderArguments},
     open, profile,
     service_arguments::ServiceArguments,
+    usage,
     wrapper::{Effect, Job, Operation, Session},
 };
 
@@ -46,13 +47,20 @@ fn ended(error: follow::Error) -> dsa_store::Error {
 }
 
 /// `run`: the service until SIGINT or SIGTERM, through the command wrapper
-/// with a grace of 5 seconds.
+/// with a grace of 10 seconds. It runs until it is stopped, so it refuses an
+/// overall timeout.
 pub(crate) fn command(
     database: DatabaseArguments,
     provider: ProviderArguments,
     follower: FollowerArguments,
     service: ServiceArguments,
 ) -> Result<(Operation, Job), Usage> {
+    if database.overall_timeout_seconds.is_some() {
+        return Err(usage(
+            "overall_timeout_not_supported",
+            "--overall-timeout-seconds",
+        ));
+    }
     let profile = profile(&database.network)?;
     let destination = connection(
         &DATABASE,
@@ -63,8 +71,8 @@ pub(crate) fn command(
     let client = provider.provider(&database.network)?;
     let settings = service.settings()?;
     let follower = follower.settings(provider.max_in_flight as usize);
-    let mut operation = Operation::new("run", Effect::Changes, database.overall_timeout_seconds);
-    operation.grace = Duration::from_secs(5);
+    let mut operation = Operation::new("run", Effect::Serves, None);
+    operation.grace = Duration::from_secs(10);
     let database = Arc::new(database);
     Ok((
         operation,

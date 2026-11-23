@@ -50,7 +50,7 @@ async fn closed_conversion_reader(
         .map(|table| format!("SELECT * FROM public.{table}"))
         .chain([
             original.to_owned(),
-            format!("SELECT * FROM ({original}) q22_original"),
+            format!("SELECT * FROM ({original}) closed_read"),
         ])
     {
         let error = reader.query(&sql, &[]).await.unwrap_err();
@@ -124,7 +124,7 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
             .batch_execute("SELECT pg_advisory_lock(728,1)")
             .await?;
         if !cancel {
-            owner.batch_execute("CREATE FUNCTION dsa.q22_convert_copy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,2);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.q22_convert_copy() FROM PUBLIC;CREATE TRIGGER q22_convert_copy BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION dsa.q22_convert_copy();CREATE FUNCTION dsa.q22_convert_publish() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,3);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.q22_convert_publish() FROM PUBLIC;CREATE TRIGGER q22_convert_publish AFTER UPDATE ON dsa.position FOR EACH ROW WHEN(NEW.serving) EXECUTE FUNCTION dsa.q22_convert_publish();SELECT pg_advisory_lock(728,2);SELECT pg_advisory_lock(728,3)").await?;
+            owner.batch_execute("CREATE FUNCTION dsa.test_convert_copy() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,2);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.test_convert_copy() FROM PUBLIC;CREATE TRIGGER test_convert_copy BEFORE INSERT ON serve.block FOR EACH ROW EXECUTE FUNCTION dsa.test_convert_copy();CREATE FUNCTION dsa.test_convert_publish() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM pg_advisory_xact_lock(728,3);RETURN NEW;END$$;REVOKE ALL ON FUNCTION dsa.test_convert_publish() FROM PUBLIC;CREATE TRIGGER test_convert_publish AFTER UPDATE ON dsa.position FOR EACH ROW WHEN(NEW.serving) EXECUTE FUNCTION dsa.test_convert_publish();SELECT pg_advisory_lock(728,2);SELECT pg_advisory_lock(728,3)").await?;
         }
         let mut child = target.start_cli(
             "convert",
@@ -160,7 +160,7 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
                 .to_string();
             assert!(
                 tokio::process::Command::new("sh")
-                    .args(["-c", "kill -TERM \"$1\"", "q22-own-converter", &pid])
+                    .args(["-c", "kill -TERM \"$1\"", "own-converter", &pid])
                     .status()
                     .await?
                     .success()
@@ -267,7 +267,7 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
         assert!(!reader.query(original, &[]).await?.is_empty());
         reader.query(&prepared, &[]).await?;
         reader
-            .query(&format!("SELECT * FROM ({original}) q22_original"), &[])
+            .query(&format!("SELECT * FROM ({original}) closed_read"), &[])
             .await?;
         target
             .cli(

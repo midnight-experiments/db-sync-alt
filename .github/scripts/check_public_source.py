@@ -21,6 +21,15 @@ PATTERNS = {
     'github_credential': re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b'),
     'credential_url': re.compile(r'(?:postgres(?:ql)?|https?)://[^\s/:]+:[^\s/@]+@'),
     'private_host_identity': re.compile(r'\b(?:eddie|acedward)@(?:[^\s]+)'),
+    # References to the development process: a plan's test numbers as a
+    # comment prefix, question numbers, requirement numbers, and short commit
+    # hashes named as history. Text states what the software is now.
+    'plan_test_number': re.compile(r'//[/!]?[ \t]*Tests? \d+\b'),
+    'question_reference': re.compile(r'(?<![A-Za-z0-9])[Qq]\d+(?![A-Za-z0-9])'),
+    'requirement_reference': re.compile(r'\b(?:FR|SC)-\d+\b'),
+    'commit_as_history': re.compile(
+        r'(?i:\b(?:commit|from|at|since|before|after|exact|in|of)[ \t]+`?)'
+        r'(?=[0-9a-f]{0,6}[a-f])(?=[0-9a-f]{0,6}[0-9])[0-9a-f]{7}(?![0-9A-Za-z_])'),
 }
 # Binary assets require an exact path and SHA-256. Compressed JSON fixtures
 # additionally receive bounded expansion, member validation and text scans.
@@ -99,6 +108,23 @@ def troubleshooting_errors(root):
     if not codes:return [(TROUBLESHOOTING,'no_codes')]
     return [(TROUBLESHOOTING,'unknown_code:'+code) for code in codes if code not in known]
 
+# The images CI runs in are the ones the image build and Compose use, so that
+# an update proposed for deploy/ fails CI until the workflow follows.
+CI_WORKFLOW='.github/workflows/ci.yml'
+
+def workflow_image_errors(root):
+    files=[root/CI_WORKFLOW,root/'deploy/Dockerfile',root/'deploy/compose.yaml']
+    if not all(path.exists() for path in files):return []
+    ci,dockerfile,compose=(path.read_text() for path in files)
+    pairs={
+        'rust':(re.findall(r'^\s*container:\s*(rust:\S+)\s*$',ci,re.M),
+                re.findall(r'^FROM\s+(rust:\S+)',dockerfile,re.M)),
+        'postgres':(re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',ci,re.M),
+                    re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',compose,re.M)),
+    }
+    return [(CI_WORKFLOW,'workflow_image_differs:'+name) for name,(used,pinned) in pairs.items()
+            if not used or not pinned or set(used)!=set(pinned) or '@sha256:' not in used[0]]
+
 def check(root):
     errors=[]; hashes={}
     tracked=set()
@@ -152,6 +178,7 @@ def check(root):
                         destination.read_text(errors='replace')):
                     errors.append((str(rel),'broken_anchor:'+link))
     errors+=troubleshooting_errors(root)
+    errors+=workflow_image_errors(root)
     try:
         profiles=sorted(p.parent for p in (root/'profiles').glob('*/source-manifest.json'))
         if not profiles:raise ValueError('no_profiles')

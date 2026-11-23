@@ -27,7 +27,8 @@
   "epochs": {
     "current_epoch": null,
     "newest_parameters_epoch": null,
-    "newest_stake_epoch": null
+    "newest_stake_epoch": null,
+    "stake_failure": null
   },
   "error_code": null,
   "first_observations": {

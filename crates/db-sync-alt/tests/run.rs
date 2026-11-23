@@ -21,6 +21,7 @@ mod harness;
 mod support;
 
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     sync::{
         Arc,
@@ -58,6 +59,9 @@ fn setting(name: &str, default: u64) -> u64 {
 
 /// 2026-11-19 12:00:00 UTC.
 const NOON: u64 = 1_795_046_400 + 43_200;
+/// The grace of `run`: a requested stop ends by itself within it (seconds);
+/// after it the stop is forced and reported as such.
+const GRACE_SECONDS: f64 = 10.0;
 /// Simulated seconds per real second of the in-process tests.
 const RATE: u64 = 50;
 
@@ -117,6 +121,36 @@ impl World {
         tokio::sync::watch::Sender<bool>,
         JoinHandle<std::result::Result<Report, follow::Error>>,
     ) {
+        self.run_with(fatal_after, config::WRITER_BUSY_AFTER_SECONDS)
+            .await
+    }
+
+    /// [`World::run`] with the time the writer lock is waited for.
+    async fn run_with(
+        &self,
+        fatal_after: u64,
+        writer_busy_after: u64,
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        JoinHandle<std::result::Result<Report, follow::Error>>,
+    ) {
+        self.run_changed(|context| {
+            context.settings.database_fatal_after = Duration::from_secs(fatal_after);
+            context.settings.writer_busy_after = Duration::from_secs(writer_busy_after);
+        })
+        .await
+    }
+
+    /// Starts the service with the world's context after `change`.
+    async fn run_changed(
+        &self,
+        change: impl FnOnce(&mut Context),
+    ) -> (
+        SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        JoinHandle<std::result::Result<Report, follow::Error>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let config = self.proxy.config(&self.start.database.config);
@@ -136,7 +170,8 @@ impl World {
                 retention: None,
                 snapshots: None,
                 health_max_lag_blocks: 9,
-                database_fatal_after: Duration::from_secs(fatal_after),
+                database_fatal_after: Duration::from_secs(config::MIN_DATABASE_FATAL_AFTER_SECONDS),
+                writer_busy_after: Duration::from_secs(config::WRITER_BUSY_AFTER_SECONDS),
             },
             follower: follow::Settings::default(),
             index_policy: IndexPolicy::default(),
@@ -146,6 +181,8 @@ impl World {
             time: self.clock.clone(),
             stop,
         };
+        let mut context = context;
+        change(&mut context);
         (address, stopper, tokio::spawn(run(context)))
     }
 }
@@ -233,7 +270,7 @@ fn broken_links() -> Hook {
     })
 }
 
-/// Test 1: the service starts while PostgreSQL is down and waits; follows
+/// The service starts while PostgreSQL is down and waits; follows
 /// once it is up; survives a restart of PostgreSQL while following; waits
 /// out a dropped provider connection, 429, 418, 5xx and 402, each for 60
 /// simulated seconds, with `/status` naming the state and the time the wait
@@ -406,6 +443,446 @@ async fn temporary_conditions_never_end_the_service() -> Result {
     );
     drop(store);
     world.start.cleanup().await
+}
+
+/// Serves the generated chain through `height` with recent block times: 20
+/// seconds apart, the newest made 20 seconds ago on the world's clock.
+fn serve_recent(world: &World, height: u32) {
+    let now = world.clock.now();
+    let mut blocks = served(&world.start.g, height);
+    for block in &mut blocks {
+        block.time = now - 20 * u64::from(height - block.height) - 20;
+    }
+    *world.fake.chain.lock().unwrap().blocks_mut() = blocks;
+}
+
+/// A provider whose chain stands still: the polls keep finding nothing new,
+/// and once the provider's head block is older than 600 seconds `/health`
+/// answers 503 with `provider_head_stale` while `/status` answers 200. A new
+/// block makes the service healthy again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_provider_whose_chain_stands_still_fails_health() -> Result {
+    let world = World::new(63, 80).await?;
+    let mut samples = Vec::new();
+    let height = world.start.target + K + 2;
+    serve_recent(&world, height);
+    let (address, stopper, task) = world.run(600).await;
+    status_until(address, &mut samples, "healthy at the tip", |document| {
+        document["healthy"] == true
+    })
+    .await;
+    let stale = status_until(
+        address,
+        &mut samples,
+        "a head older than 600 s",
+        |document| {
+            document["reason_codes"]
+                .as_array()
+                .is_some_and(|codes| codes.contains(&json!("provider_head_stale")))
+        },
+    )
+    .await;
+    assert_eq!(stale["state"], "following", "{}", summary(&stale));
+    assert_eq!(stale["reason_codes"], json!(["provider_head_stale"]));
+    let (code, health) = get(address, "/health").await.unwrap();
+    assert_eq!(code, 503, "{health}");
+    let (code, _) = get(address, "/status").await.unwrap();
+    assert_eq!(code, 200);
+    println!(
+        "{}",
+        json!({"event":"provider_head_stale","provider_head":stale["provider_head"],"generated_at":stale["generated_at"]})
+    );
+    serve_recent(&world, height + 1);
+    status_until(
+        address,
+        &mut samples,
+        "healthy after a new block",
+        |document| document["healthy"] == true,
+    )
+    .await;
+    stopper.send(true)?;
+    let report = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.stopped, "stop_requested");
+    world.start.cleanup().await
+}
+
+/// A block whose transaction page the provider client refuses on every
+/// attempt (not valid JSON) keeps the service waiting with the code in
+/// `/status`, past the fatal time; once the page is right it follows on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn an_answer_the_client_refuses_never_ends_the_service() -> Result {
+    let world = World::new(57, 80).await?;
+    let mut samples = Vec::new();
+    let target = world.start.target;
+    let busy = (target + 1..=target + 8)
+        .filter_map(|height| world.start.g.block(height))
+        .find(|block| !block.transactions.is_empty())
+        .expect("a block with transactions")
+        .clone();
+    let height = busy.height + K;
+    world.serve(height);
+    let page = format!("/blocks/{}/txs/cbor", busy.hash);
+    world.fake.set_hook(Some(Arc::new(move |path, _, _| {
+        path.contains(&page)
+            .then(|| Behavior::raw("not a transaction page".to_owned()))
+    })));
+    let (address, stopper, task) = world.run(300).await;
+    let refused = status_until(address, &mut samples, "refused page", |document| {
+        document["error_code"] == "provider_invalid_response" && waiting_with_its_end(document)
+    })
+    .await;
+    let began = world.clock.now();
+    tokio::time::sleep(world.clock.real(900)).await;
+    assert!(world.clock.now() >= began + 900);
+    assert!(!task.is_finished(), "a refused page ended the service");
+    let (code, health) = get(address, "/health").await.unwrap();
+    assert_eq!(code, 503, "{health}");
+    assert_eq!(
+        health["error_code"], "provider_invalid_response",
+        "{health}"
+    );
+    println!(
+        "{}",
+        json!({"event":"client_refused_answer","status":summary(&refused),"lasted_simulated_seconds":world.clock.now()-began})
+    );
+    world.fake.set_hook(None);
+    status_until(
+        address,
+        &mut samples,
+        "following after the page",
+        target_at(height),
+    )
+    .await;
+    stopper.send(true)?;
+    let report = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.stopped, "stop_requested");
+    world.start.cleanup().await
+}
+
+/// A session that holds the writer lock, as the session of a process that is
+/// gone does until the server ends it, keeps the service waiting with
+/// `writer_busy`, at start and on a reconnect. Once the server ends that
+/// session the service takes the lock and follows, without an exit; a lock
+/// held longer than the wait refuses the start. Every session of the store
+/// sets the server-side keepalive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_held_writer_lock_is_waited_for_and_taken_once_free() -> Result {
+    let world = World::new(59, 80).await?;
+    let mut samples = Vec::new();
+    let mut height = world.start.target + K;
+    world.serve(height);
+    let admin = &world.start.database.admin;
+    let config = world.start.database.config.clone();
+    let hold = || async {
+        let mut holder = Store::connect(config.clone(), None).await?;
+        holder.lock_writer().await.map_err(named)?;
+        let pid: i32 = holder
+            .client()
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((holder, pid))
+    };
+    let (holder, pid) = hold().await?;
+    for (name, value) in [
+        ("tcp_keepalives_idle", "30"),
+        ("tcp_keepalives_interval", "10"),
+        ("tcp_keepalives_count", "3"),
+    ] {
+        let set: String = holder
+            .client()
+            .query_one(&format!("SHOW {name}"), &[])
+            .await?
+            .get(0);
+        assert_eq!(set, value, "{name}");
+    }
+    // At start.
+    let (address, stopper, task) = world.run_with(600, 3_600).await;
+    status_until(address, &mut samples, "writer busy at start", |document| {
+        document["state_reason"] == "writer_busy" && waiting_with_its_end(document)
+    })
+    .await;
+    admin
+        .execute("SELECT pg_terminate_backend($1)", &[&pid])
+        .await?;
+    drop(holder);
+    status_until(
+        address,
+        &mut samples,
+        "following once the lock is free",
+        target_at(height),
+    )
+    .await;
+    // On a reconnect: the service's sessions end, and another session takes
+    // the lock before it is back.
+    world.proxy.refuse();
+    let (holder, pid) = hold().await?;
+    world.proxy.accept();
+    height += 3;
+    world.serve(height);
+    status_until(
+        address,
+        &mut samples,
+        "writer busy on a reconnect",
+        |document| document["state_reason"] == "writer_busy" && waiting_with_its_end(document),
+    )
+    .await;
+    admin
+        .execute("SELECT pg_terminate_backend($1)", &[&pid])
+        .await?;
+    drop(holder);
+    status_until(
+        address,
+        &mut samples,
+        "following after the reconnect",
+        target_at(height),
+    )
+    .await;
+    assert!(!task.is_finished(), "the service ended");
+    stopper.send(true)?;
+    let report = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.stopped, "stop_requested");
+    // A lock held for longer than the wait refuses the start.
+    let (holder, _) = hold().await?;
+    let (_address, _stopper, task) = world.run_with(600, 120).await;
+    let error = tokio::time::timeout(Duration::from_secs(60), task)
+        .await
+        .expect("the service ends")?
+        .unwrap_err();
+    let report = error.report();
+    assert_eq!(report["error"], "writer_busy", "{report}");
+    assert!(
+        report["detail"]["lasted_seconds"]
+            .as_u64()
+            .is_some_and(|seconds| seconds > 120),
+        "{report}"
+    );
+    println!("{}", json!({"event":"writer_busy","refused":report}));
+    drop(holder);
+    world.start.cleanup().await
+}
+
+/// Plants a size after the last rebuild of one byte for `index`, so that the
+/// index counts as grown past twice that size.
+async fn plant_index_record(config: &tokio_postgres::Config, index: &str) -> Result {
+    common::connect(config)
+        .await?
+        .execute(
+            "INSERT INTO dsa.upkeep(name,at,detail) VALUES('index:'||$1,clock_timestamp(),jsonb_build_object('bytes',1))
+             ON CONFLICT(name) DO UPDATE SET detail=EXCLUDED.detail",
+            &[&index],
+        )
+        .await?;
+    Ok(())
+}
+
+/// The `dsa.upkeep` rows by name.
+async fn upkeep_rows(config: &tokio_postgres::Config) -> Result<BTreeMap<String, Value>> {
+    Ok(common::connect(config)
+        .await?
+        .query("SELECT name,detail FROM dsa.upkeep", &[])
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
+/// The snapshot files of `network` in `dir`.
+fn daily_files(dir: &std::path::Path, network: &str) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&format!("{network}-")) && name.ends_with(".snapshot"))
+        .collect()
+}
+
+/// The service itself rebuilds an index grown past twice its size after its
+/// last rebuild, and writes a snapshot file every day at its time, keeping
+/// the newest two: after files of three days the oldest is gone, and
+/// `dsa.upkeep` and `/status` name the newest file and the rebuilt index. As
+/// the `run` command it logs both operations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn the_service_rebuilds_an_index_and_keeps_its_daily_files() -> Result {
+    let world = World::new(67, 120).await?;
+    let mut samples = Vec::new();
+    let config = world.start.database.config.clone();
+    plant_index_record(&config, "idx_tx_out_tx_id").await?;
+    let dir = tempfile::tempdir()?;
+    let mut height = world.start.target + K;
+    world.serve(height);
+    let snapshots = config::Snapshots {
+        dir: dir.path().to_owned(),
+        keep: 2,
+        at: chrono::NaiveTime::from_hms_opt(3, 0, 0).unwrap(),
+    };
+    // The service's days start after the wall clock's, which the database
+    // uses for the time a file was recorded.
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let midnight = wall - wall % 86_400 + 2 * 86_400;
+    world.clock.jump_to(midnight + 43_200);
+    let (address, stopper, task) = world
+        .run_changed(|context| {
+            context.settings.snapshots = Some(snapshots);
+            context.settings.database_fatal_after = Duration::from_secs(600);
+            context.index_policy = IndexPolicy {
+                growth: 2.0,
+                min_bytes: 0,
+            };
+        })
+        .await;
+    let network = world.start.profile.network.clone();
+    let mut written = Vec::new();
+    for day in 0..3_u64 {
+        if day > 0 {
+            height += 3;
+            world.serve(height);
+            status_until(address, &mut samples, "following", target_at(height)).await;
+            // The next day, a minute after the file's time.
+            world
+                .clock
+                .jump_to(midnight + day * 86_400 + 3 * 3_600 + 60);
+        }
+        let target = height - K;
+        let document = status_until(address, &mut samples, "the day's file", |document| {
+            document["integrity"]["snapshot"]["target"] == json!(target)
+        })
+        .await;
+        written.push(
+            document["integrity"]["snapshot"]["file"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let last = status_until(address, &mut samples, "the rebuilt index", |document| {
+        document["database"]["index_rebuilds"]["idx_tx_out_tx_id"]["bytes"]
+            .as_i64()
+            .is_some_and(|bytes| bytes > 1)
+    })
+    .await;
+    assert!(
+        last["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| !warning.as_str().unwrap().starts_with("upkeep_failed")),
+        "{}",
+        last["warnings"]
+    );
+    stopper.send(true)?;
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the service ends")?
+        .map_err(|error| error.report().to_string())?;
+    assert_eq!(
+        daily_files(dir.path(), &network),
+        written[1..].iter().cloned().collect(),
+        "the newest two of {written:?}"
+    );
+    let rows = upkeep_rows(&config).await?;
+    assert_eq!(rows["snapshot"]["file"], json!(written[2]));
+    let rebuilt = &rows["index:idx_tx_out_tx_id"];
+    assert!(
+        rebuilt.get("before").is_some() && rebuilt.get("baseline").is_none(),
+        "{rebuilt}"
+    );
+    println!(
+        "{}",
+        json!({"event":"service_upkeep","files":written,"rebuild":rebuilt})
+    );
+    world.start.cleanup().await?;
+
+    // The command: a bloated index above the floor of 8 MiB and a file at
+    // start, each logged at its start and end.
+    let p = Preprod::new(89, 1, 0, false).await?;
+    let fake = p.fake(p.t0 + p.k()).await;
+    let owner = common::connect(&p.converted.config).await?;
+    owner
+        .batch_execute(
+            "INSERT INTO serve.tx_out(id,tx_id,index,address,value)
+             SELECT t*4096,t,0,'planted_'||t,1 FROM generate_series(100000000::bigint,100399999) t;
+             DELETE FROM serve.tx_out WHERE tx_id>=100000000",
+        )
+        .await?;
+    owner.batch_execute("VACUUM serve.tx_out").await?;
+    plant_index_record(&p.converted.config, "idx_tx_out_address").await?;
+    let files = tempfile::tempdir()?;
+    let extra = [
+        "--snapshot-dir",
+        &files.path().to_string_lossy(),
+        "--snapshot-keep",
+        "2",
+        "--snapshot-at",
+        "00:00",
+    ]
+    .map(str::to_owned);
+    let child = Child::start(
+        &run_arguments(&p.converted, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let ended = |events: &[Value], name: &str| {
+        events
+            .iter()
+            .any(|line| line["event"] == format!("{name}_finished"))
+    };
+    while !(ended(&child.events(), "index_rebuild") && ended(&child.events(), "snapshot_file")) {
+        assert!(Instant::now() < deadline, "{:?}", child.events());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    child.signal("TERM");
+    let (code, _, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let events = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    for name in ["index_rebuild", "snapshot_file"] {
+        assert!(
+            events
+                .iter()
+                .any(|line| line["event"] == format!("{name}_started")),
+            "{name}: {lines:?}"
+        );
+        let end = events
+            .iter()
+            .find(|line| line["event"] == format!("{name}_finished"))
+            .unwrap();
+        assert_eq!(end["outcome"], "success", "{end}");
+    }
+    let rebuild = events
+        .iter()
+        .find(|line| line["event"] == "index_rebuild_finished")
+        .unwrap();
+    assert_eq!(rebuild["detail"]["name"], "idx_tx_out_address", "{rebuild}");
+    let file = events
+        .iter()
+        .find(|line| line["event"] == "snapshot_file_finished")
+        .unwrap()["detail"]["file"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        daily_files(files.path(), "preprod"),
+        std::collections::BTreeSet::from([file])
+    );
+    drop(owner);
+    p.cleanup().await
 }
 
 /// Review of what ends the service: a database that stays unreachable, and
@@ -685,10 +1162,10 @@ fn database_part(document: &Value) -> Value {
     Value::Object(part)
 }
 
-/// Tests 2 (first start), 4, 5 and 6, and the secrets: the first start with
-/// `--snapshot` on an empty database restores (state `restoring`) and
-/// catches up; SIGTERM during the catch-up ends the process within 5
-/// seconds with exit status 0 and a store that verifies; a restart continues
+/// The first start, the stop, the restart, memory and the secrets: the first
+/// start with `--snapshot` on an empty database restores (state `restoring`) and
+/// catches up; SIGTERM during the catch-up ends the process by itself within
+/// the grace, with exit status 0 and a store that verifies; a restart continues
 /// to the tip; resident memory stays under 64 MiB throughout; after the
 /// stop, `db-sync-alt status` equals the last document in every
 /// database-derived field; no line and no document holds the provider key,
@@ -748,7 +1225,10 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     let stop_seconds = signalled.elapsed().as_secs_f64();
     let first_peak = peak.await?;
     assert_eq!(code, Some(0), "{lines:?}");
-    assert!(stop_seconds < 5.0, "stopped after {stop_seconds} s");
+    assert!(
+        stop_seconds < GRACE_SECONDS,
+        "stopped after {stop_seconds} s"
+    );
     let report: Value = serde_json::from_str(&stdout)?;
     assert_eq!(report["stopped"], "stop_requested");
     assert_eq!(report["restored"]["content_digest"], json!(p.digest));
@@ -824,7 +1304,7 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     let second_peak = peak.await?;
     assert_eq!(code, Some(0), "{lines:?}");
     assert!(
-        final_stop_seconds < 5.0,
+        final_stop_seconds < GRACE_SECONDS,
         "stopped after {final_stop_seconds} s"
     );
     let report: Value = serde_json::from_str(&stdout)?;
@@ -836,7 +1316,7 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     let verified = store.verify(&p.profile).await.map_err(named)?;
     assert_eq!(verified.state.target.height, end);
 
-    // Test 6: the status command after the stop equals the last document.
+    // The status command after the stop equals the last document.
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
         .args([
             "status",
@@ -884,7 +1364,7 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     p.cleanup().await
 }
 
-/// Test 2 (restart): a serving store of Mainnet size follows again within
+/// A serving store of Mainnet size follows again within
 /// 60 seconds of the process start, also the second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated PostgreSQL 17"]
@@ -963,7 +1443,10 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
             .map(|line| line["seconds"].clone());
         starts.push(json!({"to_following_seconds":to_following,"sigterm_seconds":stop_seconds,"supply_check_seconds":supply}));
         assert!(to_following < 60.0, "following after {to_following} s");
-        assert!(stop_seconds < 5.0, "stopped after {stop_seconds} s");
+        assert!(
+            stop_seconds < GRACE_SECONDS,
+            "stopped after {stop_seconds} s"
+        );
     }
     println!(
         "{}",
@@ -972,7 +1455,337 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
     p.cleanup().await
 }
 
-/// Test 3: each condition that retrying cannot cure ends `run` with exit
+/// The `--snapshot` file is read only when a restore is needed: a start on a
+/// serving database whose file the daily rotation removed follows without a
+/// word about it; on an empty database the missing file refuses the start
+/// with exit status 1 and an error that names the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_missing_snapshot_file_matters_only_for_a_restore() -> Result {
+    let p = Preprod::new(87, 1, 0, false).await?;
+    let k = p.k();
+    let fake = p.fake(p.t0 + k).await;
+    let missing = p.dir.path().join("rotated-away.snapshot");
+    let extra = vec![
+        "--snapshot".to_owned(),
+        missing.to_string_lossy().into_owned(),
+        "--expect-content-digest".to_owned(),
+        p.digest.clone(),
+    ];
+    let child = Child::start(
+        &run_arguments(&p.converted, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let address = child.address().await;
+    let (mut bodies, mut states) = (Vec::new(), std::collections::BTreeSet::new());
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| document["state"] == "following",
+    )
+    .await;
+    child.signal("TERM");
+    let (code, _, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    assert!(
+        !lines.iter().any(|line| line.contains("snapshot_file")),
+        "{lines:?}"
+    );
+    assert!(
+        bodies.iter().all(|body| !body.contains("snapshot_file")),
+        "a word about the file in /status"
+    );
+    let empty = Database::new().await?;
+    let child = Child::start(
+        &run_arguments(&empty, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let (code, _, lines) = tokio::time::timeout(Duration::from_secs(60), child.finish())
+        .await
+        .expect("the service ends");
+    assert_eq!(code, Some(1), "{lines:?}");
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("\"error\":\"snapshot_file_unreadable\"")
+                && line.contains("\"flag\":\"--snapshot\"")
+        }),
+        "{lines:?}"
+    );
+    empty.cleanup().await?;
+    p.cleanup().await
+}
+
+/// The status is read once the first start has restored the database and
+/// granted the reader: the first document in which the service catches up
+/// or follows carries a passing reader check and no failed status read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn the_first_document_after_the_start_reads_the_prepared_database() -> Result {
+    let p = Preprod::new(91, 1, 0, false).await?;
+    let fake = p.fake(p.t0 + p.k()).await;
+    let database = Database::new().await?;
+    let extra = vec!["--snapshot".to_owned(), p.file()];
+    let child = Child::start(
+        &run_arguments(&database, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let address = child.address().await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let first = loop {
+        if let Some((_, document)) = get(address, "/status").await
+            && matches!(
+                document["state"].as_str(),
+                Some("catching_up" | "following")
+            )
+        {
+            break document;
+        }
+        assert!(Instant::now() < deadline, "{:?}", child.events());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    child.signal("TERM");
+    let (code, _, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let warnings = first["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .all(|warning| !warning.as_str().unwrap().starts_with("status_read_failed")),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        first["database"]["reader_check"]["passed"], true,
+        "{}",
+        first["database"]["reader_check"]
+    );
+    assert_eq!(first["serving"], "ready");
+    database.cleanup().await?;
+    p.cleanup().await
+}
+
+/// Runs a one-shot command of the binary on `database` with no `DSA_`
+/// variable; its output.
+async fn command(database: &Database, arguments: &[&str]) -> Result<std::process::Output> {
+    let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    process
+        .args(arguments)
+        .args(["--database", &database.dsn(false), "--network", "preprod"]);
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DSA_")) {
+        process.env_remove(name);
+    }
+    Ok(process.output().await?)
+}
+
+/// A first restore stopped after its build committed and before it
+/// published leaves a closed database with the build beside it; the next
+/// `run --snapshot` restores it and follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn run_completes_a_restore_interrupted_between_its_commits() -> Result {
+    let p = Preprod::new(83, 1, 0, false).await?;
+    let k = p.k();
+    let fake = p.fake(p.t0 + k).await;
+    let database = Database::new().await?;
+    for arguments in [
+        &["create"][..],
+        &["grant-reader", "--role", &database.reader],
+    ] {
+        let output = command(&database, arguments).await?;
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+    }
+    // A reader holds a view, so the restore's publication waits; it is
+    // stopped once its build has committed.
+    let mut reader_config = database.config.clone();
+    reader_config.user(&database.reader);
+    let holder = common::connect(&reader_config).await?;
+    holder
+        .batch_execute("BEGIN;DECLARE held CURSOR FOR SELECT * FROM public.block")
+        .await?;
+    let mut restore = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"));
+    restore.args([
+        "restore",
+        "--database",
+        &database.dsn(false),
+        "--network",
+        "preprod",
+        "--file",
+        &p.file(),
+    ]);
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DSA_")) {
+        restore.env_remove(name);
+    }
+    let restore = restore
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = restore.id().ok_or("restore ended")?.to_string();
+    let owner = common::connect(&database.config).await?;
+    let built = "SELECT to_regnamespace('dsa_retired') IS NOT NULL";
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !owner.query_one(built, &[]).await?.get::<_, bool>(0) {
+        assert!(Instant::now() < deadline, "the build never committed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()?
+            .success()
+    );
+    let output = restore.wait_with_output().await?;
+    assert!(!output.status.success(), "{output:?}");
+    holder.batch_execute("COMMIT").await?;
+    drop(holder);
+    assert!(owner.query_one(built, &[]).await?.get::<_, bool>(0));
+    // The next start with --snapshot restores again and follows.
+    let extra = vec![
+        "--snapshot".to_owned(),
+        p.file(),
+        "--expect-content-digest".to_owned(),
+        p.digest.clone(),
+    ];
+    let child = Child::start(
+        &run_arguments(&database, "preprod", &fake, &extra),
+        &key_environment(&fake),
+    );
+    let address = child.address().await;
+    let (mut bodies, mut states) = (Vec::new(), std::collections::BTreeSet::new());
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| {
+            document["state"] == "following" && document["served_target"]["height"] == json!(p.t0)
+        },
+    )
+    .await;
+    child.signal("TERM");
+    let (code, stdout, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let report: Value = serde_json::from_str(&stdout)?;
+    assert_eq!(
+        report["restored"]["content_digest"],
+        json!(p.digest),
+        "{report}"
+    );
+    assert!(!owner.query_one(built, &[]).await?.get::<_, bool>(0));
+    let mut store = Store::connect(database.config.clone(), None).await?;
+    let verified = store.verify(&p.profile).await.map_err(named)?;
+    assert_eq!(verified.content_digest, p.digest);
+    drop((store, owner));
+    database.cleanup().await?;
+    p.cleanup().await
+}
+
+/// Waits (at most a minute) until a `db-sync-alt` session of `database`
+/// waits for a lock.
+async fn writer_waits_for_a_lock(database: &Database) -> Result {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let waiting: bool = database
+            .admin
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt' AND wait_event_type='Lock')",
+                &[&database.name],
+            )
+            .await?
+            .get(0);
+        if waiting {
+            return Ok(());
+        }
+        assert!(Instant::now() < deadline, "no session waited for the lock");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A stop that arrives while an update waits for a lock that another session
+/// holds outlasts the grace of 10 seconds: the statements are cancelled and
+/// `run` ends with exit status 0 and a report that says the stop was forced,
+/// never with an unknown outcome. The update is absent, and a restart
+/// follows on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated PostgreSQL 17"]
+async fn a_stop_during_a_long_statement_is_forced_after_the_grace() -> Result {
+    let p = Preprod::new(79, 1, 0, false).await?;
+    let k = p.k();
+    let fake = p.fake(p.t0 + k).await;
+    let database = &p.converted;
+    let extra = ["--poll-interval-seconds", "1"].map(str::to_owned);
+    let arguments = run_arguments(database, "preprod", &fake, &extra);
+    let (mut bodies, mut states) = (Vec::new(), std::collections::BTreeSet::new());
+    let child = Child::start(&arguments, &key_environment(&fake));
+    let address = child.address().await;
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| document["state"] == "following",
+    )
+    .await;
+    // Another session holds the stored position: the next update waits.
+    let holder = common::connect(&database.config).await?;
+    holder
+        .batch_execute("BEGIN;SELECT 1 FROM dsa.position FOR UPDATE")
+        .await?;
+    *fake.chain.lock().unwrap().blocks_mut() = served(&p.g, p.t0 + k + 5);
+    writer_waits_for_a_lock(database).await?;
+    let signalled = Instant::now();
+    child.signal("TERM");
+    let (code, stdout, lines) = child.finish().await;
+    let stop_seconds = signalled.elapsed().as_secs_f64();
+    holder.batch_execute("ROLLBACK").await?;
+    assert_eq!(code, Some(0), "{lines:?}");
+    assert!(
+        (10.0..20.0).contains(&stop_seconds),
+        "stopped after {stop_seconds} s"
+    );
+    let report: Value = serde_json::from_str(&stdout)?;
+    assert_eq!(report["stopped"], "stop_forced_after_grace", "{report}");
+    assert_eq!(report["partial_update"], false, "{report}");
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("\"outcome\":\"unknown\"")),
+        "{lines:?}"
+    );
+    let mut store = Store::connect(database.config.clone(), None).await?;
+    let verified = store.verify(&p.profile).await.map_err(named)?;
+    assert_eq!(verified.state.target.height, p.t0, "the update is absent");
+    drop(store);
+    let child = Child::start(&arguments, &key_environment(&fake));
+    let address = child.address().await;
+    child_status_until(
+        &child,
+        address,
+        &mut bodies,
+        &mut states,
+        Duration::from_secs(120),
+        |document| {
+            document["state"] == "following"
+                && document["served_target"]["height"] == json!(p.t0 + 5)
+        },
+    )
+    .await;
+    child.signal("TERM");
+    let (code, stdout, lines) = child.finish().await;
+    assert_eq!(code, Some(0), "{lines:?}");
+    let report: Value = serde_json::from_str(&stdout)?;
+    assert_eq!(report["stopped"], "stop_requested", "{report}");
+    println!(
+        "{}",
+        json!({"event":"forced_stop","stop_seconds":stop_seconds,"report_stopped":"stop_forced_after_grace"})
+    );
+    p.cleanup().await
+}
+
+/// Each condition that retrying cannot cure ends `run` with exit
 /// status 1 and a named error; an invalid setting with 2; a database that
 /// stays unreachable and a provider that answers 5xx, each longer than
 /// `--database-fatal-after-seconds`, with 75.
@@ -1030,6 +1843,26 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     );
     let lasting_started = Instant::now();
     let unavailable = Child::start(&failing_arguments, &key_environment(&failing));
+    // A second writer: another session holds the writer lock of a database
+    // of its own for longer than the 120 seconds the service waits for it.
+    let busy = Database::new().await?;
+    let mut holder = Store::connect(busy.config.clone(), None).await?;
+    holder.lock_writer().await.map_err(named)?;
+    let second = Child::start(
+        &run_arguments(&busy, "preprod", &fake, &[]),
+        &key_environment(&fake),
+    );
+    let second_address = second.address().await;
+    let (mut second_bodies, mut second_states) = (Vec::new(), std::collections::BTreeSet::new());
+    child_status_until(
+        &second,
+        second_address,
+        &mut second_bodies,
+        &mut second_states,
+        Duration::from_secs(30),
+        |document| document["state"] == "waiting" && document["state_reason"] == "writer_busy",
+    )
+    .await;
 
     let mut bodies = Vec::new();
     let mut states = std::collections::BTreeSet::new();
@@ -1139,17 +1972,6 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     .await;
     ended(code, &lines, 1, "network_mismatch");
 
-    // A second writer.
-    let mut holder = Store::connect(database.config.clone(), None).await?;
-    holder.lock_writer().await.map_err(named)?;
-    let (code, lines) = quick(
-        run_arguments(database, "preprod", &fake, &[]),
-        key_environment(&fake),
-    )
-    .await;
-    ended(code, &lines, 1, "writer_busy");
-    drop(holder);
-
     // A reader that can read more than the node's relations.
     let mut root: tokio_postgres::Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
     root.dbname(&database.name);
@@ -1196,6 +2018,16 @@ async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     )
     .await;
     ended(code, &lines, 1, "database_not_serving");
+
+    // The second writer waited with `writer_busy`, then was refused.
+    let (code, _, lines) = tokio::time::timeout(Duration::from_secs(240), second.finish())
+        .await
+        .expect("the second writer ends");
+    ended(code, &lines, 1, "writer_busy");
+    let waited = lasting_started.elapsed().as_secs_f64();
+    assert!(waited >= 120.0, "{waited}");
+    drop(holder);
+    busy.cleanup().await?;
 
     // The two conditions that lasted.
     let (code, _, lines) = tokio::time::timeout(Duration::from_secs(120), down.finish())

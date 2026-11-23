@@ -4,11 +4,19 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # The actions of both workflows, pinned by commit.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+  # The base images of deploy/Dockerfile.
   - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
+  # The PostgreSQL image of deploy/compose.yaml. The images of the workflows
+  # are the same two, and the public-source check requires that they match.
+  - package-ecosystem: docker-compose
     directory: /deploy
     schedule:
       interval: weekly

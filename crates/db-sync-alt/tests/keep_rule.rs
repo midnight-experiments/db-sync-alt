@@ -53,11 +53,18 @@ impl Database {
     async fn new(profile: &dsa_chain::profiles::Profile) -> Result<Self> {
         let root: Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
         let admin = connect(root.clone(), "public", false).await?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let owner = format!("keep_owner_{}_{nonce:x}", std::process::id());
-        let database = format!("keep_database_{}_{nonce:x}", std::process::id());
+        // Tests of one process run in parallel and may read the same clock
+        // value, so a counter makes the names distinct.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = format!(
+            "{:x}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let owner = format!("keep_owner_{}_{nonce}", std::process::id());
+        let database = format!("keep_database_{}_{nonce}", std::process::id());
         admin.batch_execute(&format!("CREATE ROLE {owner} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS")).await?;
         admin
             .batch_execute(&format!("CREATE DATABASE {database} OWNER {owner}"))
@@ -328,7 +335,7 @@ fn named_cases() -> BTreeMap<&'static str, Fixture> {
     fallback.no_window_spend();
     result.insert("no_spend_in_window", fallback);
     result.insert("spend_of_output_below_horizon", Fixture::base(2));
-    result.insert("v2_mixed_assets_and_q4_datums", Fixture::base(42));
+    result.insert("v2_mixed_assets_and_node_read_datums", Fixture::base(42));
     let mut expanded = Fixture::base(42);
     expanded.bounds.horizon = 7;
     expanded.expanded_token_rule_edges();
@@ -436,7 +443,7 @@ fn named_keep_rule_edges() -> Result {
 }
 
 #[test]
-fn version_two_projection_and_q4_boundaries() -> Result {
+fn version_two_projection_and_datum_boundaries() -> Result {
     for seed in [1, 2] {
         let f = Fixture::base(seed);
         let kept = keep(&f.chain, &f.profile, f.bounds)?;
@@ -744,7 +751,7 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
         }
     }
     cases.push(empty_epochs);
-    // Supported Q4 outputs may carry a hash without an available preimage.
+    // Supported datum-hash outputs may carry a hash without an available preimage.
     // Eligibility must not invent a datum for either address or exact-unit arm.
     for (seed, address, unit) in [
         (18, "mapping", "cnight"),

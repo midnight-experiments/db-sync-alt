@@ -52,7 +52,7 @@ struct Totals {
     largest_statement_count: usize,
 }
 
-/// Test 1: following equals a conversion of the full history.
+/// Following equals a conversion of the full history.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn following_equals_a_conversion_of_the_full_history() -> Result {
@@ -279,7 +279,7 @@ fn rich_plan(setup: &Setup) -> Plan {
     }
 }
 
-/// Test 2: a failure after any statement leaves the previous state, and the
+/// A failure after any statement leaves the previous state, and the
 /// retried update equals an uninterrupted one.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
@@ -382,7 +382,7 @@ async fn an_update_is_atomic_after_every_statement() -> Result {
     setup.cleanup().await
 }
 
-/// Test 3: each refusal names its cause and writes nothing.
+/// Each refusal names its cause and writes nothing.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn each_refusal_has_its_code_and_writes_nothing() -> Result {
@@ -634,7 +634,7 @@ async fn each_refusal_has_its_code_and_writes_nothing() -> Result {
     source.database.cleanup().await
 }
 
-/// Test 4: a header replacement changes only the headers above the fork point.
+/// A header replacement changes only the headers above the fork point.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
 async fn header_replacement_changes_only_headers_above_the_fork_point() -> Result {
@@ -713,7 +713,7 @@ fn heights(rows: &[(i64, String)]) -> Vec<i64> {
     rows.iter().map(|(height, _)| *height).collect()
 }
 
-/// Test 5: the first-served rows are H…T; a catch-up update's blocks share
+/// The first-served rows are H…T; a catch-up update's blocks share
 /// one time; with times moved back the candidate moves and never passes T.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
@@ -940,7 +940,7 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
     large.cleanup().await
 }
 
-/// Test 7: a block that spends a lost cNIGHT output fails with
+/// A block that spends a lost cNIGHT output fails with
 /// `asset_conservation`; after `close_gate` every view raises 55000.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17"]
@@ -1094,7 +1094,7 @@ async fn observed(client: &tokio_postgres::Client) -> Result<BTreeMap<String, (i
         .collect())
 }
 
-/// Test 8: verify finds a lost token-less output at a profile address; the
+/// `verify` finds a lost token-less output at a profile address; the
 /// first observation of each shape is kept once; a failing insert does not
 /// fail the update.
 #[tokio::test]

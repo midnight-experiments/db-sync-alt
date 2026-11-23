@@ -84,3 +84,13 @@ Blockfrost is the only provider, read once per block. A provider that answers
 a wrong but self-consistent list of transactions for a final block is not
 detected; the hash, count, link and conservation checks catch any answer that
 contradicts itself or the chain.
+
+Three kinds of value are the provider's answers, checked only for
+consistency, and a wrong but consistent answer is stored and served:
+
+- block headers: their hash, epoch, slot, time and transaction count; only the
+  link of each header to the one before it is checked;
+- epoch parameters: the nonce and the largest transaction size, stored as
+  received;
+- stake distributions: accepted when they sum to the provider's own active
+  stake of the epoch and the epoch did not move during the read.
