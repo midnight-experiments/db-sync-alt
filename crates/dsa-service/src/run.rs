@@ -416,6 +416,15 @@ impl Service {
                 code @ ("missing_serving_position" | "unsupported_database_format"),
             )) => {
                 if !store.loadable(&self.profile).await? {
+                    // A build holds no position before its rows below the
+                    // horizon are written: it is refused as not serving,
+                    // as it is later.
+                    if let Some(building) = store.building_progress().await? {
+                        return Err(Error::Refusal {
+                            code: "database_not_serving",
+                            detail: json!({"reason": building.reason}),
+                        });
+                    }
                     return Err(Error::Store(dsa_store::Error::Refusal(code)));
                 }
                 None

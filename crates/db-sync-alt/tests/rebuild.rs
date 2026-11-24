@@ -843,6 +843,80 @@ async fn incomplete_answers_refuse_the_build_and_nothing_serves() -> Result {
     Ok(())
 }
 
+/// What the other commands make of a stopped build, before its rows below
+/// the horizon are written and after: the service refuses to start on it as
+/// not serving with the reason `rebuilding`, also with a snapshot file to
+/// restore; a restore refuses it as not empty; the status document calls it
+/// unready.
+async fn refused_while_building(
+    case: &Case,
+    database: &Database,
+    file: &std::path::Path,
+) -> Result {
+    use dsa_service::{config, retry::WallTime, run, status, upkeep::IndexPolicy};
+    let open: run::Open = {
+        let config = database.config.clone();
+        Arc::new(move |_| {
+            let config = config.clone();
+            Box::pin(async move { dsa_store::Store::connect(config, None).await })
+        })
+    };
+    let settings = config::Settings::check(config::Input {
+        listen: "127.0.0.1:0".to_owned(),
+        reader: database.reader.clone(),
+        snapshot: Some(file.to_owned()),
+        expect_content_digest: None,
+        retention_seconds: None,
+        change_retention: false,
+        snapshot_dir: None,
+        snapshot_keep: 3,
+        snapshot_at: "00:30".to_owned(),
+        health_max_lag_blocks: 9,
+        database_fatal_after_seconds: 60,
+    })
+    .map_err(|invalid| format!("{invalid:?}"))?;
+    let fake = Fake::start(&case.g, &case.profile).await;
+    let (_stopper, stop) = Stop::new();
+    let service = run::run(run::Context {
+        profile: case.profile.clone(),
+        provider: fake.provider(),
+        open,
+        settings,
+        follower: Settings::default(),
+        index_policy: IndexPolicy::default(),
+        refresh_interval: Duration::from_secs(20),
+        upkeep_tick: Duration::from_secs(60),
+        listener: tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+        time: Arc::new(WallTime),
+        stop,
+    });
+    let error = tokio::time::timeout(Duration::from_secs(120), service)
+        .await?
+        .err()
+        .ok_or("the service started on a database being built")?;
+    assert_eq!(code(&error), "database_not_serving", "{}", error.report());
+    assert_eq!(error.report()["detail"]["reason"], "rebuilding");
+    assert!(fake.paths().is_empty(), "the service asked the provider");
+    let mut store = dsa_store::Store::connect(database.config.clone(), None).await?;
+    let refused = store
+        .restore(&case.profile, file, None)
+        .await
+        .err()
+        .ok_or("a restore loaded a database being built")?;
+    assert_eq!(refused.report()["error"], "destination_not_empty");
+    let view = store.service_view(&case.profile, None).await?;
+    let document = serde_json::to_value(status::compose(
+        Some(&view),
+        None,
+        &status::Settings::new(&case.profile.network),
+        0,
+    ))?;
+    assert_eq!(document["serving"], "unready");
+    assert_eq!(document["position"]["reason"], "rebuilding");
+    assert_eq!(document["identity"]["origin"]["kind"], "rebuilding");
+    Ok(())
+}
+
 /// A build stopped at any point continues to the conversion's
 /// digest; until it publishes the database never serves, and dropping it
 /// discards the build.
@@ -954,7 +1028,16 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
     }
     // A build stopped by request, before the window and inside it, then
     // continued, reports the requests the provider answered, and at most
-    // those in flight at the stop more.
+    // those in flight at the stop more. While it is stopped, the service, a
+    // restore of a snapshot file of the conversion and the status document
+    // treat it as a database being built.
+    let files = tempfile::tempdir()?;
+    let file = files.path().join("conversion.snapshot");
+    dsa_store::Store::connect(converted.config.clone(), None)
+        .await?
+        .snapshot(&case.profile, &file)
+        .await
+        .map_err(harness::named)?;
     for in_window in [false, true] {
         let rebuilt = Database::new().await?;
         empty(&rebuilt, &case.profile).await?;
@@ -993,6 +1076,9 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
         let error = result.err().ok_or("the stopped build published")?;
         assert_eq!(code(&error), "stop_requested");
         let phase = stored_phase(&rebuilt).await;
+        refused_while_building(&case, &rebuilt, &file)
+            .await
+            .map_err(|error| format!("stopped in {phase:?}: {error}"))?;
         let (_stopper, stop) = Stop::new();
         let report = build(
             &case.profile,
