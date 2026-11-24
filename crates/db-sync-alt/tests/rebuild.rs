@@ -1143,3 +1143,45 @@ async fn a_rebuilt_database_follows_through_a_horizon_advance() -> Result {
     assert!(advances > 0, "no horizon moved");
     Ok(())
 }
+
+/// The command refuses a window longer than the retention and a horizon
+/// above the target before it connects anywhere.
+#[test]
+fn the_command_checks_its_positions_before_connecting() {
+    for (arguments, error, flag) in [
+        (
+            vec!["--retention-seconds", "86400", "--window-seconds", "172800"],
+            "window_above_retention",
+            "--window-seconds",
+        ),
+        (
+            vec!["--horizon-block", "10", "--target-block", "5"],
+            "horizon_above_target",
+            "--horizon-block",
+        ),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
+            .args([
+                "rebuild",
+                "--database",
+                "host=127.0.0.1 port=1 user=nobody dbname=none",
+                "--network",
+                "preprod",
+                "--provider-key-file",
+                "/nonexistent",
+            ])
+            .args(&arguments)
+            .env_clear()
+            .output()
+            .expect("the binary runs");
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        let refusal: serde_json::Value =
+            serde_json::from_slice(output.stderr.split(|byte| *byte == b'\n').next().unwrap())
+                .expect("a JSON refusal");
+        assert_eq!(
+            refusal,
+            json!({"error": error, "flag": flag}),
+            "{arguments:?}"
+        );
+    }
+}
