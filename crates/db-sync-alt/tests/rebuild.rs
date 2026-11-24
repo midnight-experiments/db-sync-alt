@@ -576,7 +576,7 @@ async fn serving(database: &Database) -> Result<bool> {
     Ok(position)
 }
 
-/// Test 4: the listings' paging edges give the conversion's content: one
+/// The listings' paging edges give the conversion's content: one
 /// height with 250 outputs of one asset (read through its transactions),
 /// 130 outputs of one
 /// asset at one address, exactly 100 outputs at an address (the second page
@@ -652,7 +652,7 @@ async fn listing_edges_give_the_conversion() -> Result {
     source.database.cleanup().await
 }
 
-/// Test 2: blocks arrive and a branch replaces the provider's tip while
+/// Blocks arrive and a branch replaces the provider's tip while
 /// the listings are read; outputs listed on one page are spent before the
 /// next one, outputs are created and spent again. The build still equals
 /// the conversion.
@@ -749,7 +749,7 @@ fn code(error: &follow::Error) -> String {
         .to_owned()
 }
 
-/// Test 3: a listing that lacks an output (the supply proof), a list of
+/// A listing that lacks an output (the supply proof), a list of
 /// transactions that lacks one whose input the window spends (conservation)
 /// and a provider total that does not match (the supply proof) each refuse
 /// the build; the gate stays closed.
@@ -825,7 +825,7 @@ async fn incomplete_answers_refuse_the_build_and_nothing_serves() -> Result {
     Ok(())
 }
 
-/// Test 5: a build stopped at any point continues to the conversion's
+/// A build stopped at any point continues to the conversion's
 /// digest; until it publishes the database never serves, and dropping it
 /// discards the build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
