@@ -26,4 +26,4 @@ sha2.workspace = true
 bytes = "1"
 futures-util = "0.3"
 tempfile = "3"
-zstd = "0.13"
+zstd = "0.14"

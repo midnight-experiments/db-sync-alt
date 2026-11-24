@@ -278,8 +278,8 @@ which the release archive and the container image carry.
 | zerovec | 0.11.9 | `Unicode-3.0` |
 | zerovec-derive | 0.11.7 | `Unicode-3.0` |
 | zmij | 1.0.23 | `MIT` |
-| zstd | 0.13.5 | `BSD-3-Clause` |
-| zstd-safe | 7.4.1 | `BSD-3-Clause` |
+| zstd | 0.14.4 | `BSD-3-Clause` |
+| zstd-safe | 8.3.0 | `BSD-3-Clause` |
 | zstd-sys | 2.1.3+zstd.1.5.7 | `BSD-3-Clause AND BSD-2-Clause` |
 
 <!-- END generated -->
