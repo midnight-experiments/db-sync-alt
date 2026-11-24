@@ -64,6 +64,22 @@ async fn empty(database: &Database, profile: &Profile) -> Result {
     Ok(())
 }
 
+/// Requests a build sends at once (`Settings::max_in_flight` of `build`):
+/// a stopped build may have counted these without the provider answering.
+const IN_FLIGHT: i64 = 4;
+
+/// The phase a build in `database` recorded, if any.
+async fn stored_phase(database: &Database) -> Option<String> {
+    common::connect(&database.config)
+        .await
+        .ok()?
+        .query_opt("SELECT phase FROM dsa_rebuild.progress WHERE id=1", &[])
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.get(0))
+}
+
 /// One build into `database` from `fake`, at H and T.
 async fn build(
     profile: &Profile,
@@ -923,10 +939,87 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             &format!("killed at request {kill_at}"),
         )?;
         assert!(serving(&rebuilt).await?);
+        // A request is counted once: never more than the provider answered.
+        let answered = fake.paths().len() as i64;
+        assert!(
+            report.calls <= answered + IN_FLIGHT,
+            "kill at {kill_at}: {} requests counted, {answered} answered",
+            report.calls
+        );
         let outcome = json!({"kill_at_request":kill_at,"phase":phase,"stored_state":stored,
-            "resumed":report.resumed,"calls":report.calls});
+            "resumed":report.resumed,"calls":report.calls,"answered":answered});
         println!("{}", json!({"event":"kill","outcome":outcome}));
         outcomes.push(outcome);
+        rebuilt.cleanup().await?;
+    }
+    // A build stopped by request, before the window and inside it, then
+    // continued, reports the requests the provider answered, and at most
+    // those in flight at the stop more.
+    for in_window in [false, true] {
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &case.profile).await?;
+        let fake = Fake::start(&case.g, &case.profile).await;
+        let (stopper, stop) = Stop::new();
+        let run = build(
+            &case.profile,
+            &fake,
+            &rebuilt,
+            case.horizon,
+            case.target,
+            stop,
+        );
+        let stopping = async {
+            let mut window_from = None;
+            loop {
+                let answered = fake.paths().len();
+                let due = if in_window {
+                    if window_from.is_none()
+                        && stored_phase(&rebuilt).await.as_deref() == Some("window")
+                    {
+                        window_from = Some(answered);
+                    }
+                    window_from.is_some_and(|from| answered >= from + 5)
+                } else {
+                    answered >= total / 2
+                };
+                if due {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _ = stopper.send(true);
+        };
+        let (result, ()) = tokio::join!(run, stopping);
+        let error = result.err().ok_or("the stopped build published")?;
+        assert_eq!(code(&error), "stop_requested");
+        let phase = stored_phase(&rebuilt).await;
+        let (_stopper, stop) = Stop::new();
+        let report = build(
+            &case.profile,
+            &fake,
+            &rebuilt,
+            case.horizon,
+            case.target,
+            stop,
+        )
+        .await
+        .map_err(|error| format!("continued after a stop in {phase:?}: {}", error.report()))?;
+        same(
+            &report.verified,
+            &conversion,
+            &format!("stopped in {phase:?}"),
+        )?;
+        let answered = fake.paths().len() as i64;
+        assert!(
+            (answered..=answered + IN_FLIGHT).contains(&report.calls),
+            "stopped in {phase:?}: {} requests counted, {answered} answered",
+            report.calls
+        );
+        assert_eq!(in_window, phase.as_deref() == Some("window"));
+        println!(
+            "{}",
+            json!({"event":"stopped_and_continued","phase":phase,"calls":report.calls,"answered":answered})
+        );
         rebuilt.cleanup().await?;
     }
     // A discarded build: stopped, then the database dropped.

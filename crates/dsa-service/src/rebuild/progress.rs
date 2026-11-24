@@ -59,8 +59,10 @@ pub(super) fn parse<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
 }
 
 impl Build<'_> {
+    /// The provider requests of the whole build: a continued build's
+    /// provider starts from the counts the database holds.
     pub(super) fn calls(&self) -> i64 {
-        self.calls_before + (sent(&self.asker.provider) - self.sent_at_start)
+        sent(&self.asker.provider)
     }
 
     pub(super) async fn store(&mut self) -> Result<&mut Store, Error> {
@@ -111,10 +113,11 @@ impl Build<'_> {
     }
 
     /// Records the phase the build reached with its calls so far and the
-    /// work it still expects, in its progress row and as the service state
-    /// that `status` prints.
+    /// work it still expects, in its progress row, in the request counts per
+    /// day and as the service state that `status` prints.
     pub(super) async fn reach(&mut self, phase: &str) -> Result<(), Error> {
         let calls = self.calls();
+        let per_day = self.asker.provider.counts();
         let (counts, target) = self.store().await?.building_counts().await?;
         let count = |kind: &str| counts.get(kind).copied().unwrap_or(0);
         let window = target.map_or(self.plan.target - self.plan.horizon + 1, |stored| {
@@ -128,6 +131,7 @@ impl Build<'_> {
             "remaining": {"transactions_to_read": transactions, "window_blocks": window},
             "expected_remaining_requests_at_least": transactions + i64::from(window)});
         let store = self.store().await?;
+        store.record_calls(&per_day).await?;
         store.record_building(phase, &detail, calls).await?;
         store
             .record_state("rebuilding", phase, &detail, None)

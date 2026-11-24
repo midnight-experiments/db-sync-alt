@@ -51,6 +51,7 @@ use std::{
     time::Instant,
 };
 
+use chrono::NaiveDate;
 use dsa_chain::{assets::AssetRule, profiles::Profile};
 use dsa_provider::Provider;
 use dsa_store::{Store, rebuild::Building, verify::Verification};
@@ -66,7 +67,7 @@ use crate::{
 use self::{
     asker::{Asker, refusal},
     content::Content,
-    progress::{PHASES, parse, phase_index, sent, to_value},
+    progress::{PHASES, parse, phase_index, to_value},
 };
 
 /// Items stored at once.
@@ -131,8 +132,6 @@ struct Build<'a> {
     store: Option<Store>,
     connect: Arc<Connect>,
     plan: Plan,
-    calls_before: i64,
-    sent_at_start: i64,
     phase: String,
     /// When the progress was last recorded.
     recorded: Instant,
@@ -229,10 +228,11 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
 
 /// Builds the database from the provider, or continues a build that
 /// stopped, and publishes it. A build that ends without publishing records
-/// its error as the stopped service state `status` prints.
+/// its requests and its error as the stopped service state `status` prints.
 pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
     let connect = Arc::new(context.connect);
     let recorder = Arc::clone(&connect);
+    let provider = context.provider.clone();
     let context = Context {
         connect: Box::new(move || connect()),
         ..context
@@ -247,6 +247,7 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         if let Ok(mut store) = recorder().await
             && store.building_progress().await.ok().flatten().is_some()
         {
+            let _ = store.record_calls(&provider.counts()).await;
             let _ = store
                 .record_state("stopped", &code, &json!({}), Some(&report))
                 .await;
@@ -277,15 +278,13 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
     };
     let mut store = connect().await?;
     store.lock_writer().await?;
-    let (plan, phase, calls_before, resumed) = match store.building(profile).await? {
+    let (plan, phase, resumed) = match store.building(profile).await? {
         Building::Empty => {
             let plan = plan(&asker, profile, &options).await?;
             store.start_building(profile, &to_value(&plan)?).await?;
-            (plan, "listing".to_owned(), sent(&provider), false)
+            (plan, "listing".to_owned(), false)
         }
-        Building::Stopped {
-            plan, phase, calls, ..
-        } => {
+        Building::Stopped { plan, phase, .. } => {
             let plan: Plan = parse(plan)?;
             if plan.network != profile.network
                 || options.horizon_block.is_some_and(|h| h != plan.horizon)
@@ -298,7 +297,9 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
                         "target": options.target_block, "retention_seconds": options.retention_seconds}}),
                 ));
             }
-            (plan, phase, calls, true)
+            // The requests of the earlier runs, as they recorded them per day.
+            provider.seed_counts(&store.calls(NaiveDate::default()).await?);
+            (plan, phase, true)
         }
     };
     let rule = AssetRule::from_profile(profile);
@@ -316,8 +317,6 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
         store: Some(store),
         connect,
         plan: plan.clone(),
-        calls_before,
-        sent_at_start: sent(&provider),
         phase,
         recorded: Instant::now(),
     };

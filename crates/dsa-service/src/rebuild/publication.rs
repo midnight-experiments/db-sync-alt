@@ -368,9 +368,10 @@ impl Build<'_> {
             "target_height":plan.target,"tip_height":plan.tip,"window_seconds":plan.window_seconds,
             "provider_requests":calls});
         let profile = self.profile;
-        let verified = self
-            .store()
-            .await?
+        let per_day = self.asker.provider.counts();
+        let store = self.store().await?;
+        store.record_calls(&per_day).await?;
+        let verified = store
             .publish_building(profile, &expected, newest_spend.as_ref(), &origin)
             .await?;
         eprintln!(
