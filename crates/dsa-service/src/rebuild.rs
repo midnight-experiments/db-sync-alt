@@ -69,6 +69,8 @@ use crate::{
 const PASSES: usize = 8;
 /// Items stored at once.
 const BATCH: usize = 200;
+/// The progress is recorded at least this often while a phase runs.
+const RECORD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The choices of a build.
 #[derive(Clone, Debug, Default)]
@@ -438,6 +440,8 @@ struct Build<'a> {
     calls_before: i64,
     sent_at_start: i64,
     phase: String,
+    /// When the progress was last recorded.
+    recorded: Instant,
 }
 
 fn sent(provider: &Provider) -> i64 {
@@ -496,6 +500,10 @@ impl Build<'_> {
         for chunk in items.chunks(BATCH) {
             self.store().await?.put_building_items(kind, chunk).await?;
         }
+        if self.recorded.elapsed() >= RECORD_INTERVAL {
+            let phase = self.phase.clone();
+            self.reach(&phase).await?;
+        }
         Ok(())
     }
 
@@ -504,13 +512,30 @@ impl Build<'_> {
             .await
     }
 
-    async fn reach(&mut self, phase: &str, detail: Value) -> Result<(), Error> {
+    /// Records the phase the build reached with its calls so far and the
+    /// work it still expects, in its progress row and as the service state
+    /// that `status` prints.
+    async fn reach(&mut self, phase: &str) -> Result<(), Error> {
         let calls = self.calls();
-        self.store()
-            .await?
-            .record_building(phase, &detail, calls)
+        let (counts, target) = self.store().await?.building_counts().await?;
+        let count = |kind: &str| counts.get(kind).copied().unwrap_or(0);
+        let window = target.map_or(self.plan.target - self.plan.horizon + 1, |stored| {
+            self.plan
+                .target
+                .saturating_sub(stored.max(self.plan.horizon - 1))
+        });
+        let transactions = (count("since") - count("moved")).max(0);
+        let detail = json!({"phase": phase, "provider_requests": calls,
+            "horizon": self.plan.horizon, "target": self.plan.target,
+            "remaining": {"transactions_to_read": transactions, "window_blocks": window},
+            "expected_remaining_requests_at_least": transactions + i64::from(window)});
+        let store = self.store().await?;
+        store.record_building(phase, &detail, calls).await?;
+        store
+            .record_state("rebuilding", phase, &detail, None)
             .await?;
         self.phase = phase.to_owned();
+        self.recorded = Instant::now();
         eprintln!(
             "{}",
             json!({"event":"rebuild_phase","phase":phase,"calls":calls,"detail":detail})
@@ -537,9 +562,8 @@ impl Build<'_> {
     /// The sources of the listings: units and addresses, as `unit:` and
     /// `address:` keys.
     async fn units(&mut self) -> Result<Vec<String>, Error> {
-        let stored = self.items("unit").await?;
-        if !stored.is_empty() {
-            return Ok(stored.into_keys().collect());
+        if self.cursor("units").await?.done {
+            return Ok(self.items("unit").await?.into_keys().collect());
         }
         let mut units: BTreeSet<String> = self.rule.exact_units().clone();
         for policy in self.rule.governance_policies().clone() {
@@ -553,6 +577,7 @@ impl Build<'_> {
         }
         let items = units.iter().map(|unit| (unit.clone(), json!({}))).collect();
         self.put("unit", items).await?;
+        self.finished("units").await?;
         Ok(units.into_iter().collect())
     }
 
@@ -574,6 +599,20 @@ impl Build<'_> {
             .get(key)
             .cloned()
             .map_or(Ok(Cursor::default()), parse)
+    }
+
+    /// Marks a step whose items are stored in more than one statement as
+    /// complete.
+    async fn finished(&mut self, key: &str) -> Result<(), Error> {
+        self.put_one(
+            "cursor",
+            key,
+            Cursor {
+                done: true,
+                ..Cursor::default()
+            },
+        )
+        .await
     }
 
     async fn listed(&mut self, rows: &[ListedOutput]) -> Result<(), Error> {
@@ -1517,7 +1556,7 @@ impl Build<'_> {
     /// K7 headers, K8 parameters below the window, the headers H − 1 …
     /// H − 1 + k and the target's header.
     async fn epochs(&mut self) -> Result<(), Error> {
-        if !self.items("header").await?.is_empty() {
+        if self.cursor("epochs").await?.done {
             return Ok(());
         }
         let provider = self.asker.provider.clone();
@@ -1605,7 +1644,8 @@ impl Build<'_> {
         for header in chain {
             headers.push((format!("chain:{}", header.height), to_value(header)?));
         }
-        self.put("header", headers).await
+        self.put("header", headers).await?;
+        self.finished("epochs").await
     }
 
     // ----- step 5 -----------------------------------------------------------
@@ -2179,8 +2219,34 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
 }
 
 /// Builds the database from the provider, or continues a build that
-/// stopped, and publishes it.
+/// stopped, and publishes it. A build that ends without publishing records
+/// its error as the stopped service state `status` prints.
 pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
+    let connect = Arc::new(context.connect);
+    let recorder = Arc::clone(&connect);
+    let context = Context {
+        connect: Box::new(move || connect()),
+        ..context
+    };
+    let result = run(context).await;
+    if let Err(error) = &result {
+        let report = error.report();
+        let code = report["error"]
+            .as_str()
+            .unwrap_or("rebuild_failed")
+            .to_owned();
+        if let Ok(mut store) = recorder().await
+            && store.building_progress().await.ok().flatten().is_some()
+        {
+            let _ = store
+                .record_state("stopped", &code, &json!({}), Some(&report))
+                .await;
+        }
+    }
+    result
+}
+
+async fn run(context: Context<'_>) -> Result<Report, Error> {
     let started = Instant::now();
     let Context {
         profile,
@@ -2244,6 +2310,7 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         calls_before,
         sent_at_start: sent(&provider),
         phase,
+        recorded: Instant::now(),
     };
     eprintln!(
         "{}",
@@ -2251,10 +2318,8 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
     );
     let mut counts = json!({});
     let start_at = phase_index(&build.phase).max(1);
-    for (index, phase) in PHASES.iter().enumerate().skip(start_at) {
-        if index > start_at || build.phase != *phase {
-            build.reach(phase, json!({})).await?;
-        }
+    for phase in PHASES.iter().skip(start_at) {
+        build.reach(phase).await?;
         match *phase {
             "listing" => build.listing().await?,
             "quantities" => build.quantities().await?,

@@ -893,6 +893,17 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             .map(|row| row.get(0));
         let serves = serving(&rebuilt).await.unwrap_or(false);
         assert!(!serves, "kill at {kill_at}: the database serves");
+        // What `status` prints of a build: the stored service state.
+        let stored = client
+            .query_opt(
+                "SELECT state,reason,detail FROM dsa.service_state WHERE id=1",
+                &[],
+            )
+            .await?
+            .map(|row| {
+                json!({"state": row.get::<_, String>(0), "reason": row.get::<_, String>(1),
+                    "detail": row.get::<_, serde_json::Value>(2)})
+            });
         let (_stopper, stop) = Stop::new();
         let report = build(
             &case.profile,
@@ -910,7 +921,10 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             &format!("killed at request {kill_at}"),
         )?;
         assert!(serving(&rebuilt).await?);
-        outcomes.push(json!({"kill_at_request":kill_at,"phase":phase,"resumed":report.resumed}));
+        let outcome = json!({"kill_at_request":kill_at,"phase":phase,"stored_state":stored,
+            "resumed":report.resumed,"calls":report.calls});
+        println!("{}", json!({"event":"kill","outcome":outcome}));
+        outcomes.push(outcome);
         rebuilt.cleanup().await?;
     }
     // A discarded build: stopped, then the database dropped.
@@ -936,14 +950,79 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
     let error = result.err().ok_or("the stopped build published")?;
     assert_eq!(code(&error), "stop_requested");
     assert!(!serving(&discarded).await?);
-    let restore = discarded.cli("status", &case.profile.network, &[]).await?;
+    let stopped: (String, String) = common::connect(&discarded.config)
+        .await?
+        .query_one("SELECT state,reason FROM dsa.service_state WHERE id=1", &[])
+        .await
+        .map(|row| (row.get(0), row.get(1)))?;
+    assert_eq!(stopped, ("stopped".to_owned(), "stop_requested".to_owned()));
     discarded.cleanup().await?;
     println!(
         "{}",
-        json!({"event":"kills","requests_whole_build":total,"outcomes":outcomes,
-            "discarded_status":restore["state"]})
+        json!({"event":"kills","requests_whole_build":total,"points":outcomes.len(),
+            "discarded_state":stopped})
     );
     assert_eq!(outcomes.len(), points);
     converted.cleanup().await?;
     source.database.cleanup().await
+}
+
+/// The fixed `multi_asset` IDs of Mainnet and Preprod that a build writes
+/// are the IDs the published snapshot files hold: each `*.snapshot` file of
+/// the directory in DSA_RELEASE_FILES is restored and its fixed descriptors
+/// compared with the network's table. Without the variable the test says so
+/// and passes: the files are not part of the repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn fixed_descriptor_ids_are_those_of_the_published_files() -> Result {
+    let Ok(directory) = std::env::var("DSA_RELEASE_FILES") else {
+        println!("DSA_RELEASE_FILES is not set: no published file is compared");
+        return Ok(());
+    };
+    let mut compared = Vec::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !name.ends_with(".snapshot") {
+            continue;
+        }
+        let network = name.split('-').next().unwrap_or_default();
+        let profile = Profile::load(network)?;
+        let database = Database::new().await?;
+        let mut store = dsa_store::Store::connect(database.config.clone(), None).await?;
+        store
+            .restore(&profile, &path, None)
+            .await
+            .map_err(harness::named)?;
+        let stored: BTreeMap<String, i64> = common::connect(&database.config)
+            .await?
+            .query(
+                "SELECT encode(policy,'hex')||encode(name,'hex'),id FROM serve.multi_asset",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let table = dsa_chain::profiles::fixed_descriptor_ids(&profile);
+        let differing: Vec<_> = table
+            .iter()
+            .filter(|(unit, id)| stored.get(unit) != Some(id))
+            .map(|(unit, id)| json!({"unit": unit, "table": id, "file": stored.get(unit)}))
+            .collect();
+        compared.push(json!({"file": name, "fixed": table.len(), "differing": differing}));
+        drop(store);
+        database.cleanup().await?;
+        assert!(differing.is_empty(), "{name}: {differing:?}");
+    }
+    println!(
+        "{}",
+        json!({"event":"fixed_descriptor_ids","compared":compared})
+    );
+    assert!(!compared.is_empty(), "no snapshot file in {directory}");
+    Ok(())
 }

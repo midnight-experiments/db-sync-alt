@@ -916,11 +916,14 @@ impl<'a> Follower<'a> {
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        let detail = json!({
+        let mut detail = json!({
             "wait_until": until,
             "target": self.stored.target.height,
             "provider_tip": self.provider_tip,
         });
+        if self.settings.building {
+            detail["build_target"] = json!(self.settings.stop_at_target);
+        }
         match store
             .record_state(state.as_str(), reason, &detail, error)
             .await

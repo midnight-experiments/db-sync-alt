@@ -432,6 +432,29 @@ impl Store {
         Ok(())
     }
 
+    /// The number of stored items of each kind, and the stored target.
+    pub async fn building_counts(&self) -> Result<(BTreeMap<String, i64>, Option<u32>), Error> {
+        let counts = self
+            .client
+            .query(
+                "SELECT kind,count(*) FROM dsa_rebuild.item GROUP BY kind",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let target: Option<i32> = self
+            .client
+            .query_one(
+                "SELECT target_height::integer FROM dsa.position WHERE id=1",
+                &[],
+            )
+            .await?
+            .get(0);
+        Ok((counts, target.and_then(|height| u32::try_from(height).ok())))
+    }
+
     /// Writes the rows below the horizon, the supply at H and the position
     /// the follower starts from, in one transaction. The gate stays closed.
     pub async fn write_building_base(
