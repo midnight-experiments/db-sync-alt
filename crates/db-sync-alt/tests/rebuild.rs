@@ -99,7 +99,6 @@ struct Totals {
     chains: u64,
     quiet_windows: u64,
     markers: u64,
-    carried_spent: u64,
     revealed_at_spend: usize,
     invalid: usize,
     requests: BTreeMap<String, u64>,

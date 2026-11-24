@@ -588,7 +588,7 @@ fn the_operations_page_explains_every_health_reason_and_status_field() {
 
 /// Commands the binary has outside its documented interface, for development
 /// and maintenance: `--help` does not list them and no page names them.
-const HIDDEN_COMMANDS: &[&str] = &["convert", "follow"];
+const HIDDEN_COMMANDS: &[&str] = &["convert", "follow", "rebuild"];
 /// Flags of listed commands that `--help` does not show, with their command.
 const HIDDEN_FLAGS: &[(&str, &str)] = &[("compare", "--a-capture")];
 

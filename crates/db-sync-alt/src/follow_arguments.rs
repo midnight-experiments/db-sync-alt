@@ -125,7 +125,7 @@ impl FollowerArguments {
 /// The store error the command wrapper reports and maps to an exit status.
 /// A database condition keeps its own error, so one that lasted ends with
 /// the temporary-failure status.
-fn reported(error: follow::Error) -> dsa_store::Error {
+pub(crate) fn reported(error: follow::Error) -> dsa_store::Error {
     let report = error.report();
     match error {
         follow::Error::Store(error) => error,

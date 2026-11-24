@@ -2,6 +2,7 @@
 //! command to the store through the wrapper of `wrapper.rs`.
 
 mod follow_arguments;
+mod rebuild_arguments;
 mod run_command;
 mod service_arguments;
 mod wrapper;
@@ -258,6 +259,19 @@ enum Command {
         #[arg(long)]
         stop_at_target: Option<u32>,
     },
+    /// Build an empty database from the provider alone, verify it and open
+    /// it for the node.
+    #[command(hide = true)]
+    Rebuild {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[command(flatten)]
+        provider: follow_arguments::ProviderArguments,
+        #[command(flatten)]
+        follower: follow_arguments::FollowerArguments,
+        #[command(flatten)]
+        choices: rebuild_arguments::RebuildArguments,
+    },
 }
 
 impl Command {
@@ -271,7 +285,8 @@ impl Command {
             | Self::Convert { database, .. }
             | Self::GrantReader { database, .. }
             | Self::Run { database, .. }
-            | Self::Follow { database, .. } => Some(database),
+            | Self::Follow { database, .. }
+            | Self::Rebuild { database, .. } => Some(database),
             Self::Profile { .. } | Self::Compare(_) | Self::Health { .. } => None,
         }
     }
@@ -438,6 +453,12 @@ fn prepare(command: Command) -> Result<(Operation, Job), Usage> {
             follower,
             service,
         } => run_command::command(database, provider, follower, service),
+        Command::Rebuild {
+            database,
+            provider,
+            follower,
+            choices,
+        } => rebuild_arguments::command(database, provider, follower, choices),
         command => database_command(command),
     }
 }
@@ -548,6 +569,7 @@ fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
         | Command::Compare(_)
         | Command::Follow { .. }
         | Command::Run { .. }
+        | Command::Rebuild { .. }
         | Command::Health { .. } => {
             unreachable!("not a database command")
         }
@@ -714,6 +736,7 @@ async fn execute(
         | Command::Compare(_)
         | Command::Follow { .. }
         | Command::Run { .. }
+        | Command::Rebuild { .. }
         | Command::Health { .. } => {
             unreachable!("not a database command")
         }
