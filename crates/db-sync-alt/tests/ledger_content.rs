@@ -509,7 +509,7 @@ fn unrelated(scenario: &Scenario, seed: u8) -> Tx {
 /// metadatum map, and bridge metadata at the ICS address beside a deep label,
 /// nested 1,000 levels, at the 2,000-level limit and past it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn deep_and_repeated_key_metadata_never_stops_the_follower() -> Result {
     let scenario = Scenario::new(31_000).await?;
     let ordinary = scenario.ordinary(0);
@@ -619,7 +619,7 @@ async fn deep_and_repeated_key_metadata_never_stops_the_follower() -> Result {
 /// that is an indefinite map with a repeated key, and a redeemer of 1,000
 /// nested constructors; relevant outputs whose datums come from such sets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn deep_and_repeated_key_witness_data_never_stops_the_follower() -> Result {
     let scenario = Scenario::new(32_000).await?;
     let ordinary = scenario.ordinary(0);
@@ -693,7 +693,7 @@ async fn deep_and_repeated_key_witness_data_never_stops_the_follower() -> Result
 /// key, and datum hashes whose preimage is not on chain, at the ICS, reserve,
 /// mapping and governance addresses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn deep_and_unresolvable_datums_at_profile_addresses_never_stop_the_follower() -> Result {
     let scenario = Scenario::new(33_000).await?;
     let ordinary = scenario.ordinary(0);
@@ -793,7 +793,7 @@ async fn deep_and_unresolvable_datums_at_profile_addresses_never_stop_the_follow
 /// Payments to the registered-candidates address, with a datum and with
 /// cNIGHT: the address is not a profile address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn payments_to_the_registered_candidates_address_never_stop_the_follower() -> Result {
     let scenario = Scenario::new(34_000).await?;
     let ordinary = scenario.ordinary(0);
@@ -847,7 +847,7 @@ async fn payments_to_the_registered_candidates_address_never_stop_the_follower()
 /// beyond 2^53, a 2,000-byte chunked bignum and a repeated map key, at the
 /// mapping address (stored exactly) and at holders of cNIGHT (not read).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn exact_integers_and_repeated_keys_in_datums_never_stop_the_follower() -> Result {
     let scenario = Scenario::new(35_000).await?;
     let ordinary = scenario.ordinary(0);
@@ -970,7 +970,7 @@ fn junk_units() -> Vec<String> {
 /// its outputs answer is read: above 32 MiB because the provider renders
 /// every reference input with every token it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn an_oversized_outputs_answer_never_stops_the_follower() -> Result {
     let scenario = Scenario::new(36_000).await?;
     let ordinary = scenario.ordinary(0);
@@ -1052,7 +1052,7 @@ async fn an_oversized_outputs_answer_never_stops_the_follower() -> Result {
 /// one whose collateral return the decoder cannot classify, resolved through
 /// the outputs answer the provider renders for an invalid transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn phase_two_invalid_transactions_never_stop_the_follower() -> Result {
     let scenario = Scenario::new(37_000).await?;
     let ordinary = scenario.ordinary(0);
@@ -1144,7 +1144,7 @@ async fn phase_two_invalid_transactions_never_stop_the_follower() -> Result {
 /// return holding a token, whose outputs answer renders the pointer address
 /// canonically and the collateral return as lovelace only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn provider_renderings_of_collateral_returns_and_pointers_never_stop_the_follower() -> Result
 {
     let scenario = Scenario::new(38_000).await?;

@@ -159,7 +159,7 @@ fn refusal(output: &std::process::Output) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn catalogue_matches_legacy_and_node_reader_probes() -> Result {
     let db = Database::new().await?;
     db.create().await?;
@@ -248,7 +248,7 @@ async fn catalogue_matches_legacy_and_node_reader_probes() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn every_view_gates_cached_prepared_queries() -> Result {
     let db = Database::new().await?;
     db.create().await?;
@@ -293,7 +293,7 @@ async fn every_view_gates_cached_prepared_queries() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn reader_refuses_extra_effective_privileges() -> Result {
     let db = Database::new().await?;
     db.create().await?;
@@ -409,7 +409,7 @@ async fn reader_refuses_extra_effective_privileges() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn identity_refusals_status_and_single_writer() -> Result {
     let db = Database::new().await?;
     let preprod = Profile::load("preprod")?;
@@ -495,7 +495,7 @@ async fn identity_refusals_status_and_single_writer() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn status_prints_identity_position_and_capabilities_without_writing() -> Result {
     let db = Database::new().await?;
     let profile = Profile::load("preprod")?;

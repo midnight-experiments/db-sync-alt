@@ -167,9 +167,10 @@ A Rust workspace. What each folder holds:
 | `crates/dsa-testkit` | Test support only: a transaction builder, a fake provider and generated chains. |
 
 Around them: `deploy` (the container image and the Compose deployment), `docs`,
-`tools/corpus` (records real provider answers for tests), and `profiles` and
-`reference` (pinned copies of the Midnight node's settings and sources, where
-the queries and each network's addresses come from). More in
+`tools/corpus` (records real provider answers for tests), `reference` (pinned
+copies of the Midnight node's sources, where the queries come from) and
+`profiles` (node settings used as test input). Each network's addresses and
+assets are compiled into the binary from `crates/dsa-chain/profiles`. More in
 [contributing](CONTRIBUTING.md).
 
 ## Documentation

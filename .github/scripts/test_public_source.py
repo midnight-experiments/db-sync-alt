@@ -194,5 +194,13 @@ class WorkflowImageChecks(unittest.TestCase):
         self.assertEqual(self.errors(ci.replace(f'other: {servers[0]}','other: postgres:17'),
                                      dockerfile,compose(servers[0])),
                          ['workflow_image_differs:postgres'])
+        # The second server of the snapshot file test is not a server the suite runs on.
+        second='postgres:17.1@sha256:'+'f'*64
+        self.assertEqual(self.errors(ci.replace(f'other: {servers[0]}',f'other: {second}'),
+                                     dockerfile,compose(second)),
+                         ['workflow_image_differs:postgres'])
+        self.assertEqual(self.errors(ci.replace(f'other: {servers[0]}',f'other: {second}'),
+                                     dockerfile,compose(servers[0])),
+                         ['workflow_image_differs:postgres'])
 
 if __name__=='__main__':unittest.main()

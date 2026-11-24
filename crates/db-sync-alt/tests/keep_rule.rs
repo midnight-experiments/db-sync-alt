@@ -512,7 +512,7 @@ fn version_two_projection_and_datum_boundaries() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_v2_literal_governance_and_datum_edges() -> Result {
     for seed in [41, 42] {
         let mut f = Fixture::base(seed);
@@ -738,7 +738,7 @@ async fn verify_observations(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_indexed_stages_match_independent_model() -> Result {
     let initial = Fixture::base(1);
     let db = Database::new(&initial.profile).await?;
@@ -827,7 +827,7 @@ async fn keep_rule_indexed_stages_match_independent_model() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_ten_thousand_chains() -> Result {
     let cases: u64 = std::env::var("DSA_KEEP_CASES")
         .unwrap_or_else(|_| "10000".to_owned())
@@ -930,7 +930,7 @@ async fn keep_rule_ten_thousand_chains() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_node_regressions() -> Result {
     let db = Database::new(&Fixture::base(1).profile).await?;
     for (name, fixture) in named_cases() {
@@ -962,7 +962,7 @@ async fn keep_rule_node_regressions() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_selection_entry_points() -> Result {
     let fixture = Fixture::base(18);
     let mut db = Database::new(&fixture.profile).await?;
@@ -1087,7 +1087,7 @@ async fn keep_rule_selection_entry_points() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_node_spend_regression() -> Result {
     let fixture = Fixture::base(2);
     let db = Database::new(&fixture.profile).await?;
@@ -1135,7 +1135,7 @@ async fn keep_rule_node_spend_regression() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_partial_order_witnesses() -> Result {
     // A schema-only ambiguity control. The deployed singleton-token policies
     // exclude these ties on a valid chain; selection still preserves all ties.
@@ -1222,7 +1222,7 @@ async fn keep_rule_partial_order_witnesses() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_height_limit_and_collector_guard() -> Result {
     let mut fixture = Fixture::base(42);
     fixture.translate_heights(dsa_chain::ids::HEIGHT_LIMIT - 11);
@@ -1310,7 +1310,7 @@ async fn keep_rule_height_limit_and_collector_guard() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn keep_rule_page_and_bridge_checkpoints() -> Result {
     let db = Database::new(&Fixture::base(2).profile).await?;
     let wide = (

@@ -3,9 +3,9 @@
 You provide the PostgreSQL server, version 17 or newer, as you would for
 cardano-db-sync. db-sync-alt is tested on PostgreSQL 17, 18 and 19 and refuses
 a server older than 17 (`postgresql_17_or_newer_required`). A snapshot file
-restores on any of these versions, whichever one wrote it. The database can
-live on a server that holds other databases of a Midnight deployment.
-db-sync-alt:
+written on one of these versions restores on another; this is tested between
+17 and each of 18 and 19. The database can live on a server that holds other
+databases of a Midnight deployment. db-sync-alt:
 
 - needs a dedicated database that `PUBLIC` cannot connect to, and an owner
   login that owns it;
