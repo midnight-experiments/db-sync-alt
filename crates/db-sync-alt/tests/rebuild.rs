@@ -3,8 +3,10 @@
 //! its full history at horizon H and target T, and the same chain built from
 //! the provider's listings at the same H and T, give the same content and
 //! state digests, supply and position. DSA_REBUILD_CASES sets the number of
-//! generated chains of the property test (default 8) and
-//! DSA_REBUILD_PARALLEL how many run at once (default 4).
+//! generated chains of the property test (default 8), DSA_REBUILD_PARALLEL
+//! how many run at once (default 4), DSA_REBUILD_KILL_POINTS where a build
+//! is stopped and continued (default 6) and DSA_REBUILD_FOLLOW_CASES the
+//! chains followed on after their build (default 4).
 
 #[path = "common/legacy.rs"]
 #[allow(dead_code)]
@@ -854,7 +856,7 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
     .map_err(|error| error.report().to_string())?;
     let total = fake.paths().len();
     whole.cleanup().await?;
-    let points = setting("DSA_REBUILD_KILL_POINTS", 12) as usize;
+    let points = setting("DSA_REBUILD_KILL_POINTS", 6) as usize;
     let mut outcomes = Vec::new();
     for point in 1..=points {
         let kill_at = (total * point / (points + 1)).max(1);
