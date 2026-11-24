@@ -259,9 +259,26 @@ enum Command {
         #[arg(long)]
         stop_at_target: Option<u32>,
     },
-    /// Build an empty database from the provider alone, verify it and open
-    /// it for the node.
-    #[command(hide = true)]
+    /// Build an empty database from the provider alone, without a snapshot
+    /// file, then verify it and open it for the node.
+    ///
+    /// The build finds the outputs the node needs that were unspent at the
+    /// horizon in the provider's listings of what is unspent now and of
+    /// what moved since, then reads every block from the horizon to the
+    /// target as the service follows them, with the same checks. Before
+    /// the gate opens, the unspent amount of each fixed-supply asset at the
+    /// horizon must equal the provider's quantity less the net mint since
+    /// then, and `verify` must pass; otherwise the build ends and nothing is
+    /// served. Given the horizon and target of a snapshot file, it builds
+    /// the same blocks, so the two can be compared by their content digests.
+    ///
+    /// The build takes the writer lock and records its progress in the
+    /// database, which serves nothing until the build has published. SIGINT
+    /// or SIGTERM stops it; the same command continues it. `status` on the
+    /// database shows its progress. Then start `run` on the database.
+    ///
+    /// The provider, follower and database flags are those of `run`, also as
+    /// DSA_ variables; the four flags of the build itself have no variable.
     Rebuild {
         #[command(flatten)]
         database: DatabaseArguments,

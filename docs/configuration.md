@@ -20,8 +20,8 @@ command: each flag, its variable and its default.
 
 ## Database flags
 
-`run`, `create`, `restore`, `snapshot`, `verify`, `status` and `grant-reader`
-take these flags for the database db-sync-alt writes or reads.
+`run`, `rebuild`, `create`, `restore`, `snapshot`, `verify`, `status` and
+`grant-reader` take these flags for the database db-sync-alt writes or reads.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
@@ -40,7 +40,7 @@ server on the same host; `--tls-root-cert` is then refused.
 
 ## Provider flags
 
-`run` takes these flags for the provider ([provider](provider.md)).
+`run` and `rebuild` take these flags for the provider ([provider](provider.md)).
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
@@ -52,7 +52,7 @@ server on the same host; `--tls-root-cert` is then refused.
 
 ## Follower flags
 
-`run` takes these flags for following the chain.
+`run` and `rebuild` take these flags for following the chain.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
@@ -88,6 +88,24 @@ The service ([operations](operations.md)). It takes the
 no others. It refuses `--overall-timeout-seconds` and
 `DSA_OVERALL_TIMEOUT_SECONDS` with exit status 2
 (`overall_timeout_not_supported`): the service runs until it is stopped.
+
+## `rebuild`
+
+Builds an empty database from the provider alone, without a snapshot file,
+checks it and opens the gate. It takes the
+[database flags](#database-flags), the [provider flags](#provider-flags), the
+[follower flags](#follower-flags) and these, which have no variable:
+
+| Flag | Variable | Default | Meaning |
+| --- | --- | --- | --- |
+| `--retention-seconds` | — | `604800` | Seconds an event stays after it is first served, stored in the built database, at least 86,400. A stopped build continues only with the same value. |
+| `--window-seconds` | — | `--retention-seconds` | Seconds of chain time from the horizon to the target, from 86,400 to `--retention-seconds`. Without `--horizon-block`, the horizon is the newest block at or before the target's time minus this. |
+| `--horizon-block` | — | the newest block at or before the target's time minus `--window-seconds` | The height of the horizon, the oldest block of the window. Not above `--target-block`. |
+| `--target-block` | — | the provider's tip minus k | The height of the target, the newest block whose events the built database serves; at most the provider's tip minus k. |
+
+A stopped build continues with the same command; `--horizon-block` and
+`--target-block` may then be left out, and when given they must name the
+stored horizon and target (`rebuild_plan_mismatch` otherwise).
 
 ## `create`
 

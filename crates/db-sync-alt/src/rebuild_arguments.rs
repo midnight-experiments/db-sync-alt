@@ -1,5 +1,5 @@
-//! The hidden `rebuild` command: an empty database built from the provider
-//! alone, verified and left serving.
+//! The `rebuild` command: an empty database built from the provider alone,
+//! verified and left serving.
 
 use std::{sync::Arc, time::Duration};
 
@@ -19,20 +19,26 @@ use crate::{
 
 #[derive(Args, Clone, Debug)]
 pub(crate) struct RebuildArguments {
-    /// The retention the built database keeps.
+    /// Seconds an event stays after it is first served, stored in the built
+    /// database, at least 86400. A stopped build continues only with the
+    /// same value.
     #[arg(long, default_value_t = 604_800,
         value_parser = clap::value_parser!(i64).range(86_400..))]
     pub(crate) retention_seconds: i64,
-    /// The window the build starts with, at least 24 hours and at most the
-    /// retention [default: the retention].
+    /// Seconds of chain time from the horizon to the target, at least 86400
+    /// and at most --retention-seconds; sets the horizon when
+    /// --horizon-block is not given [default: --retention-seconds].
     #[arg(long,
         value_parser = clap::value_parser!(i64).range(86_400..))]
     pub(crate) window_seconds: Option<i64>,
-    /// The horizon block [default: the newest block at or before the
-    /// target's time minus the window].
+    /// The height of the horizon, the oldest block of the window [default:
+    /// the newest block at or before the target's time minus
+    /// --window-seconds].
     #[arg(long)]
     pub(crate) horizon_block: Option<u32>,
-    /// The target block [default: the provider's tip minus k].
+    /// The height of the target, the newest block whose events the built
+    /// database serves; at most the provider's tip minus k [default: the
+    /// provider's tip minus k].
     #[arg(long)]
     pub(crate) target_block: Option<u32>,
 }
