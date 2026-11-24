@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # The Pallas crates are pinned to one exact version and move together.
+      pallas:
+        patterns: ["pallas-*"]
   # The actions of both workflows, pinned by commit.
   - package-ecosystem: github-actions
     directory: /
@@ -20,3 +24,7 @@ updates:
     directory: /deploy
     schedule:
       interval: weekly
+    # db-sync-alt runs on PostgreSQL 17: only updates within 17 are proposed.
+    ignore:
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]

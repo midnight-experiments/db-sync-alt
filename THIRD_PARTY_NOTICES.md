@@ -92,7 +92,7 @@ which the release archive and the container image carry.
 | base64 | 0.22.1 | `MIT OR Apache-2.0` |
 | base64 | 0.23.1 | `MIT OR Apache-2.0` |
 | base64ct | 1.8.3 | `Apache-2.0 OR MIT` |
-| bech32 | 0.11.1 | `MIT` |
+| bech32 | 0.12.0 | `MIT` |
 | bech32 | 0.9.1 | `MIT` |
 | bitflags | 2.13.2 | `MIT OR Apache-2.0` |
 | block-buffer | 0.10.4 | `MIT OR Apache-2.0` |
