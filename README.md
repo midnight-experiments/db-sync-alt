@@ -3,16 +3,13 @@
 Cardano data for a Midnight node in a small PostgreSQL database, instead of a
 full Cardano node and cardano-db-sync stack.
 
-db-sync-alt follows Cardano through the Blockfrost API and serves
-**Midnight node 2.1.101** the cardano-db-sync tables its queries read, from
-PostgreSQL 17, through a read-only login. The node's SQL runs unchanged.
+db-sync-alt follows Cardano through the Blockfrost API and serves a Midnight
+node the cardano-db-sync tables its queries read, from PostgreSQL, through a
+read-only login. The node's SQL runs unchanged.
 
-The database keeps only what the node can still ask for: the events of the
-last 7 days (the retention, counted from when this database first served them),
-the Cardano outputs of Midnight's addresses and assets that are still unspent,
-and a few governance records and epoch values. Everything older is deleted as
-the chain advances, so the database stays small: 0.4 GB on Mainnet
-([system requirements](#system-requirements)).
+db-sync-alt keeps 7 days of detailed data, the range a Midnight node can start
+syncing from, plus the historic data the node still needs
+([limitations](docs/limitations.md#history-older-than-the-window)).
 
 > This whole project is vibe coded. If you use it for a real application that
 > manages any real money, that money will likely be lost. This project is for
@@ -22,7 +19,7 @@ the chain advances, so the database stays small: 0.4 GB on Mainnet
 flowchart LR
     blockfrost["Blockfrost API<br/>(Cardano)"] -- final blocks --> service
     file["Snapshot file"] -. first start, once .-> service
-    service["db-sync-alt run"] -- checked updates --> postgres[("PostgreSQL 17")]
+    service["db-sync-alt run"] -- checked updates --> postgres[("PostgreSQL")]
     node["Midnight node"] -- "cardano-db-sync SQL<br/>(reader login)" --> postgres
 ```
 
@@ -93,7 +90,7 @@ db-sync-alt --version
 The archive also holds the license texts of everything the binary is built
 from. The image is `ghcr.io/midnight-experiments/db-sync-alt:0.5.0`; its
 entry point is the binary and its default command is `run`. The Compose
-deployment runs it next to its own PostgreSQL 17 server:
+deployment runs it next to its own PostgreSQL server:
 [`deploy/README.md`](deploy/README.md).
 
 ## First start
@@ -113,15 +110,22 @@ db-sync-alt run --network mainnet \
   --snapshot-dir /var/lib/db-sync-alt/snapshots
 ```
 
-The service restores the file, grants the reader login the node's rights,
-catches up from the file's target to the chain's tip and then follows it. It
-runs in the foreground; SIGINT or SIGTERM stops it, and the same command
-continues: `--snapshot` is read only when a restore is needed, so it may stay
-set. With `--snapshot-dir` it writes a snapshot file every day, the database's
-backup; every file of the network's daily name pattern in that directory
-belongs to the rotation.
-Every flag can also be given as an environment variable
-([configuration](docs/configuration.md)).
+What the command does:
+
+- Restores the snapshot file into the empty database.
+- Gives the reader login the rights the node needs.
+- Catches up from the file's block to the chain's tip, then follows the chain.
+
+Good to know:
+
+- It runs in the foreground. SIGINT or SIGTERM stops it.
+- The same command continues where it stopped. `--snapshot` is read only when
+  a restore is needed, so it may stay set.
+- With `--snapshot-dir` it writes a snapshot file every day: the database's
+  backup. Every file in that directory with the network's daily name pattern
+  belongs to the rotation.
+- Every flag can also be given as an environment variable
+  ([configuration](docs/configuration.md)).
 
 ```sh
 curl -i http://127.0.0.1:18080/health
@@ -144,9 +148,29 @@ SSL_ROOT_CERT=/path/to/root-ca.crt
 CARDANO_SECURITY_PARAMETER=2160
 ```
 
-Midnight node 2.1.101 connects only over TLS. The reader login can read the
-node's eleven views and nothing else. Details and checks:
-[connect a node](docs/connect-a-node.md).
+The node connects only over TLS. The reader login can read the node's eleven
+views and nothing else. Details and checks:
+[connect a node](docs/connect-a-node.md); the supported node release:
+[compatibility](docs/compatibility.md).
+
+## Code
+
+A Rust workspace. What each folder holds:
+
+| Folder | What it holds |
+| --- | --- |
+| `crates/db-sync-alt` | The program itself: the command line that starts every command. |
+| `crates/dsa-chain` | Cardano, without any I/O: reads blocks and transactions, knows each network's addresses and assets, and decides what is kept. |
+| `crates/dsa-provider` | The Blockfrost client: one method per request, pacing and limits. |
+| `crates/dsa-store` | The PostgreSQL database: its tables and the node's read-only access, restore, snapshot files, verification, pruning and the comparison. |
+| `crates/dsa-service` | The running service: follows the chain, retries, upkeep, `/health` and `/status`. |
+| `crates/dsa-testkit` | Test support only: a transaction builder, a fake provider and generated chains. |
+
+Around them: `deploy` (the container image and the Compose deployment), `docs`,
+`tools/corpus` (records real provider answers for tests), and `profiles` and
+`reference` (pinned copies of the Midnight node's settings and sources, where
+the queries and each network's addresses come from). More in
+[contributing](CONTRIBUTING.md).
 
 ## Documentation
 
