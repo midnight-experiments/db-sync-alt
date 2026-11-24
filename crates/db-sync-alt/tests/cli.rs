@@ -124,7 +124,7 @@ async fn an_unreachable_database_exits_75() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn failures_exit_1_and_check_refusals_exit_3() -> Result {
     let db = Database::new().await?;
     // A check refuses a database that is not a db-sync-alt database.
@@ -174,7 +174,7 @@ const SERVED: &str = "serve.block, serve.tx, serve.tx_out, serve.tx_in, serve.ma
 /// once (no session of the command remains while the lock is still held),
 /// temporary files are removed and nothing is reported as published.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn sigterm_during_verify_and_snapshot_cancels_the_statement() -> Result {
     let mut f = fixture(353);
     f.reindex_ordinals();

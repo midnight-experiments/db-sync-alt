@@ -9,8 +9,8 @@ PostgreSQL client tools. It runs as user 65532. Its
 entry point is `/usr/local/bin/db-sync-alt` and its default command is `run`;
 `/var/lib/db-sync-alt/snapshots` belongs to user 65532 for the daily snapshot
 files. The license texts are in `/usr/share/doc/db-sync-alt`. The image is
-33 MB (33,199,302 bytes) and its binary 9.1 MB (9,054,520 bytes). `Dockerfile`
-builds it from the repository root:
+about 33 MB and its binary about 9 MB. `Dockerfile` builds it from the
+repository root:
 
 ```sh
 docker build -f deploy/Dockerfile -t db-sync-alt:local .
@@ -19,7 +19,7 @@ docker build -f deploy/Dockerfile -t db-sync-alt:local .
 The service is configured through `DSA_` variables
 ([configuration](../docs/configuration.md)); secrets are files mounted into the
 container. Any command runs the same way, for example
-`docker run --rm ghcr.io/midnight-experiments/db-sync-alt:0.5.0 verify …`.
+`docker run --rm ghcr.io/midnight-experiments/db-sync-alt:0.5.1 verify …`.
 `db-sync-alt health` is the health check: it needs no HTTP client in the image.
 
 ## Compose

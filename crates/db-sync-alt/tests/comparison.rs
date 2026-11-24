@@ -8,7 +8,7 @@ use std::error::Error as StdError;
 use tokio::process::Command;
 type Result<T = ()> = std::result::Result<T, Box<dyn StdError + Send + Sync>>;
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_cli_legacy_conversion_complete_catalogue() -> Result {
     let f = fixture(301);
     let source = Database::new().await?;
@@ -146,7 +146,7 @@ async fn cli(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> Result {
     for seed in [303, 304] {
         let (source, target, f) = setup(seed).await?;
@@ -261,7 +261,7 @@ async fn compare_both_networks_all_events_units_pages_and_numeric_payloads() -> 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_detects_removed_unspent_governance_changed_header_and_ident() -> Result {
     for mutation in ["unspent", "governance", "tx_count", "ident"] {
         let (source, target, f) = setup(305).await?;
@@ -301,7 +301,7 @@ async fn compare_detects_removed_unspent_governance_changed_header_and_ident() -
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_bounds_sentinels_broken_relationship_and_ordinal_order() -> Result {
     let (source, target, f) = setup(307).await?;
     let mut reader = Reader::connect(target.reader_config(), None).await?;
@@ -340,7 +340,7 @@ async fn compare_bounds_sentinels_broken_relationship_and_ordinal_order() -> Res
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() -> Result {
     let mut f = fixture(309);
     f.reindex_ordinals();
@@ -467,7 +467,7 @@ async fn compare_source_snapshot_matches_newest_query_while_legacy_advances() ->
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_refusals_readonly_credentials_and_no_data_mutation() -> Result {
     let (source, target, f) = setup(311).await?;
     let before_source = source.catalog().await?;
@@ -530,7 +530,7 @@ async fn compare_refusals_readonly_credentials_and_no_data_mutation() -> Result 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_catalogue_sqlx08_native_types_empty_serving_29x2() -> Result {
     use sqlx::{Connection, Row};
     let target = Database::new().await?;
@@ -632,7 +632,7 @@ async fn compare_catalogue_sqlx08_native_types_empty_serving_29x2() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_refuses_rule_one_and_declared_stored_mismatch_even_empty() -> Result {
     let (source, target, f) = setup(319).await?;
     let mut reader = Reader::connect(source.reader_config(), None).await?;
@@ -678,7 +678,7 @@ async fn compare_refuses_rule_one_and_declared_stored_mismatch_even_empty() -> R
 /// Dedicated generated TLS/SCRAM Docker server: the normal service has no test
 /// certificate. On-demand validation must provide both public root paths.
 #[tokio::test]
-#[ignore = "requires generated TLS/SCRAM PostgreSQL17 and DSA_TLS roots"]
+#[ignore = "requires a generated TLS/SCRAM PostgreSQL server and DSA_TLS roots"]
 async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
     let root = std::env::var("DSA_TLS_ROOT_CERT")?;
     let wrong_root = std::env::var("DSA_TLS_WRONG_ROOT_CERT")?;
@@ -826,7 +826,7 @@ async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_incidental_candidate_literal_counterexamples() -> Result {
     for scenario in [
         "window_datum",
@@ -1019,7 +1019,7 @@ async fn compare_incidental_candidate_literal_counterexamples() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_optional_governance_descriptors_both_absent_and_one_sided() -> Result {
     let mut f = fixture(333);
     let roles = ["council", "technical_committee"];
@@ -1083,7 +1083,7 @@ async fn compare_optional_governance_descriptors_both_absent_and_one_sided() -> 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_capture_row_and_byte_caps_refuse_before_accumulation() -> Result {
     let (source, target, f) = setup(339).await?;
     let mut r = Reader::connect(source.reader_config(), None).await?;
@@ -1114,7 +1114,7 @@ async fn compare_capture_row_and_byte_caps_refuse_before_accumulation() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_cli_capture_from_conversion_survives_source_advancement_and_integrity() -> Result {
     let mut f = fixture(345);
     f.reindex_ordinals();
@@ -1285,7 +1285,7 @@ async fn compare_cli_capture_from_conversion_survives_source_advancement_and_int
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_preserves_json_numeric_spelling_but_normalizes_scalar_amounts() -> Result {
     let (source, target, f) = setup(347).await?;
     let mut r = Reader::connect(source.reader_config(), None).await?;
@@ -1341,7 +1341,7 @@ async fn compare_preserves_json_numeric_spelling_but_normalizes_scalar_amounts()
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_interrupt_and_deadline_cancel_own_queries_and_release_snapshots() -> Result {
     use std::time::{Duration, Instant};
     let (source, target, f) = setup(349).await?;
@@ -1430,7 +1430,7 @@ async fn compare_interrupt_and_deadline_cancel_own_queries_and_release_snapshots
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_event_anchors_real_transaction_witness_and_full_window_coverage() -> Result {
     let mut f = fixture(352);
     f.reindex_ordinals();
@@ -1502,7 +1502,7 @@ async fn compare_event_anchors_real_transaction_witness_and_full_window_coverage
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_more_than_five_hundred_pairs_and_quiet_event_classes() -> Result {
     let mut f = fixture(353);
     f.bounds.target = 610;
@@ -1562,7 +1562,7 @@ async fn compare_more_than_five_hundred_pairs_and_quiet_event_classes() -> Resul
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_cli_refuses_helper_sentinel_that_violates_the_native_guarantee() -> Result {
     let (source, target, f) = setup(355).await?;
     let c = connect(&source.config).await?;
@@ -1599,7 +1599,7 @@ async fn compare_cli_refuses_helper_sentinel_that_violates_the_native_guarantee(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_reader_limits_fill_zero_and_preserve_positive_owner_settings() -> Result {
     let (source, target, _) = setup(357).await?;
     for (statement, idle, expected_statement, expected_idle) in
@@ -1623,7 +1623,7 @@ async fn compare_reader_limits_fill_zero_and_preserve_positive_owner_settings() 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_peer_backend_failure_cancels_the_other_active_query() -> Result {
     use std::time::{Duration, Instant};
     let (source, target, f) = setup(359).await?;
@@ -1712,7 +1712,7 @@ async fn compare_peer_backend_failure_cancels_the_other_active_query() -> Result
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_source_capture_path_preflight_preserves_pristine_destination() -> Result {
     let mut f = fixture(361);
     f.reindex_ordinals();
@@ -1750,7 +1750,7 @@ async fn compare_source_capture_path_preflight_preserves_pristine_destination() 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_no_window_transactions_uses_carried_witness_or_explicit_unavailable() -> Result {
     for carried in [true, false] {
         let mut f = fixture(363);
@@ -1839,7 +1839,7 @@ async fn compare_no_window_transactions_uses_carried_witness_or_explicit_unavail
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_cli_refuses_duplicate_units_on_window_and_old_spent_outputs() -> Result {
     for kind in ["window", "old_spent"] {
         let (source, target, f) = setup(365).await?;
@@ -1882,7 +1882,7 @@ async fn compare_cli_refuses_duplicate_units_on_window_and_old_spent_outputs() -
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result {
     for mutation in [
         "epoch_header",
@@ -1981,7 +1981,7 @@ async fn compare_adjacent_rpc_and_noncontract_address_stay_fatal() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17; optional DSA_TEST_OLD_CLI proves reuse of a format-2 capture written by an older binary"]
+#[ignore = "requires an isolated PostgreSQL server; optional DSA_TEST_OLD_CLI proves reuse of a format-2 capture written by an older binary"]
 async fn compare_format2_capture_without_reconversion() -> Result {
     let mut f = fixture(375);
     let output = f.output(7, 12, 20, "other", "cnight", Some(99075));
@@ -2106,7 +2106,7 @@ const BASE_CAPTURE: &str = concat!(
 /// before captures recorded probe plans and result columns. It still loads,
 /// and the comparison it passed still passes.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_reads_a_capture_without_probe_plan_or_columns() -> Result {
     let profile = Profile::load("mainnet")?;
     let recorded = dsa_store::source_capture::read(std::path::Path::new(BASE_CAPTURE), &profile)?;
@@ -2187,7 +2187,7 @@ async fn compare_reads_a_capture_without_probe_plan_or_columns() -> Result {
 /// The node decodes result columns by type; equal values of another type
 /// must fail the comparison.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn compare_fails_on_a_type_only_difference() -> Result {
     let (source, target, f) = setup(351).await?;
     connect(&target.config)

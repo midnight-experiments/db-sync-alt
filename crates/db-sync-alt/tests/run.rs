@@ -278,7 +278,7 @@ fn broken_links() -> Hook {
 /// attempt is retried for longer than the fatal time, named in `/status`,
 /// `/health` and `dsa.service_state`, and never ends the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn temporary_conditions_never_end_the_service() -> Result {
     let world = World::new(51, 160).await?;
     let mut samples = Vec::new();
@@ -461,7 +461,7 @@ fn serve_recent(world: &World, height: u32) {
 /// answers 503 with `provider_head_stale` while `/status` answers 200. A new
 /// block makes the service healthy again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_provider_whose_chain_stands_still_fails_health() -> Result {
     let world = World::new(63, 80).await?;
     let mut samples = Vec::new();
@@ -514,7 +514,7 @@ async fn a_provider_whose_chain_stands_still_fails_health() -> Result {
 /// attempt (not valid JSON) keeps the service waiting with the code in
 /// `/status`, past the fatal time; once the page is right it follows on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn an_answer_the_client_refuses_never_ends_the_service() -> Result {
     let world = World::new(57, 80).await?;
     let mut samples = Vec::new();
@@ -574,7 +574,7 @@ async fn an_answer_the_client_refuses_never_ends_the_service() -> Result {
 /// held longer than the wait refuses the start. Every session of the store
 /// sets the server-side keepalive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_held_writer_lock_is_waited_for_and_taken_once_free() -> Result {
     let world = World::new(59, 80).await?;
     let mut samples = Vec::new();
@@ -714,7 +714,7 @@ fn daily_files(dir: &std::path::Path, network: &str) -> std::collections::BTreeS
 /// `dsa.upkeep` and `/status` name the newest file and the rebuilt index. As
 /// the `run` command it logs both operations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn the_service_rebuilds_an_index_and_keeps_its_daily_files() -> Result {
     let world = World::new(67, 120).await?;
     let mut samples = Vec::new();
@@ -889,7 +889,7 @@ async fn the_service_rebuilds_an_index_and_keeps_its_daily_files() -> Result {
 /// a provider that answers 5xx, end it after the fatal time with the lasting
 /// condition, which the command reports with exit status 75.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn lasting_conditions_end_the_service() -> Result {
     let world = World::new(53, 60).await?;
     world.serve(world.start.target + K);
@@ -1171,7 +1171,7 @@ fn database_part(document: &Value) -> Value {
 /// database-derived field; no line and no document holds the provider key,
 /// the database password or the connection string.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     let blocks = setting("DSA_RUN_CATCH_UP_BLOCKS", 300) as u32;
     let p = Preprod::new(61, 1, blocks, true).await?;
@@ -1370,7 +1370,7 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
 /// A serving store of Mainnet size follows again within
 /// 60 seconds of the process start, also the second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result {
     let ranges = setting("DSA_RUN_LARGE_BLOCKS", 30) as i32;
     let p = Preprod::new(71, 1_000_000, 0, false).await?;
@@ -1463,7 +1463,7 @@ async fn a_restart_of_a_mainnet_size_store_follows_within_60_seconds() -> Result
 /// word about it; on an empty database the missing file refuses the start
 /// with exit status 1 and an error that names the flag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_missing_snapshot_file_matters_only_for_a_restore() -> Result {
     let p = Preprod::new(87, 1, 0, false).await?;
     let k = p.k();
@@ -1525,7 +1525,7 @@ async fn a_missing_snapshot_file_matters_only_for_a_restore() -> Result {
 /// granted the reader: the first document in which the service catches up
 /// or follows carries a passing reader check and no failed status read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn the_first_document_after_the_start_reads_the_prepared_database() -> Result {
     let p = Preprod::new(91, 1, 0, false).await?;
     let fake = p.fake(p.t0 + p.k()).await;
@@ -1586,7 +1586,7 @@ async fn command(database: &Database, arguments: &[&str]) -> Result<std::process
 /// published leaves a closed database with the build beside it; the next
 /// `run --snapshot` restores it and follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn run_completes_a_restore_interrupted_between_its_commits() -> Result {
     let p = Preprod::new(83, 1, 0, false).await?;
     let k = p.k();
@@ -1712,7 +1712,7 @@ async fn writer_waits_for_a_lock(database: &Database) -> Result {
 /// never with an unknown outcome. The update is absent, and a restart
 /// follows on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_stop_during_a_long_statement_is_forced_after_the_grace() -> Result {
     let p = Preprod::new(79, 1, 0, false).await?;
     let k = p.k();
@@ -1793,7 +1793,7 @@ async fn a_stop_during_a_long_statement_is_forced_after_the_grace() -> Result {
 /// stays unreachable and a provider that answers 5xx, each longer than
 /// `--database-fatal-after-seconds`, with 75.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn fatal_conditions_end_the_service_with_their_status() -> Result {
     let p = Preprod::new(73, 1, 0, false).await?;
     let k = p.k();

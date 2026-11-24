@@ -528,7 +528,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "db-sync-alt"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "clap",
@@ -634,7 +634,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dsa-chain"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bech32 0.12.0",
  "clap",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "dsa-corpus-tools"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "clap",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "dsa-provider"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bech32 0.12.0",
  "bytes",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "dsa-service"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bech32 0.12.0",
  "chrono",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "dsa-store"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "dsa-testkit"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bech32 0.12.0",
  "bytes",

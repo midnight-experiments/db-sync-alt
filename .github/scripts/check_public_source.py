@@ -140,9 +140,10 @@ def history_errors(rel,text):
     return found
 
 # CI builds in the Rust image the image build uses, and the PostgreSQL image
-# of Compose is one of the servers the integration jobs test, so that an update
-# proposed for deploy/ fails CI until the workflow follows. Every image the
-# workflow names is pinned by digest.
+# of Compose is one of the servers the integration jobs run the suite on
+# (`image:`), so that an update proposed for deploy/ fails CI until the
+# workflow follows. A second server of the snapshot file test (`other:`) is one
+# of those servers. Every image the workflow names is pinned by digest.
 CI_WORKFLOW='.github/workflows/ci.yml'
 PINNED_IMAGE=re.compile(r'[\w./-]+:[\w.-]+@sha256:[0-9a-f]{64}')
 
@@ -150,19 +151,18 @@ def workflow_image_errors(root):
     files=[root/CI_WORKFLOW,root/'deploy/Dockerfile',root/'deploy/compose.yaml']
     if not all(path.exists() for path in files):return []
     ci,dockerfile,compose=(path.read_text() for path in files)
-    images={
-        # (images the workflow names, images of deploy/ that must be among them)
-        'rust':(re.findall(r'^\s*container:\s*(rust:\S+)\s*$',ci,re.M),
-                re.findall(r'^FROM\s+(rust:\S+)',dockerfile,re.M)),
-        'postgres':(re.findall(r'^\s*(?:-\s+)?[\w-]+:\s*(postgres:\S+)\s*$',ci,re.M),
-                    re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',compose,re.M)),
-    }
+    named=lambda key:re.findall(rf'^\s*(?:-\s+)?{key}:\s*(postgres:\S+)\s*$',ci,re.M)
+    pinned=lambda images:all(PINNED_IMAGE.fullmatch(image) for image in images)
+    builders=re.findall(r'^\s*container:\s*(rust:\S+)\s*$',ci,re.M)
+    built=re.findall(r'^FROM\s+(rust:\S+)',dockerfile,re.M)
+    servers,second=named('image'),named('other')
+    deployed=re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',compose,re.M)
     errors=[]
-    for name,(tested,deployed) in images.items():
-        if (not tested or not deployed or not set(deployed)<=set(tested)
-                or (name=='rust' and set(tested)!=set(deployed))
-                or not all(PINNED_IMAGE.fullmatch(image) for image in tested)):
-            errors.append((CI_WORKFLOW,'workflow_image_differs:'+name))
+    if not builders or not built or set(builders)!=set(built) or not pinned(builders):
+        errors.append((CI_WORKFLOW,'workflow_image_differs:rust'))
+    if (not servers or not deployed or not set(deployed)<=set(servers)
+            or not set(second)<=set(servers) or not pinned(servers+second)):
+        errors.append((CI_WORKFLOW,'workflow_image_differs:postgres'))
     return errors
 
 def check(root):

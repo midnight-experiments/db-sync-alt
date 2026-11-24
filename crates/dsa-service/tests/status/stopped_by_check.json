@@ -267,7 +267,7 @@
     "state": "stopped",
     "updated_at": 1795003190
   },
-  "service_version": "0.5.0",
+  "service_version": "0.5.1",
   "serving": "revoked",
   "state": "stopped",
   "state_reason": "supply_mismatch",
