@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **PostgreSQL 17 or newer.** db-sync-alt runs on PostgreSQL 17 and every
+  newer major version and refuses a server older than 17
+  (`postgresql_17_or_newer_required`). The PostgreSQL tests run on 17, 18 and
+  19, and snapshot files move between 17 and each of 18 and 19 with their
+  content digests ([PostgreSQL](docs/postgresql.md)). The Compose deployment
+  runs PostgreSQL 17.
+
 ## 0.5.0
 
 The first release. db-sync-alt follows Cardano through the Blockfrost API and
