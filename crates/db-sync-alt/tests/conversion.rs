@@ -2077,6 +2077,8 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
             )
             .await?
             .get(0);
+        // `Actual Rows` (rows per loop) is a whole number on PostgreSQL 17 and
+        // has two decimals on 18 and newer, so it is read as a float.
         fn page_limit(v: &Value) -> bool {
             if let Some(o) = v.as_object() {
                 if o.get("Subplan Name").and_then(Value::as_str) == Some("CTE page") {
@@ -2088,14 +2090,14 @@ async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Re
                                     Some("Index Scan" | "Index Only Scan")
                                 ) && o.get("Scan Direction").and_then(Value::as_str)
                                     == Some("Forward")
-                                    && o["Actual Rows"].as_u64().unwrap() <= 4096;
+                                    && o["Actual Rows"].as_f64().unwrap() <= 4096.0;
                             }
                             return o.values().any(ordered_index);
                         }
                         v.as_array().is_some_and(|a| a.iter().any(ordered_index))
                     }
                     return o.get("Node Type").and_then(Value::as_str) == Some("Limit")
-                        && o["Actual Rows"].as_u64().unwrap() <= 4096
+                        && o["Actual Rows"].as_f64().unwrap() <= 4096.0
                         && ordered_index(v);
                 }
                 return o.values().any(page_limit);

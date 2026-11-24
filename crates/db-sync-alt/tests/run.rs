@@ -1313,10 +1313,11 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     outputs.push(stdout);
     let peak = first_peak.max(second_peak);
     assert!(peak < 64 * 1024, "peak resident memory {peak} KiB");
-    let verified = store.verify(&p.profile).await.map_err(named)?;
-    assert_eq!(verified.state.target.height, end);
 
-    // The status command after the stop equals the last document.
+    // The status command after the stop equals the last document. It runs
+    // before any other read: on PostgreSQL 19 a query that scans a table can
+    // set pages all-visible, which creates the table's visibility map and free
+    // space map and so grows the database (`database.size_bytes`).
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))
         .args([
             "status",
@@ -1340,6 +1341,8 @@ async fn the_service_restores_catches_up_stops_and_restarts() -> Result {
     assert_eq!(stored["state"], "stopped");
     assert_eq!(stored["state_reason"], "stop_requested");
     outputs.push(String::from_utf8_lossy(&output.stdout).into_owned());
+    let verified = store.verify(&p.profile).await.map_err(named)?;
+    assert_eq!(verified.state.target.height, end);
 
     // No secret in any line or document.
     let text = [all_lines.join("\n"), outputs.join("\n"), bodies.join("\n")].join("\n");
