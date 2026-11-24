@@ -174,4 +174,25 @@ class WorkflowImageChecks(unittest.TestCase):
         self.assertEqual(self.errors(ci,dockerfile,compose.replace('b'*64,'c'*64)),
                          ['workflow_image_differs:postgres'])
 
+    def test_the_compose_server_is_one_of_the_tested_servers(self):
+        rust='rust:1@sha256:'+'a'*64
+        servers=[f'postgres:{major}@sha256:'+digit*64 for major,digit in [(17,'b'),(18,'c'),(19,'d')]]
+        matrix=''.join(f'          - postgresql: {major}\n            image: {image}\n'
+                       for major,image in zip([17,18,19],servers))
+        ci=(f'jobs:\n  integration:\n    container: {rust}\n    strategy:\n      matrix:\n'
+            f'        include:\n{matrix}            other: {servers[0]}\n'
+            '    services:\n      postgres:\n        image: ${{ matrix.image }}\n')
+        dockerfile=f'FROM {rust} AS build\n'
+        compose=lambda image:f'services:\n  postgres:\n    image: {image}\n'
+        for server in servers:
+            self.assertEqual(self.errors(ci,dockerfile,compose(server)),[],server)
+        self.assertEqual(self.errors(ci,dockerfile,compose('postgres:20@sha256:'+'e'*64)),
+                         ['workflow_image_differs:postgres'])
+        for unpinned in [servers[1].split('@')[0],servers[2][:-1],'postgres:19@sha256:'+'D'*64]:
+            self.assertEqual(self.errors(ci.replace(servers[2],unpinned),dockerfile,compose(servers[0])),
+                             ['workflow_image_differs:postgres'],unpinned)
+        self.assertEqual(self.errors(ci.replace(f'other: {servers[0]}','other: postgres:17'),
+                                     dockerfile,compose(servers[0])),
+                         ['workflow_image_differs:postgres'])
+
 if __name__=='__main__':unittest.main()

@@ -42,13 +42,39 @@ jobs:
           python3 .github/scripts/check_reference_source.py --node-source "$RUNNER_TEMP/midnight-node"
 
   integration:
-    name: PostgreSQL 17 integration tests
+    name: PostgreSQL ${{ matrix.postgresql }} integration tests
     runs-on: ubuntu-24.04
     container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      # db-sync-alt runs on PostgreSQL 17 and newer. The PostgreSQL 17 image is
+      # the one deploy/compose.yaml runs. The jobs of 18 and 19 also move
+      # snapshot files to and from a second server, PostgreSQL 17.
+      matrix:
+        include:
+          - postgresql: 17
+            image: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+          - postgresql: 18
+            image: postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35
+            other: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+          - postgresql: 19
+            image: postgres:19.0-bookworm@sha256:f8b826440669ad283328d2ac8326682539eddd91867904ad5abf4ec19269d241
+            other: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
     services:
       postgres:
-        image: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: dsa_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      # A service whose image is empty does not start: the job of 17 has none.
+      other:
+        image: ${{ matrix.other || '' }}
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: dsa_test
@@ -69,6 +95,8 @@ jobs:
       - name: PostgreSQL integration tests
         env:
           DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
+          # The second server of the snapshot file test; empty in the job of 17.
+          DSA_TEST_DATABASE_OTHER: ${{ matrix.other && 'host=other port=5432 user=postgres dbname=dsa_test' || '' }}
           # Deterministic CI sample; the full proof defaults to 10,000 cases
           # when DSA_KEEP_CASES is unset in the on-demand test invocation.
           DSA_KEEP_CASES: 64
