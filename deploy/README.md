@@ -24,7 +24,8 @@ container. Any command runs the same way, for example
 
 ## Compose
 
-`compose.yaml` runs db-sync-alt next to its own PostgreSQL 17 server:
+`compose.yaml` runs db-sync-alt next to its own server, PostgreSQL 17
+(db-sync-alt runs on [PostgreSQL 17 or newer](../docs/postgresql.md)):
 
 | Service | What it does |
 | --- | --- |

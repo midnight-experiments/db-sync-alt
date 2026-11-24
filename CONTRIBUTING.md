@@ -32,9 +32,10 @@ docker run --rm -v "$PWD":/work -w /work rust:1.100.0-bookworm bash -c '
   cargo build --release --locked -p db-sync-alt'
 ```
 
-The tests that need PostgreSQL 17 are marked `#[ignore]` and read the
-connection settings of a disposable server from `DSA_TEST_DATABASE`. Never
-point it at a database you care about: the tests create and drop databases.
+The tests that need PostgreSQL are marked `#[ignore]` and read the connection
+settings of a disposable server, PostgreSQL 17 or newer, from
+`DSA_TEST_DATABASE`. Never point it at a database you care about: the tests
+create and drop databases. CI runs them on PostgreSQL 17, 18 and 19.
 Run them against a PostgreSQL container on a private network, without a
 published port:
 
@@ -54,6 +55,11 @@ docker network rm dsa-test
 
 `DSA_KEEP_CASES` sets how many generated chains the keep-rule tests check; CI
 uses 64. The three skipped tests are the long ones CI also skips.
+`DSA_TEST_DATABASE_OTHER`, in the same form, names a second disposable server
+of another major version: `snapshot_file_moves_between_major_versions` then
+moves snapshot files between the two servers in both directions; without it,
+that test returns at once. CI gives the jobs of 18 and 19 a second server,
+PostgreSQL 17.
 
 The binary has a hidden command, `follow`, that runs only the follower and
 stops at `--stop-at-target`; the tests use it to prove catch-ups, and

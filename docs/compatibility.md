@@ -5,7 +5,7 @@ What db-sync-alt 0.5.0 works with. Anything else is refused or unsupported.
 | Component | Supported | Notes |
 | --- | --- | --- |
 | Midnight node | 2.1.101 | The SQL catalogue is extracted from the node's sources at tag `node-2.1.101` (commit `86774edf8cc76345a5c3a4221f3fe80c094b1c33`), kept unchanged under `reference/`. The keep rule (version 2) is derived from these queries. Another release works only if it sends the same queries and reads the same addresses and assets. |
-| PostgreSQL | 17 | Provided by you ([PostgreSQL](postgresql.md)). Every connection checks the major version; another one is refused (`postgresql_17_required`). The node connects over TLS only. |
+| PostgreSQL | 17 or newer | Provided by you ([PostgreSQL](postgresql.md)). Tested on 17, 18 and 19. Every connection checks the version; a server older than 17 is refused (`postgresql_17_or_newer_required`). The node connects over TLS only. |
 | PostgreSQL client tools | none | Restore and snapshot need no `psql`, `pg_dump` or `pg_restore`. |
 | Cardano networks | Mainnet, Preprod | `--network mainnet` or `--network preprod`. Other names are refused (`unsupported_network`). |
 | Provider | Blockfrost API v0 of the network | One key file. See [provider](provider.md). |
