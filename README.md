@@ -44,9 +44,9 @@ flowchart LR
 
 | Program | Version | Memory | Disk |
 | --- | --- | --- | --- |
-| Mainnet db-sync-alt | 0.5.0 | 20 MiB + 222 MiB PostgreSQL | 1 GB |
+| Mainnet db-sync-alt | 0.5.1 | 20 MiB + 222 MiB PostgreSQL | 1 GB |
 | Mainnet Midnight node | 2.1.101 | 3.7 GiB | 436 GB |
-| Preprod db-sync-alt | 0.5.0 | 16 MiB + 49 MiB PostgreSQL | 0.1 GB |
+| Preprod db-sync-alt | 0.5.1 | 16 MiB + 49 MiB PostgreSQL | 0.1 GB |
 | Preprod Midnight node | 2.1.101 | 1.7 GiB | 394 GB |
 
 Memory is without file cache. Disk is the PostgreSQL data directory with three
@@ -77,7 +77,7 @@ same in both stacks.
 The release binary for Linux x86-64 is built on Ubuntu 24.04:
 
 ```sh
-version=0.5.0
+version=0.5.1
 base=https://github.com/midnight-experiments/db-sync-alt/releases/download/v$version
 curl -fLO "$base/db-sync-alt-$version-linux-x86_64.tar.gz"
 curl -fLO "$base/SHA256SUMS"
@@ -88,7 +88,7 @@ db-sync-alt --version
 ```
 
 The archive also holds the license texts of everything the binary is built
-from. The image is `ghcr.io/midnight-experiments/db-sync-alt:0.5.0`; its
+from. The image is `ghcr.io/midnight-experiments/db-sync-alt:0.5.1`; its
 entry point is the binary and its default command is `run`. The Compose
 deployment runs it next to its own PostgreSQL server:
 [`deploy/README.md`](deploy/README.md).

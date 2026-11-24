@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
 - **PostgreSQL 17 or newer.** db-sync-alt runs on PostgreSQL 17 and every
   newer major version and refuses a server older than 17
@@ -8,6 +8,20 @@
   19, and snapshot files move between 17 and each of 18 and 19 with their
   content digests ([PostgreSQL](docs/postgresql.md)). The Compose deployment
   runs PostgreSQL 17.
+- **Formats.** The database format (1), the snapshot file format (1) and the
+  keep rule (version 2) are those of 0.5.0: this version runs on a 0.5.0
+  database and restores a 0.5.0 snapshot file as they are
+  ([compatibility](docs/compatibility.md)).
+- **Dependencies.** bech32 0.12 and zstd 0.14 in the binary; the PostgreSQL
+  17.11 image of the Compose deployment is pinned to its current build.
+- **README.** The system requirements are one table of memory and disk per
+  network, next to the same figures of a stack with a Cardano node and
+  cardano-db-sync; the first start is a list of what `run` does
+  ([README](README.md#system-requirements)).
+- **Checks.** A Midnight node 2.1.101 on Preprod reads a db-sync-alt database
+  and imports blocks at the tip of its chain. A node on Mainnet, and a Cardano
+  epoch change while a node reads the database, are not part of the checks
+  ([compatibility](docs/compatibility.md#what-the-release-checks-cover)).
 
 ## 0.5.0
 

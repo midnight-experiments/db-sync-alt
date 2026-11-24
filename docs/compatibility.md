@@ -1,6 +1,6 @@
 # Compatibility
 
-What db-sync-alt 0.5.0 works with. Anything else is refused or unsupported.
+What db-sync-alt 0.5.1 works with. Anything else is refused or unsupported.
 
 | Component | Supported | Notes |
 | --- | --- | --- |
@@ -16,13 +16,15 @@ What db-sync-alt 0.5.0 works with. Anything else is refused or unsupported.
 ## What the release checks cover
 
 - Queries: every statement of the node's query catalogue returns the same rows
-  from a 0.5.0 database as from a full-history database of the same chain at
-  the same block ([comparison](comparison.md)).
+  from a db-sync-alt database as from a full-history database of the same
+  chain at the same block ([comparison](comparison.md)).
 - Following: the follower ran on real Preprod and Mainnet blocks, and on
   Preprod its database had the content digest of a database built from the
   full history at the same blocks ([provider](provider.md#catching-up)).
-- A Midnight node running against a 0.5.0 database is not part of these
-  checks. Before a node depends on a new database, run the connection check of
+- A node: a Midnight node 2.1.101 on Preprod reads a db-sync-alt database and
+  imports blocks at the tip of its chain. A node on Mainnet, and a Cardano
+  epoch change while a node reads the database, are not part of these checks.
+  Before a node depends on a new database, run the connection check of
   [connect a node](connect-a-node.md) and watch the node follow.
 
 ## Networks and their profiles

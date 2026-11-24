@@ -19,7 +19,7 @@ docker build -f deploy/Dockerfile -t db-sync-alt:local .
 The service is configured through `DSA_` variables
 ([configuration](../docs/configuration.md)); secrets are files mounted into the
 container. Any command runs the same way, for example
-`docker run --rm ghcr.io/midnight-experiments/db-sync-alt:0.5.0 verify …`.
+`docker run --rm ghcr.io/midnight-experiments/db-sync-alt:0.5.1 verify …`.
 `db-sync-alt health` is the health check: it needs no HTTP client in the image.
 
 ## Compose
