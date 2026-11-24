@@ -473,9 +473,11 @@ pub fn compose(
             .filter(|reason| !matches!(reason.as_str(), "stop_requested" | "service_not_running")),
         _ => None,
     };
+    // A database that a build fills has a target before it ever served.
     let serving = match database {
         None => Serving::Unknown,
         Some(view) if view.position.serving => Serving::Ready,
+        Some(view) if view.position.reason == dsa_store::rebuild::REBUILDING => Serving::Unready,
         Some(view) if view.target.is_some() => Serving::Revoked,
         Some(_) => Serving::Unready,
     };
