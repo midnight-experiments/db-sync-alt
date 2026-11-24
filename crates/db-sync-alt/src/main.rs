@@ -114,7 +114,7 @@ enum Command {
         #[arg(long)]
         network: String,
     },
-    /// Initialize an empty, operator-owned PostgreSQL 17 database.
+    /// Initialize an empty, operator-owned database (PostgreSQL 17 or newer).
     Create {
         #[command(flatten)]
         database: DatabaseArguments,

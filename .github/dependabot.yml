@@ -23,13 +23,14 @@ updates:
     directory: /deploy
     schedule:
       interval: weekly
-  # The PostgreSQL image of deploy/compose.yaml. The images of the workflows
-  # are the same two, and the public-source check requires that they match.
+  # The PostgreSQL image of deploy/compose.yaml. The public-source check
+  # requires that the Rust image of the workflows is the one of the Dockerfile
+  # and that the Compose server is one of the servers the workflow tests.
   - package-ecosystem: docker-compose
     directory: /deploy
     schedule:
       interval: weekly
-    # db-sync-alt runs on PostgreSQL 17: only updates within 17 are proposed.
+    # The bundled server is PostgreSQL 17: only updates within 17 are proposed.
     ignore:
       - dependency-name: postgres
         update-types: ["version-update:semver-major"]

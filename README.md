@@ -37,7 +37,7 @@ flowchart LR
 ## System requirements
 
 - Linux x86-64 with glibc 2.39 or newer, or Docker.
-- PostgreSQL 17 ([setup](docs/postgresql.md)).
+- PostgreSQL 17+ ([setup](docs/postgresql.md)).
 - A Blockfrost API key.
 - A database snapshot file for the first start, from the
   [release page](https://github.com/midnight-experiments/db-sync-alt/releases).

@@ -58,7 +58,7 @@ connection, is starting or stopping, or has too many connections.
 | `tls_unknown_ca` | The server's certificate is not signed by `--tls-root-cert` (or a public authority without it). | Give the right certificate authority. |
 | `tls_certificate_invalid` | The certificate is expired or otherwise invalid. | Renew it. |
 | `tls_error` | Another TLS failure, for example a server without TLS. | Turn TLS on ([PostgreSQL](postgresql.md#tls)) or use `sslmode=disable` for a local server. |
-| `postgresql_17_required` | The server is not PostgreSQL 17. | |
+| `postgresql_17_or_newer_required` | The server is older than PostgreSQL 17. | Use PostgreSQL 17 or newer ([PostgreSQL](postgresql.md)). |
 | `invalid_owner_role` | The login does not own the database, or has superuser or other role attributes. | [PostgreSQL](postgresql.md#the-database-and-its-logins). |
 | `writer_busy` | Another session holds the writer lock: a running service or a restore, or the session of a db-sync-alt process that has died, whose host lost power or whose network to the server was cut. `run` waits for the lock, at start and when its writer reconnects, with the state `waiting` and the reason `writer_busy`, and ends with exit status 1 after 120 seconds; the other commands refuse at once. | Stop the other process, or wait for it. A session left by a process that has died ends by itself within about a minute; to end it at once, see below. |
 

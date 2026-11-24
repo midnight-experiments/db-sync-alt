@@ -139,22 +139,31 @@ def history_errors(rel,text):
             if regex.search(line):found.append((str(rel),f'{label}:line {number}'))
     return found
 
-# The images CI runs in are the ones the image build and Compose use, so that
-# an update proposed for deploy/ fails CI until the workflow follows.
+# CI builds in the Rust image the image build uses, and the PostgreSQL image
+# of Compose is one of the servers the integration jobs test, so that an update
+# proposed for deploy/ fails CI until the workflow follows. Every image the
+# workflow names is pinned by digest.
 CI_WORKFLOW='.github/workflows/ci.yml'
+PINNED_IMAGE=re.compile(r'[\w./-]+:[\w.-]+@sha256:[0-9a-f]{64}')
 
 def workflow_image_errors(root):
     files=[root/CI_WORKFLOW,root/'deploy/Dockerfile',root/'deploy/compose.yaml']
     if not all(path.exists() for path in files):return []
     ci,dockerfile,compose=(path.read_text() for path in files)
-    pairs={
+    images={
+        # (images the workflow names, images of deploy/ that must be among them)
         'rust':(re.findall(r'^\s*container:\s*(rust:\S+)\s*$',ci,re.M),
                 re.findall(r'^FROM\s+(rust:\S+)',dockerfile,re.M)),
-        'postgres':(re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',ci,re.M),
+        'postgres':(re.findall(r'^\s*(?:-\s+)?[\w-]+:\s*(postgres:\S+)\s*$',ci,re.M),
                     re.findall(r'^\s*image:\s*(postgres:\S+)\s*$',compose,re.M)),
     }
-    return [(CI_WORKFLOW,'workflow_image_differs:'+name) for name,(used,pinned) in pairs.items()
-            if not used or not pinned or set(used)!=set(pinned) or '@sha256:' not in used[0]]
+    errors=[]
+    for name,(tested,deployed) in images.items():
+        if (not tested or not deployed or not set(deployed)<=set(tested)
+                or (name=='rust' and set(tested)!=set(deployed))
+                or not all(PINNED_IMAGE.fullmatch(image) for image in tested)):
+            errors.append((CI_WORKFLOW,'workflow_image_differs:'+name))
+    return errors
 
 def check(root):
     errors=[]; hashes={}

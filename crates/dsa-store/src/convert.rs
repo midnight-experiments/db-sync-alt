@@ -316,9 +316,7 @@ async fn settings(source: &Transaction<'_>) -> Result<SourceSettings, Error> {
         transaction_isolation: row.get(6),
         ssl: row.get(7),
     };
-    if !(170000..180000).contains(&settings.server_version_num) {
-        return Err(Error::Refusal("postgresql_17_required"));
-    }
+    crate::supported_server(settings.server_version_num)?;
     if settings.default_transaction_read_only != "on"
         || settings.transaction_read_only != "on"
         || settings.transaction_isolation != "repeatable read"

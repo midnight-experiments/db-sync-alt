@@ -34,6 +34,9 @@ use tokio_postgres::{Client, Config, GenericClient, Transaction, config::SslMode
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub const DATABASE_FORMAT: i32 = 1;
+/// The oldest server db-sync-alt runs on, as `server_version_num`: PostgreSQL
+/// 17.0. Every newer major version is accepted.
+pub const MINIMUM_SERVER_VERSION: i32 = 170000;
 pub const KEEP_RULE_VERSION: i32 = dsa_chain::assets::RULE_VERSION as i32;
 pub const NODE_RELATIONS: [&str; 11] = dsa_chain::keep::TABLES;
 const WRITER_NAMESPACE: i32 = 0x647361;
@@ -389,6 +392,16 @@ impl Drop for Store {
     }
 }
 
+/// The server version rule of every connection, the store's and a conversion
+/// source's: PostgreSQL 17 or newer (`server_version_num` at least
+/// [`MINIMUM_SERVER_VERSION`]).
+pub fn supported_server(server_version_num: i32) -> Result<(), Error> {
+    if server_version_num < MINIMUM_SERVER_VERSION {
+        return Err(Error::Refusal("postgresql_17_or_newer_required"));
+    }
+    Ok(())
+}
+
 impl Store {
     /// A custom CA requires TLS and verifies the server hostname. Explicit
     /// sslmode=disable supports operator-provided local connections.
@@ -464,9 +477,7 @@ impl Store {
             .query_one("SELECT current_setting('server_version_num')::int", &[])
             .await?
             .get(0);
-        if !(170000..180000).contains(&version) {
-            return Err(Error::Refusal("postgresql_17_required"));
-        }
+        supported_server(version)?;
         // The server notices a client that is gone within about a minute and
         // ends its session, with the locks the session holds.
         store
@@ -824,5 +835,34 @@ mod diagnostic_tests {
         .report();
         assert_eq!(staged["family"], "block");
         assert!(!staged.to_string().contains("another-secret"));
+    }
+}
+
+#[cfg(test)]
+mod server_version_tests {
+    use super::*;
+
+    fn refusal(server_version_num: i32) -> Option<&'static str> {
+        match supported_server(server_version_num) {
+            Ok(()) => None,
+            Err(Error::Refusal(code)) => Some(code),
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    fn postgresql_17_and_every_newer_major_version_are_accepted() {
+        for older in [90_624, 150_010, 160_000, 160_013, 169_999] {
+            assert_eq!(
+                refusal(older),
+                Some("postgresql_17_or_newer_required"),
+                "{older}"
+            );
+        }
+        for supported in [
+            170_000, 170_011, 180_000, 180_007, 190_000, 200_000, 210_003,
+        ] {
+            assert_eq!(refusal(supported), None, "{supported}");
+        }
     }
 }
