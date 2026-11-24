@@ -14,6 +14,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn StdError + Send + Sync>>;
 
 const FIRST: &str = "DSA_TEST_DATABASE";
 const OTHER: &str = "DSA_TEST_DATABASE_OTHER";
+const REQUIRE_OTHER: &str = "DSA_TEST_REQUIRE_OTHER";
 
 async fn major(database: &Database) -> Result<i32> {
     Ok(database
@@ -115,9 +116,14 @@ async fn file_moves(from: &str, to: &str, seed: u64) -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17 or newer; runs with a second server of another major version in DSA_TEST_DATABASE_OTHER"]
+#[ignore = "requires an isolated PostgreSQL server; runs with a second server of another major version in DSA_TEST_DATABASE_OTHER"]
 async fn snapshot_file_moves_between_major_versions() -> Result {
     if std::env::var(OTHER).unwrap_or_default().is_empty() {
+        // CI sets this in the jobs that have a second server.
+        assert!(
+            std::env::var(REQUIRE_OTHER).unwrap_or_default().is_empty(),
+            "{REQUIRE_OTHER} is set and {OTHER} is not: this run must move files"
+        );
         println!("{OTHER} is not set: no second server, no file is moved");
         return Ok(());
     }

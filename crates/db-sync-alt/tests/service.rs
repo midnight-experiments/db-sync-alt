@@ -227,7 +227,7 @@ async fn http_get(address: SocketAddr, path: &str) -> Result<(u16, String)> {
 /// stopped service from the database alone, with the shape of the golden
 /// document; a stored `following` is not claimed; a closed gate is named.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn the_status_command_prints_the_document_of_a_stopped_service() -> Result {
     let f = common::fixture(201);
     let network = f.profile.network.clone();
@@ -394,7 +394,7 @@ fn plan_nodes(plan: &Value, nodes: &mut Vec<Value>) {
 /// runs on any session of the database while 1,000 requests are answered;
 /// every served table the view reads has an index path.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn http_answers_come_from_the_last_view_and_run_no_statement() -> Result {
     let requests = setting("DSA_HTTP_REQUESTS", 200);
     let mut setup = Setup::new(4101, 1, 60, false, WEEK).await?;
@@ -507,7 +507,7 @@ async fn index_name_counts(
 /// index name exactly once in `pg_indexes` at every sample. An interrupted
 /// rebuild's leftover is dropped at the next start.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn an_index_rebuild_keeps_each_index_name_once_while_the_node_reads() -> Result {
     let rows = setting("DSA_INDEX_BLOAT_ROWS", 60_000);
     let mut setup = Setup::new(4301, 1, 60, false, WEEK).await?;
@@ -789,7 +789,7 @@ const VACUUMED: &str = "VACUUM serve.block,serve.tx,serve.tx_out,serve.tx_in,ser
 /// and state tables stay within 1.3 times a fresh restore of the final
 /// content.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
     let days = setting("DSA_CHURN_DAYS", 30) as u32;
     let blocks_per_day = setting("DSA_CHURN_BLOCKS_PER_DAY", 48) as u32;
@@ -943,7 +943,7 @@ async fn thirty_days_of_churn_stay_within_a_fresh_restore() -> Result {
 /// service did not write, such as a release file put there for the first
 /// start, belongs to the rotation.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Result {
     use std::os::unix::fs::PermissionsExt;
     const HOUR: u64 = 3600;
@@ -1139,7 +1139,7 @@ async fn daily_snapshot_files_follow_their_schedule_and_keep_the_newest() -> Res
 /// A planted supply difference closes the gate; the node reads
 /// SQLSTATE 55000 and `/status` names the check.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_supply_difference_closes_the_gate_and_the_status_names_it() -> Result {
     let mut setup = Setup::new(4701, 1, 60, false, WEEK).await?;
     let profile = setup.profile.clone();

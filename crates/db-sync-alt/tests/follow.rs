@@ -54,7 +54,7 @@ struct Totals {
 
 /// Following equals a conversion of the full history.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn following_equals_a_conversion_of_the_full_history() -> Result {
     let cases = cases();
     let start: u64 = std::env::var("DSA_FOLLOW_SEED_START")
@@ -282,7 +282,7 @@ fn rich_plan(setup: &Setup) -> Plan {
 /// A failure after any statement leaves the previous state, and the
 /// retried update equals an uninterrupted one.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn an_update_is_atomic_after_every_statement() -> Result {
     let seed = 7;
     let mut setup = Setup::new(seed, 1, 60, true, WEEK).await?;
@@ -384,7 +384,7 @@ async fn an_update_is_atomic_after_every_statement() -> Result {
 
 /// Each refusal names its cause and writes nothing.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn each_refusal_has_its_code_and_writes_nothing() -> Result {
     let mut setup = Setup::new(11, 1, 60, false, WEEK).await?;
     rich_position(&mut setup, 3).await?;
@@ -636,7 +636,7 @@ async fn each_refusal_has_its_code_and_writes_nothing() -> Result {
 
 /// A header replacement changes only the headers above the fork point.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn header_replacement_changes_only_headers_above_the_fork_point() -> Result {
     let mut setup = Setup::new(13, 1, 60, false, WEEK).await?;
     let plan = advance(&setup.g, &setup.follower, 3, None);
@@ -716,7 +716,7 @@ fn heights(rows: &[(i64, String)]) -> Vec<i64> {
 /// The first-served rows are H…T; a catch-up update's blocks share
 /// one time; with times moved back the candidate moves and never passes T.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn first_served_rows_follow_the_window() -> Result {
     let mut setup = Setup::new(17, 1, 70, false, 86_400).await?;
     let config = setup.database.config.clone();
@@ -857,7 +857,7 @@ async fn costed(setup: &mut Setup, plan: &Plan) -> Result<Costs> {
 /// the other rows would cost ten times more. The horizon advance is timed on
 /// a Mainnet-size store.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn update_cost_is_bounded_by_the_update() -> Result {
     let first = 1_000_000;
     let mut small = Setup::new(19, first, 60, true, WEEK).await?;
@@ -943,7 +943,7 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
 /// A block that spends a lost cNIGHT output fails with
 /// `asset_conservation`; after `close_gate` every view raises 55000.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_lost_output_stops_the_block_and_close_gate_stops_serving() -> Result {
     let mut setup = Setup::new(23, 1, 70, false, WEEK).await?;
     let cnight = setup.profile.assets.cnight.unit();
@@ -1098,7 +1098,7 @@ async fn observed(client: &tokio_postgres::Client) -> Result<BTreeMap<String, (i
 /// first observation of each shape is kept once; a failing insert does not
 /// fail the update.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn verify_counts_unspent_outputs_and_first_observations_are_kept_once() -> Result {
     let mut setup = Setup::new(29, 1, 70, true, WEEK).await?;
     let config = setup.database.config.clone();

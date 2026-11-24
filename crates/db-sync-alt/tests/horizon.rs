@@ -266,7 +266,7 @@ fn horizons(f: &Fixture, seed: u64) -> Option<(u32, u32, u32)> {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn horizon_advance_equals_one_step_the_model_and_a_conversion() -> Result {
     let cases: u64 = std::env::var("DSA_KEEP_CASES")
         .unwrap_or_else(|_| "2000".to_owned())
@@ -371,7 +371,7 @@ async fn horizon_advance_equals_one_step_the_model_and_a_conversion() -> Result 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn horizon_advance_refuses_invalid_targets_and_candidate_follows_retention() -> Result {
     let f = Fixture::generated(5);
     let scratch = Scratch::new(&f).await?;

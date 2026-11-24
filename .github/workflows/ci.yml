@@ -45,7 +45,7 @@ jobs:
     name: PostgreSQL ${{ matrix.postgresql }} integration tests
     runs-on: ubuntu-24.04
     container: rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       # db-sync-alt runs on PostgreSQL 17 and newer. The PostgreSQL 17 image is
@@ -97,6 +97,10 @@ jobs:
           DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
           # The second server of the snapshot file test; empty in the job of 17.
           DSA_TEST_DATABASE_OTHER: ${{ matrix.other && 'host=other port=5432 user=postgres dbname=dsa_test' || '' }}
+          # The tests fail when the server is not the major version the job
+          # names and, in the jobs of 18 and 19, when no file is moved.
+          DSA_TEST_SERVER_MAJOR: ${{ matrix.postgresql }}
+          DSA_TEST_REQUIRE_OTHER: ${{ matrix.postgresql != 17 && '1' || '' }}
           # Deterministic CI sample; the full proof defaults to 10,000 cases
           # when DSA_KEEP_CASES is unset in the on-demand test invocation.
           DSA_KEEP_CASES: 64

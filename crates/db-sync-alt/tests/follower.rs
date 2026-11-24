@@ -213,7 +213,7 @@ async fn equivalence(
 /// history at the same position, with random batch limits, poll timing,
 /// branches at the tip, horizon advances and a restart every round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn following_through_the_provider_equals_a_conversion() -> Result {
     let cases = setting("DSA_FOLLOW_HTTP_CASES", 4);
     let parallel = setting("DSA_FOLLOW_HTTP_PARALLEL", 4).clamp(1, 16);
@@ -321,7 +321,7 @@ fn times_of(fake: &Fake, exact: &str) -> Vec<u64> {
 /// the fork point; a target contradicted once is read again a minute later
 /// and following goes on; contradicted twice, the gate closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gate() -> Result {
     let mut start = Start::new(11, 80, 20).await?;
     let fake = Fake::start(&start.g, &start.profile).await;
@@ -500,7 +500,7 @@ async fn tip_forks_replace_only_headers_and_a_contradicted_target_closes_the_gat
 /// that stand above the stored tip lead to the fork search, and following
 /// goes on on the provider's chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn an_empty_next_below_a_higher_head_leads_to_the_fork_search() -> Result {
     let mut start = Start::new(31, 80, 20).await?;
     let target = start.target;
@@ -578,7 +578,7 @@ fn genesis(magic: u32) -> Behavior {
 /// position as it was: found at the start, before any other request, and
 /// found before a contradiction of the target would close the gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_provider_of_another_network_never_closes_the_gate() -> Result {
     let start = Start::new(29, 80, 20).await?;
     let target = start.target;
@@ -710,7 +710,7 @@ fn scripted_target(height: u32, script: &[&'static str]) -> Hook {
 /// Only another hash on both reads, a minute apart, closes the gate, also
 /// after a missing answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_missing_target_is_retried_and_only_another_hash_twice_closes_the_gate() -> Result {
     let mut start = Start::new(43, 80, 20).await?;
     let mut target = start.target;
@@ -810,7 +810,7 @@ async fn a_missing_target_is_retried_and_only_another_hash_twice_closes_the_gate
 /// of the fake provider write nothing; the loop retries and continues. A
 /// spent allowance is waited out until the next UTC day without an exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn faulty_answers_write_nothing_and_are_retried() -> Result {
     let mut start = Start::new(13, 70, 15).await?;
     let fake = Fake::start(&start.g, &start.profile).await;
@@ -899,7 +899,7 @@ async fn faulty_answers_write_nothing_and_are_retried() -> Result {
 /// ends before that block. The stake arrives later, and a failing stake read
 /// never delays an update.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn epoch_parameters_come_first_and_stake_never_delays_an_update() -> Result {
     let mut start = Start::new(17, 90, 15).await?;
     let g = start.g.known_from_start();
@@ -991,7 +991,7 @@ async fn epoch_parameters_come_first_and_stake_never_delays_an_update() -> Resul
 /// seconds), while the next epoch's stake is read and stored; the last
 /// failure names the epoch and both numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
     let start = Start::new(37, 100, 15).await?;
     let g = start.g.known_from_start();
@@ -1085,7 +1085,7 @@ async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
 /// transactions costs one page request. DSA_FOLLOW_TIP_BLOCKS sets the number
 /// of followed blocks (default 200).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
     let blocks = setting("DSA_FOLLOW_TIP_BLOCKS", 200) as u32;
     let profile = profile(19);
@@ -1171,7 +1171,7 @@ async fn at_the_tip_one_request_per_poll_and_one_page_per_block() -> Result {
 /// restart; a block of 201 transactions is read in three pages; an output the
 /// decoder cannot classify is resolved through the provider's outputs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn held_datums_three_pages_and_unclassified_outputs() -> Result {
     let profile = profile(23);
     let g = chain(&profile, 23, 1, 30, false).known_from_start();
@@ -1373,7 +1373,7 @@ fn follow_command(
 /// A stop target below the stored target is refused.
 /// DSA_FOLLOW_COMMAND_BLOCKS sets the blocks of the catch-up (default 300).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn the_follow_command_catches_up_stops_and_is_stopped() -> Result {
     let blocks = setting("DSA_FOLLOW_COMMAND_BLOCKS", 300) as u32;
     let extra = 200;
@@ -1618,7 +1618,7 @@ async fn follow_flags_come_from_the_environment_and_the_flag_wins() -> Result {
 /// While no update happens the call counts are stored at least every ten
 /// minutes, and once more before a requested stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn call_counts_are_stored_while_no_update_happens() -> Result {
     let start = Start::new(31, 40, 15).await?;
     let fake = Fake::start(&start.g, &start.profile).await;
@@ -1666,7 +1666,7 @@ async fn call_counts_are_stored_while_no_update_happens() -> Result {
 /// A database connection that drops is retried with a reconnect; the stored
 /// position is read again and following continues.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_dropped_database_connection_is_retried_with_a_reconnect() -> Result {
     let mut start = Start::new(37, 70, 15).await?;
     let fake = Fake::start(&start.g, &start.profile).await;
@@ -1721,7 +1721,7 @@ async fn a_dropped_database_connection_is_retried_with_a_reconnect() -> Result {
 /// A provider failure that lasts longer than `fatal_after` ends the run
 /// with that failure, recorded as the stopped state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn a_lasting_failure_ends_the_run() -> Result {
     let start = Start::new(41, 40, 15).await?;
     let fake = Fake::start(&start.g, &start.profile).await;

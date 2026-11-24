@@ -59,7 +59,9 @@ uses 64. The three skipped tests are the long ones CI also skips.
 of another major version: `snapshot_file_moves_between_major_versions` then
 moves snapshot files between the two servers in both directions; without it,
 that test returns at once. CI gives the jobs of 18 and 19 a second server,
-PostgreSQL 17.
+PostgreSQL 17. CI also sets `DSA_TEST_SERVER_MAJOR`, the major version the
+server must have, and in the jobs of 18 and 19 `DSA_TEST_REQUIRE_OTHER`, with
+which that test fails when no second server is given.
 
 The binary has a hidden command, `follow`, that runs only the follower and
 stops at `--stop-at-target`; the tests use it to prove catch-ups, and

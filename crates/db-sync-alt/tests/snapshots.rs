@@ -271,7 +271,7 @@ fn file_args(path: &Path) -> [&str; 2] {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_generated_roundtrips_and_reader() -> Result {
     let dir = tempfile::tempdir()?;
     for seed in 0..8 {
@@ -355,7 +355,7 @@ fn rewrite_description(bytes: &[u8], change: impl FnOnce(&mut Value)) -> Vec<u8>
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_corruption_refusal_retry_and_serving_protection() -> Result {
     let dir = tempfile::tempdir()?;
     let f = fixture(41);
@@ -489,7 +489,7 @@ async fn snapshot_corruption_refusal_retry_and_serving_protection() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_digest_identity_independence_and_payload_sensitivity() -> Result {
     let f = fixture(51);
     let db = Database::new().await?;
@@ -583,7 +583,7 @@ async fn snapshot_digest_identity_independence_and_payload_sensitivity() -> Resu
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_verify_named_corruptions() -> Result {
     let dir = tempfile::tempdir()?;
     let f = fixture(61);
@@ -677,7 +677,7 @@ async fn snapshot_verify_named_corruptions() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_sparse_spent_state_survives_restore_and_horizon_advances() -> Result {
     let dir = tempfile::tempdir()?;
     let mut f = fixture(71);
@@ -750,7 +750,7 @@ async fn snapshot_sparse_spent_state_survives_restore_and_horizon_advances() -> 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_repeatable_read_while_writer_commits() -> Result {
     let f = fixture(81);
     let db = Database::new().await?;
@@ -807,7 +807,7 @@ async fn snapshot_repeatable_read_while_writer_commits() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_lossless_structured_jsonb_and_flat_generations() -> Result {
     let f = fixture(91);
     let dir = tempfile::tempdir()?;
@@ -888,7 +888,7 @@ async fn snapshot_lossless_structured_jsonb_and_flat_generations() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_preflight_limits_lock_and_relative_paths() -> Result {
     let f = fixture(101);
     let dir = tempfile::tempdir()?;
@@ -974,7 +974,7 @@ async fn snapshot_preflight_limits_lock_and_relative_paths() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn snapshot_input_change_after_preflight_is_refused() -> Result {
     let f = fixture(111);
     let dir = tempfile::tempdir()?;
@@ -1046,7 +1046,7 @@ async fn snapshot_input_change_after_preflight_is_refused() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL 17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn restore_load_failure_names_its_cause_and_retry_succeeds() -> Result {
     let mut f = fixture(39);
     f.bounds.horizon = 6;
@@ -1229,7 +1229,7 @@ async fn one_layout(client: &Client) -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn restore_publishes_by_view_switch_while_readers_see_55000() -> Result {
     let f = fixture(301);
     let dir = tempfile::tempdir()?;
@@ -1372,7 +1372,7 @@ async fn database_state(client: &Client) -> Result<Value> {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn restore_refusals_leave_database_unchanged_and_interrupted_publication_retries() -> Result {
     let dir = tempfile::tempdir()?;
     let mut sources = Vec::new();
@@ -1539,7 +1539,7 @@ async fn restore_refusals_leave_database_unchanged_and_interrupted_publication_r
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn restored_database_survives_rename_and_owner_change() -> Result {
     let f = fixture(321);
     let dir = tempfile::tempdir()?;
@@ -1623,7 +1623,7 @@ async fn restored_database_survives_rename_and_owner_change() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn verify_refuses_rows_outside_the_keep_rule_and_missing_coverage() -> Result {
     let mut f = fixture(331);
     f.bounds.horizon = 6;
@@ -1724,7 +1724,7 @@ async fn verify_refuses_rows_outside_the_keep_rule_and_missing_coverage() -> Res
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn restore_rechecks_the_empty_layout_under_its_locks() -> Result {
     let f = fixture(341);
     let dir = tempfile::tempdir()?;

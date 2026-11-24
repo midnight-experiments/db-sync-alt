@@ -62,7 +62,7 @@ async fn closed_conversion_reader(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publication() -> Result
 {
     use tokio::io::AsyncReadExt;
@@ -318,7 +318,7 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_reader_recheck_late_row_grant_origin_and_index_conflict() -> Result {
     for mode in ["late_row", "wrong_origin"] {
         let f = fixture(201);
@@ -419,7 +419,7 @@ async fn convert_reader_recheck_late_row_grant_origin_and_index_conflict() -> Re
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_true_legacy_public_reader_model_and_snapshot() -> Result {
     let f = fixture(201);
     let dir = tempfile::tempdir()?;
@@ -516,7 +516,7 @@ async fn convert_true_legacy_public_reader_model_and_snapshot() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_preflight_refusals_preserve_pristine_and_created_destinations() -> Result {
     let f = fixture(203);
     let source = Database::new().await?;
@@ -601,7 +601,7 @@ async fn convert_preflight_refusals_preserve_pristine_and_created_destinations()
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_network_identity_rejects_shared_units_and_uses_positive_anchor() -> Result {
     // Preview-like schema5 data: only shared Preprod/Preview policies, never
     // placeholder multi_asset rows as evidence of a held network-specific unit.
@@ -689,7 +689,7 @@ async fn convert_network_identity_rejects_shared_units_and_uses_positive_anchor(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_sparse_origins_continuous_suffix_and_missing_window_headers() -> Result {
     let mut f = fixture(208);
     let start = f.profile.start.block_number;
@@ -778,7 +778,7 @@ async fn convert_sparse_origins_continuous_suffix_and_missing_window_headers() -
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_target_time_cutoff_clamp_k10_and_first_served() -> Result {
     for seed in [209, 210] {
         let mut f = fixture(seed);
@@ -841,7 +841,7 @@ async fn convert_target_time_cutoff_clamp_k10_and_first_served() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_corrupt_selected_parents_are_not_silently_dropped() -> Result {
     for invalid_case in 0..3 {
         let mut f = fixture(213);
@@ -899,7 +899,7 @@ async fn convert_corrupt_selected_parents_are_not_silently_dropped() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_readonly_session_counters_and_coordinator_snapshot() -> Result {
     let f = fixture(215);
     let source = Database::new().await?;
@@ -1015,7 +1015,7 @@ async fn convert_readonly_session_counters_and_coordinator_snapshot() -> Result 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_tls_default_refuses_plaintext_explicit_local_works() -> Result {
     let db = Database::new().await?;
     assert_eq!(
@@ -1036,7 +1036,7 @@ async fn convert_tls_default_refuses_plaintext_explicit_local_works() -> Result 
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_cancellation_and_explicit_destination_idle_timeout_retry() -> Result {
     for cancel in [true, false] {
         let f = fixture(217);
@@ -1094,7 +1094,7 @@ async fn convert_cancellation_and_explicit_destination_idle_timeout_retry() -> R
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_late_snapshot_failure_reports_published_digest_and_recovery() -> Result {
     let f = fixture(219);
     let source = Database::new().await?;
@@ -1243,7 +1243,7 @@ async fn commit_reply_proxy(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_deadline_and_term_after_publication_report_unknown_then_verify() -> Result {
     use tokio::io::AsyncReadExt;
     for signal in [false, true] {
@@ -1399,7 +1399,7 @@ async fn convert_deadline_and_term_after_publication_report_unknown_then_verify(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_large_lossless_rows_and_k10_fallback() -> Result {
     let mut f = fixture(221);
     f.no_window_spend();
@@ -1482,7 +1482,7 @@ async fn convert_large_lossless_rows_and_k10_fallback() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_source_statement_timeout_is_named_closed_and_retryable() -> Result {
     let f = fixture(223);
     let source = Database::new().await?;
@@ -1532,7 +1532,7 @@ async fn convert_source_statement_timeout_is_named_closed_and_retryable() -> Res
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_destination_termination_stream_finish_and_post_source_commit_kill() -> Result {
     use tokio::io::AsyncReadExt;
     for mode in ["stream", "finish", "kill"] {
@@ -1842,7 +1842,7 @@ async fn convert_scaled_source_cost() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_source_preflight_rejects_extra_rights_empty_spends_and_old_schema() -> Result {
     let f = fixture(229);
     let source = Database::new().await?;
@@ -1891,7 +1891,7 @@ async fn convert_source_preflight_rejects_extra_rights_empty_spends_and_old_sche
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_v2_historical_outpoint_tokens_and_original_ordinals_roundtrip() -> Result {
     // Generated ledger rows seeded with two public unit/outpoint facts;
     // no historical dump, provider sample or fixed network digest is involved.
@@ -1993,7 +1993,7 @@ async fn convert_v2_historical_outpoint_tokens_and_original_ordinals_roundtrip()
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_supply_pages_sparse_dense_target_and_numeric_boundaries() -> Result {
     let mut f = fixture(401);
     let mut added = Vec::new();
@@ -2426,7 +2426,7 @@ async fn supply_source_realistic_cost() -> Result {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_binary_staging_preserves_nulls_numeric_and_oversized_row() -> Result {
     let mut f = fixture(403);
     for (tx, datum) in [(25, 90301), (26, 90302), (27, 90303)] {
@@ -2526,7 +2526,7 @@ async fn convert_binary_staging_preserves_nulls_numeric_and_oversized_row() -> R
 /// A store converted at H, advanced in two steps with a restart between them,
 /// equals a conversion of the same source at the later horizon.
 #[tokio::test]
-#[ignore = "requires isolated PostgreSQL17"]
+#[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_then_advance_equals_a_conversion_at_the_later_horizon() -> Result {
     for seed in [201, 202] {
         let f = fixture(seed);

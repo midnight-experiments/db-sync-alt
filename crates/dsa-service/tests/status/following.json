@@ -260,7 +260,7 @@
     "state": "following",
     "updated_at": 1795003190
   },
-  "service_version": "0.5.0",
+  "service_version": "0.5.1",
   "serving": "ready",
   "state": "following",
   "state_reason": "at_tip",
