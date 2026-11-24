@@ -76,6 +76,10 @@ pub struct Settings {
     /// Make no block above this height final, complete the stake of the
     /// epochs up to it and return once the stored target equals it.
     pub stop_at_target: Option<u32>,
+    /// Follow a database that a build fills (not serving, reason
+    /// `rebuilding`): its window is made final with the same checks, and
+    /// the horizon does not move.
+    pub building: bool,
 }
 
 impl Default for Settings {
@@ -89,6 +93,7 @@ impl Default for Settings {
             refused_answers_end_the_run: true,
             writer_busy_after: None,
             stop_at_target: None,
+            building: false,
         }
     }
 }
@@ -368,9 +373,10 @@ impl Stored {
     }
 }
 
-async fn load(store: &Store, profile: &Profile) -> Result<Stored, Error> {
+async fn load(store: &Store, profile: &Profile, building: bool) -> Result<Stored, Error> {
     let state = store.follow_state(profile).await?;
-    if !state.serving {
+    let built = building && state.reason == dsa_store::rebuild::REBUILDING;
+    if !state.serving && !built {
         return Err(Error::Refusal {
             code: "database_not_serving",
             detail: json!({"reason":state.reason}),
@@ -533,7 +539,7 @@ impl<'a> Follower<'a> {
             progress,
         } = context;
         let mut store = connect().await?;
-        let stored = load(&store, profile).await?;
+        let stored = load(&store, profile, settings.building).await?;
         if let Some(stop_at) = settings.stop_at_target
             && stop_at < stored.target.height
         {
@@ -859,7 +865,7 @@ impl<'a> Follower<'a> {
             return Ok(());
         }
         let mut store = (self.connect)().await?;
-        let stored = load(&store, self.profile).await?;
+        let stored = load(&store, self.profile, self.settings.building).await?;
         store.record_calls(&self.provider.counts()).await?;
         self.stored = stored;
         self.store = Some(store);
@@ -1192,9 +1198,10 @@ impl<'a> Follower<'a> {
             .map(|height| (height, header_at(height)))
             .collect::<BTreeMap<_, _>>();
         let now = self.now();
-        let prune_due = self
-            .last_prune_check
-            .is_none_or(|at| now.saturating_sub(at) >= self.settings.prune_interval.as_secs());
+        let prune_due = !self.settings.building
+            && self
+                .last_prune_check
+                .is_none_or(|at| now.saturating_sub(at) >= self.settings.prune_interval.as_secs());
         let store = self.store.as_mut().expect("connected");
         let prune_to = if prune_due {
             let candidate = store.horizon_candidate().await?;

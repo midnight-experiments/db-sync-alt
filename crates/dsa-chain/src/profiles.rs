@@ -224,6 +224,48 @@ pub enum ProfileError {
 
 /// The Cardano network magic of a supported network, as a provider's
 /// `/genesis` names it.
+/// The `multi_asset` IDs of the fixed descriptors of a network, by unit.
+/// Mainnet and Preprod carry the IDs their converted databases and published
+/// snapshot files hold; another network numbers its units in bytewise order.
+/// The table lives beside the profiles, not in them, so that a profile's
+/// hash stays the one each database stores.
+pub fn fixed_descriptor_ids(profile: &Profile) -> Vec<(String, i64)> {
+    use AssetRole::{Auth, Bridge, Cnight, Council, PermissionedCandidates, TechnicalCommittee};
+    let order: Vec<String> = match profile.network.as_str() {
+        "mainnet" => [
+            Cnight,
+            PermissionedCandidates,
+            Council,
+            TechnicalCommittee,
+            Auth,
+            Bridge,
+        ]
+        .iter()
+        .map(|role| profile.assets.get(*role).unit())
+        .collect(),
+        "preprod" => [
+            TechnicalCommittee,
+            Auth,
+            Council,
+            Cnight,
+            Bridge,
+            PermissionedCandidates,
+        ]
+        .iter()
+        .map(|role| profile.assets.get(*role).unit())
+        .collect(),
+        _ => crate::assets::fixed_units(profile).into_iter().collect(),
+    };
+    let mut ids: Vec<(String, i64)> = Vec::new();
+    for unit in order {
+        if !ids.iter().any(|(known, _)| *known == unit) {
+            let next = ids.len() as i64 + 1;
+            ids.push((unit, next));
+        }
+    }
+    ids
+}
+
 pub fn network_magic(network: &str) -> Option<u32> {
     match network {
         "mainnet" => Some(764_824_073),

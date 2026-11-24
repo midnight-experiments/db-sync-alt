@@ -71,6 +71,9 @@ impl Checks {
         gate: true,
         exact: true,
     };
+    /// A build's publication: every check, inside the transaction that opens
+    /// the gate.
+    pub(crate) const PUBLISH: Self = Self::COMMAND;
 }
 
 impl Store {
