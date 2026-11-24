@@ -30,7 +30,7 @@ bytes = "1"
 dsa-testkit = { path = "../dsa-testkit" }
 flate2 = "1"
 futures-util = "0.3"
-pallas-primitives = "=0.33.0"
-pallas-traverse = "=0.33.0"
+pallas-primitives = "=1.4.0"
+pallas-traverse = "=1.4.0"
 sha2.workspace = true
 tempfile = "3"
