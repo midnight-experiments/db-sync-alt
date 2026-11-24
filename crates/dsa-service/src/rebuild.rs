@@ -394,25 +394,35 @@ where
     }
 }
 
-/// Reads a list in passes until two consecutive passes agree.
-async fn stable<T, F, Fut>(asker: &Asker, family: &'static str, fetch: F) -> Result<Vec<T>, Error>
+/// Reads a list in passes until two consecutive passes agree. A list that
+/// keeps moving gives the union of its passes: every row of a pass was
+/// unspent when it was read, and a row spent since is found by its spend.
+async fn stable<T, F, Fut>(
+    asker: &Asker,
+    family: &'static str,
+    key: impl Fn(&T) -> String,
+    fetch: F,
+) -> Result<Vec<T>, Error>
 where
-    T: PartialEq,
+    T: PartialEq + Clone,
     F: Fn(Page) -> Fut,
     Fut: Future<Output = Result<Vec<T>, dsa_provider::Error>>,
 {
     let mut last = every_page(asker, family, &fetch).await?;
+    let mut union: BTreeMap<String, T> = last.iter().map(|row| (key(row), row.clone())).collect();
     for _ in 1..PASSES {
         let next = every_page(asker, family, &fetch).await?;
         if next == last {
             return Ok(next);
         }
+        union.extend(next.iter().map(|row| (key(row), row.clone())));
         last = next;
     }
-    Err(Error::answer(
-        "provider_listing_unstable",
-        json!({"passes": PASSES}),
-    ))
+    eprintln!(
+        "{}",
+        json!({"event":"rebuild_listing_moving","passes":PASSES,"rows":union.len()})
+    );
+    Ok(union.into_values().collect())
 }
 
 struct Build<'a> {
@@ -615,16 +625,7 @@ impl Build<'_> {
                         .collect();
                     (taken, Some(last))
                 } else {
-                    let one = Heights {
-                        from: Some(from),
-                        to: Some(from),
-                    };
-                    let rows = stable(&self.asker, "listings", |page| {
-                        let (provider, parsed) = (provider.clone(), parsed.clone());
-                        async move { provider.asset_outputs(&parsed, one, page).await }
-                    })
-                    .await?;
-                    (rows, Some(from + 1))
+                    (self.outputs_at_height(&parsed, from).await?, Some(from + 1))
                 }
             };
             self.listed(&taken).await?;
@@ -637,6 +638,67 @@ impl Build<'_> {
         Ok(())
     }
 
+    /// The unspent outputs of `unit` created at one height that holds 100
+    /// or more of them: the unit's transactions at that height (final: below
+    /// H) and the outputs each one created that no transaction has spent.
+    /// No page of a moving list is involved.
+    async fn outputs_at_height(
+        &self,
+        unit: &Unit,
+        height: u32,
+    ) -> Result<Vec<ListedOutput>, Error> {
+        let at = Heights {
+            from: Some(height),
+            to: Some(height),
+        };
+        let provider = self.asker.provider.clone();
+        let transactions = every_page(&self.asker, "listings", |page| {
+            let (provider, unit) = (provider.clone(), unit.clone());
+            async move { provider.asset_transactions(&unit, at, page, false).await }
+        })
+        .await?;
+        let mut rows = Vec::new();
+        for listed in transactions {
+            let key = listed.tx_hash.clone();
+            let answer = self
+                .asker
+                .ask("outputs", || provider.transaction_utxos(&key))
+                .await?
+                .ok_or_else(|| {
+                    Error::answer("provider_transaction_unknown", json!({"transaction": key}))
+                })?;
+            let info = self
+                .asker
+                .ask("transactions", || provider.transaction(&key))
+                .await?
+                .ok_or_else(|| {
+                    Error::answer("provider_transaction_unknown", json!({"transaction": key}))
+                })?;
+            for output in answer.outputs {
+                let holds = output
+                    .amount
+                    .iter()
+                    .any(|amount| amount.unit == unit.as_str() && amount.quantity.0 > 0);
+                if output.collateral == info.valid_contract
+                    || output.consumed_by_tx.is_some()
+                    || !holds
+                {
+                    continue;
+                }
+                rows.push(ListedOutput {
+                    address: output.address,
+                    tx_hash: listed.tx_hash.clone(),
+                    output_index: output.output_index,
+                    amount: output.amount,
+                    block_height: Some(height),
+                    data_hash: output.data_hash,
+                    inline_datum: output.inline_datum,
+                });
+            }
+        }
+        Ok(rows)
+    }
+
     async fn list_address(&mut self, address: &str) -> Result<(), Error> {
         let key = format!("address:{address}");
         if self.cursor(&key).await?.done {
@@ -644,10 +706,15 @@ impl Build<'_> {
         }
         let parsed: AddressText = address.parse().map_err(Error::Provider)?;
         let provider = self.asker.provider.clone();
-        let rows = stable(&self.asker, "listings", |page| {
-            let (provider, parsed) = (provider.clone(), parsed.clone());
-            async move { provider.address_outputs(&parsed, page).await }
-        })
+        let rows = stable(
+            &self.asker,
+            "listings",
+            |row: &ListedOutput| outpoint(row.tx_hash.as_str(), row.output_index),
+            |page| {
+                let (provider, parsed) = (provider.clone(), parsed.clone());
+                async move { provider.address_outputs(&parsed, page).await }
+            },
+        )
         .await?;
         self.listed(&rows).await?;
         self.put_one(
@@ -763,6 +830,7 @@ impl Build<'_> {
                             to: Some(from),
                         };
                         let mut last_pass: Option<Vec<ListedTransaction>> = None;
+                        let mut union: BTreeMap<String, ListedTransaction> = BTreeMap::new();
                         let mut agreed = None;
                         for _ in 0..PASSES {
                             let mut pass = Vec::new();
@@ -783,11 +851,13 @@ impl Build<'_> {
                                 agreed = Some(pass);
                                 break;
                             }
+                            union.extend(
+                                pass.iter()
+                                    .map(|row| (row.tx_hash.to_string(), row.clone())),
+                            );
                             last_pass = Some(pass);
                         }
-                        let pass = agreed.ok_or_else(|| {
-                            Error::answer("provider_listing_unstable", json!({"source": source}))
-                        })?;
+                        let pass = agreed.unwrap_or_else(|| union.into_values().collect());
                         (pass, Some(from + 1))
                     }
                 };

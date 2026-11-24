@@ -269,6 +269,9 @@ pub struct Output {
     pub data_hash: Option<Hash32>,
     pub inline_datum: Option<Hex>,
     pub collateral: bool,
+    /// The transaction that spent the output, as far as the provider knows.
+    #[serde(default)]
+    pub consumed_by_tx: Option<Hash32>,
 }
 
 /// A transaction's outputs. The provider's input rendering is discarded
