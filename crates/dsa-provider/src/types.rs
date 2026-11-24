@@ -309,12 +309,164 @@ impl TransactionOutputs {
     }
 }
 
+/// A unit (policy followed by name, lowercase hex) or an address, checked
+/// before it becomes part of a request path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Unit(String);
+
+impl TryFrom<String> for Unit {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if !(56..=120).contains(&value.len()) || !hex(&value) {
+            return Err("invalid unit");
+        }
+        Ok(Self(value))
+    }
+}
+impl FromStr for Unit {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value.to_owned()).map_err(|_| Error::configuration("request.unit"))
+    }
+}
+impl Unit {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// The policy: the first 28 bytes.
+    pub fn policy(&self) -> &str {
+        &self.0[..56]
+    }
+    /// The asset name, possibly empty.
+    pub fn name(&self) -> &str {
+        &self.0[56..]
+    }
+}
+impl fmt::Display for Unit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A Bech32 or Base58 address as a path component: letters, digits and the
+/// underscore of a test network's prefix only.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressText(String);
+
+impl FromStr for AddressText {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || value.len() > 256
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(Error::configuration("request.address"));
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+impl fmt::Display for AddressText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A block-height range of a list, both ends included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Heights {
+    pub from: Option<u32>,
+    pub to: Option<u32>,
+}
+
+/// One unspent output of `/assets/{unit}/utxos` or `/addresses/{address}/utxos`.
+/// Only the asset listing names the creating block's height.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ListedOutput {
+    pub address: String,
+    pub tx_hash: Hash32,
+    pub output_index: u32,
+    pub amount: Vec<AssetAmount>,
+    #[serde(default)]
+    pub block_height: Option<u32>,
+    pub data_hash: Option<Hash32>,
+    pub inline_datum: Option<Hex>,
+}
+
+/// One row of `/assets/{unit}/transactions` or `/addresses/{address}/transactions`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ListedTransaction {
+    pub tx_hash: Hash32,
+    pub tx_index: u32,
+    pub block_height: u32,
+    pub block_time: u64,
+}
+
+/// One input row of `/txs/{hash}/utxos`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InputRow {
+    pub address: String,
+    pub amount: Vec<AssetAmount>,
+    pub tx_hash: Hash32,
+    pub output_index: u32,
+    pub data_hash: Option<Hash32>,
+    pub inline_datum: Option<Hex>,
+    pub collateral: bool,
+    #[serde(default)]
+    pub reference: bool,
+}
+
+/// `/txs/{hash}/utxos` with its inputs: collateral and reference inputs are
+/// flagged, the collateral return is an output flagged `collateral`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransactionUtxos {
+    pub hash: Hash32,
+    pub inputs: Vec<InputRow>,
+    pub outputs: Vec<Output>,
+}
+
+/// `/txs/{hash}`: the transaction's block, position and phase-2 validity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TransactionInfo {
+    pub hash: Hash32,
+    pub block: Hash32,
+    pub block_height: u32,
+    pub index: u32,
+    pub valid_contract: bool,
+}
+
+/// `/assets/{unit}`: the quantity in circulation now, the first mint and the
+/// number of mints and burns.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AssetInfo {
+    pub asset: String,
+    pub quantity: String,
+    pub initial_mint_tx_hash: Hash32,
+    pub mint_or_burn_count: u64,
+}
+
+/// One row of `/assets/policy/{policy}`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PolicyAsset {
+    pub asset: String,
+    pub quantity: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn request_values_are_bounded_before_a_send() {
+        assert!("ab".repeat(28).parse::<Unit>().is_ok());
+        assert!("ab".repeat(27).parse::<Unit>().is_err());
+        assert!(format!("{}/x", "ab".repeat(28)).parse::<Unit>().is_err());
+        assert!("addr_test1wplxjzranravtp".parse::<AddressText>().is_ok());
+        assert!("addr1w9e7ft4rrdd4rk".parse::<AddressText>().is_ok());
+        assert!("addr1?x".parse::<AddressText>().is_err());
+        assert!("../a".parse::<AddressText>().is_err());
         assert!(Page::new(0).is_err());
         assert!(Page::new(21474837).is_err());
         assert!("../elsewhere".parse::<Hash32>().is_err());

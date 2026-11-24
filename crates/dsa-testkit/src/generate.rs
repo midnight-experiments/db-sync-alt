@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     chain::{Block, Chain, Pools},
     tx::{
-        self, Built, Output, Tx, enterprise_address, hash, int_datum, large_datum, pointer_address,
-        recipient_metadatum,
+        self, Built, Facts, Output, Tx, enterprise_address, hash, int_datum, large_datum,
+        pointer_address, recipient_metadatum,
     },
 };
 
@@ -74,6 +74,8 @@ pub struct Generated {
     pub epochs: BTreeMap<u32, (String, u32)>,
     /// Epoch -> pools (hash of 28 bytes, amount).
     pub stake: BTreeMap<u32, Vec<(String, u64)>>,
+    /// Transaction -> what it holds, for the provider's listings.
+    pub facts: BTreeMap<String, Facts>,
     pub counts: Counts,
 }
 
@@ -92,6 +94,7 @@ impl Generated {
             metadata: self.metadata.clone(),
             epochs: self.epochs.clone(),
             stake: self.stake.clone(),
+            facts: self.facts.clone(),
             counts: self.counts.clone(),
         }
     }
@@ -233,6 +236,7 @@ struct Generator<'r> {
     governance: BTreeMap<String, (bool, Option<Point>)>,
     permissioned: (bool, Option<Point>, u32),
     epoch: u32,
+    facts: BTreeMap<String, Facts>,
     counts: Counts,
 }
 
@@ -750,6 +754,7 @@ impl Generator<'_> {
             tx = tx.metadata(6_500_973, recipient_metadatum(recipient));
         }
         let built = tx.build();
+        self.facts.insert(built.hash.clone(), tx.facts());
         if ics {
             let rendering = draft
                 .ics_metadata
@@ -832,6 +837,7 @@ pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
             .collect(),
         permissioned: (false, None, 0),
         epoch: 100 + (settings.seed % 50) as u32,
+        facts: BTreeMap::new(),
         counts: Counts::default(),
     };
     let mut blocks: Vec<Block> = Vec::new();
@@ -938,6 +944,7 @@ pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
         metadata: g.metadata,
         epochs,
         stake,
+        facts: g.facts,
         counts: g.counts,
     }
 }
@@ -960,6 +967,11 @@ impl Chain {
             .collect();
         chain.metadata = g.metadata.clone();
         chain.parameters = g.epochs.clone();
+        chain.facts = g
+            .facts
+            .iter()
+            .map(|(hash, facts)| (hash.clone(), std::sync::Arc::new(facts.clone())))
+            .collect();
         let stake: BTreeMap<u32, BTreeMap<String, u64>> = g
             .stake
             .iter()

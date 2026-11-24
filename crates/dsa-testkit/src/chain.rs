@@ -12,8 +12,9 @@ use std::{
 use serde_json::{Value, json};
 
 use crate::{
+    listing::{self, Index},
     server::{Behavior, Handler},
-    tx::{Built, Output, Tx, enterprise_address, hash},
+    tx::{Built, Facts, Output, Tx, enterprise_address, hash},
 };
 
 /// Blockfrost's page size for lists.
@@ -143,6 +144,10 @@ pub struct Chain {
     pub pools: Pools,
     /// The network magic `/genesis` names; without one it answers 404.
     pub network_magic: Option<u32>,
+    /// Transaction -> what it holds: the listing endpoints read these.
+    pub facts: BTreeMap<String, Arc<Facts>>,
+    /// The listings' state of the served blocks, built when first asked.
+    index: Option<Arc<Index>>,
 }
 
 /// A distinct ordinary transaction, for filling blocks.
@@ -368,6 +373,22 @@ impl Chain {
         &self.blocks
     }
 
+    /// The listings' state of the blocks served now.
+    pub fn index(&mut self) -> Arc<Index> {
+        let signature = (
+            self.blocks.len(),
+            self.blocks.last().map(|block| block.hash.clone()),
+        );
+        match &self.index {
+            Some(index) if index.signature == signature => index.clone(),
+            _ => {
+                let index = Arc::new(Index::build(&self.blocks, &self.facts));
+                self.index = Some(index.clone());
+                index
+            }
+        }
+    }
+
     pub fn at(&self, height: u32) -> Option<&Block> {
         self.blocks.iter().find(|block| block.height == height)
     }
@@ -437,6 +458,21 @@ impl Chain {
             return Behavior::json(body.clone());
         }
         let parts: Vec<_> = route.trim_start_matches('/').split('/').collect();
+        let listed = match parts.as_slice() {
+            ["assets", ..] | ["addresses", ..] | ["txs", _] | ["epochs", _, "blocks"] => true,
+            ["txs", hash, "utxos"] => !self.outputs.contains_key(*hash),
+            _ => false,
+        };
+        if listed {
+            let index = self.index();
+            if let Some((status, body)) = listing::answer(&index, &parts, query) {
+                return if status == 200 {
+                    Behavior::json(body)
+                } else {
+                    Behavior::status(status)
+                };
+            }
+        }
         let missing = || Behavior::status(404);
         match parts.as_slice() {
             ["genesis"] => self.network_magic.map_or_else(missing, |magic| {

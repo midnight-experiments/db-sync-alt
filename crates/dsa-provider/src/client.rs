@@ -68,6 +68,8 @@ pub struct Limits {
     pub outputs: usize,
     /// The outputs kept from a `/utxos` answer.
     pub output_values: usize,
+    /// One page of an address, asset or transaction list.
+    pub lists: usize,
 }
 
 impl Default for Limits {
@@ -79,6 +81,7 @@ impl Default for Limits {
             metadata: 8 * 1024 * 1024,
             outputs: 128 * 1024 * 1024,
             output_values: 8 * 1024 * 1024,
+            lists: 16 * 1024 * 1024,
         }
     }
 }
@@ -89,6 +92,9 @@ pub(crate) enum Family {
     Block,
     Datum,
     Metadata,
+    List,
+    /// A whole `/txs/{hash}/utxos` answer, its inputs included.
+    Outputs,
 }
 
 #[derive(Clone)]
@@ -132,6 +138,7 @@ impl Config {
             ("provider.limits.metadata", limits.metadata),
             ("provider.limits.outputs", limits.outputs),
             ("provider.limits.output_values", limits.output_values),
+            ("provider.limits.lists", limits.lists),
         ] {
             if value == 0 || value > isize::MAX as usize / 2 {
                 return Err(Error::configuration(field));
@@ -555,8 +562,15 @@ impl Provider {
             Family::Block => self.0.config.limits.block,
             Family::Datum => self.0.config.limits.datum,
             Family::Metadata => self.0.config.limits.metadata,
+            Family::List => self.0.config.limits.lists,
+            Family::Outputs => self.0.config.limits.outputs,
         };
-        let mut sent = self.send(path, self.0.config.request_timeout).await?;
+        let timeout = if family == Family::Outputs {
+            self.0.config.outputs_timeout
+        } else {
+            self.0.config.request_timeout
+        };
+        let mut sent = self.send(path, timeout).await?;
         let response = &mut sent.response;
         if response.status().as_u16() != 200 {
             self.status_error(response)?;
