@@ -23,7 +23,7 @@ base58 0.2.0 (MIT): no license file in the crate; SPDX MIT text [7]; copyright h
 base64 0.22.1 (MIT OR Apache-2.0): LICENSE-APACHE [5], LICENSE-MIT [8]
 base64 0.23.1 (MIT OR Apache-2.0): LICENSE-APACHE [5], LICENSE-MIT [9]
 base64ct 1.8.3 (Apache-2.0 OR MIT): LICENSE-APACHE [10], LICENSE-MIT [11]
-bech32 0.11.1 (MIT): LICENSE-MIT [12]
+bech32 0.12.0 (MIT): LICENSE-MIT [12]
 bech32 0.9.1 (MIT): no license file in the crate; SPDX MIT text [7]; copyright holders, as its manifest names its authors: Clark Moody
 bitflags 2.13.2 (MIT OR Apache-2.0): LICENSE-APACHE [5], LICENSE-MIT [13]
 block-buffer 0.10.4 (MIT OR Apache-2.0): LICENSE-APACHE [10], LICENSE-MIT [14]
