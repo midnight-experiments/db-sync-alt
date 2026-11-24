@@ -37,7 +37,12 @@ pub(crate) struct Database {
 }
 impl Database {
     pub(crate) async fn new() -> Result<Self> {
-        let root: Config = std::env::var("DSA_TEST_DATABASE")?.parse()?;
+        Self::on("DSA_TEST_DATABASE").await
+    }
+    /// A new database on the server whose connection settings are in the
+    /// environment variable `server`.
+    pub(crate) async fn on(server: &str) -> Result<Self> {
+        let root: Config = std::env::var(server)?.parse()?;
         let admin = connect(&root).await?;
         // Tests of one process run in parallel and may read the same clock
         // value, so a counter makes the names distinct.
