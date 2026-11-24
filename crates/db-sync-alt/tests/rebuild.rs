@@ -1026,3 +1026,120 @@ async fn fixed_descriptor_ids_are_those_of_the_published_files() -> Result {
     assert!(!compared.is_empty(), "no snapshot file in {directory}");
     Ok(())
 }
+
+/// A rebuilt database follows on: after the build, the follower makes more
+/// blocks final while the oldest heights age past the retention, so that
+/// the horizon moves and the outputs spent before it stay recorded; after
+/// each round the database equals a conversion of the full history at its
+/// new horizon and target. DSA_REBUILD_FOLLOW_CASES chains (default 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_rebuilt_database_follows_through_a_horizon_advance() -> Result {
+    let cases = setting("DSA_REBUILD_FOLLOW_CASES", 4);
+    let parallel = setting("DSA_REBUILD_PARALLEL", 4).clamp(1, 16);
+    let workers = (0..parallel).map(|worker| async move {
+        let mut source = Source::new().await?;
+        let converted = Database::new().await?;
+        let rebuilt = Database::new().await?;
+        let (mut chains, mut advances, mut rounds) = (0_u64, 0_u64, 0_u64);
+        let mut seed = 1_000 + worker;
+        while seed < 1_000 + cases {
+            let mut random = Random::new(seed ^ 0x0d2b_d2b0);
+            let case = Case::new(seed, &mut random).await?;
+            let conversion = case.convert(&mut source, &converted).await?;
+            empty(&rebuilt, &case.profile).await?;
+            let fake = Fake::start(&case.g, &case.profile).await;
+            let (_stopper, stop) = Stop::new();
+            let report = build(&case.profile, &fake, &rebuilt, case.horizon, case.target, stop)
+                .await
+                .map_err(|error| format!("seed {seed}: {}", error.report()))?;
+            same(&report.verified, &conversion, &format!("seed {seed} built"))?;
+            let last_target = case.g.blocks.last().unwrap().height - K;
+            let mut target = case.target;
+            while target < last_target {
+                let next = (target + 1 + random.below(8) as u32).min(last_target);
+                let aged = target.saturating_sub(random.below(4) as u32);
+                common::connect(&rebuilt.config)
+                    .await?
+                    .execute(
+                        "UPDATE dsa.first_served SET first_served_at=first_served_at-interval '2 days' WHERE height<=$1",
+                        &[&(aged as i32)],
+                    )
+                    .await?;
+                let mut store = dsa_store::Store::connect(rebuilt.config.clone(), None).await?;
+                let before = store
+                    .follow_state(&case.profile)
+                    .await
+                    .map_err(harness::named)?
+                    .horizon
+                    .height;
+                support::follow_to(
+                    &case.profile,
+                    &fake,
+                    &rebuilt.config,
+                    Settings {
+                        prune_interval: Duration::from_secs(60),
+                        ..support::until(next)
+                    },
+                )
+                .await
+                .map_err(|error| format!("seed {seed} to {next}: {}", error.report()))?;
+                let state = store
+                    .follow_state(&case.profile)
+                    .await
+                    .map_err(harness::named)?;
+                advances += u64::from(state.horizon.height > before);
+                let above = store
+                    .headers_above(state.target.height)
+                    .await
+                    .map_err(harness::named)?;
+                let headers = (source.through + 1..=state.target.height)
+                    .map(|height| header(case.g.block(height).unwrap()))
+                    .chain(above)
+                    .collect::<Vec<_>>();
+                source
+                    .extend(&case.g, &case.history, state.target.height, &headers)
+                    .await?;
+                let conversion = convert(
+                    &converted,
+                    &source.database,
+                    &case.profile,
+                    state.horizon.height,
+                    DAY,
+                )
+                .await?;
+                let verified = store.verify(&case.profile).await.map_err(harness::named)?;
+                let context = format!(
+                    "seed {seed} followed to H {} T {}",
+                    state.horizon.height, state.target.height
+                );
+                if let Err(error) = same(&verified, &conversion, &context) {
+                    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+                    return Err(format!("{error}; rows {rows}").into());
+                }
+                target = next;
+                rounds += 1;
+            }
+            chains += 1;
+            seed += parallel;
+        }
+        source.database.cleanup().await?;
+        converted.cleanup().await?;
+        rebuilt.cleanup().await?;
+        Result::<(u64, u64, u64)>::Ok((chains, rounds, advances))
+    });
+    let (mut chains, mut rounds, mut advances) = (0, 0, 0);
+    for result in futures_util::future::join_all(workers).await {
+        let (c, r, a) = result?;
+        chains += c;
+        rounds += r;
+        advances += a;
+    }
+    println!(
+        "{}",
+        json!({"event":"rebuilt_then_followed","chains":chains,"rounds":rounds,"horizon_advances":advances})
+    );
+    assert_eq!(chains, cases);
+    assert!(advances > 0, "no horizon moved");
+    Ok(())
+}
