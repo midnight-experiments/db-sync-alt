@@ -11,8 +11,8 @@ The database keeps only what the node can still ask for: the events of the
 last 7 days (the retention, counted from when this database first served them),
 the Cardano outputs of Midnight's addresses and assets that are still unspent,
 and a few governance records and epoch values. Everything older is deleted as
-the chain advances, so the database stays small: 194 MB on Mainnet right after
-a restore ([measured](#requirements)).
+the chain advances, so the database stays small: 0.4 GB on Mainnet
+([system requirements](#system-requirements)).
 
 > This whole project is vibe coded. If you use it for a real application that
 > manages any real money, that money will likely be lost. This project is for
@@ -26,6 +26,8 @@ flowchart LR
     node["Midnight node"] -- "cardano-db-sync SQL<br/>(reader login)" --> postgres
 ```
 
+- **Small.** About 14 GiB less memory and 63 GB less disk than a Cardano node
+  with cardano-db-sync ([comparison](#compared-with-the-full-stack)).
 - **Never silently wrong.** Events come from transaction bytes whose hashes
   are checked; block headers, epoch parameters and stake distributions are
   the provider's answers, checked for consistency (links, sums, the epoch not
@@ -35,30 +37,43 @@ flowchart LR
   stopped or restarting.
 - **One binary.** No PostgreSQL client tools, no configuration file.
 
-## Requirements
+## System requirements
 
 - Linux x86-64 with glibc 2.39 or newer, or Docker.
-- PostgreSQL 17 with TLS, which you provide: a dedicated database, an owner
-  login and a reader login for the node ([PostgreSQL](docs/postgresql.md)).
-- A Blockfrost key for the network, in a file.
-- A snapshot file of the network to start from.
+- PostgreSQL 17 ([setup](docs/postgresql.md)).
+- A Blockfrost API key.
+- A database snapshot file for the first start, from the
+  [release page](https://github.com/midnight-experiments/db-sync-alt/releases).
 
-Measured on 2026-11-23 with release builds on an x86-64 Linux host,
-PostgreSQL 17 in a container:
+| Program | Version | Memory | Disk |
+| --- | --- | --- | --- |
+| Mainnet db-sync-alt | 0.5.0 | 20 MiB + 222 MiB PostgreSQL | 1 GB |
+| Mainnet Midnight node | 2.1.101 | 3.7 GiB | 436 GB |
+| Preprod db-sync-alt | 0.5.0 | 16 MiB + 49 MiB PostgreSQL | 0.1 GB |
+| Preprod Midnight node | 2.1.101 | 1.7 GiB | 394 GB |
 
-| Measured | Mainnet | Preprod |
-| --- | --- | --- |
-| Memory of the service, resident | 26 MB at the tip; peak 42 MB catching up 75,000 blocks | 15 MB at the tip; peak 17 MB |
-| [Database](docs/postgresql.md#size-and-connections) | 194 MB after restoring a 7-day window; 376 MB holding 25 days of blocks, before its first pruning | 18 MB after a restore; 20 MB after following for three hours |
-| [Snapshot file](docs/snapshots.md#what-a-file-contains) | 32.9 MB for a 7-day window; 44.1 MB for 24 days | 1.5 to 1.6 MB |
-| [Restore](docs/snapshots.md#restore); [writing a file](docs/snapshots.md#write-a-file) | 19.9 s; 13.0 s for 24 days | 0.5 to 0.7 s; 0.4 s |
-| [Supply check](docs/operations.md#supply-check) | 1.1 s (247,986 unspent outputs) | — |
-| [Provider requests](docs/provider.md#catching-up) | 0.92 a block catching up | 0.80 a block catching up; 319 an hour at the tip, about 7,700 a day |
-| [Compose](deploy/README.md#postgresql-settings), two minutes after a first start | — | service container 4.8 MiB, PostgreSQL container 67 MiB |
+Memory is without file cache. Disk is the PostgreSQL data directory with three
+daily snapshot files and, for the Midnight node, its archive database. More
+figures: [database](docs/postgresql.md#size-and-connections),
+[snapshot files](docs/snapshots.md#what-a-file-contains),
+[provider requests](docs/provider.md#catching-up),
+[binary and image](deploy/README.md#the-image).
 
-The binary is 9.1 MB and the image 33 MB ([deployment](deploy/README.md#the-image)).
-In a test, a restart of the service reached `following` in 0.19 s on a 185 MB
-database ([operations](docs/operations.md#start)).
+## Compared with the full stack
+
+Without db-sync-alt, the Cardano data of a Midnight node comes from a Cardano
+node, cardano-db-sync and its PostgreSQL database. On Preprod, with swap and
+file cache counted as memory:
+
+| Original full stack | Memory | Disk | db-sync-alt stack | Memory | Disk |
+| --- | ---: | ---: | --- | ---: | ---: |
+| Cardano node | 6.70 GiB | 21.7 GB | db-sync-alt | 0.02 GiB | 0.01 GB |
+| cardano-db-sync | 5.36 GiB | 3.2 GB | PostgreSQL 17 | 0.12 GiB | 0.08 GB |
+| PostgreSQL 15 | 2.20 GiB | 38.6 GB | | | |
+| **Total** | **14.26 GiB** | **63.5 GB** | **Total** | **0.14 GiB** | **0.09 GB** |
+
+About 14 GiB less memory and 63 GB less disk. The Midnight node itself is the
+same in both stacks.
 
 ## Install
 
