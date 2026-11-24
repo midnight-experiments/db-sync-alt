@@ -2443,7 +2443,7 @@ mod tests {
             amount: vec![
                 amount("lovelace", 5),
                 amount(&format!("{}01", "bb".repeat(28)), 1),
-                amount(&format!("{}", "aa".repeat(28)), 2),
+                amount(&"aa".repeat(28), 2),
                 amount(&format!("{}00", "bb".repeat(28)), 0),
             ],
             data_hash: None,
