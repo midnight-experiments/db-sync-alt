@@ -13,7 +13,7 @@ a small PostgreSQL 17 database that prunes itself.
   through a read-only login; while the database is not serving, every view
   raises SQLSTATE 55000 instead of returning an empty answer. A different
   `--retention-seconds` is refused unless `--change-retention` is given
-  ([measured sizes](README.md#requirements), [PostgreSQL](docs/postgresql.md)).
+  ([measured sizes](README.md#system-requirements), [PostgreSQL](docs/postgresql.md)).
 - **Snapshot files.** One file holds a whole database and its content digest.
   `snapshot` writes one, `restore` and `run --snapshot` load one into an empty
   database with `--expect-content-digest`, without PostgreSQL client tools; the
