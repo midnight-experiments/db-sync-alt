@@ -111,7 +111,8 @@ docker compose -f deploy/compose.yaml --env-file deploy/compose.env config --qui
 
 ### 4. First start
 
-On an empty database the service starts from a snapshot file. Put the file in
+The Compose deployment starts from a snapshot file: on an empty database the
+service restores it. Put the file in
 `DSA_SNAPSHOT_HOST_DIR`, and set in `compose.env` its path as the service sees
 it and its published content digest:
 
@@ -133,6 +134,13 @@ directory is also the directory of the daily files, and every file of the
 network's daily name pattern in it belongs to the rotation, the release file
 included: it is removed once `DSA_SNAPSHOT_KEEP` (default 3) newer daily files
 exist. Keep a copy elsewhere if you want to keep it.
+
+Without a snapshot file, `rebuild` is run with the binary or the image against
+the deployment's PostgreSQL, before the service starts
+([rebuild](../docs/rebuild.md)). The server publishes no port on the host, and
+the build needs the owner login, its password file, `root-ca.crt` and the
+provider key. Until the build has published, the service refuses the database
+(`snapshot_required` while it is empty) and Compose restarts it.
 
 ### 5. Connect a Midnight node
 
