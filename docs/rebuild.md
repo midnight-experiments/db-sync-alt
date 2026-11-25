@@ -131,7 +131,7 @@ While a build fills the database, or after it stopped:
   is written at the start of each phase, and again once 30 seconds have
   passed since the last one while a phase stores what it read.
 - In the window, `service_state` is the follower's own record, as for the
-  service: `state` `catching_up` or `waiting` with its reason, and
+  service: its `state` and `reason` (for example `catching_up`), and
   `build_target`, T, in its `detail`. `served_target` and `stored_tip` grow
   towards T and T plus k, and `last_update` describes the last update.
 - `provider.calls_today` and `provider.calls_previous_days` count the build's
