@@ -21,6 +21,11 @@ What db-sync-alt 0.5.1 works with. Anything else is refused or unsupported.
 - Following: the follower ran on real Preprod and Mainnet blocks, and on
   Preprod its database had the content digest of a database built from the
   full history at the same blocks ([provider](provider.md#catching-up)).
+- A build from the provider: on Preprod, `rebuild` with the horizon and target
+  of the Preprod snapshot file of release 0.5.1 gave the file's content
+  digest, and the built database then followed real blocks to the chain's tip
+  and passed `verify` ([rebuild](rebuild.md#cost)). A Mainnet build is not part
+  of these checks.
 - A node: a Midnight node 2.1.101 on Preprod reads a db-sync-alt database and
   imports blocks at the tip of its chain. A node on Mainnet, and a Cardano
   epoch change while a node reads the database, are not part of these checks.

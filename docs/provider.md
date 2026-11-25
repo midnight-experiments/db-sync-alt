@@ -105,6 +105,18 @@ a minute while the polls find nothing new, one page request per block with
 transactions, and the epoch requests. At the default poll of 20 seconds that is
 4,320 polls a day and at most 1,440 reads of the head.
 
+## A build from the provider
+
+`rebuild` builds a database without a snapshot file and sends its own
+requests ([rebuild](rebuild.md#what-it-reads)): the listings of the profile's
+assets and addresses, the transactions since the horizon with their inputs and
+outputs, the full transaction lists below the horizon, then every block of the
+window as the service reads it. Measured on Preprod, a build of 34,653 blocks
+sent 26,490 requests. On Mainnet a build has not been run; the expected
+request count for a 7-day window is an estimate of about 270,000 requests.
+Check the daily allowance of the key's plan before such a build
+([rebuild](rebuild.md#cost)).
+
 ## Refusals and outages
 
 | Provider answer | What the service does |

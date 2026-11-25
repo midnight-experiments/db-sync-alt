@@ -203,3 +203,26 @@ content digest. When they differ, `verify` on the built database and on a
 restore of the file prints the digest and row count of each table
 (`families`), which shows where they differ; [`compare`](comparison.md) runs
 the node's queries against both.
+
+## Cost
+
+Measured on Preprod: a build with the horizon and target of the Preprod
+snapshot file of release 0.5.1 (5,414,627 and 5,449,279: 34,653 blocks, about
+9.4 days) gave the file's content digest
+`5a5a4636b1e18c2af73b0bd7c71e1398f38a493f055fca83e631225388572b94`. It sent
+26,490 requests in 2 h 34 min at 3 requests a second. Following real blocks
+from the built database to the chain's tip, and `verify` after it, passed.
+
+Mainnet: a build has not been run. The expected request count for a 7-day
+window is an estimate, from Mainnet's counts of outputs and transactions and
+the request pattern measured on Preprod: about 270,000 requests. That is about
+two orders of magnitude more requests than restoring a recent snapshot file
+and catching up from it: a restore sends no request, and catching up sends
+about one request per block ([provider](provider.md#catching-up)).
+
+Check the daily request allowance of your provider plan before a Mainnet
+build. When the provider answers 402, the build waits until the next UTC day
+and goes on, as the service does
+([provider](provider.md#refusals-and-outages)). The pace is
+`--requests-per-second`; lower it when the service of another database shares
+the key.
