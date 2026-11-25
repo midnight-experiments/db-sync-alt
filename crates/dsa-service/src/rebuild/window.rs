@@ -7,7 +7,7 @@ use dsa_chain::{
     block::{InputRow, Rows, TxRow},
     ids,
 };
-use dsa_provider::types::{Heights, ListedTransaction, Page};
+use dsa_provider::types::{Hash32, Heights, Page};
 use dsa_store::rebuild::BuiltRows;
 use serde_json::json;
 use tokio::sync::watch;
@@ -56,7 +56,9 @@ impl Build<'_> {
     }
 
     /// K10: the newest relevant spend below H, found in the units' and
-    /// addresses' lists read backward from H − 1.
+    /// addresses' lists read backward from H − 1 and among the burns below
+    /// H, which a unit's list does not name when they leave no output of the
+    /// unit.
     pub(super) async fn newest_spend(&mut self) -> Result<Option<BuiltRows>, Error> {
         let stored: BTreeMap<String, NewestSpend> = self.typed("spend").await?;
         let spend = match stored.get("newest") {
@@ -137,7 +139,7 @@ impl Build<'_> {
                     if best.as_ref().is_some_and(|best| best.place >= place) {
                         break 'pages;
                     }
-                    if let Some(spend) = self.spend_of(row, place).await? {
+                    if let Some(spend) = self.spend_of(&row.tx_hash, place).await? {
                         best = Some(spend);
                         break 'pages;
                     }
@@ -150,17 +152,32 @@ impl Build<'_> {
                     .ok_or_else(|| Error::answer("provider_list_too_long", json!({})))?;
             }
         }
+        let burns: BTreeMap<String, Place> = self.typed("burn").await?;
+        let mut burns: Vec<(Place, String)> = burns
+            .into_iter()
+            .map(|(transaction, place)| (place, transaction))
+            .collect();
+        burns.sort();
+        for (place, transaction) in burns.into_iter().rev() {
+            if best.as_ref().is_some_and(|best| best.place >= place) {
+                break;
+            }
+            if let Some(spend) = self.spend_of(&hash32(&transaction)?, place).await? {
+                best = Some(spend);
+                break;
+            }
+        }
         Ok(best)
     }
 
-    /// The relevant spend of the highest ordinal in `row`'s transaction.
+    /// The relevant spend of the highest ordinal in `transaction`.
     async fn spend_of(
         &mut self,
-        row: &ListedTransaction,
+        transaction: &Hash32,
         place: Place,
     ) -> Result<Option<NewestSpend>, Error> {
-        let transaction = row.tx_hash.to_string();
-        let key = row.tx_hash.clone();
+        let key = transaction.clone();
+        let transaction = transaction.to_string();
         let provider = self.asker.provider.clone();
         let answer = self
             .asker

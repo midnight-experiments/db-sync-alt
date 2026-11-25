@@ -12,9 +12,9 @@ use crate::{
     client::Family,
     pages::{PAGE_SIZE, TransactionPage},
     types::{
-        AddressText, AssetInfo, Datum, EpochInfo, EpochParameters, Genesis, Hash32, Header,
-        Heights, Hex, ListedOutput, ListedTransaction, Metadata, MetadataEntry, Page, PolicyAsset,
-        PoolHistory, PoolId, PoolStake, RetiredPool, StakeAddress, TransactionCbor,
+        AddressText, AssetEvent, AssetInfo, Datum, EpochInfo, EpochParameters, Genesis, Hash32,
+        Header, Heights, Hex, ListedOutput, ListedTransaction, Metadata, MetadataEntry, Page,
+        PolicyAsset, PoolHistory, PoolId, PoolStake, RetiredPool, StakeAddress, TransactionCbor,
         TransactionInfo, TransactionOutputs, TransactionUtxos, Unit,
     },
 };
@@ -434,6 +434,18 @@ impl Provider {
             return Err(self.invalid("provider_invalid_response"));
         }
         Ok(Some(answer))
+    }
+
+    /// One page of `/assets/{unit}/history`, oldest first: the unit's mints
+    /// and burns.
+    pub async fn asset_history(&self, unit: &Unit, page: Page) -> Result<Vec<AssetEvent>, Error> {
+        let rows: Vec<AssetEvent> = self
+            .list_page(&paged(&format!("/assets/{unit}/history"), page, false))
+            .await?;
+        if rows.iter().any(|row| row.quantity().is_none()) {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(rows)
     }
 
     /// One page of `/assets/policy/{policy}`.

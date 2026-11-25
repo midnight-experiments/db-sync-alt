@@ -6,9 +6,11 @@
 //!    one page each, so that a spend between two pages cannot shift a row out
 //!    of the listing; per profile address `/addresses/{address}/utxos`, read
 //!    until two passes agree.
-//! 2. The quantity of each fixed unit with the provider's tip around it, then
-//!    every transaction from H on that moved a unit or touched an address,
-//!    with its resolved inputs (`/txs/{hash}/utxos`).
+//! 2. The quantity and the mints and burns (`/assets/{unit}/history`) of each
+//!    unit with the provider's tip around them, then every transaction from H
+//!    on that created an output of a unit or touched an address, and every
+//!    mint or burn from H on (a burn of a unit's whole input amount is in no
+//!    list of the unit), with its resolved inputs (`/txs/{hash}/utxos`).
 //! 3. Unspent at H: the listed outputs and the relevant inputs of those
 //!    transactions, without the outputs they created; each one's creating
 //!    transaction placed below H by the full transaction lists (`to` H − 1),
@@ -17,10 +19,12 @@
 //!    lists read backward from H − 1, K7 and K8 from the epochs, the headers
 //!    H − 1 … H − 1 + k.
 //! 5. Proof: per fixed unit the unspent amount at H equals the provider's
-//!    quantity minus the net mint of the transactions from H to the tip the
-//!    quantity was read at. Then the base is written with the gate closed.
+//!    quantity minus the mints and plus the burns of its history from H to
+//!    the tip the quantity was read at. Then the base is written with the
+//!    gate closed.
 //! 6. The window H … T through the follower's own updates and checks.
-//! 7. K10 when the window holds no spend; publication with `verify`.
+//! 7. K10 when the window holds no spend, from the lists and the burns
+//!    below H; publication with `verify`.
 //!
 //! Every provider result a phase uses is stored in the database being built
 //! before the next phase starts, so a stopped build continues where it

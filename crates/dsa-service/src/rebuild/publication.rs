@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 
 use super::{
     Build,
-    asker::{check, hash32, invalid, refusal},
-    content::{Carried, Content, Moved, Place},
+    asker::{check, invalid, refusal},
+    content::{Carried, Content, Event, Place},
 };
 use crate::follow::Error;
 
@@ -237,9 +237,7 @@ impl Build<'_> {
     ) -> Result<BTreeMap<String, String>, Error> {
         let quantities = self.items("quantity").await?;
         let since: BTreeMap<String, Place> = self.typed("since").await?;
-        let moved: BTreeMap<String, Moved> = self.typed("moved").await?;
         let mut supply = BTreeMap::new();
-        let mut known_valid: BTreeMap<String, bool> = self.typed("valid").await?;
         for unit in fixed_units(self.profile) {
             let at_horizon: u128 = unspent
                 .values()
@@ -252,65 +250,23 @@ impl Build<'_> {
                 .map_err(|_| Error::answer("provider_quantity_invalid", json!({"unit": unit})))?;
             let tip_before = reading["tip_before"].as_u64().unwrap_or_default();
             let tip_after = reading["tip_after"].as_u64().unwrap_or_default();
+            // The mints and burns from H on, from the unit's history: every
+            // one of them is a transaction from H on, placed by a list or by
+            // its own answer; one that is not is below H.
             let mut minted: i128 = 0;
-            for (transaction, place) in &since {
-                let Some(moved) = moved.get(transaction) else {
+            for event in Event::of(reading)? {
+                let Some(place) = since.get(&event.tx) else {
                     continue;
                 };
-                if moved.unknown {
-                    continue;
-                }
-                let made: i128 = moved
-                    .outputs
-                    .iter()
-                    .filter(|output| !output.collateral)
-                    .flat_map(|output| output.amount.iter())
-                    .filter(|amount| amount.unit == unit)
-                    .map(|amount| i128::from(amount.quantity.0))
-                    .sum();
-                let used: i128 = moved
-                    .inputs
-                    .iter()
-                    .filter(|input| !input.collateral && !input.reference)
-                    .filter_map(|input| input.content.as_ref())
-                    .map(|content| content.quantity(&unit) as i128)
-                    .sum();
-                let net = made - used;
-                if net == 0 {
-                    continue;
-                }
-                let valid = match known_valid.get(transaction) {
-                    Some(valid) => *valid,
-                    None => {
-                        let key = hash32(transaction)?;
-                        let provider = self.asker.provider.clone();
-                        let info = self
-                            .asker
-                            .ask("transactions", || provider.transaction(&key))
-                            .await?
-                            .ok_or_else(|| {
-                                Error::answer(
-                                    "provider_transaction_unknown",
-                                    json!({"transaction": transaction}),
-                                )
-                            })?;
-                        self.put_one("valid", transaction, info.valid_contract)
-                            .await?;
-                        known_valid.insert(transaction.clone(), info.valid_contract);
-                        info.valid_contract
-                    }
-                };
-                if !valid {
-                    continue;
-                }
-                if u64::from(place.height) > tip_before && u64::from(place.height) <= tip_after {
+                let height = u64::from(place.height);
+                if height > tip_before && height <= tip_after {
                     return Err(Error::answer(
                         "provider_mint_while_quantity_read",
-                        json!({"unit": unit, "transaction": transaction}),
+                        json!({"unit": unit, "transaction": event.tx}),
                     ));
                 }
-                if u64::from(place.height) <= tip_before {
-                    minted += net;
+                if height <= tip_before {
+                    minted += event.quantity()?;
                 }
             }
             let expected = quantity - minted;

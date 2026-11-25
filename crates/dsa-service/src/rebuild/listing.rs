@@ -14,7 +14,7 @@ use serde_json::json;
 use super::{
     BATCH, Build,
     asker::{PASSES, every_page, hash32, stable, transactions_page},
-    content::{Content, Made, Moved, Spent, outpoint},
+    content::{Content, Event, Made, Moved, Spent, outpoint},
     progress::{Cursor, to_value},
 };
 use crate::follow::Error;
@@ -204,13 +204,18 @@ impl Build<'_> {
         .await
     }
 
-    /// The quantity of each fixed unit and the provider's tip before and
-    /// after it, with the height of the unit's first mint.
+    /// The quantity and the mints and burns (`/assets/{unit}/history`) of
+    /// each unit of the listing and each fixed unit, read between two
+    /// readings of the provider's tip, with the height of each fixed unit's
+    /// first mint. A unit's history must hold as many mints and burns as its
+    /// quantity's answer counts.
     pub(super) async fn quantities(&mut self) -> Result<(), Error> {
         if !self.items("quantity").await?.is_empty() {
             return Ok(());
         }
-        let units = fixed_units(self.profile);
+        let fixed = fixed_units(self.profile);
+        let mut units: BTreeSet<String> = self.units().await?.into_iter().collect();
+        units.extend(fixed.iter().cloned());
         let provider = self.asker.provider.clone();
         let mut last = None;
         for _ in 0..10 {
@@ -222,7 +227,12 @@ impl Build<'_> {
             for unit in &units {
                 let parsed: Unit = unit.parse().map_err(Error::Provider)?;
                 let answer = self.asker.ask("assets", || provider.asset(&parsed)).await?;
-                answers.insert(unit.clone(), answer);
+                let events = every_page(&self.asker, "assets", |page| {
+                    let (provider, parsed) = (provider.clone(), parsed.clone());
+                    async move { provider.asset_history(&parsed, page).await }
+                })
+                .await?;
+                answers.insert(unit.clone(), (answer, events));
             }
             let after = self
                 .asker
@@ -235,27 +245,98 @@ impl Build<'_> {
             }
         }
         let (before, after, answers) = last.expect("one reading");
+        let steady = before.hash == after.hash;
         let mut items = Vec::new();
-        for (unit, answer) in answers {
+        for (unit, (answer, events)) in answers {
+            let count = answer.as_ref().map_or(0, |info| info.mint_or_burn_count);
+            if events.len() as u64 != count {
+                // At one tip the two answers must agree; across a moving tip
+                // a mint or burn may have landed between them.
+                let code = if steady {
+                    "provider_mint_history_mismatch"
+                } else {
+                    "provider_mint_while_quantity_read"
+                };
+                return Err(Error::answer(
+                    code,
+                    json!({"unit": unit, "mint_or_burn_count": count, "history_rows": events.len(),
+                        "tip_before": before.height, "tip_after": after.height}),
+                ));
+            }
             let first_mint = match &answer {
-                Some(info) => {
+                Some(info) if fixed.contains(&unit) => {
                     let mint = info.initial_mint_tx_hash.clone();
                     self.asker
                         .ask("transactions", || provider.transaction(&mint))
                         .await?
                         .map(|tx| tx.block_height)
                 }
-                None => None,
+                _ => None,
             };
+            let events: Vec<Event> = events
+                .iter()
+                .map(|event| Event {
+                    tx: event.tx_hash.to_string(),
+                    amount: event.amount.clone(),
+                })
+                .collect();
             items.push((
                 unit,
                 json!({"quantity": answer.as_ref().map(|info| info.quantity.clone()),
-                    "mints": answer.as_ref().map(|info| info.mint_or_burn_count),
+                    "mints": count, "events": events,
                     "first_mint_height": first_mint, "tip_before": before.height,
                     "tip_after": after.height}),
             ));
         }
         self.put("quantity", items).await
+    }
+
+    /// The mints and burns that no list from H on names. A mint creates an
+    /// output holding its unit, so a mint missing from the unit's list from
+    /// H on is below H. A burn of a unit's whole input amount creates none and
+    /// is in no list of the unit: every burn no list names is placed by
+    /// `/txs/{hash}`; from H on it joins the transactions whose inputs are
+    /// read, below H it is kept as a spend the lists may not name.
+    async fn place_burns(&mut self) -> Result<(), Error> {
+        if self.cursor("burns").await?.done {
+            return Ok(());
+        }
+        let since = self.items("since").await?;
+        let placed = self.items("burn").await?;
+        let readings = self.items("quantity").await?;
+        let mut wanted = BTreeSet::new();
+        for reading in readings.values() {
+            for event in Event::of(reading)? {
+                if event.quantity()? < 0
+                    && !since.contains_key(&event.tx)
+                    && !placed.contains_key(&event.tx)
+                {
+                    wanted.insert(event.tx);
+                }
+            }
+        }
+        let provider = self.asker.provider.clone();
+        for transaction in wanted {
+            let key = hash32(&transaction)?;
+            let info = self
+                .asker
+                .ask("transactions", || provider.transaction(&key))
+                .await?
+                .ok_or_else(|| {
+                    Error::answer(
+                        "provider_transaction_unknown",
+                        json!({"transaction": transaction}),
+                    )
+                })?;
+            let place = json!({"height": info.block_height, "index": info.index});
+            let kind = if info.block_height >= self.plan.horizon {
+                "since"
+            } else {
+                "burn"
+            };
+            self.put_one(kind, &transaction, place).await?;
+        }
+        self.finished("burns").await
     }
 
     /// Every transaction from H on of each unit and address, in height
@@ -352,7 +433,7 @@ impl Build<'_> {
                 self.put_one("cursor", &key, &cursor).await?;
             }
         }
-        Ok(())
+        self.place_burns().await
     }
 
     pub(super) async fn transactions_page(

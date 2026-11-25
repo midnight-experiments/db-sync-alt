@@ -2,6 +2,10 @@
 
 use dsa_provider::types::{AssetAmount, Header, ListedOutput};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::asker::refusal;
+use crate::follow::Error;
 
 /// The content of an output as a listing or an input row renders it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +85,28 @@ pub(super) struct Moved {
     pub(super) unknown: bool,
     pub(super) inputs: Vec<Spent>,
     pub(super) outputs: Vec<Made>,
+}
+
+/// A mint (positive amount) or burn (negative) of a unit by a transaction,
+/// as the unit's history lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Event {
+    pub(super) tx: String,
+    pub(super) amount: String,
+}
+
+impl Event {
+    /// The events of a stored reading of a unit.
+    pub(super) fn of(reading: &Value) -> Result<Vec<Event>, Error> {
+        serde_json::from_value(reading["events"].clone())
+            .map_err(|_| refusal("rebuild_progress_invalid", json!({})))
+    }
+
+    pub(super) fn quantity(&self) -> Result<i128, Error> {
+        self.amount
+            .parse()
+            .map_err(|_| refusal("rebuild_progress_invalid", json!({"transaction": self.tx})))
+    }
 }
 
 /// A position: block height and index in the block.

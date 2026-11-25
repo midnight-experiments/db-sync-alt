@@ -457,6 +457,30 @@ pub struct PolicyAsset {
     pub quantity: String,
 }
 
+/// One row of `/assets/{unit}/history`: a mint or a burn of the unit by a
+/// phase-2-valid transaction, with the signed amount.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AssetEvent {
+    pub tx_hash: Hash32,
+    /// The amount as text, negative for a burn.
+    pub amount: String,
+    /// `minted` or `burned`.
+    pub action: String,
+}
+
+impl AssetEvent {
+    /// The signed amount, when it is a number whose sign the action names.
+    pub fn quantity(&self) -> Option<i128> {
+        let amount: i128 = self.amount.parse().ok()?;
+        let burned = match self.action.as_str() {
+            "burned" => true,
+            "minted" => false,
+            _ => return None,
+        };
+        (burned == (amount < 0)).then_some(amount)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

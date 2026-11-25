@@ -141,3 +141,65 @@ async fn the_listing_calls_read_the_backends_answers() {
         (5_401_535, 324, 1)
     );
 }
+
+/// A provider over a loopback server answering `answer(path)`, the path
+/// without `/api/v0`.
+async fn provider_of(
+    answer: impl Fn(&str) -> Behavior + Send + Sync + 'static,
+) -> (Server, tempfile::NamedTempFile, Provider) {
+    let server =
+        Server::start(move |path, _| answer(path.strip_prefix("/api/v0").unwrap_or(path))).await;
+    let key = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(key.path(), KEY).unwrap();
+    let mut config = Config::new(server.url.clone(), key.path());
+    config.requests_per_second = 10.0;
+    let provider =
+        Provider::with_clock(config, Arc::new(Fixed(AtomicU64::new(1_795_000_000)))).unwrap();
+    (server, key, provider)
+}
+
+/// `/assets/{unit}/history` as the backend's query renders it (`tx_hash`,
+/// `amount` as signed text, `action`): the call reads the signed amounts,
+/// a unit the provider does not know has no history, and a row whose action
+/// does not name the amount's sign is refused.
+#[tokio::test]
+async fn the_history_call_reads_mints_and_burns() {
+    let cnight = "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1";
+    let unit: Unit = cnight.parse().unwrap();
+    let mint = "24db5990d78fc8c273854fcf4e0e290a419529680d6e6a837104c91f3a3c2f3a";
+    let burn = "f74215250265a6d5be00d8e3bf1ecb9dc40e5a85f6c9309c8160be77fea7950f";
+    let good = serde_json::json!([
+        {"tx_hash": mint, "amount": "1000003000", "action": "minted"},
+        {"tx_hash": burn, "amount": "-3000", "action": "burned"}
+    ])
+    .to_string();
+    let wanted = format!("/assets/{cnight}/history?count=100&page=1&order=asc");
+    let (_server, _key, provider) = provider_of(move |path| {
+        if path == wanted {
+            Behavior::raw(good.clone())
+        } else {
+            Behavior::status(404)
+        }
+    })
+    .await;
+    let rows = provider.asset_history(&unit, Page::first()).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.quantity()).collect::<Vec<_>>(),
+        [Some(1_000_003_000), Some(-3_000)]
+    );
+    assert_eq!(rows[1].tx_hash, burn.parse::<Hash32>().unwrap());
+    let other: Unit = "7e69087d98fac5869eac14e13dfb6f98228c41e638aa2a59d1f85e9c"
+        .parse()
+        .unwrap();
+    assert!(
+        provider
+            .asset_history(&other, Page::first())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let wrong =
+        serde_json::json!([{"tx_hash": burn, "amount": "3000", "action": "burned"}]).to_string();
+    let (_server, _key, provider) = provider_of(move |_| Behavior::raw(wrong.clone())).await;
+    assert!(provider.asset_history(&unit, Page::first()).await.is_err());
+}

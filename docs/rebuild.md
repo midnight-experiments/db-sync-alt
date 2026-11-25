@@ -64,8 +64,8 @@ only for what it does not hold yet.
 | Phase | What it reads |
 | --- | --- |
 | `listing` | The outputs the node needs that are unspent now and were created below H: for each asset unit of the profile (with every unit of the two governance policies, from `/assets/policy/{policy}`) `/assets/{unit}/utxos` by ranges of creation height; for each address of the profile `/addresses/{address}/utxos`, read again until two reads agree. |
-| `quantities` | The provider's quantity of each fixed-supply asset (`/assets/{unit}`), with the provider's tip before and after it. |
-| `since` | Every transaction from H on that moved a profile asset or touched a profile address (`/assets/{unit}/transactions`, `/addresses/{address}/transactions`). |
+| `quantities` | The provider's quantity and the mints and burns (`/assets/{unit}`, `/assets/{unit}/history`) of each asset unit of the listing and each fixed-supply asset, between two readings of the provider's tip. Each history must hold as many mints and burns as the quantity's answer counts. |
+| `since` | Every transaction from H on that created an output holding a profile asset or touched a profile address (`/assets/{unit}/transactions`, `/addresses/{address}/transactions`), and every mint or burn from H on. A transaction that burns all it spends of an asset is in no list of the asset, only in its history: each burn that no list names is placed by `/txs/{hash}`. |
 | `transactions` | The inputs and outputs of those transactions (`/txs/{hash}/utxos`). |
 | `origins` | The outputs that collateral inputs spend, from their own transactions. |
 | `history` | The full transaction lists of the assets and addresses up to H − 1: the block and position of each transaction that created an output unspent at H. |
@@ -85,10 +85,10 @@ transactions since H spent, without the outputs those transactions created.
 The gate stays closed for the whole build. Before it opens:
 
 1. **Supply.** For each fixed-supply asset of the profile, the unspent amount
-   at H equals the provider's quantity minus the net mint of the transactions
-   from H to the provider's tip at which the quantity was read. Otherwise the
-   build ends with `rebuild_supply_mismatch`, which names the unit and the
-   amounts.
+   at H equals the provider's quantity minus the mints and plus the burns
+   that the asset's history lists from H to the provider's tip at which the
+   quantity was read. Otherwise the build ends with `rebuild_supply_mismatch`,
+   which names the unit and the amounts.
 2. **Conservation.** Every block of the window passes the checks of following.
    A transaction that spends more of a profile asset than the database holds
    closes the build's gate with `asset_conservation`.

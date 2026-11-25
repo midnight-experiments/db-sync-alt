@@ -788,6 +788,178 @@ async fn listing_edges_give_the_conversion() -> Result {
     source.database.cleanup().await
 }
 
+// ----- complete burns --------------------------------------------------------
+
+/// Where a scripted chain burns a whole cNIGHT output: a transaction that
+/// spends it, burns all of it and creates no output holding cNIGHT. Such a
+/// transaction is in no transaction list of cNIGHT, only in its history.
+#[derive(Clone, Copy, Debug)]
+enum BurnAt {
+    /// In the window, H … T.
+    Window,
+    /// After T, before the listing reads the provider.
+    AfterTarget,
+    /// The output is minted from H on and burnt from H on.
+    MintedSinceHorizon,
+    /// Below H, the newest relevant spend before a window without one.
+    BelowHorizon,
+}
+
+/// Mainnet profile, k 12, the edge chain's H, T and length. Height 1 mints
+/// 10 cNIGHT into five outputs of 2 at ordinary addresses; when the window
+/// holds no relevant spend, height 10 spends one of them into a new cNIGHT
+/// output; the other blocks are empty except for the case's transactions.
+/// Returns the chain and the burning transaction.
+fn burn_chain(profile: &Profile, at: BurnAt) -> (Generated, String) {
+    let ordinary = |index: u8| {
+        let mut key = [0x6b; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let mut s = Script::new();
+    let mut tx = s.tx().mint(&policy, &name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(&policy, &name, 2));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    let (mut young, mut burn) = (String::new(), String::new());
+    for height in 2..=EDGE_END {
+        let burning = matches!(
+            (at, height),
+            (BurnAt::Window, 35)
+                | (BurnAt::AfterTarget, 45)
+                | (BurnAt::BelowHorizon, 20)
+                | (BurnAt::MintedSinceHorizon, 37)
+        );
+        let transaction = match (at, height) {
+            // An older relevant spend that the list of cNIGHT names (a
+            // conversion needs one at or below T).
+            (BurnAt::BelowHorizon | BurnAt::AfterTarget, 10) => Some(
+                s.tx()
+                    .input(&minted, 1)
+                    .output(Output::new(ordinary(5), 1_400_000).token(&policy, &name, 2)),
+            ),
+            (BurnAt::MintedSinceHorizon, 34) => Some(
+                s.tx()
+                    .mint(&policy, &name, 3)
+                    .output(Output::new(ordinary(7), 1_600_000).token(&policy, &name, 3)),
+            ),
+            (BurnAt::MintedSinceHorizon, 37) => Some(
+                s.tx()
+                    .input(&young, 0)
+                    .mint(&policy, &name, -3)
+                    .output(Output::new(ordinary(6), 1_300_000)),
+            ),
+            _ if burning => Some(
+                s.tx()
+                    .input(&minted, 0)
+                    .mint(&policy, &name, -2)
+                    .output(Output::new(ordinary(6), 1_300_000)),
+            ),
+            _ => None,
+        };
+        let hashes = s.block(transaction.into_iter().collect());
+        if matches!((at, height), (BurnAt::MintedSinceHorizon, 34)) {
+            young = hashes[0].clone();
+        }
+        if burning {
+            burn = hashes[0].clone();
+        }
+    }
+    (s.g, burn)
+}
+
+/// The burn chain of `at` converted at H and T and built from the provider
+/// at the same H and T: equal content and state digests, supply and
+/// position. The build reads cNIGHT's history and asks for the burning
+/// transaction, which no list names.
+async fn burn_case(at: BurnAt) -> Result {
+    let profile = profile(1);
+    let (g, burn) = burn_chain(&profile, at);
+    let name = format!("{at:?}");
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("{name}: {}", error.report()))?;
+    if let Err(error) = same(&report.verified, &conversion, &name) {
+        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+        return Err(format!("{error}; rows {rows}").into());
+    }
+    let cnight = profile.assets.cnight.unit();
+    let paths = fake.paths();
+    let history = format!("/assets/{cnight}/history?");
+    assert!(
+        paths.iter().any(|path| path.contains(&history)),
+        "{name}: the history of cNIGHT was not read"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|path| path.ends_with(&format!("/txs/{burn}"))),
+        "{name}: the burning transaction was not placed by its own answer"
+    );
+    // The burn's input is a row of the built database: in the window, or
+    // below H as the newest relevant spend (the keep rule's clause K10).
+    let inputs: i64 = common::connect(&rebuilt.config)
+        .await?
+        .query_one(
+            "SELECT count(*) FROM serve.tx_in i JOIN serve.tx t ON t.id=i.tx_in_id WHERE t.hash=$1",
+            &[&hex::decode(&burn)?],
+        )
+        .await?
+        .get(0);
+    let expected = i64::from(!matches!(at, BurnAt::AfterTarget));
+    println!(
+        "{}",
+        json!({"event":"complete_burn","case":name,"burn":burn,"burn_input_rows":inputs,
+            "requests":paths.len(),"calls":report.calls})
+    );
+    assert_eq!(inputs, expected, "{name}: rows of the burn's input");
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// A transaction in the window spends a cNIGHT output and burns all of it:
+/// the build holds the output at H, and the window's conservation check
+/// passes on the burn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_complete_burn_in_the_window_gives_the_conversion() -> Result {
+    burn_case(BurnAt::Window).await
+}
+
+/// A transaction after the target burns a whole cNIGHT output before the
+/// listing: the output is unspent at H and T, and the build holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_complete_burn_after_the_target_gives_the_conversion() -> Result {
+    burn_case(BurnAt::AfterTarget).await
+}
+
+/// An output minted from H on and burnt whole from H on: the supply proof
+/// counts both the mint and the burn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_mint_and_a_complete_burn_since_the_horizon_give_the_conversion() -> Result {
+    burn_case(BurnAt::MintedSinceHorizon).await
+}
+
+/// A complete burn below H is the newest relevant spend before a window
+/// without one: the build keeps it as the conversion does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_complete_burn_below_the_horizon_gives_the_conversion() -> Result {
+    burn_case(BurnAt::BelowHorizon).await
+}
+
 /// Blocks arrive and a branch replaces the provider's tip while
 /// the listings are read; outputs listed on one page are spent before the
 /// next one, outputs are created and spent again. The build still equals
