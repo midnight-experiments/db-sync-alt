@@ -15,7 +15,7 @@ use dsa_provider::types::{
     AddressText, Header, Heights, ListedOutput, ListedTransaction, Page, TransactionUtxos, Unit,
 };
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{
     BATCH, Build,
@@ -24,6 +24,10 @@ use super::{
     progress::{Cursor, parse, to_value},
 };
 use crate::follow::Error;
+
+/// Readings of a unit whose history and quantity disagree before the build
+/// refuses.
+const READINGS: usize = 5;
 
 /// Times the address listings and the lists from H on are read again when
 /// the tip they were read up to left the chain.
@@ -205,98 +209,95 @@ impl Build<'_> {
     }
 
     /// The quantity and the mints and burns (`/assets/{unit}/history`) of
-    /// each unit of the listing and each fixed unit, read between two
-    /// readings of the provider's tip, with the height of each fixed unit's
-    /// first mint. A unit's history must hold as many mints and burns as its
-    /// quantity's answer counts.
+    /// each unit of the listing and each fixed unit, one unit at a time,
+    /// with the height of each fixed unit's first mint. Each unit's reading
+    /// is stored on its own: a continued phase reads the units without one.
     pub(super) async fn quantities(&mut self) -> Result<(), Error> {
-        if !self.items("quantity").await?.is_empty() {
-            return Ok(());
-        }
         let fixed = fixed_units(self.profile);
         let mut units: BTreeSet<String> = self.units().await?.into_iter().collect();
         units.extend(fixed.iter().cloned());
-        let provider = self.asker.provider.clone();
-        let mut last = None;
-        for _ in 0..10 {
-            let before = self
-                .asker
-                .ask("headers", || provider.latest_block())
-                .await?;
-            let mut answers = BTreeMap::new();
-            for unit in &units {
-                let parsed: Unit = unit.parse().map_err(Error::Provider)?;
-                let answer = self.asker.ask("assets", || provider.asset(&parsed)).await?;
-                let events = every_page(&self.asker, "assets", |page| {
-                    let (provider, parsed) = (provider.clone(), parsed.clone());
-                    async move { provider.asset_history(&parsed, page).await }
-                })
-                .await?;
-                answers.insert(unit.clone(), (answer, events));
+        let read = self.items("quantity").await?;
+        for unit in units {
+            if read.contains_key(&unit) {
+                continue;
             }
-            let after = self
-                .asker
-                .ask("headers", || provider.latest_block())
-                .await?;
-            let steady = before.hash == after.hash;
-            last = Some((before, after, answers));
-            if steady {
-                break;
-            }
+            let reading = self.reading(&unit, fixed.contains(&unit)).await?;
+            self.put_one("quantity", &unit, reading).await?;
         }
-        let (before, after, answers) = last.expect("one reading");
-        let steady = before.hash == after.hash;
-        let mut items = Vec::new();
-        for (unit, (answer, events)) in answers {
-            let count = answer.as_ref().map_or(0, |info| info.mint_or_burn_count);
-            if events.len() as u64 != count {
-                // At one tip the two answers must agree; across a moving tip
-                // a mint or burn may have landed between them.
-                let code = if steady {
-                    "provider_mint_history_mismatch"
-                } else {
-                    "provider_mint_while_quantity_read"
-                };
-                return Err(Error::answer(
-                    code,
-                    json!({"unit": unit, "mint_or_burn_count": count, "history_rows": events.len(),
-                        "tip_before": before.height, "tip_after": after.height}),
-                ));
-            }
-            let first_mint = match &answer {
-                Some(info) if fixed.contains(&unit) => {
-                    let mint = info.initial_mint_tx_hash.clone();
-                    self.asker
-                        .ask("transactions", || provider.transaction(&mint))
-                        .await?
-                        .map(|tx| tx.block_height)
-                }
-                _ => None,
-            };
-            let events: Vec<Event> = events
-                .iter()
-                .map(|event| Event {
-                    tx: event.tx_hash.to_string(),
-                    amount: event.amount.clone(),
-                })
-                .collect();
-            items.push((
-                unit,
-                json!({"quantity": answer.as_ref().map(|info| info.quantity.clone()),
-                    "mints": count, "events": events,
-                    "first_mint_height": first_mint, "tip_before": before.height,
-                    "tip_after": after.height}),
-            ));
-        }
-        self.put("quantity", items).await
+        Ok(())
     }
 
-    /// The mints and burns that no list from H on names. A mint creates an
-    /// output holding its unit, so a mint missing from the unit's list from
-    /// H on is below H. A burn of a unit's whole input amount creates none and
-    /// is in no list of the unit: every burn no list names is placed by
-    /// `/txs/{hash}`; from H on it joins the transactions whose inputs are
-    /// read, below H it is kept as a spend the lists may not name.
+    /// One unit's reading: every page of its history in chain order, then
+    /// its quantity. It is taken when no transaction occurs twice in the
+    /// history, the history has as many rows as the quantity's answer counts
+    /// and its amounts add up to the quantity; otherwise the unit is read
+    /// again, `READINGS` times in all, and the build ends with
+    /// `provider_mint_history_mismatch`.
+    async fn reading(&self, unit: &str, fixed: bool) -> Result<Value, Error> {
+        let parsed: Unit = unit.parse().map_err(Error::Provider)?;
+        let provider = self.asker.provider.clone();
+        let mut last = json!({});
+        for attempt in 1..=READINGS {
+            let events = every_page(&self.asker, "assets", |page| {
+                let (provider, parsed) = (provider.clone(), parsed.clone());
+                async move { provider.asset_history(&parsed, page).await }
+            })
+            .await?;
+            let answer = self.asker.ask("assets", || provider.asset(&parsed)).await?;
+            let count = answer.as_ref().map_or(0, |info| info.mint_or_burn_count);
+            let quantity: Option<i128> = answer
+                .as_ref()
+                .map_or(Some(0), |info| info.quantity.parse().ok());
+            let sum = events.iter().try_fold(0_i128, |sum, event| {
+                event.quantity().and_then(|amount| sum.checked_add(amount))
+            });
+            let distinct = events
+                .iter()
+                .map(|event| &event.tx_hash)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == events.len();
+            if let Some(quantity) = quantity.filter(|quantity| {
+                distinct && events.len() as u64 == count && sum == Some(*quantity)
+            }) {
+                let first_mint_height = match &answer {
+                    Some(asset) if fixed => {
+                        let mint = asset.initial_mint_tx_hash.to_string();
+                        Some(info(&self.asker, &mint).await?.block_height)
+                    }
+                    _ => None,
+                };
+                let events: Vec<Event> = events
+                    .iter()
+                    .map(|event| Event {
+                        tx: event.tx_hash.to_string(),
+                        amount: event.amount.clone(),
+                    })
+                    .collect();
+                return Ok(json!({"quantity": quantity.to_string(), "events": events,
+                    "first_mint_height": first_mint_height}));
+            }
+            last = json!({"unit": unit, "history_rows": events.len(), "mint_or_burn_count": count,
+                "history_sum": sum.map(|sum| sum.to_string()),
+                "quantity": answer.as_ref().map(|info| info.quantity.clone()),
+                "distinct_transactions": distinct, "readings": attempt});
+            eprintln!(
+                "{}",
+                json!({"event":"rebuild_reading_again","reading":last})
+            );
+        }
+        Err(Error::answer("provider_mint_history_mismatch", last))
+    }
+
+    /// The mints and burns that no list from H on names. The lists from H
+    /// on are read after the histories, up to a tip read after them, so
+    /// they cover every height a stored history reaches. A mint creates an
+    /// output holding its unit and is then in the unit's list from H on:
+    /// one that the list does not name is below H. A burn of a unit's whole
+    /// input amount creates none and is in no list of the unit: every burn
+    /// no list names is placed by `/txs/{hash}`; from H on it joins the
+    /// transactions whose inputs are read, below H it is kept as a spend the
+    /// lists may not name.
     async fn place_burns(&mut self) -> Result<(), Error> {
         if self.cursor("burns").await?.done {
             return Ok(());
@@ -382,11 +383,13 @@ impl Build<'_> {
         Ok(tip)
     }
 
+    /// The lists from H on of every unit that has a reading (a fixed unit
+    /// first minted during the build included) and of every address.
     async fn since_lists(&mut self, tip: u32) -> Result<(), Error> {
         let mut sources: Vec<String> = self
-            .units()
+            .items("quantity")
             .await?
-            .into_iter()
+            .into_keys()
             .map(|unit| format!("unit:{unit}"))
             .collect();
         sources.extend(self.addresses.iter().map(|a| format!("address:{a}")));

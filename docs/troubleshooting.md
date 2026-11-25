@@ -221,8 +221,7 @@ and of [`verify`](#verify) at its publication. Nothing is served in any case
 | Code | Cause | What to do |
 | --- | --- | --- |
 | `rebuild_supply_mismatch` | The unspent amount of a fixed-supply asset at the horizon differs from the provider's quantity minus the net mint since the horizon; `detail` names the unit and the amounts. | Drop the database and build again; report it if it repeats. |
-| `provider_mint_while_quantity_read` | A mint or burn of an asset of the build landed between the two readings of the provider's tip around the quantities and their histories. | Drop the database and build again. |
-| `provider_mint_history_mismatch` | At one tip of the provider, an asset's history (`/assets/{unit}/history`) lists another number of mints and burns than the asset's answer counts; `detail` names the unit and both numbers. | Run the same command again; report it if it repeats. |
+| `provider_mint_history_mismatch` | An asset's history (`/assets/{unit}/history`) and its answer (`/assets/{unit}`) did not agree in five readings: a transaction listed twice, another number of rows than the answer's `mint_or_burn_count`, or amounts that do not add up to its quantity; `detail` names the unit and the numbers. | Run the same command again: the assets already read are kept. Report it if it repeats. |
 | `rebuild_refused` | A check closed the gate of the build in the database (`asset_conservation` or another), so it cannot go on. | Drop the database and build again; report the check's `last_error` if it repeats. |
 | `rebuild_plan_mismatch` | The database holds a stopped build started with other choices: `detail.stored` and `detail.given`. | Run the build with the stored choices, or drop the database. |
 | `target_above_provider_final` | `--target-block` is above the provider's tip minus k. | Give a lower target, or leave it out. |

@@ -231,41 +231,32 @@ impl Build<'_> {
         Ok(counts)
     }
 
+    /// Proof: for every unit that has a reading, the unspent amount at H
+    /// equals the provider's quantity minus the mints and plus the burns of
+    /// its history whose transactions are placed from H on, by a list from
+    /// H on or by their own answer, whatever their height: the quantity holds
+    /// every event of the history. Returns the supply at H of the fixed
+    /// units.
     async fn proof(
         &mut self,
         unspent: &BTreeMap<(String, u16), (Content, Place)>,
     ) -> Result<BTreeMap<String, String>, Error> {
-        let quantities = self.items("quantity").await?;
+        let readings = self.items("quantity").await?;
         let since: BTreeMap<String, Place> = self.typed("since").await?;
+        let fixed = fixed_units(self.profile);
         let mut supply = BTreeMap::new();
-        for unit in fixed_units(self.profile) {
+        for (unit, reading) in &readings {
             let at_horizon: u128 = unspent
                 .values()
-                .map(|(content, _)| content.quantity(&unit))
+                .map(|(content, _)| content.quantity(unit))
                 .sum();
-            let reading = &quantities[&unit];
             let quantity: i128 = reading["quantity"]
                 .as_str()
                 .map_or(Ok(0), str::parse)
                 .map_err(|_| Error::answer("provider_quantity_invalid", json!({"unit": unit})))?;
-            let tip_before = reading["tip_before"].as_u64().unwrap_or_default();
-            let tip_after = reading["tip_after"].as_u64().unwrap_or_default();
-            // The mints and burns from H on, from the unit's history: every
-            // one of them is a transaction from H on, placed by a list or by
-            // its own answer; one that is not is below H.
             let mut minted: i128 = 0;
             for event in Event::of(reading)? {
-                let Some(place) = since.get(&event.tx) else {
-                    continue;
-                };
-                let height = u64::from(place.height);
-                if height > tip_before && height <= tip_after {
-                    return Err(Error::answer(
-                        "provider_mint_while_quantity_read",
-                        json!({"unit": unit, "transaction": event.tx}),
-                    ));
-                }
-                if height <= tip_before {
+                if since.contains_key(&event.tx) {
                     minted += event.quantity()?;
                 }
             }
@@ -274,11 +265,17 @@ impl Build<'_> {
                 return Err(check(
                     "rebuild_supply_mismatch",
                     json!({"unit": unit, "unspent_at_horizon": at_horizon.to_string(),
-                        "provider_quantity": quantity.to_string(), "net_mint_since_horizon": minted.to_string(),
-                        "provider_tip": tip_before}),
+                        "provider_quantity": quantity.to_string(), "net_mint_since_horizon": minted.to_string()}),
                 ));
             }
-            supply.insert(unit, at_horizon.to_string());
+            if fixed.contains(unit) {
+                supply.insert(unit.clone(), at_horizon.to_string());
+            }
+        }
+        for unit in &fixed {
+            if !supply.contains_key(unit) {
+                return Err(refusal("rebuild_reading_missing", json!({"unit": unit})));
+            }
         }
         Ok(supply)
     }

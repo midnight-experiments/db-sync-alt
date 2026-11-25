@@ -22,7 +22,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -811,6 +811,12 @@ enum BurnAt {
 /// output; the other blocks are empty except for the case's transactions.
 /// Returns the chain and the burning transaction.
 fn burn_chain(profile: &Profile, at: BurnAt) -> (Generated, String) {
+    let (s, burn) = burn_script(profile, at);
+    (s.g, burn)
+}
+
+/// The script of `burn_chain`, to which a test may add blocks.
+fn burn_script(profile: &Profile, at: BurnAt) -> (Script, String) {
     let ordinary = |index: u8| {
         let mut key = [0x6b; 28];
         key[0] = index;
@@ -868,7 +874,7 @@ fn burn_chain(profile: &Profile, at: BurnAt) -> (Generated, String) {
             burn = hashes[0].clone();
         }
     }
-    (s.g, burn)
+    (s, burn)
 }
 
 /// The burn chain of `at` converted at H and T and built from the provider
@@ -958,6 +964,360 @@ async fn a_mint_and_a_complete_burn_since_the_horizon_give_the_conversion() -> R
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_complete_burn_below_the_horizon_gives_the_conversion() -> Result {
     burn_case(BurnAt::BelowHorizon).await
+}
+
+// ----- the readings of the units ------------------------------------------------
+
+/// The scripted chain `g` converted at the edge chain's H and T and built
+/// from `fake` into a new database: equal content and state digests,
+/// supply and position, and the same rows table by table.
+async fn built_equal(profile: &Profile, g: &Generated, fake: &Fake, name: &str) -> Result<Report> {
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(profile, g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, profile).await?;
+    let (_stopper, stop) = Stop::new();
+    let report = build(profile, fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("{name}: {}", error.report()))?;
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    if let Err(error) = same(&report.verified, &conversion, name) {
+        return Err(format!("{error}; rows {rows}").into());
+    }
+    if rows != json!({}) {
+        return Err(format!("{name}: rows differ: {rows}").into());
+    }
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await?;
+    Ok(report)
+}
+
+/// A hook that rewrites the rows of a list answer whose path holds `part`
+/// while `on` is set.
+fn rows_hook(
+    part: String,
+    on: Arc<AtomicBool>,
+    change: impl Fn(&mut Vec<serde_json::Value>) + Send + Sync + 'static,
+) -> Hook {
+    Arc::new(move |path: &str, chain: &mut Chain, _| {
+        if !on.load(Ordering::SeqCst) || !path.contains(&part) {
+            return None;
+        }
+        let mut rows: Vec<serde_json::Value> =
+            serde_json::from_str(&chain.answer(path).body).ok()?;
+        change(&mut rows);
+        Some(Behavior::json(serde_json::Value::Array(rows)))
+    })
+}
+
+/// A history answered without its burn disagrees with the quantity in
+/// every reading: after five the build ends with
+/// `provider_mint_history_mismatch` and nothing serves; the same command
+/// with honest answers then publishes the conversion's digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_history_without_its_burn_refuses_until_it_is_whole() -> Result {
+    let profile = profile(1);
+    let (g, burn) = burn_chain(&profile, BurnAt::AfterTarget);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let history = format!("/assets/{}/history?", profile.assets.cnight.unit());
+    let cut = Arc::new(AtomicBool::new(true));
+    let hook = rows_hook(history.clone(), cut.clone(), move |rows| {
+        rows.retain(|row| row["tx_hash"] != burn.as_str());
+    });
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), Some(hook)).await;
+    let (_stopper, stop) = Stop::new();
+    let error = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("a history without its burn was taken")?;
+    let readings = fake.requests(&history);
+    assert_eq!(
+        code(&error),
+        "provider_mint_history_mismatch",
+        "{}",
+        error.report()
+    );
+    assert!(!serving(&rebuilt).await?, "the database serves");
+    assert_eq!(readings, 5, "readings of the history");
+    cut.store(false, Ordering::SeqCst);
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("continued: {}", error.report()))?;
+    same(
+        &report.verified,
+        &conversion,
+        "continued with honest answers",
+    )?;
+    println!(
+        "{}",
+        json!({"event":"history_without_its_burn","refusal":error.report(),"readings":readings,
+            "continued_digest":report.verified.content_digest})
+    );
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// A mint joins the chain between the first reading of cNIGHT's history
+/// and its quantity: the two disagree, cNIGHT is read again, and the build
+/// equals the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_event_between_a_history_and_its_quantity_is_read_again() -> Result {
+    let profile = profile(1);
+    let (mut s, _) = burn_script(&profile, BurnAt::AfterTarget);
+    let cnight = profile.assets.cnight.clone();
+    let tx = s.tx().mint(&cnight.policy, &cnight.name, 3).output(
+        Output::new(enterprise_address(1, [0x2e; 28]), 1_700_000).token(
+            &cnight.policy,
+            &cnight.name,
+            3,
+        ),
+    );
+    s.block(vec![tx]);
+    let g = s.g;
+    let late = g.blocks.last().expect("a block").clone();
+    let quantity = format!("/api/v0/assets/{}", cnight.unit());
+    let joined = Arc::new(AtomicBool::new(false));
+    let hook: Hook = {
+        let joined = joined.clone();
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if path == quantity && !joined.swap(true, Ordering::SeqCst) {
+                chain.blocks_mut().push(late.clone());
+            }
+            None
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), Some(hook)).await;
+    let report = built_equal(&profile, &g, &fake, "event between the readings").await?;
+    let history = fake.requests(&format!("/assets/{}/history?", cnight.unit()));
+    println!(
+        "{}",
+        json!({"event":"event_between_readings","history_readings":history,"calls":report.calls})
+    );
+    assert!(joined.load(Ordering::SeqCst), "no block joined");
+    assert_eq!(history, 2, "readings of the history");
+    Ok(())
+}
+
+/// Mainnet profile, k 12, the edge chain's H, T and length. Heights 1–17:
+/// 101 transactions that each mint 1 cNIGHT into an output of their own at
+/// an ordinary address, so that cNIGHT's history has two pages; at each
+/// height of `burns` a transaction spends one of those outputs and burns it
+/// whole. Returns the chain and the burning transactions in that order.
+fn mints_chain(profile: &Profile, burns: &[u32]) -> (Generated, Vec<String>) {
+    let ordinary = |index: u8| {
+        let mut key = [0x1f; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let cnight = profile.assets.cnight.clone();
+    let mut s = Script::new();
+    let mut minted = Vec::new();
+    for block in 0..17_u32 {
+        let mut transactions = Vec::new();
+        for slot in 0..6_u32 {
+            let n = block * 6 + slot;
+            if n >= 101 {
+                break;
+            }
+            transactions.push(s.tx().mint(&cnight.policy, &cnight.name, 1).output(
+                Output::new(ordinary((n % 7) as u8), 1_500_000 + u64::from(n)).token(
+                    &cnight.policy,
+                    &cnight.name,
+                    1,
+                ),
+            ));
+        }
+        minted.extend(s.block(transactions));
+    }
+    let mut burnt = Vec::new();
+    for height in 18..=EDGE_END {
+        let transaction = burns.contains(&height).then(|| {
+            s.tx()
+                .input(&minted[burnt.len()], 0)
+                .mint(&cnight.policy, &cnight.name, -1)
+                .output(Output::new(ordinary(8), 1_300_000))
+        });
+        let hashes = s.block(transaction.into_iter().collect());
+        if burns.contains(&height) {
+            burnt.push(hashes[0].clone());
+        }
+    }
+    (s.g, burnt)
+}
+
+/// A history of two pages: 101 mints below H and a complete burn at H + 2.
+/// Both pages are read and the build equals the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_history_of_two_pages_gives_the_conversion() -> Result {
+    let profile = profile(1);
+    let (g, _) = mints_chain(&profile, &[EDGE_HORIZON + 2]);
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), None).await;
+    built_equal(&profile, &g, &fake, "history of two pages").await?;
+    let second = format!(
+        "/assets/{}/history?count=100&page=2",
+        profile.assets.cnight.unit()
+    );
+    assert!(fake.requests(&second) > 0, "no request {second}");
+    Ok(())
+}
+
+/// A history in which the burn after T is answered as a second copy of the
+/// burn below H, of the same amount: the count and the sum agree with the
+/// quantity, a transaction occurs twice, and the build refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_history_with_a_row_answered_twice_refuses() -> Result {
+    let profile = profile(1);
+    let (g, burns) = mints_chain(&profile, &[20, 45]);
+    let (below, after) = (burns[0].clone(), burns[1].clone());
+    let hook = rows_hook(
+        format!("/assets/{}/history?", profile.assets.cnight.unit()),
+        Arc::new(AtomicBool::new(true)),
+        move |rows| {
+            let copy = rows
+                .iter()
+                .find(|row| row["tx_hash"] == below.as_str())
+                .cloned();
+            if let (Some(copy), Some(row)) = (
+                copy,
+                rows.iter_mut().find(|row| row["tx_hash"] == after.as_str()),
+            ) {
+                *row = copy;
+            }
+        },
+    );
+    let (error, serves) = refused(&profile, &g, hook).await?;
+    println!(
+        "{}",
+        json!({"event":"history_row_twice","refusal":error.report(),"serving":serves})
+    );
+    assert_eq!(
+        code(&error),
+        "provider_mint_history_mismatch",
+        "{}",
+        error.report()
+    );
+    assert_eq!(error.report()["detail"]["distinct_transactions"], false);
+    assert!(!serves, "the database serves");
+    Ok(())
+}
+
+/// The burn after T is placed by its own answer at a height above the
+/// provider's tip: its amount is still taken from the quantity, its input is
+/// read, and the build equals the conversion. Answered 404 for its inputs, it
+/// refuses the build instead of publishing one without the burnt output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_burn_placed_above_the_tip_is_counted() -> Result {
+    let profile = profile(1);
+    let (g, burn) = burn_chain(&profile, BurnAt::AfterTarget);
+    let placed = format!("/api/v0/txs/{burn}");
+    let higher: Hook = {
+        let placed = placed.clone();
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if path != placed {
+                return None;
+            }
+            let mut answer: serde_json::Value =
+                serde_json::from_str(&chain.answer(path).body).ok()?;
+            answer["block_height"] = json!(EDGE_END + 1);
+            Some(Behavior::json(answer))
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), Some(higher.clone())).await;
+    built_equal(&profile, &g, &fake, "burn placed above the tip").await?;
+    assert!(fake.requests(&placed) > 0, "the burn was not asked for");
+    let unanswered: Hook = {
+        let inputs = format!("{placed}/utxos");
+        Arc::new(move |path: &str, chain: &mut Chain, now| {
+            if path == inputs {
+                return Some(Behavior::status(404));
+            }
+            higher(path, chain, now)
+        })
+    };
+    let (error, serves) = refused(&profile, &g, unanswered).await?;
+    println!(
+        "{}",
+        json!({"event":"burn_above_the_tip","unanswered":error.report(),"serving":serves})
+    );
+    assert_eq!(
+        code(&error),
+        "provider_transaction_unknown",
+        "{}",
+        error.report()
+    );
+    assert!(!serves, "the database serves");
+    Ok(())
+}
+
+/// A council-policy token of another name at an ordinary address, never
+/// spent, missing from its unit's unspent listing: the proof runs for every
+/// unit that has a reading and refuses naming that unit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_governance_output_missing_from_its_listing_refuses_the_build() -> Result {
+    let profile = profile(1);
+    let ordinary = |index: u8| {
+        let mut key = [0x48; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let cnight = profile.assets.cnight.clone();
+    let council = profile.assets.council.policy.clone();
+    let mut s = Script::new();
+    let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
+            &cnight.policy,
+            &cnight.name,
+            2,
+        ));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    for height in 2..=EDGE_END {
+        let transaction = match height {
+            6 => Some(
+                s.tx()
+                    .mint(&council, "01", 1)
+                    .output(Output::new(ordinary(8), 2_000_000).token(&council, "01", 1)),
+            ),
+            10 | 35 => Some(s.tx().input(&minted, (height / 10) as u16).output(
+                Output::new(ordinary(5), 1_400_000).token(&cnight.policy, &cnight.name, 2),
+            )),
+            _ => None,
+        };
+        s.block(transaction.into_iter().collect());
+    }
+    let unit = format!("{council}01");
+    let hook = rows_hook(
+        format!("/assets/{unit}/utxos?"),
+        Arc::new(AtomicBool::new(true)),
+        |rows| rows.clear(),
+    );
+    let (error, serves) = refused(&profile, &s.g, hook).await?;
+    println!(
+        "{}",
+        json!({"event":"governance_output_missing","refusal":error.report(),"serving":serves})
+    );
+    assert_eq!(
+        code(&error),
+        "rebuild_supply_mismatch",
+        "{}",
+        error.report()
+    );
+    assert_eq!(error.report()["detail"]["unit"], unit.as_str());
+    assert!(!serves, "the database serves");
+    Ok(())
 }
 
 // ----- phase-2-invalid transactions ------------------------------------------
@@ -1214,10 +1574,11 @@ fn code(error: &follow::Error) -> String {
         .to_owned()
 }
 
-/// A listing that lacks an output (the supply proof), a list of
-/// transactions that lacks one whose input the window spends (conservation)
-/// and a provider total that does not match (the supply proof) each refuse
-/// the build; the gate stays closed.
+/// A listing that lacks an output (the supply proof), the lists lacking the
+/// window's spend of a council-policy token of another name (the proof of
+/// that unit, before the window) and a provider total that does not match
+/// the asset's history (the reading) each refuse the build; the gate stays
+/// closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn incomplete_answers_refuse_the_build_and_nothing_serves() -> Result {
@@ -1252,7 +1613,8 @@ async fn incomplete_answers_refuse_the_build_and_nothing_serves() -> Result {
             .collect();
         Some(Behavior::json(serde_json::Value::Array(kept)))
     });
-    // A total one unit above the outputs.
+    // A total one unit above the outputs: the history does not add up to
+    // it, so the reading refuses before the proof.
     let total = format!("/api/v0/assets/{cnight}");
     let wrong_total: Hook = Arc::new(move |path: &str, chain: &mut Chain, _| {
         if path != total {
@@ -1273,12 +1635,12 @@ async fn incomplete_answers_refuse_the_build_and_nothing_serves() -> Result {
         (
             "missing_transaction",
             missing_transaction,
-            "asset_conservation",
+            "rebuild_supply_mismatch",
         ),
         (
             "wrong_provider_total",
             wrong_total,
-            "rebuild_supply_mismatch",
+            "provider_mint_history_mismatch",
         ),
     ] {
         let (error, serves) = refused(&profile, &edges.g, hook).await?;
