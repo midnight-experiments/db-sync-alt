@@ -294,7 +294,8 @@ impl Provider {
     }
 
     /// One page of `/assets/{unit}/utxos`, oldest first, restricted to
-    /// outputs created in `heights`.
+    /// outputs created in `heights`: valid rows, each output once, in
+    /// ascending order of their heights.
     pub async fn asset_outputs(
         &self,
         unit: &Unit,
@@ -308,13 +309,18 @@ impl Provider {
                 heights.from.is_some_and(|from| height < from)
                     || heights.to.is_some_and(|to| height > to)
             })
-        }) {
+        }) || !rows
+            .windows(2)
+            .all(|pair| pair[0].block_height <= pair[1].block_height)
+            || !outputs_valid(&rows)
+        {
             return Err(self.invalid("provider_invalid_response"));
         }
         Ok(rows)
     }
 
-    /// One page of `/addresses/{address}/utxos`, oldest first.
+    /// One page of `/addresses/{address}/utxos`, oldest first: valid rows of
+    /// the address, each output once.
     pub async fn address_outputs(
         &self,
         address: &AddressText,
@@ -323,7 +329,7 @@ impl Provider {
         let rows: Vec<ListedOutput> = self
             .list_page(&paged(&format!("/addresses/{address}/utxos"), page, false))
             .await?;
-        if rows.iter().any(|row| row.address != address.to_string()) {
+        if rows.iter().any(|row| row.address != address.to_string()) || !outputs_valid(&rows) {
             return Err(self.invalid("provider_invalid_response"));
         }
         Ok(rows)
@@ -343,7 +349,7 @@ impl Provider {
             page,
             descending,
         )?;
-        self.checked_transactions(&path, heights).await
+        self.checked_transactions(&path, heights, descending).await
     }
 
     /// One page of `/addresses/{address}/transactions` in `heights`.
@@ -360,20 +366,30 @@ impl Provider {
             page,
             descending,
         )?;
-        self.checked_transactions(&path, heights).await
+        self.checked_transactions(&path, heights, descending).await
     }
 
+    /// A page of a transaction list: rows in `heights`, at places a
+    /// positional ID can hold, each place once and in the asked order.
     async fn checked_transactions(
         &self,
         path: &str,
         heights: Heights,
+        descending: bool,
     ) -> Result<Vec<ListedTransaction>, Error> {
         let rows: Vec<ListedTransaction> = self.list_page(path).await?;
+        let place = |row: &ListedTransaction| (row.block_height, row.tx_index);
         if rows.iter().any(|row| {
             row.block_height >= HEIGHT_LIMIT
                 || row.tx_index >= u32::from(dsa_chain::ids::INDEX_LIMIT)
                 || heights.from.is_some_and(|from| row.block_height < from)
                 || heights.to.is_some_and(|to| row.block_height > to)
+        }) || !rows.windows(2).all(|pair| {
+            if descending {
+                place(&pair[0]) > place(&pair[1])
+            } else {
+                place(&pair[0]) < place(&pair[1])
+            }
         }) {
             return Err(self.invalid("provider_invalid_response"));
         }
@@ -392,9 +408,9 @@ impl Provider {
             return Ok(None);
         };
         let answer: TransactionUtxos = self.parsed(parse::json(&body))?;
-        if answer.hash != *transaction {
-            return Err(self.invalid("provider_invalid_response"));
-        }
+        answer
+            .validate(transaction)
+            .map_err(|code| self.invalid(code))?;
         Ok(Some(answer))
     }
 
@@ -495,6 +511,13 @@ impl Provider {
         }
         Ok(Some(header))
     }
+}
+
+/// Valid rows of an output list, each output once.
+fn outputs_valid(rows: &[ListedOutput]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .all(|row| row.valid() && seen.insert((&row.tx_hash, row.output_index)))
 }
 
 /// A list path with a height range: `from` and `to` are block heights.

@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use super::{
     Build,
-    asker::{check, invalid, refusal},
+    asker::{check, index16, invalid, refusal},
     content::{Carried, Content, Event, Place},
 };
 use crate::follow::Error;
@@ -79,7 +79,7 @@ impl Build<'_> {
             if !self.rule.allows(&policy, &name) {
                 continue;
             }
-            let ordinal = u16::try_from(ordinal).unwrap_or(u16::MAX);
+            let ordinal = index16(ordinal)?;
             rows.ma_tx_out.push(AssetRow {
                 id: ids::asset_id(place.height, place.index, point.1, ordinal).map_err(invalid)?,
                 quantity: quantity.to_string(),

@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 
 use super::{
     BATCH, Build,
-    asker::{PASSES, every_page, info, stable, transactions_page, utxos},
-    content::{Content, Event, Made, Moved, Spent, outpoint},
+    asker::{PASSES, every_page, index16, info, stable, transactions_page, utxos},
+    content::{Content, Event, Moved, Spent, outpoint},
     progress::{Cursor, parse, to_value},
 };
 use crate::follow::Error;
@@ -521,7 +521,7 @@ impl Build<'_> {
         let mut batch = Vec::new();
         while let Some(result) = answers.next().await {
             let (transaction, answer) = result?;
-            let moved = self.moved(answer);
+            let moved = self.moved(answer)?;
             batch.push((transaction, to_value(moved)?));
             if batch.len() >= BATCH {
                 self.put("moved", std::mem::take(&mut batch)).await?;
@@ -530,40 +530,25 @@ impl Build<'_> {
         self.put("moved", batch).await
     }
 
-    fn moved(&self, answer: TransactionUtxos) -> Moved {
+    /// The inputs of a transaction from H on, with the content of the
+    /// relevant ones and of collateral inputs.
+    fn moved(&self, answer: TransactionUtxos) -> Result<Moved, Error> {
         let inputs = answer
             .inputs
             .iter()
             .map(|row| {
                 let content = Content::of_input(row);
                 let keep = row.collateral || self.relevant(&content);
-                Spent {
+                Ok(Spent {
                     tx_hash: row.tx_hash.to_string(),
-                    index: u16::try_from(row.output_index).unwrap_or(u16::MAX),
+                    index: index16(row.output_index)?,
                     collateral: row.collateral,
                     reference: row.reference,
                     content: keep.then_some(content),
-                }
+                })
             })
-            .collect();
-        let outputs = answer
-            .outputs
-            .iter()
-            .map(|row| Made {
-                index: u16::try_from(row.output_index).unwrap_or(u16::MAX),
-                collateral: row.collateral,
-                amount: row
-                    .amount
-                    .iter()
-                    .filter(|amount| {
-                        amount.unit != "lovelace"
-                            && self.rule.allows(&amount.unit[..56], &amount.unit[56..])
-                    })
-                    .cloned()
-                    .collect(),
-            })
-            .collect();
-        Moved { inputs, outputs }
+            .collect::<Result<_, Error>>()?;
+        Ok(Moved { inputs })
     }
 
     /// The original content of every collateral input from H on whose

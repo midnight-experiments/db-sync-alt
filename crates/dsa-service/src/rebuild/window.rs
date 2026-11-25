@@ -14,7 +14,7 @@ use tokio::sync::watch;
 
 use super::{
     Build,
-    asker::{hash32, info, invalid, utxos},
+    asker::{hash32, index16, info, invalid, utxos},
     content::{Content, NewestSpend, Place},
 };
 use crate::follow::{self, Connect, Error, Progress, Settings};
@@ -214,9 +214,9 @@ impl Build<'_> {
             tx: transaction,
             place,
             valid: spender.valid_contract,
-            ordinal: u16::try_from(ordinal).unwrap_or(u16::MAX),
+            ordinal: index16(ordinal)?,
             origin: origin.clone(),
-            origin_index: u16::try_from(*origin_index).unwrap_or(u16::MAX),
+            origin_index: index16(*origin_index)?,
             origin_place: Place {
                 height: origin_info.block_height,
                 index: origin_info.index as u16,

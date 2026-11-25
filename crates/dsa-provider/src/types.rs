@@ -395,6 +395,28 @@ pub struct ListedOutput {
     pub inline_datum: Option<Hex>,
 }
 
+/// The amounts of one row of the lists and of `/txs/{hash}/utxos`: lovelace
+/// once, and each native unit once as a policy and a name in lowercase
+/// hexadecimal.
+fn amounts_valid(amounts: &[AssetAmount]) -> bool {
+    let mut units = std::collections::HashSet::new();
+    amounts.iter().all(|amount| {
+        units.insert(amount.unit.as_str())
+            && (amount.unit == "lovelace"
+                || ((56..=120).contains(&amount.unit.len()) && hex(&amount.unit)))
+    }) && units.contains("lovelace")
+}
+
+impl ListedOutput {
+    /// An address, an output index that a positional ID can hold, and valid
+    /// amounts.
+    pub(crate) fn valid(&self) -> bool {
+        !self.address.is_empty()
+            && self.output_index < u32::from(dsa_chain::ids::INDEX_LIMIT)
+            && amounts_valid(&self.amount)
+    }
+}
+
 /// One row of `/assets/{unit}/transactions` or `/addresses/{address}/transactions`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ListedTransaction {
@@ -432,13 +454,55 @@ pub struct UtxoOutput {
     pub consumed_by_tx: Option<Hash32>,
 }
 
-/// `/txs/{hash}/utxos` with its inputs: collateral and reference inputs are
-/// flagged, the collateral return is an output flagged `collateral`.
+/// `/txs/{hash}/utxos` with its inputs. A phase-2-valid transaction: its
+/// inputs, its reference inputs (flagged `reference`) and its collateral
+/// inputs (flagged `collateral`, lovelace only); its outputs and its
+/// collateral return (flagged `collateral`, lovelace only, never spent). A
+/// phase-2-invalid one: its collateral inputs as inputs and its collateral
+/// return as its one output, neither flagged.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TransactionUtxos {
     pub hash: Hash32,
     pub inputs: Vec<InputRow>,
     pub outputs: Vec<UtxoOutput>,
+}
+
+impl TransactionUtxos {
+    /// The transaction asked for; each output index once and each input once
+    /// per role, every index one that a positional ID can hold, every row with
+    /// an address and valid amounts.
+    pub(crate) fn validate(&self, expected: &Hash32) -> Result<(), &'static str> {
+        let limit = u32::from(dsa_chain::ids::INDEX_LIMIT);
+        if self.hash != *expected {
+            return Err("provider_invalid_response");
+        }
+        let mut outputs = std::collections::HashSet::new();
+        for row in &self.outputs {
+            if row.address.is_empty()
+                || row.output_index >= limit
+                || !outputs.insert(row.output_index)
+                || !amounts_valid(&row.amount)
+            {
+                return Err("provider_invalid_response");
+            }
+        }
+        let mut inputs = std::collections::HashSet::new();
+        for row in &self.inputs {
+            if row.address.is_empty()
+                || row.output_index >= limit
+                || !inputs.insert((
+                    &row.tx_hash,
+                    row.output_index,
+                    row.collateral,
+                    row.reference,
+                ))
+                || !amounts_valid(&row.amount)
+            {
+                return Err("provider_invalid_response");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `/txs/{hash}`: the transaction's block, position and phase-2 validity.

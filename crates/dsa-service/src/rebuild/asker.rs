@@ -97,6 +97,14 @@ pub(super) fn hash32(value: &str) -> Result<Hash32, Error> {
         .map_err(|_| Error::answer("invalid_transaction_hash", json!({"hash": value})))
 }
 
+/// An output index, input ordinal or asset ordinal as a positional ID holds
+/// it; the answers are checked to fit before they are used.
+pub(super) fn index16(value: impl TryInto<u16>) -> Result<u16, Error> {
+    value
+        .try_into()
+        .map_err(|_| Error::answer("provider_output_index", json!({})))
+}
+
 /// An answer the build needs: a 404 is asked again with the outcome rules
 /// of every other refused answer, and once that has lasted `fatal_after`
 /// the build ends with `provider_transaction_unknown`.

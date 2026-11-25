@@ -250,3 +250,173 @@ async fn only_a_build_reads_the_spending_transaction_of_an_output() {
         }
     }
 }
+
+/// Answers the backend's queries never give are refused by the calls a build
+/// makes, before any row is used: an amount whose unit is too short, an
+/// output index a positional ID cannot hold, a row given twice, and a page
+/// that is not in the order asked.
+#[tokio::test]
+async fn the_build_calls_refuse_answers_out_of_shape() {
+    let transaction = "24db5990d78fc8c273854fcf4e0e290a419529680d6e6a837104c91f3a3c2f3a";
+    let other = "f74215250265a6d5be00d8e3bf1ecb9dc40e5a85f6c9309c8160be77fea7950f";
+    let address = "addr_test1wraevj382xaeeww85mg5whg75j3evzpq5re33zpkgagzgfsgag5wv";
+    let cnight = "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1";
+    let lovelace = serde_json::json!([{"unit": "lovelace", "quantity": "1000000"}]);
+    let short = serde_json::json!([{"unit": "lovelace", "quantity": "1000000"},
+        {"unit": "abcd", "quantity": "1"}]);
+    let output = |index: u32, amount: &Value| {
+        serde_json::json!({"address": address, "amount": amount, "output_index": index,
+            "data_hash": null, "inline_datum": null, "collateral": false,
+            "reference_script_hash": null, "consumed_by_tx": null})
+    };
+    let input = |amount: &Value| {
+        serde_json::json!({"address": address, "amount": amount, "tx_hash": other,
+            "output_index": 0, "data_hash": null, "inline_datum": null,
+            "reference_script_hash": null, "collateral": false, "reference": false})
+    };
+    let utxos = |inputs: Vec<Value>, outputs: Vec<Value>| {
+        serde_json::json!({"hash": transaction, "inputs": inputs, "outputs": outputs}).to_string()
+    };
+    let listed = |height: u32, index: u32, amount: &Value| {
+        serde_json::json!({"address": address, "tx_hash": transaction, "output_index": index,
+            "amount": amount, "block": other, "block_height": height, "block_time": 1_700_000_000,
+            "data_hash": null, "inline_datum": null, "inline_datum_json": null,
+            "reference_script_hash": null})
+    };
+    let row = |height: u32, index: u32, hash: &str| {
+        serde_json::json!({"tx_hash": hash, "tx_index": index, "block_height": height,
+            "block_time": 1_700_000_000})
+    };
+    let hash: Hash32 = transaction.parse().unwrap();
+    let unit: Unit = cnight.parse().unwrap();
+    let at: AddressText = address.parse().unwrap();
+    let range = Heights {
+        from: Some(1),
+        to: Some(100),
+    };
+    let mut refused = Vec::new();
+    // `/txs/{hash}/utxos`
+    for (name, body) in [
+        (
+            "output unit too short",
+            utxos(vec![], vec![output(0, &short)]),
+        ),
+        (
+            "input unit too short",
+            utxos(vec![input(&short)], vec![output(0, &lovelace)]),
+        ),
+        (
+            "output index above the positional limit",
+            utxos(vec![], vec![output(5_000, &lovelace)]),
+        ),
+        (
+            "output given twice",
+            utxos(vec![], vec![output(0, &lovelace), output(0, &lovelace)]),
+        ),
+        (
+            "input given twice",
+            utxos(vec![input(&lovelace), input(&lovelace)], vec![]),
+        ),
+    ] {
+        let (_server, _key, provider) = provider_of(move |_| Behavior::raw(body.clone())).await;
+        refused.push((name, provider.transaction_utxos(&hash).await.err()));
+    }
+    // `/assets/{unit}/utxos` and `/addresses/{address}/utxos`
+    for (name, body) in [
+        (
+            "unit listing not in height order",
+            serde_json::json!([listed(20, 0, &lovelace), listed(10, 1, &lovelace)]),
+        ),
+        (
+            "unit listing with a row given twice",
+            serde_json::json!([listed(10, 0, &lovelace), listed(10, 0, &lovelace)]),
+        ),
+        (
+            "unit listing with a unit too short",
+            serde_json::json!([listed(10, 0, &short)]),
+        ),
+    ] {
+        let body = body.to_string();
+        let (_server, _key, provider) = provider_of(move |_| Behavior::raw(body.clone())).await;
+        refused.push((
+            name,
+            provider
+                .asset_outputs(&unit, range, Page::first())
+                .await
+                .err(),
+        ));
+    }
+    let twice = serde_json::json!([listed(10, 0, &lovelace), listed(10, 0, &lovelace)]).to_string();
+    let (_server, _key, provider) = provider_of(move |_| Behavior::raw(twice.clone())).await;
+    refused.push((
+        "address listing with a row given twice",
+        provider.address_outputs(&at, Page::first()).await.err(),
+    ));
+    // transaction lists, ascending and descending
+    let ascending = serde_json::json!([row(10, 0, transaction), row(11, 2, other)]).to_string();
+    let descending = serde_json::json!([row(11, 2, other), row(10, 0, transaction)]).to_string();
+    for (name, body, descend) in [
+        (
+            "ascending list in descending order",
+            descending.clone(),
+            false,
+        ),
+        (
+            "descending list in ascending order",
+            ascending.clone(),
+            true,
+        ),
+        (
+            "list with a place given twice",
+            serde_json::json!([row(10, 0, transaction), row(10, 0, other)]).to_string(),
+            false,
+        ),
+    ] {
+        let (_server, _key, provider) = provider_of(move |_| Behavior::raw(body.clone())).await;
+        refused.push((
+            name,
+            provider
+                .asset_transactions(&unit, range, Page::first(), descend)
+                .await
+                .err(),
+        ));
+        let (_server, _key, provider) = provider_of({
+            let body = if descend {
+                ascending.clone()
+            } else {
+                descending.clone()
+            };
+            move |_| Behavior::raw(body.clone())
+        })
+        .await;
+        if name != "list with a place given twice" {
+            refused.push((
+                name,
+                provider
+                    .address_transactions(&at, range, Page::first(), descend)
+                    .await
+                    .err(),
+            ));
+        }
+    }
+    let accepted: Vec<_> = refused
+        .iter()
+        .filter(|(_, error)| {
+            error
+                .as_ref()
+                .is_none_or(|e| e.code != "provider_invalid_response")
+        })
+        .map(|(name, error)| format!("{name}: {error:?}"))
+        .collect();
+    assert!(accepted.is_empty(), "not refused: {accepted:#?}");
+    // The answers in shape are read.
+    let (_server, _key, provider) = provider_of(move |_| Behavior::raw(ascending.clone())).await;
+    assert_eq!(
+        provider
+            .asset_transactions(&unit, range, Page::first(), false)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}

@@ -25,8 +25,9 @@ use tokio_postgres::Transaction;
 use crate::{
     Error, Store,
     follow::{
-        BlockRow, Columns, EpochParamRow, FinalBlock, INSERT_ASSET_ROWS, INSERT_DATUMS,
-        INSERT_EPOCH_PARAMS, INSERT_HEADERS, INSERT_INPUTS, INSERT_OUTPUTS, INSERT_TRANSACTIONS,
+        BlockRow, Columns, EpochParamRow, FinalBlock, INSERT_ASSET_ROWS, INSERT_ASSETS,
+        INSERT_DATUMS, INSERT_EPOCH_PARAMS, INSERT_HEADERS, INSERT_INPUTS, INSERT_OUTPUTS,
+        INSERT_TRANSACTIONS,
     },
     horizon, load,
     verify::{self, Checks, Position, ServingState, Verification},
@@ -226,6 +227,14 @@ async fn insert(
             .await?;
     }
     if !c.asset.id.is_empty() {
+        if existing {
+            // Rows added to stored ones (the newest spend below H) bring the
+            // descriptors they need, numbered as the follower numbers new
+            // ones.
+            transaction
+                .execute(INSERT_ASSETS, &[&c.asset.policy, &c.asset.name])
+                .await?;
+        }
         let rows = transaction
             .execute(
                 &format!("{INSERT_ASSET_ROWS}{conflict}"),
@@ -238,7 +247,14 @@ async fn insert(
                 ],
             )
             .await?;
-        if !existing && rows != c.asset.id.len() as u64 {
+        let stored: i64 = transaction
+            .query_one(
+                "SELECT count(*) FROM serve.ma_tx_out WHERE id=ANY($1)",
+                &[&c.asset.id],
+            )
+            .await?
+            .get(0);
+        if (!existing && rows != c.asset.id.len() as u64) || stored != c.asset.id.len() as i64 {
             return Err(Error::Refusal("rebuild_asset_descriptor_missing"));
         }
     }

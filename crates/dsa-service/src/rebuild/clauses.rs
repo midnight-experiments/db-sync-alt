@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::{
     Build,
-    asker::{hash32, info, utxos},
+    asker::{hash32, index16, info, utxos},
     content::{Carried, Content, Place},
     progress::to_value,
 };
@@ -104,13 +104,8 @@ impl Build<'_> {
             .outputs
             .iter()
             .filter(|row| !row.collateral)
-            .map(|row| {
-                (
-                    u16::try_from(row.output_index).unwrap_or(u16::MAX),
-                    Content::of_output(row),
-                )
-            })
-            .collect();
+            .map(|row| Ok((index16(row.output_index)?, Content::of_output(row))))
+            .collect::<Result<_, Error>>()?;
         Ok((info.valid_contract, outputs))
     }
 

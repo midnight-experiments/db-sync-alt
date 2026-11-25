@@ -105,18 +105,10 @@ pub(super) struct Spent {
     pub(super) content: Option<Content>,
 }
 
-/// An output of a transaction from H on: its eligible amounts only.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct Made {
-    pub(super) index: u16,
-    pub(super) collateral: bool,
-    pub(super) amount: Vec<AssetAmount>,
-}
-
+/// The inputs of a transaction from H on.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(super) struct Moved {
     pub(super) inputs: Vec<Spent>,
-    pub(super) outputs: Vec<Made>,
 }
 
 /// An output at a profile address created by a transaction of the

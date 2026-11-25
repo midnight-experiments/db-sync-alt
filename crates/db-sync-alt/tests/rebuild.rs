@@ -1320,6 +1320,57 @@ async fn a_governance_output_missing_from_its_listing_refuses_the_build() -> Res
     Ok(())
 }
 
+/// The newest relevant spend below H, in a window without one, burns the
+/// only council-policy token of another name: the spent output's asset row
+/// needs a descriptor that nothing else of the build stores. The build
+/// writes it with the row, and equals the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn the_newest_spend_below_the_horizon_brings_its_descriptor() -> Result {
+    let profile = profile(1);
+    let ordinary = |index: u8| {
+        let mut key = [0x52; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let cnight = profile.assets.cnight.clone();
+    let council = profile.assets.council.policy.clone();
+    let mut s = Script::new();
+    let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
+            &cnight.policy,
+            &cnight.name,
+            2,
+        ));
+    }
+    s.block(vec![tx]);
+    let mut token = String::new();
+    for height in 2..=EDGE_END {
+        let transaction = match height {
+            6 => Some(
+                s.tx()
+                    .mint(&council, "01", 1)
+                    .output(Output::new(ordinary(8), 2_000_000).token(&council, "01", 1)),
+            ),
+            20 => Some(
+                s.tx()
+                    .input(&token, 0)
+                    .mint(&council, "01", -1)
+                    .output(Output::new(ordinary(9), 1_800_000)),
+            ),
+            _ => None,
+        };
+        let hashes = s.block(transaction.into_iter().collect());
+        if height == 6 {
+            token = hashes[0].clone();
+        }
+    }
+    let fake = Fake::with_chain(edge_chain(&profile, &s.g, EDGE_END), None).await;
+    built_equal(&profile, &s.g, &fake, "newest spend with its descriptor").await?;
+    Ok(())
+}
+
 // ----- phase-2-invalid transactions ------------------------------------------
 
 /// What the invalid-transaction chain's test refers to.
