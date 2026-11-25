@@ -85,6 +85,30 @@ use self::{
 /// Items stored at once.
 const BATCH: usize = 200;
 
+/// Refusals of a build before its window whose cause can be a moment at
+/// which the provider's answers did not fit together: the same command
+/// reads the listings, the readings of the units and the lists from H on
+/// again, and keeps the places, validity answers and other results below H.
+const READ_AGAIN: [&str; 5] = [
+    "rebuild_supply_mismatch",
+    "rebuild_listing_incomplete",
+    "rebuild_address_outputs_mismatch",
+    "provider_tip_left_chain",
+    "provider_transaction_unknown",
+];
+
+/// What is discarded to read the listings again: stored kinds, and cursors
+/// by key prefix.
+const LISTING_KINDS: [&str; 6] = [
+    "unit",
+    "listed",
+    "address_listed",
+    "quantity",
+    "since",
+    "tip",
+];
+const LISTING_CURSORS: [&str; 6] = ["units", "unit:", "address:", "since:", "burns", "history:"];
+
 /// The choices of a build.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -260,7 +284,9 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
 
 /// Builds the database from the provider, or continues a build that
 /// stopped, and publishes it. A build that ends without publishing records
-/// its requests and its error as the stopped service state `status` prints.
+/// its requests and its error as the stopped service state `status` prints;
+/// after a refusal of `READ_AGAIN` before the window, the next run of the
+/// command reads the listings again.
 pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
     let connect = Arc::new(context.connect);
     let recorder = Arc::clone(&connect);
@@ -277,8 +303,20 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
             .unwrap_or("rebuild_failed")
             .to_owned();
         if let Ok(mut store) = recorder().await
-            && store.building_progress().await.ok().flatten().is_some()
+            && let Some(progress) = store.building_progress().await.ok().flatten()
         {
+            if READ_AGAIN.contains(&code.as_str())
+                && phase_index(&progress.phase) < phase_index("window")
+                && store
+                    .discard_building_items(&LISTING_KINDS, &LISTING_CURSORS, Some("listing"))
+                    .await
+                    .is_ok()
+            {
+                eprintln!(
+                    "{}",
+                    json!({"event":"rebuild_listings_discarded","error":code,"phase":progress.phase})
+                );
+            }
             let _ = store.record_calls(&provider.counts()).await;
             let _ = store
                 .record_state("stopped", &code, &json!({}), Some(&report))

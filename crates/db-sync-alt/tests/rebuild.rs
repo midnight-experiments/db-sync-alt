@@ -1854,6 +1854,90 @@ async fn a_spend_that_leaves_the_chain_while_listing_gives_the_conversion() -> R
     source.database.cleanup().await
 }
 
+/// A listing that lacks a cNIGHT output refuses the build in its proof; the
+/// same command, now answered honestly, reads the listings, the readings of
+/// the units and the lists from H on again, keeps the places and validity
+/// answers below H, and publishes the conversion's digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_refused_proof_is_read_again_by_the_same_command() -> Result {
+    let profile = profile(1);
+    let edges = edges(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &edges.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let listing = format!("/assets/{}/utxos?", edges.cnight);
+    let cut = Arc::new(AtomicBool::new(true));
+    let hook = rows_hook(listing.clone(), cut.clone(), |rows| {
+        if !rows.is_empty() && rows.len() < 100 {
+            rows.pop();
+        }
+    });
+    let fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), Some(hook)).await;
+    let (_stopper, stop) = Stop::new();
+    let error = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("a listing without an output was published")?;
+    assert_eq!(
+        code(&error),
+        "rebuild_supply_mismatch",
+        "{}",
+        error.report()
+    );
+    assert!(!serving(&rebuilt).await?, "the database serves");
+    let first = fake.paths();
+    cut.store(false, Ordering::SeqCst);
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("continued: {}", error.report()))?;
+    same(&report.verified, &conversion, "read again")?;
+    let second: Vec<String> = fake.paths()[first.len()..].to_vec();
+    let count = |part: &str, paths: &[String]| paths.iter().filter(|p| p.contains(part)).count();
+    // A list below H read for places: `to` below H without `from`.
+    let below = format!("&to={}", EDGE_HORIZON - 1);
+    let places = |paths: &[String]| {
+        paths
+            .iter()
+            .filter(|p| p.contains("/transactions?") && p.contains(&below) && !p.contains("from="))
+            .count()
+    };
+    // `/txs/{hash}` without `/utxos`: places and validity of single transactions.
+    let single = |paths: &[String]| {
+        paths
+            .iter()
+            .filter(|p| p.contains("/api/v0/txs/") && !p.ends_with("/utxos"))
+            .count()
+    };
+    let outcome = json!({"refusal":error.report(),"resumed":report.resumed,
+        "first_run":{"requests":first.len(),"listing":count(&listing, &first),
+            "histories":count("/history?", &first),"lists_below_h":places(&first),"single_transactions":single(&first)},
+        "second_run":{"requests":second.len(),"listing":count(&listing, &second),
+            "histories":count("/history?", &second),"lists_below_h":places(&second),"single_transactions":single(&second)}});
+    println!("{}", json!({"event":"read_again","outcome":outcome}));
+    assert!(report.resumed);
+    assert!(
+        count(&listing, &second) > 0,
+        "the listing was not read again"
+    );
+    assert!(
+        count("/history?", &second) > 0,
+        "the readings were not read again"
+    );
+    assert_eq!(places(&second), 0, "the places below H were read again");
+    // Only the first mints of the fixed units are asked again: the
+    // validity answers are kept.
+    assert!(
+        single(&second) <= dsa_chain::assets::fixed_units(&profile).len(),
+        "validity was read again: {outcome}"
+    );
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
 /// A provider of another network ends a build at its first request,
 /// before the database changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
