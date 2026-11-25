@@ -31,7 +31,6 @@ impl Build<'_> {
         let since = self.items("since").await?;
         let mut listed: BTreeMap<String, ListedOutput> = self.typed("listed").await?;
         listed.extend(self.typed::<ListedOutput>("address_listed").await?);
-        let origins: BTreeMap<String, Content> = self.typed("origin").await?;
         let moved = self.moved_since().await?;
         let mut candidates = BTreeMap::new();
         for row in listed.values() {
@@ -56,20 +55,23 @@ impl Build<'_> {
                 candidates.insert((transaction, index), content);
             }
         }
+        // The outputs a transaction from H on spent: its inputs not flagged.
+        // A flagged collateral input is an output a valid transaction did not
+        // spend; when relevant it is listed while unspent, or an input of the
+        // transaction that spends it later, which a list from H on names.
         for input in moved.values().flat_map(|moved| moved.inputs.iter()) {
-            if input.reference || since.contains_key(&input.tx_hash) {
+            if input.reference || input.collateral || since.contains_key(&input.tx_hash) {
                 continue;
             }
             let point = (input.tx_hash.clone(), input.index);
             if candidates.contains_key(&point) {
                 continue;
             }
-            let content = if input.collateral {
-                origins.get(&outpoint(&input.tx_hash, input.index)).cloned()
-            } else {
-                input.content.clone()
-            };
-            if let Some(content) = content.filter(|content| self.relevant(content)) {
+            if let Some(content) = input
+                .content
+                .clone()
+                .filter(|content| self.relevant(content))
+            {
                 candidates.insert(point, content);
             }
         }

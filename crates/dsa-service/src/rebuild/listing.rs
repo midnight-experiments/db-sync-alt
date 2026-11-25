@@ -1,6 +1,6 @@
-//! Steps 1 and 2: the relevant unspent outputs listed now, the quantity of
-//! each fixed unit, every transaction from H on with its resolved inputs,
-//! and the original content of collateral inputs.
+//! Steps 1 and 2: the relevant unspent outputs listed now, the quantity and
+//! the mints and burns of each unit, and every transaction from H on with
+//! its resolved inputs.
 //!
 //! The lists from H on are read up to the provider's tip as read after the
 //! address listings, and that block must still be on the chain after them:
@@ -548,14 +548,14 @@ impl Build<'_> {
     }
 
     /// The inputs of a transaction from H on, with the content of the
-    /// relevant ones and of collateral inputs.
+    /// relevant ones.
     fn moved(&self, answer: TransactionUtxos) -> Result<Moved, Error> {
         let inputs = answer
             .inputs
             .iter()
             .map(|row| {
                 let content = Content::of_input(row);
-                let keep = row.collateral || self.relevant(&content);
+                let keep = self.relevant(&content);
                 Ok(Spent {
                     tx_hash: row.tx_hash.to_string(),
                     index: index16(row.output_index)?,
@@ -566,45 +566,6 @@ impl Build<'_> {
             })
             .collect::<Result<_, Error>>()?;
         Ok(Moved { inputs })
-    }
-
-    /// The original content of every collateral input from H on whose
-    /// output is not listed: a collateral row may omit native assets.
-    pub(super) async fn origins(&mut self) -> Result<(), Error> {
-        let since = self.items("since").await?;
-        let mut listed = self.items("listed").await?;
-        listed.extend(self.items("address_listed").await?);
-        let known = self.items("origin").await?;
-        let moved = self.moved_since().await?;
-        let wanted: BTreeSet<(String, u16)> = moved
-            .values()
-            .flat_map(|moved| moved.inputs.iter())
-            .filter(|input| {
-                input.collateral
-                    && !input.reference
-                    && !since.contains_key(&input.tx_hash)
-                    && !listed.contains_key(&outpoint(&input.tx_hash, input.index))
-                    && !known.contains_key(&outpoint(&input.tx_hash, input.index))
-            })
-            .map(|input| (input.tx_hash.clone(), input.index))
-            .collect();
-        for (transaction, index) in wanted {
-            let answer = utxos(&self.asker, &transaction).await?;
-            let row = answer
-                .outputs
-                .iter()
-                .find(|row| row.output_index == u32::from(index))
-                .ok_or_else(|| {
-                    Error::answer(
-                        "provider_origin_unknown",
-                        json!({"transaction": transaction, "index": index}),
-                    )
-                })?;
-            let content = Content::of_output(row);
-            self.put_one("origin", &outpoint(&transaction, index), content)
-                .await?;
-        }
-        Ok(())
     }
 
     /// The resolved transactions of the current lists from H on: answers

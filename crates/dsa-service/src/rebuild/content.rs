@@ -101,7 +101,7 @@ pub(super) struct Spent {
     pub(super) index: u16,
     pub(super) collateral: bool,
     pub(super) reference: bool,
-    /// Kept for relevant and collateral inputs only.
+    /// Kept for relevant inputs only.
     pub(super) content: Option<Content>,
 }
 

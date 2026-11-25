@@ -34,8 +34,7 @@
 //! before the next phase starts, so a stopped build continues where it
 //! stopped.
 //!
-//! The phases by module: `listing` (steps 1 and 2 and the origins of
-//! collateral inputs), `positions` (the unspent outputs at H, their
+//! The phases by module: `listing` (steps 1 and 2), `positions` (the unspent outputs at H, their
 //! creating transactions' places and the second derivation of the profile
 //! addresses' outputs), `validity` (their phase-2 validity),
 //! `clauses` (K4 datums, K5 and K6 carried transactions, K7 and K8 epochs and
@@ -517,7 +516,6 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
             "quantities" => build.quantities().await?,
             "since" => build.since().await?,
             "transactions" => build.transactions().await?,
-            "origins" => build.origins().await?,
             "addresses" => build.addresses().await?,
             "history" => build.history().await?,
             "validity" => build.validity().await?,

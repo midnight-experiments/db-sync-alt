@@ -230,7 +230,6 @@ and of [`verify`](#verify) at its publication. Nothing is served in any case
 | `provider_block_missing` | The provider does not know a block the build asked for by height or hash. | Run the same command again; if the code stays, drop the database and build again. |
 | `provider_fork_point_unknown` | The provider does not know the block below the horizon whose next blocks the build reads. | As above. |
 | `provider_transaction_unknown` | The provider does not know a transaction that one of its lists named. | As above. |
-| `provider_origin_unknown` | The output that a collateral input spends is not in its transaction's answer. | As above. |
 | `provider_position_mismatch` | A transaction's block and position differ between a list and `/txs/{hash}`. | As above. |
 | `provider_list_too_long` | A list has more pages than the build reads. | Report it. |
 | `provider_quantity_invalid` | The provider's quantity of an asset is not a number. | Report it. |

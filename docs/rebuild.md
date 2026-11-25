@@ -67,7 +67,6 @@ only for what it does not hold yet.
 | `quantities` | The provider's quantity and the mints and burns (`/assets/{unit}`, `/assets/{unit}/history`) of each asset unit of the listing and each fixed-supply asset, between two readings of the provider's tip. Each history must hold as many mints and burns as the quantity's answer counts. |
 | `since` | Every transaction from H on that created an output holding a profile asset or touched a profile address (`/assets/{unit}/transactions`, `/addresses/{address}/transactions`), and every mint or burn from H on. A transaction that burns all it spends of an asset is in no list of the asset, only in its history: each burn that no list names is placed by `/txs/{hash}`. |
 | `transactions` | The inputs and outputs of those transactions (`/txs/{hash}/utxos`). |
-| `origins` | The outputs that collateral inputs spend, from their own transactions. |
 | `history` | The full transaction lists of the assets and addresses up to H − 1: the block and position of each transaction that created an output unspent at H. |
 | `validity` | Whether those transactions passed (`/txs/{hash}`), where their outputs do not already tell. |
 | `datums` | A datum the node reads that is not inline in its output (`/scripts/datum/{hash}/cbor`). |
