@@ -1,6 +1,6 @@
 //! The records a build stores about outputs and transactions.
 
-use dsa_provider::types::{AssetAmount, Header, ListedOutput};
+use dsa_provider::types::{AssetAmount, Header, InputRow, ListedOutput, UtxoOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -24,6 +24,39 @@ impl Content {
             data_hash: row.data_hash.as_ref().map(ToString::to_string),
             inline_datum: row.inline_datum.as_ref().map(|bytes| hex::encode(&bytes.0)),
         }
+    }
+
+    /// An output row of `/txs/{hash}/utxos`.
+    pub(super) fn of_output(row: &UtxoOutput) -> Self {
+        Self {
+            address: row.address.clone(),
+            amount: row.amount.clone(),
+            data_hash: row.data_hash.as_ref().map(ToString::to_string),
+            inline_datum: row.inline_datum.as_ref().map(|bytes| hex::encode(&bytes.0)),
+        }
+    }
+
+    /// An input row of `/txs/{hash}/utxos`: the content of the output it
+    /// names.
+    pub(super) fn of_input(row: &InputRow) -> Self {
+        Self {
+            address: row.address.clone(),
+            amount: row.amount.clone(),
+            data_hash: row.data_hash.as_ref().map(ToString::to_string),
+            inline_datum: row.inline_datum.as_ref().map(|bytes| hex::encode(&bytes.0)),
+        }
+    }
+
+    /// The content in a form that does not depend on the order of the
+    /// amounts: address, lovelace, native assets, datum hash, inline datum.
+    pub(super) fn normal(&self) -> Value {
+        json!([
+            self.address,
+            self.lovelace(),
+            self.assets(),
+            self.data_hash,
+            self.inline_datum
+        ])
     }
 
     pub(super) fn lovelace(&self) -> u64 {
@@ -82,9 +115,17 @@ pub(super) struct Made {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(super) struct Moved {
-    pub(super) unknown: bool,
     pub(super) inputs: Vec<Spent>,
     pub(super) outputs: Vec<Made>,
+}
+
+/// An output at a profile address created by a transaction of the
+/// address's list below H, with the transaction that spent it, if any.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct Held {
+    pub(super) index: u16,
+    pub(super) content: Content,
+    pub(super) consumed_by: Option<String>,
 }
 
 /// A mint (positive amount) or burn (negative) of a unit by a transaction,

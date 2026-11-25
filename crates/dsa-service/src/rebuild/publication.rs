@@ -142,7 +142,7 @@ impl Build<'_> {
 
     /// The base: rows below H, supply at H after the proof, the position.
     pub(super) async fn base(&mut self) -> Result<Value, Error> {
-        let (unspent, unplaced) = self.unspent_at_horizon().await?;
+        let unspent = self.unspent_at_horizon().await?;
         let valid: BTreeMap<String, bool> = self.typed("valid").await?;
         let datums = self.items("datum").await?;
         let carried: BTreeMap<String, Vec<Carried>> = self.typed("carried").await?;
@@ -208,7 +208,7 @@ impl Build<'_> {
         let horizon = header("horizon")?;
         let target = header(&format!("chain:{}", self.plan.horizon - 1))?;
         let tip = header(&format!("chain:{}", self.plan.horizon - 1 + k))?;
-        let counts = json!({"unspent_at_horizon": unspent.len(), "unplaced_candidates": unplaced,
+        let counts = json!({"unspent_at_horizon": unspent.len(),
             "transactions": rows.tx.len(), "outputs": rows.tx_out.len(), "asset_rows": rows.ma_tx_out.len(),
             "datums": rows.datum.len(), "headers": block_rows.len(), "markers": markers.len(),
             "carried": carried.values().map(Vec::len).sum::<usize>()});

@@ -29,13 +29,14 @@ pub(super) fn sent(provider: &Provider) -> i64 {
     provider.counts().iter().map(|(_, count)| count).sum()
 }
 
-pub(super) const PHASES: [&str; 14] = [
+pub(super) const PHASES: [&str; 15] = [
     "positions",
     "listing",
     "quantities",
     "since",
     "transactions",
     "origins",
+    "addresses",
     "history",
     "validity",
     "datums",
@@ -210,7 +211,7 @@ mod tests {
     #[test]
     fn phases_run_in_their_order() {
         assert_eq!(phase_index("listing"), 1);
-        assert_eq!(phase_index("window"), 12);
+        assert_eq!(phase_index("window"), 13);
         assert!(
             PHASES
                 .windows(2)

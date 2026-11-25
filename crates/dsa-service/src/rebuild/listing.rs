@@ -1,23 +1,38 @@
 //! Steps 1 and 2: the relevant unspent outputs listed now, the quantity of
 //! each fixed unit, every transaction from H on with its resolved inputs,
 //! and the original content of collateral inputs.
+//!
+//! The lists from H on are read up to the provider's tip as read after the
+//! address listings, and that block must still be on the chain after them:
+//! otherwise a spend the address listings saw may have left the chain with
+//! its block, and the address listings and the lists from H on are read
+//! again.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use dsa_chain::assets::fixed_units;
 use dsa_provider::types::{
-    AddressText, Heights, ListedOutput, ListedTransaction, Page, TransactionUtxos, Unit,
+    AddressText, Header, Heights, ListedOutput, ListedTransaction, Page, TransactionUtxos, Unit,
 };
 use futures_util::StreamExt;
 use serde_json::json;
 
 use super::{
     BATCH, Build,
-    asker::{PASSES, every_page, hash32, stable, transactions_page},
+    asker::{PASSES, every_page, info, stable, transactions_page, utxos},
     content::{Content, Event, Made, Moved, Spent, outpoint},
-    progress::{Cursor, to_value},
+    progress::{Cursor, parse, to_value},
 };
 use crate::follow::Error;
+
+/// Times the address listings and the lists from H on are read again when
+/// the tip they were read up to left the chain.
+const REREADS: usize = 3;
+
+/// The items an address listing and the lists from H on store, discarded
+/// when they are read again: kinds, and cursor keys by prefix.
+const SINCE_KINDS: [&str; 3] = ["address_listed", "since", "tip"];
+const SINCE_CURSORS: [&str; 3] = ["address:", "since:", "burns"];
 
 impl Build<'_> {
     /// The sources of the listings: units and addresses, as `unit:` and
@@ -52,7 +67,7 @@ impl Build<'_> {
         Ok(())
     }
 
-    async fn listed(&mut self, rows: &[ListedOutput]) -> Result<(), Error> {
+    async fn listed(&mut self, kind: &str, rows: &[ListedOutput]) -> Result<(), Error> {
         let items = rows
             .iter()
             .map(|row| {
@@ -62,7 +77,7 @@ impl Build<'_> {
                 ))
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        self.put("listed", items).await
+        self.put(kind, items).await
     }
 
     /// The asset's unspent outputs created below H, in height ranges that
@@ -104,7 +119,7 @@ impl Build<'_> {
                     (self.outputs_at_height(&parsed, from).await?, Some(from + 1))
                 }
             };
-            self.listed(&taken).await?;
+            self.listed("listed", &taken).await?;
             match next {
                 Some(next) => cursor.from = next,
                 None => cursor.done = true,
@@ -137,14 +152,7 @@ impl Build<'_> {
         .await?;
         let mut rows = Vec::new();
         for listed in transactions {
-            let key = listed.tx_hash.clone();
-            let answer = self
-                .asker
-                .ask("outputs", || provider.transaction_utxos(&key))
-                .await?
-                .ok_or_else(|| {
-                    Error::answer("provider_transaction_unknown", json!({"transaction": key}))
-                })?;
+            let answer = utxos(&self.asker, listed.tx_hash.as_str()).await?;
             for output in answer.outputs {
                 let holds = output
                     .amount
@@ -184,7 +192,7 @@ impl Build<'_> {
             },
         )
         .await?;
-        self.listed(&rows).await?;
+        self.listed("address_listed", &rows).await?;
         self.put_one(
             "cursor",
             &key,
@@ -307,19 +315,8 @@ impl Build<'_> {
                 }
             }
         }
-        let provider = self.asker.provider.clone();
         for transaction in wanted {
-            let key = hash32(&transaction)?;
-            let info = self
-                .asker
-                .ask("transactions", || provider.transaction(&key))
-                .await?
-                .ok_or_else(|| {
-                    Error::answer(
-                        "provider_transaction_unknown",
-                        json!({"transaction": transaction}),
-                    )
-                })?;
+            let info = info(&self.asker, &transaction).await?;
             let place = json!({"height": info.block_height, "index": info.index});
             let kind = if info.block_height >= self.plan.horizon {
                 "since"
@@ -331,9 +328,61 @@ impl Build<'_> {
         self.finished("burns").await
     }
 
-    /// Every transaction from H on of each unit and address, in height
-    /// ranges that each fit one answer.
+    /// Every transaction from H on of each unit and address up to the tip
+    /// read after the address listings, in height ranges that each fit one
+    /// answer; then the mints and burns no list names.
     pub(super) async fn since(&mut self) -> Result<(), Error> {
+        let mut rereads = 0;
+        loop {
+            // A reading of the lists stopped while the address listings were
+            // read again continues with them.
+            for address in self.addresses.clone() {
+                self.list_address(&address).await?;
+            }
+            let tip = self.since_tip().await?;
+            self.since_lists(tip.height).await?;
+            let provider = self.asker.provider.clone();
+            let now = self
+                .asker
+                .ask("headers", || provider.block_at(tip.height))
+                .await?;
+            if now.as_ref().is_some_and(|header| header.hash == tip.hash) {
+                break;
+            }
+            if rereads == REREADS {
+                return Err(Error::answer(
+                    "provider_tip_left_chain",
+                    json!({"height": tip.height, "hash": tip.hash, "reads": rereads + 1}),
+                ));
+            }
+            rereads += 1;
+            eprintln!(
+                "{}",
+                json!({"event":"rebuild_tip_left_chain","height":tip.height,"read_again":rereads})
+            );
+            self.store()
+                .await?
+                .discard_building_items(&SINCE_KINDS, &SINCE_CURSORS, None)
+                .await?;
+        }
+        self.place_burns().await
+    }
+
+    /// The provider's tip the lists from H on are read up to, read once.
+    async fn since_tip(&mut self) -> Result<Header, Error> {
+        if let Some(stored) = self.items("tip").await?.remove("since") {
+            return parse(stored);
+        }
+        let provider = self.asker.provider.clone();
+        let tip = self
+            .asker
+            .ask("headers", || provider.latest_block())
+            .await?;
+        self.put_one("tip", "since", &tip).await?;
+        Ok(tip)
+    }
+
+    async fn since_lists(&mut self, tip: u32) -> Result<(), Error> {
         let mut sources: Vec<String> = self
             .units()
             .await?
@@ -349,12 +398,17 @@ impl Build<'_> {
             }
             while !cursor.done {
                 let from = cursor.from;
+                if from > tip {
+                    cursor.done = true;
+                    self.put_one("cursor", &key, &cursor).await?;
+                    break;
+                }
                 let rows = self
                     .transactions_page(
                         &source,
                         Heights {
                             from: Some(from),
-                            to: None,
+                            to: Some(tip),
                         },
                         Page::first(),
                         false,
@@ -372,40 +426,7 @@ impl Build<'_> {
                             Some(last),
                         )
                     } else {
-                        let one = Heights {
-                            from: Some(from),
-                            to: Some(from),
-                        };
-                        let mut last_pass: Option<Vec<ListedTransaction>> = None;
-                        let mut union: BTreeMap<String, ListedTransaction> = BTreeMap::new();
-                        let mut agreed = None;
-                        for _ in 0..PASSES {
-                            let mut pass = Vec::new();
-                            let mut page = Page::first();
-                            loop {
-                                let rows =
-                                    self.transactions_page(&source, one, page, false).await?;
-                                let full = rows.len() >= 100;
-                                pass.extend(rows);
-                                if !full {
-                                    break;
-                                }
-                                page = page.next().ok_or_else(|| {
-                                    Error::answer("provider_list_too_long", json!({}))
-                                })?;
-                            }
-                            if last_pass.as_ref() == Some(&pass) {
-                                agreed = Some(pass);
-                                break;
-                            }
-                            union.extend(
-                                pass.iter()
-                                    .map(|row| (row.tx_hash.to_string(), row.clone())),
-                            );
-                            last_pass = Some(pass);
-                        }
-                        let pass = agreed.unwrap_or_else(|| union.into_values().collect());
-                        (pass, Some(from + 1))
+                        (self.since_at_height(&source, from).await?, Some(from + 1))
                     }
                 };
                 let items = taken
@@ -425,7 +446,46 @@ impl Build<'_> {
                 self.put_one("cursor", &key, &cursor).await?;
             }
         }
-        self.place_burns().await
+        Ok(())
+    }
+
+    /// The transactions of `source` at one height that holds 100 or more of
+    /// them, read in passes until two agree, or the union of the passes.
+    async fn since_at_height(
+        &self,
+        source: &str,
+        height: u32,
+    ) -> Result<Vec<ListedTransaction>, Error> {
+        let one = Heights {
+            from: Some(height),
+            to: Some(height),
+        };
+        let mut last_pass: Option<Vec<ListedTransaction>> = None;
+        let mut union: BTreeMap<String, ListedTransaction> = BTreeMap::new();
+        for _ in 0..PASSES {
+            let mut pass = Vec::new();
+            let mut page = Page::first();
+            loop {
+                let rows = self.transactions_page(source, one, page, false).await?;
+                let full = rows.len() >= 100;
+                pass.extend(rows);
+                if !full {
+                    break;
+                }
+                page = page
+                    .next()
+                    .ok_or_else(|| Error::answer("provider_list_too_long", json!({})))?;
+            }
+            if last_pass.as_ref() == Some(&pass) {
+                return Ok(pass);
+            }
+            union.extend(
+                pass.iter()
+                    .map(|row| (row.tx_hash.to_string(), row.clone())),
+            );
+            last_pass = Some(pass);
+        }
+        Ok(union.into_values().collect())
     }
 
     pub(super) async fn transactions_page(
@@ -446,15 +506,11 @@ impl Build<'_> {
             .into_keys()
             .filter(|hash| !done.contains_key(hash))
             .collect();
-        let provider = self.asker.provider.clone();
         let asker = self.asker.clone();
         let mut answers = futures_util::stream::iter(missing.into_iter().map(|transaction| {
-            let (provider, asker) = (provider.clone(), asker.clone());
+            let asker = asker.clone();
             async move {
-                let key = hash32(&transaction)?;
-                let answer = asker
-                    .ask("outputs", || provider.transaction_utxos(&key))
-                    .await?;
+                let answer = utxos(&asker, &transaction).await?;
                 Ok::<_, Error>((transaction, answer))
             }
         }))
@@ -471,23 +527,12 @@ impl Build<'_> {
         self.put("moved", batch).await
     }
 
-    fn moved(&self, answer: Option<TransactionUtxos>) -> Moved {
-        let Some(answer) = answer else {
-            return Moved {
-                unknown: true,
-                ..Moved::default()
-            };
-        };
+    fn moved(&self, answer: TransactionUtxos) -> Moved {
         let inputs = answer
             .inputs
             .iter()
             .map(|row| {
-                let content = Content {
-                    address: row.address.clone(),
-                    amount: row.amount.clone(),
-                    data_hash: row.data_hash.as_ref().map(ToString::to_string),
-                    inline_datum: row.inline_datum.as_ref().map(|bytes| hex::encode(&bytes.0)),
-                };
+                let content = Content::of_input(row);
                 let keep = row.collateral || self.relevant(&content);
                 Spent {
                     tx_hash: row.tx_hash.to_string(),
@@ -515,20 +560,17 @@ impl Build<'_> {
                     .collect(),
             })
             .collect();
-        Moved {
-            unknown: false,
-            inputs,
-            outputs,
-        }
+        Moved { inputs, outputs }
     }
 
     /// The original content of every collateral input from H on whose
     /// output is not listed: a collateral row may omit native assets.
     pub(super) async fn origins(&mut self) -> Result<(), Error> {
         let since = self.items("since").await?;
-        let listed = self.items("listed").await?;
+        let mut listed = self.items("listed").await?;
+        listed.extend(self.items("address_listed").await?);
         let known = self.items("origin").await?;
-        let moved: BTreeMap<String, Moved> = self.typed("moved").await?;
+        let moved = self.moved_since().await?;
         let wanted: BTreeSet<(String, u16)> = moved
             .values()
             .flat_map(|moved| moved.inputs.iter())
@@ -541,19 +583,8 @@ impl Build<'_> {
             })
             .map(|input| (input.tx_hash.clone(), input.index))
             .collect();
-        let provider = self.asker.provider.clone();
         for (transaction, index) in wanted {
-            let key = hash32(&transaction)?;
-            let answer = self
-                .asker
-                .ask("outputs", || provider.transaction_utxos(&key))
-                .await?
-                .ok_or_else(|| {
-                    Error::answer(
-                        "provider_origin_unknown",
-                        json!({"transaction": transaction}),
-                    )
-                })?;
+            let answer = utxos(&self.asker, &transaction).await?;
             let row = answer
                 .outputs
                 .iter()
@@ -564,15 +595,19 @@ impl Build<'_> {
                         json!({"transaction": transaction, "index": index}),
                     )
                 })?;
-            let content = Content {
-                address: row.address.clone(),
-                amount: row.amount.clone(),
-                data_hash: row.data_hash.as_ref().map(ToString::to_string),
-                inline_datum: row.inline_datum.as_ref().map(|bytes| hex::encode(&bytes.0)),
-            };
+            let content = Content::of_output(row);
             self.put_one("origin", &outpoint(&transaction, index), content)
                 .await?;
         }
         Ok(())
+    }
+
+    /// The resolved transactions of the current lists from H on: answers
+    /// stored for transactions no list names any more are not used.
+    pub(super) async fn moved_since(&mut self) -> Result<BTreeMap<String, Moved>, Error> {
+        let since = self.items("since").await?;
+        let mut moved: BTreeMap<String, Moved> = self.typed("moved").await?;
+        moved.retain(|transaction, _| since.contains_key(transaction));
+        Ok(moved)
     }
 }

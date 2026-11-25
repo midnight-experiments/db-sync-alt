@@ -14,7 +14,7 @@ use tokio::sync::watch;
 
 use super::{
     Build,
-    asker::{hash32, invalid},
+    asker::{hash32, info, invalid, utxos},
     content::{Content, NewestSpend, Place},
 };
 use crate::follow::{self, Connect, Error, Progress, Settings};
@@ -176,19 +176,8 @@ impl Build<'_> {
         transaction: &Hash32,
         place: Place,
     ) -> Result<Option<NewestSpend>, Error> {
-        let key = transaction.clone();
         let transaction = transaction.to_string();
-        let provider = self.asker.provider.clone();
-        let answer = self
-            .asker
-            .ask("outputs", || provider.transaction_utxos(&key))
-            .await?
-            .ok_or_else(|| {
-                Error::answer(
-                    "provider_transaction_unknown",
-                    json!({"transaction": transaction}),
-                )
-            })?;
+        let answer = utxos(&self.asker, &transaction).await?;
         // The transaction's spends are its rows not flagged `reference` or
         // `collateral`: a valid transaction's inputs, an invalid one's
         // collateral, which the provider shows as ordinary inputs.
@@ -196,29 +185,12 @@ impl Build<'_> {
             .inputs
             .iter()
             .filter(|input| !input.reference && !input.collateral)
-            .map(|input| {
-                let content = Content {
-                    address: input.address.clone(),
-                    amount: input.amount.clone(),
-                    data_hash: input.data_hash.as_ref().map(ToString::to_string),
-                    inline_datum: input.inline_datum.as_ref().map(|b| hex::encode(&b.0)),
-                };
-                (input, content)
-            })
+            .map(|input| (input, Content::of_input(input)))
             .collect();
         if !contents.iter().any(|(_, content)| self.relevant(content)) {
             return Ok(None);
         }
-        let info = self
-            .asker
-            .ask("transactions", || provider.transaction(&key))
-            .await?
-            .ok_or_else(|| {
-                Error::answer(
-                    "provider_transaction_unknown",
-                    json!({"transaction": transaction}),
-                )
-            })?;
+        let spender = info(&self.asker, &transaction).await?;
         let mut effective: Vec<_> = contents
             .into_iter()
             .map(|(input, content)| ((input.tx_hash.to_string(), input.output_index), content))
@@ -232,17 +204,7 @@ impl Build<'_> {
         else {
             return Ok(None);
         };
-        let origin_key = hash32(origin)?;
-        let origin_info = self
-            .asker
-            .ask("transactions", || provider.transaction(&origin_key))
-            .await?
-            .ok_or_else(|| {
-                Error::answer(
-                    "provider_transaction_unknown",
-                    json!({"transaction": origin}),
-                )
-            })?;
+        let origin_info = info(&self.asker, origin).await?;
         let content = content.clone();
         if self.needs_datum(&content) && content.inline_datum.is_none() {
             self.fetch_datums(content.data_hash.iter().cloned().collect())
@@ -251,7 +213,7 @@ impl Build<'_> {
         Ok(Some(NewestSpend {
             tx: transaction,
             place,
-            valid: info.valid_contract,
+            valid: spender.valid_contract,
             ordinal: u16::try_from(ordinal).unwrap_or(u16::MAX),
             origin: origin.clone(),
             origin_index: u16::try_from(*origin_index).unwrap_or(u16::MAX),

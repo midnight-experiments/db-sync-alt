@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::{
     Build,
-    asker::hash32,
+    asker::{hash32, info, utxos},
     content::{Carried, Content, Place},
     progress::to_value,
 };
@@ -19,7 +19,7 @@ use crate::{epoch, follow::Error};
 impl Build<'_> {
     /// The datum of each kept output the node reads one for, unless inline.
     pub(super) async fn datums(&mut self) -> Result<(), Error> {
-        let (unspent, _) = self.unspent_at_horizon().await?;
+        let unspent = self.unspent_at_horizon().await?;
         let mut wanted: BTreeSet<String> = unspent
             .values()
             .filter(|(content, _)| self.needs_datum(content) && content.inline_datum.is_none())
@@ -98,28 +98,8 @@ impl Build<'_> {
     /// transaction's outputs and an invalid one's collateral return, and the
     /// transaction's validity.
     async fn created(&self, transaction: &str) -> Result<(bool, Vec<(u16, Content)>), Error> {
-        let key = hash32(transaction)?;
-        let provider = self.asker.provider.clone();
-        let answer = self
-            .asker
-            .ask("outputs", || provider.transaction_utxos(&key))
-            .await?
-            .ok_or_else(|| {
-                Error::answer(
-                    "provider_transaction_unknown",
-                    json!({"transaction": transaction}),
-                )
-            })?;
-        let info = self
-            .asker
-            .ask("transactions", || provider.transaction(&key))
-            .await?
-            .ok_or_else(|| {
-                Error::answer(
-                    "provider_transaction_unknown",
-                    json!({"transaction": transaction}),
-                )
-            })?;
+        let answer = utxos(&self.asker, transaction).await?;
+        let info = info(&self.asker, transaction).await?;
         let outputs = answer
             .outputs
             .iter()
@@ -127,12 +107,7 @@ impl Build<'_> {
             .map(|row| {
                 (
                     u16::try_from(row.output_index).unwrap_or(u16::MAX),
-                    Content {
-                        address: row.address.clone(),
-                        amount: row.amount.clone(),
-                        data_hash: row.data_hash.as_ref().map(ToString::to_string),
-                        inline_datum: row.inline_datum.as_ref().map(|bytes| hex::encode(&bytes.0)),
-                    },
+                    Content::of_output(row),
                 )
             })
             .collect();

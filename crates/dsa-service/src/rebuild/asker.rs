@@ -5,8 +5,12 @@ use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 use dsa_chain::ids;
 use dsa_provider::{
     Kind, Provider,
-    types::{AddressText, Hash32, Heights, ListedTransaction, Page, Unit},
+    types::{
+        AddressText, Hash32, Heights, ListedTransaction, Page, TransactionInfo, TransactionUtxos,
+        Unit,
+    },
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
@@ -93,6 +97,67 @@ pub(super) fn hash32(value: &str) -> Result<Hash32, Error> {
         .map_err(|_| Error::answer("invalid_transaction_hash", json!({"hash": value})))
 }
 
+/// An answer the build needs: a 404 is asked again with the outcome rules
+/// of every other refused answer, and once that has lasted `fatal_after`
+/// the build ends with `provider_transaction_unknown`.
+async fn required<T, F, Fut>(
+    asker: &Asker,
+    family: &'static str,
+    transaction: &str,
+    call: F,
+) -> Result<T, Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<Option<T>, dsa_provider::Error>>,
+{
+    let time = Arc::clone(&asker.time);
+    let answer = asker
+        .ask(family, || {
+            let (answer, time) = (call(), Arc::clone(&time));
+            async move {
+                answer.await?.ok_or_else(|| dsa_provider::Error {
+                    code: "provider_not_found",
+                    kind: Kind::Retry {
+                        until: time.unix_seconds(),
+                    },
+                    http_status: Some(404),
+                })
+            }
+        })
+        .await;
+    match answer {
+        Err(Error::Lasting { seconds, error })
+            if error.report()["error"] == "provider_not_found" =>
+        {
+            Err(Error::answer(
+                "provider_transaction_unknown",
+                json!({"transaction": transaction, "lasted_seconds": seconds}),
+            ))
+        }
+        other => other,
+    }
+}
+
+/// `/txs/{hash}/utxos` of a transaction the build needs.
+pub(super) async fn utxos(asker: &Asker, transaction: &str) -> Result<TransactionUtxos, Error> {
+    let key = hash32(transaction)?;
+    let provider = asker.provider.clone();
+    required(asker, "outputs", transaction, || {
+        provider.transaction_utxos(&key)
+    })
+    .await
+}
+
+/// `/txs/{hash}` of a transaction the build needs.
+pub(super) async fn info(asker: &Asker, transaction: &str) -> Result<TransactionInfo, Error> {
+    let key = hash32(transaction)?;
+    let provider = asker.provider.clone();
+    required(asker, "transactions", transaction, || {
+        provider.transaction(&key)
+    })
+    .await
+}
+
 /// One page of the transaction list of a source, `unit:` or `address:`.
 pub(super) async fn transactions_page(
     asker: &Asker,
@@ -121,6 +186,38 @@ pub(super) async fn transactions_page(
             })
             .await
     }
+}
+
+/// Pages `first`, `first + 1`, … of the list of `source` up to `below`,
+/// `in_flight` of them at once (a list below H no longer changes), up to
+/// and including the first page with fewer than 100 rows. Returns the pages
+/// read and whether the list ended.
+pub(super) async fn pages_below(
+    asker: &Asker,
+    source: &str,
+    below: u32,
+    first: u32,
+    in_flight: usize,
+) -> Result<(Vec<Vec<ListedTransaction>>, bool), Error> {
+    let heights = Heights {
+        from: None,
+        to: Some(below),
+    };
+    let fetches = (first..first + in_flight as u32).map(|number| async move {
+        let page = Page::new(number).map_err(Error::Provider)?;
+        transactions_page(asker, source, heights, page, false).await
+    });
+    let mut stream = futures_util::stream::iter(fetches).buffered(in_flight);
+    let mut pages = Vec::new();
+    while let Some(rows) = stream.next().await {
+        let rows = rows?;
+        let ended = rows.len() < 100;
+        pages.push(rows);
+        if ended {
+            return Ok((pages, true));
+        }
+    }
+    Ok((pages, false))
 }
 
 /// Reads every page of a list (`page` from 1), until a page has fewer than

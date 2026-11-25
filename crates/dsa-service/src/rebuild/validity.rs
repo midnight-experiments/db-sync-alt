@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use futures_util::StreamExt;
 use serde_json::json;
 
-use super::{BATCH, Build, asker::hash32, content::Place};
+use super::{BATCH, Build, asker::info, content::Place};
 use crate::follow::Error;
 
 impl Build<'_> {
@@ -13,7 +13,7 @@ impl Build<'_> {
     /// with two known outputs is valid (a failing one creates one output);
     /// any other is read.
     pub(super) async fn validity(&mut self) -> Result<(), Error> {
-        let (unspent, _) = self.unspent_at_horizon().await?;
+        let unspent = self.unspent_at_horizon().await?;
         let mut outputs: BTreeMap<String, usize> = BTreeMap::new();
         for (transaction, _) in unspent.keys() {
             *outputs.entry(transaction.clone()).or_default() += 1;
@@ -33,28 +33,18 @@ impl Build<'_> {
         }
         self.put("valid", settled).await?;
         let placed: BTreeMap<String, Place> = self.typed("position").await?;
-        let provider = self.asker.provider.clone();
         let asker = self.asker.clone();
         let mut answers = futures_util::stream::iter(wanted.into_iter().map(|transaction| {
-            let (provider, asker) = (provider.clone(), asker.clone());
+            let asker = asker.clone();
             async move {
-                let key = hash32(&transaction)?;
-                let answer = asker
-                    .ask("transactions", || provider.transaction(&key))
-                    .await?;
+                let answer = info(&asker, &transaction).await?;
                 Ok::<_, Error>((transaction, answer))
             }
         }))
         .buffered(self.max_in_flight);
         let mut batch = Vec::new();
         while let Some(result) = answers.next().await {
-            let (transaction, answer) = result?;
-            let info = answer.ok_or_else(|| {
-                Error::answer(
-                    "provider_transaction_unknown",
-                    json!({"transaction": transaction}),
-                )
-            })?;
+            let (transaction, info) = result?;
             let place = placed[&transaction];
             if info.block_height != place.height || info.index != u32::from(place.index) {
                 return Err(Error::answer(

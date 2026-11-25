@@ -1290,6 +1290,208 @@ async fn incomplete_answers_refuse_the_build_and_nothing_serves() -> Result {
     Ok(())
 }
 
+// ----- outputs relevant by their address alone -------------------------------
+
+/// What the reserve chain's tests refer to.
+struct Reserve {
+    g: Generated,
+    /// Height 2: five outputs at the reserve address, without tokens.
+    creator: String,
+    /// Height 35, in the window: spends the reserve output 0.
+    spender: String,
+}
+
+/// Mainnet profile, k 12, the edge chain's H and T. Height 1 mints 10
+/// cNIGHT into five outputs at ordinary addresses; 2: five outputs at the
+/// reserve address without tokens, which only the address makes relevant;
+/// 35: a spend of the reserve output 0; 36: a spend of a cNIGHT output (the
+/// window holds a spend whatever the reserve's); 50, after T: a spend of the
+/// reserve output 1; with `tip_spend`, height 61 spends the reserve output
+/// 3. The other blocks are empty.
+fn reserve_chain(profile: &Profile, tip_spend: bool) -> Reserve {
+    let ordinary = |index: u8| {
+        let mut key = [0x3d; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let reserve = profile.addresses.reserve.clone();
+    let mut s = Script::new();
+    let mut tx = s.tx().mint(&policy, &name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(&policy, &name, 2));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    let mut tx = s.tx();
+    for index in 0..5_u64 {
+        tx = tx.output(Output::to(&reserve, 3_000_000 + index));
+    }
+    let creator = s.block(vec![tx])[0].clone();
+    let mut spender = String::new();
+    let end = if tip_spend { EDGE_END + 1 } else { EDGE_END };
+    for height in 3..=end {
+        let spent = match height {
+            35 => Some(0),
+            50 => Some(1),
+            61 => Some(3),
+            _ => None,
+        };
+        let transaction = match (height, spent) {
+            (36, _) => Some(
+                s.tx()
+                    .input(&minted, 1)
+                    .output(Output::new(ordinary(5), 1_400_000).token(&policy, &name, 2)),
+            ),
+            (_, Some(index)) => Some(
+                s.tx()
+                    .input(&creator, index)
+                    .output(Output::new(ordinary(9), 2_500_000)),
+            ),
+            _ => None,
+        };
+        let hashes = s.block(transaction.into_iter().collect());
+        if height == 35 {
+            spender = hashes[0].clone();
+        }
+    }
+    Reserve {
+        g: s.g,
+        creator,
+        spender,
+    }
+}
+
+/// Lists and answers that miss an output relevant by its address alone
+/// refuse the build, and the gate stays closed: the spend in the window
+/// missing from the address's list from H on (the address's own
+/// derivation from its full list below H keeps the output), the creating
+/// transaction missing from the address's list below H (no list places
+/// the listed outputs), and the spend in the window answered 404 every time
+/// it is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn listings_that_miss_an_address_output_refuse_the_build() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, false);
+    let list = format!("/addresses/{}/transactions?", profile.addresses.reserve);
+    let without = |hidden: String, since: bool| -> Hook {
+        let list = list.clone();
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if !path.contains(&list) || path.contains("from=") != since {
+                return None;
+            }
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(&chain.answer(path).body).ok()?;
+            let kept: Vec<_> = rows
+                .into_iter()
+                .filter(|row| row["tx_hash"] != hidden.as_str())
+                .collect();
+            Some(Behavior::json(serde_json::Value::Array(kept)))
+        })
+    };
+    let unanswered: Hook = {
+        let path = format!("/txs/{}/utxos", chain.spender);
+        Arc::new(move |asked: &str, _: &mut Chain, _| {
+            asked.ends_with(&path).then(|| Behavior::status(404))
+        })
+    };
+    let mut outcomes = Vec::new();
+    for (name, hook, expected) in [
+        (
+            "spend_missing_from_the_list_since_the_horizon",
+            without(chain.spender.clone(), true),
+            "rebuild_address_outputs_mismatch",
+        ),
+        (
+            "creator_missing_from_the_list_below_the_horizon",
+            without(chain.creator.clone(), false),
+            "rebuild_listing_incomplete",
+        ),
+        (
+            "spend_answered_404",
+            unanswered,
+            "provider_transaction_unknown",
+        ),
+    ] {
+        let outcome = match refused(&profile, &chain.g, hook).await {
+            Ok((error, serves)) => {
+                json!({"case":name,"code":code(&error),"error":error.report(),"serving":serves})
+            }
+            Err(error) => json!({"case":name,"code":null,"failure":error.to_string()}),
+        };
+        outcomes.push((expected, outcome));
+    }
+    println!(
+        "{}",
+        json!({"event":"address_refusals","outcomes":outcomes.iter().map(|(_, o)| o).collect::<Vec<_>>()})
+    );
+    for (expected, outcome) in &outcomes {
+        assert_eq!(outcome["code"], *expected, "{outcome}");
+        assert_eq!(outcome["serving"], false, "{outcome}");
+    }
+    Ok(())
+}
+
+/// A tip block that spends an output relevant by its address alone is
+/// served while the listings are read and replaced for good when the lists
+/// from H on begin: the address listing no longer shows the output and no
+/// list names the spend. The tip the lists were read up to has left the
+/// chain, the address listings and the lists from H on are read again, and
+/// the build equals the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_spend_that_leaves_the_chain_while_listing_gives_the_conversion() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, true);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &chain.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let replaced = Arc::new(AtomicUsize::new(0));
+    let hook: Hook = {
+        let replaced = replaced.clone();
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if path.contains("/transactions?")
+                && path.contains("from=33")
+                && replaced.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                let blocks = chain.blocks_mut();
+                let tip = blocks.pop().expect("a tip");
+                blocks.push(generate::alternative(&tip, 7, 0));
+            }
+            None
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END + 1), Some(hook)).await;
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| error.report().to_string())?;
+    if let Err(error) = same(&report.verified, &conversion, "tip spend left the chain") {
+        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+        return Err(format!("{error}; rows {rows}").into());
+    }
+    let listings = fake.requests(&format!(
+        "/addresses/{}/utxos?count=100&page=1",
+        profile.addresses.reserve
+    ));
+    println!(
+        "{}",
+        json!({"event":"tip_spend_left_the_chain","reserve_listings":listings,
+            "tip_checks":fake.requests("/blocks/61"),"calls":report.calls})
+    );
+    assert!(
+        replaced.load(Ordering::SeqCst) > 0,
+        "the tip was not replaced"
+    );
+    // Two passes that agree, then two more after the tip left the chain.
+    assert!(listings >= 4, "the reserve address was not listed again");
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
 /// A provider of another network ends a build at its first request,
 /// before the database changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

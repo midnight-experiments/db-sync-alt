@@ -14,7 +14,11 @@
 //! 3. Unspent at H: the listed outputs and the relevant inputs of those
 //!    transactions, without the outputs they created; each one's creating
 //!    transaction placed below H by the full transaction lists (`to` H − 1),
-//!    its phase-2 validity, its datum.
+//!    its phase-2 validity, its datum. An output whose creating transaction
+//!    no list places refuses the build. The outputs at each profile address
+//!    are derived a second time from the address's full list below H (an
+//!    output there is unspent at H unless a transaction of the list spent
+//!    it) and must be the same.
 //! 4. K5 and K6 from the governance addresses' and the permissioned unit's
 //!    lists read backward from H − 1, K7 and K8 from the epochs, the headers
 //!    H − 1 … H − 1 + k.
@@ -31,8 +35,9 @@
 //! stopped.
 //!
 //! The phases by module: `listing` (steps 1 and 2 and the origins of
-//! collateral inputs), `positions` (the unspent outputs at H and their
-//! creating transactions' places), `validity` (their phase-2 validity),
+//! collateral inputs), `positions` (the unspent outputs at H, their
+//! creating transactions' places and the second derivation of the profile
+//! addresses' outputs), `validity` (their phase-2 validity),
 //! `clauses` (K4 datums, K5 and K6 carried transactions, K7 and K8 epochs and
 //! the headers after H − 1), `publication` (the base, the proof and the
 //! publication), `window` (the window and K10), `progress` (what a build
@@ -364,6 +369,7 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
             "since" => build.since().await?,
             "transactions" => build.transactions().await?,
             "origins" => build.origins().await?,
+            "addresses" => build.addresses().await?,
             "history" => build.history().await?,
             "validity" => build.validity().await?,
             "datums" => {

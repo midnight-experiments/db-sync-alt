@@ -432,6 +432,36 @@ impl Store {
         Ok(())
     }
 
+    /// Discards the stored items of `kinds` and the cursors whose keys start
+    /// with one of `cursors`, so that the build reads them again; with
+    /// `phase` the build continues from that phase. One transaction.
+    pub async fn discard_building_items(
+        &mut self,
+        kinds: &[&str],
+        cursors: &[&str],
+        phase: Option<&str>,
+    ) -> Result<(), Error> {
+        self.lock_writer().await?;
+        let transaction = self.writer_transaction().await?;
+        transaction
+            .execute(
+                "DELETE FROM dsa_rebuild.item WHERE kind=ANY($1)
+                 OR (kind='cursor' AND EXISTS(SELECT 1 FROM unnest($2::text[]) p(prefix) WHERE starts_with(key,p.prefix)))",
+                &[&kinds, &cursors],
+            )
+            .await?;
+        if let Some(phase) = phase {
+            transaction
+                .execute(
+                    "UPDATE dsa_rebuild.progress SET phase=$1,updated_at=clock_timestamp() WHERE id=1",
+                    &[&phase],
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// The number of stored items of each kind, and the stored target.
     pub async fn building_counts(&self) -> Result<(BTreeMap<String, i64>, Option<u32>), Error> {
         let counts = self
