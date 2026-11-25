@@ -108,6 +108,17 @@ const LISTING_KINDS: [&str; 6] = [
 ];
 const LISTING_CURSORS: [&str; 6] = ["units", "unit:", "address:", "since:", "burns", "history:"];
 
+/// Refusals of a listing that misses an output. The answer that missed it
+/// may be on either side of the comparison, so the profile addresses' full
+/// lists below H and the outputs of their transactions, from which their
+/// outputs are derived a second time, are read again with the listings.
+const ADDRESS_HISTORIES_AGAIN: [&str; 2] = [
+    "rebuild_listing_incomplete",
+    "rebuild_address_outputs_mismatch",
+];
+const ADDRESS_HISTORY_KINDS: [&str; 2] = ["address_tx", "held"];
+const ADDRESS_HISTORY_CURSORS: [&str; 1] = ["held:"];
+
 /// The version of the software that begins a build; a build is continued
 /// only by the same version.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -403,15 +414,24 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         {
             if READ_AGAIN.contains(&code.as_str())
                 && phase_index(&progress.phase) < phase_index("window")
-                && store
-                    .discard_building_items(&LISTING_KINDS, &LISTING_CURSORS, Some("listing"))
+            {
+                let histories = ADDRESS_HISTORIES_AGAIN.contains(&code.as_str());
+                let (mut kinds, mut cursors) = (LISTING_KINDS.to_vec(), LISTING_CURSORS.to_vec());
+                if histories {
+                    kinds.extend(ADDRESS_HISTORY_KINDS);
+                    cursors.extend(ADDRESS_HISTORY_CURSORS);
+                }
+                if store
+                    .discard_building_items(&kinds, &cursors, Some("listing"))
                     .await
                     .is_ok()
-            {
-                eprintln!(
-                    "{}",
-                    json!({"event":"rebuild_listings_discarded","error":code,"phase":progress.phase})
-                );
+                {
+                    eprintln!(
+                        "{}",
+                        json!({"event":"rebuild_listings_discarded","error":code,"phase":progress.phase,
+                            "address_histories":histories})
+                    );
+                }
             }
             let _ = store.record_calls(&provider.counts()).await;
             let _ = store

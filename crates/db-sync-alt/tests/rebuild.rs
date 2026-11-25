@@ -1415,7 +1415,9 @@ async fn a_history_with_a_row_answered_twice_refuses() -> Result {
 /// The burn after T is placed by its own answer at a height above the
 /// provider's tip: its amount is still taken from the quantity, its input is
 /// read, and the build equals the conversion. Answered 404 for its inputs, it
-/// refuses the build instead of publishing one without the burnt output.
+/// refuses the build instead of publishing one without the burnt output;
+/// the same command, with its inputs answered, equals the conversion row by
+/// row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_burn_placed_above_the_tip_is_counted() -> Result {
@@ -1437,28 +1439,34 @@ async fn a_burn_placed_above_the_tip_is_counted() -> Result {
     let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), Some(higher.clone())).await;
     built_equal(&profile, &g, &fake, "burn placed above the tip").await?;
     assert!(fake.requests(&placed) > 0, "the burn was not asked for");
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &g, &converted).await?;
+    let on = Arc::new(AtomicBool::new(true));
     let unanswered: Hook = {
-        let inputs = format!("{placed}/utxos");
+        let (inputs, on) = (format!("{placed}/utxos"), on.clone());
         Arc::new(move |path: &str, chain: &mut Chain, now| {
-            if path == inputs {
+            if path == inputs && on.load(Ordering::SeqCst) {
                 return Some(Behavior::status(404));
             }
             higher(path, chain, now)
         })
     };
-    let (error, serves) = refused(&profile, &g, unanswered).await?;
+    let outcome = refused_then_continued(
+        &profile,
+        &g,
+        EDGE_END,
+        (unanswered, on),
+        &converted,
+        &conversion,
+    )
+    .await?;
     println!(
         "{}",
-        json!({"event":"burn_above_the_tip","unanswered":error.report(),"serving":serves})
+        json!({"event":"burn_above_the_tip","unanswered":outcome})
     );
-    assert_eq!(
-        code(&error),
-        "provider_transaction_unknown",
-        "{}",
-        error.report()
-    );
-    assert!(!serves, "the database serves");
-    Ok(())
+    refused_then_equal(&outcome, "provider_transaction_unknown");
+    converted.cleanup().await?;
+    source.database.cleanup().await
 }
 
 /// A council-policy token of another name at an ordinary address, never
@@ -2120,18 +2128,90 @@ fn reserve_chain(profile: &Profile, tip_spend: bool) -> Reserve {
     }
 }
 
+/// `hook` while `on` is set; after, the chain answers alone.
+fn while_on(on: Arc<AtomicBool>, hook: Hook) -> Hook {
+    Arc::new(move |path: &str, chain: &mut Chain, now| {
+        if on.load(Ordering::SeqCst) {
+            hook(path, chain, now)
+        } else {
+            None
+        }
+    })
+}
+
+/// A build of `g`, served through `through`, refused under `hook` at the
+/// edge chain's H and T; then `on` is cleared, which the hook reads, and
+/// the same command runs again on the same database. The outcome: the
+/// refusal's code and report, whether the refused database served, the
+/// requests of each run, and the continued build: its code when it was
+/// refused, else whether it continued the stored build, its difference
+/// from `conversion` (`null` when the digests, supply and position are
+/// equal) and the rows only one side holds (`harness::diff`).
+async fn refused_then_continued(
+    profile: &Profile,
+    g: &Generated,
+    through: u32,
+    (hook, on): (Hook, Arc<AtomicBool>),
+    converted: &Database,
+    conversion: &dsa_store::verify::Verification,
+) -> Result<serde_json::Value> {
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, profile).await?;
+    let fake = Fake::with_chain(edge_chain(profile, g, through), Some(hook)).await;
+    let (_stopper, stop) = Stop::new();
+    let refusal = build(profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop).await;
+    let first = fake.paths().len();
+    let serves = serving(&rebuilt).await?;
+    on.store(false, Ordering::SeqCst);
+    let (_stopper, stop) = Stop::new();
+    let continued = match build(profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop).await {
+        Ok(report) => {
+            let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+            let differs = same(&report.verified, conversion, "continued")
+                .err()
+                .map(|error| error.to_string());
+            json!({"code":null,"resumed":report.resumed,"differs":differs,"rows":rows})
+        }
+        Err(error) => json!({"code":code(&error),"error":error.report()}),
+    };
+    let requests = json!({"refused":first,"continued":fake.paths().len() - first});
+    rebuilt.cleanup().await?;
+    Ok(match refusal {
+        Ok(_) => json!({"code":null,"serving":serves,"requests":requests,"continued":continued}),
+        Err(error) => json!({"code":code(&error),"error":error.report(),"serving":serves,
+            "requests":requests,"continued":continued}),
+    })
+}
+
+/// The outcome of `refused_then_continued` is the refusal `expected` with
+/// the gate closed, followed by a build that continued the stored one and
+/// equals the conversion row by row.
+fn refused_then_equal(outcome: &serde_json::Value, expected: &str) {
+    assert_eq!(outcome["code"], expected, "{outcome}");
+    assert_eq!(outcome["serving"], false, "{outcome}");
+    let continued = &outcome["continued"];
+    assert!(continued["code"].is_null(), "continued: {outcome}");
+    assert_eq!(continued["resumed"], true, "continued: {outcome}");
+    assert!(continued["differs"].is_null(), "continued: {outcome}");
+    assert_eq!(continued["rows"], json!({}), "continued: {outcome}");
+}
+
 /// Lists and answers that miss an output relevant by its address alone
 /// refuse the build, and the gate stays closed: the spend in the window
 /// missing from the address's list from H on (the address's own
 /// derivation from its full list below H keeps the output), the creating
 /// transaction missing from the address's list below H (no list places
 /// the listed outputs), and the spend in the window answered 404 every time
-/// it is asked.
+/// it is asked. After each refusal the same command, answered honestly,
+/// equals the conversion row by row: whichever answer missed the output,
+/// the listings and the address's full list below H are read again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn listings_that_miss_an_address_output_refuse_the_build() -> Result {
     let profile = profile(1);
     let chain = reserve_chain(&profile, false);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &chain.g, &converted).await?;
     let list = format!("/addresses/{}/transactions?", profile.addresses.reserve);
     let without = |hidden: String, since: bool| -> Hook {
         let list = list.clone();
@@ -2172,12 +2252,17 @@ async fn listings_that_miss_an_address_output_refuse_the_build() -> Result {
             "provider_transaction_unknown",
         ),
     ] {
-        let outcome = match refused(&profile, &chain.g, hook).await {
-            Ok((error, serves)) => {
-                json!({"case":name,"code":code(&error),"error":error.report(),"serving":serves})
-            }
-            Err(error) => json!({"case":name,"code":null,"failure":error.to_string()}),
-        };
+        let on = Arc::new(AtomicBool::new(true));
+        let mut outcome = refused_then_continued(
+            &profile,
+            &chain.g,
+            EDGE_END,
+            (while_on(on.clone(), hook), on),
+            &converted,
+            &conversion,
+        )
+        .await?;
+        outcome["case"] = json!(name);
         outcomes.push((expected, outcome));
     }
     println!(
@@ -2185,10 +2270,59 @@ async fn listings_that_miss_an_address_output_refuse_the_build() -> Result {
         json!({"event":"address_refusals","outcomes":outcomes.iter().map(|(_, o)| o).collect::<Vec<_>>()})
     );
     for (expected, outcome) in &outcomes {
-        assert_eq!(outcome["code"], *expected, "{outcome}");
-        assert_eq!(outcome["serving"], false, "{outcome}");
+        refused_then_equal(outcome, expected);
     }
-    Ok(())
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// The provider's tip block is replaced each time the build checks it
+/// after the lists from H on: the address listings and the lists are read
+/// again three times, and the fourth reading ends the build with
+/// `provider_tip_left_chain` while nothing serves. The same command, with
+/// the tip left in place, reads them again and equals the conversion row by
+/// row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, true);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &chain.g, &converted).await?;
+    let replaced = Arc::new(AtomicUsize::new(0));
+    let tip = format!("/blocks/{}", EDGE_END + 1);
+    let hook: Hook = {
+        let replaced = replaced.clone();
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if path.ends_with(&tip) {
+                let salt = replaced.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                let blocks = chain.blocks_mut();
+                let last = blocks.pop().expect("a tip");
+                blocks.push(generate::alternative(&last, salt, 0));
+            }
+            None
+        })
+    };
+    let on = Arc::new(AtomicBool::new(true));
+    let outcome = refused_then_continued(
+        &profile,
+        &chain.g,
+        EDGE_END + 1,
+        (while_on(on.clone(), hook), on),
+        &converted,
+        &conversion,
+    )
+    .await?;
+    let replaced = replaced.load(Ordering::SeqCst);
+    println!(
+        "{}",
+        json!({"event":"tip_left_chain_four_times","outcome":outcome,"tip_replaced":replaced})
+    );
+    refused_then_equal(&outcome, "provider_tip_left_chain");
+    assert_eq!(outcome["error"]["detail"]["reads"], 4, "{outcome}");
+    assert_eq!(replaced, 4, "checks of the tip");
+    converted.cleanup().await?;
+    source.database.cleanup().await
 }
 
 /// A tip block that spends an output relevant by its address alone is
