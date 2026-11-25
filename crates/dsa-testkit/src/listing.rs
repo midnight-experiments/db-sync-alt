@@ -1,10 +1,26 @@
 //! The provider's listing endpoints over the served blocks, rendered as the
-//! backend renders them: the unspent outputs of an asset or an address, the
-//! transaction lists of an asset or an address, a transaction with its
-//! resolved inputs and its position, an asset's quantity and mints, a policy's
-//! assets and an epoch's blocks. Everything is derived from the facts the
-//! builder recorded for each transaction (`tx::Facts`), as of the newest
-//! served block; transactions without facts (fillers) touch nothing listed.
+//! backend's queries over db-sync's tables render them: the unspent outputs
+//! of an asset or an address, the transaction lists of an asset or an
+//! address, a transaction with its resolved inputs and its position, an
+//! asset's quantity, mints and burns, a policy's assets and an epoch's blocks.
+//! Everything is derived from the facts the builder recorded for each
+//! transaction (`tx::Facts`), as of the newest served block; transactions
+//! without facts (fillers) touch nothing listed.
+//!
+//! What db-sync stores, and so what the backend lists:
+//! - a phase-2-valid transaction has its body inputs and outputs as ordinary
+//!   rows, its reference and collateral inputs and its collateral return in
+//!   tables of their own, and its mint;
+//! - a phase-2-invalid transaction has its collateral inputs as ordinary
+//!   inputs and its collateral return as its one ordinary output, at the index
+//!   after the body's outputs, and nothing else: no body input or output, no
+//!   reference input, no mint;
+//! - an asset's transaction list names the transactions that create an
+//!   ordinary output holding the asset, and nothing else: a transaction that
+//!   only spends or burns it is not in the list;
+//! - an address's transaction list names the transactions with an ordinary
+//!   input or output at the address;
+//! - an asset's history lists the mints and burns of valid transactions.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -59,9 +75,13 @@ pub struct Index {
     pub transactions: BTreeMap<String, Placed>,
     unspent: BTreeMap<(String, u16), Created>,
     spent_by: BTreeMap<(String, u16), String>,
+    /// Per unit, the transactions that create an output holding it.
     unit_transactions: BTreeMap<String, BTreeSet<(u32, u16, String)>>,
+    /// Per address, the transactions with an input or output there.
     address_transactions: BTreeMap<String, BTreeSet<(u32, u16, String)>>,
     assets: BTreeMap<String, AssetState>,
+    /// Per unit, its mints and burns in chain order: transaction and amount.
+    history: BTreeMap<String, Vec<(String, i128)>>,
     epoch_blocks: BTreeMap<u32, Vec<String>>,
     /// The served blocks the index was built from: count and last hash.
     pub signature: (usize, Option<String>),
@@ -107,11 +127,15 @@ impl Index {
                     let point = (input.hash.clone(), input.index);
                     if let Some(created) = index.unspent.remove(&point) {
                         index.spent_by.insert(point.clone(), built.hash.clone());
-                        index.touch(&created.output, &key);
+                        index
+                            .address_transactions
+                            .entry(address_text(&created.output.address))
+                            .or_default()
+                            .insert(key.clone());
                     }
                 }
                 for (output_index, output) in facts.created() {
-                    index.touch(output, &key);
+                    index.created(output, &key);
                     index.unspent.insert(
                         (built.hash.clone(), output_index),
                         Created {
@@ -137,10 +161,10 @@ impl Index {
                             state.first_mint = Some(built.hash.clone());
                         }
                         index
-                            .unit_transactions
+                            .history
                             .entry(unit)
                             .or_default()
-                            .insert(key.clone());
+                            .push((built.hash.clone(), quantity));
                     }
                 }
                 index.transactions.insert(
@@ -158,7 +182,9 @@ impl Index {
         index
     }
 
-    fn touch(&mut self, output: &Output, key: &(u32, u16, String)) {
+    /// A transaction that creates `output`: in the lists of its units and of
+    /// its address.
+    fn created(&mut self, output: &Output, key: &(u32, u16, String)) {
         for unit in units(output) {
             self.unit_transactions
                 .entry(unit)
@@ -297,6 +323,25 @@ pub fn answer(index: &Index, parts: &[&str], query_text: &str) -> Option<(u16, V
             ),
             None => not_found(),
         },
+        ["assets", unit, "history"] => {
+            if !index.assets.contains_key(*unit) {
+                return Some(not_found());
+            }
+            let rows = index
+                .history
+                .get(*unit)
+                .map(|events| {
+                    events
+                        .iter()
+                        .map(|(transaction, amount)| {
+                            json!({"tx_hash": transaction, "amount": amount.to_string(),
+                                "action": if *amount < 0 { "burned" } else { "minted" }})
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (200, Value::Array(q.page(rows)))
+        }
         ["assets", unit, "utxos"] => {
             if !index.unit_transactions.contains_key(*unit) {
                 return Some(not_found());
@@ -373,7 +418,8 @@ pub fn answer(index: &Index, parts: &[&str], query_text: &str) -> Option<(u16, V
                     "utxo_count": placed.facts.inputs.len() + placed.facts.outputs.len(),
                     "withdrawal_count": 0, "mir_cert_count": 0, "delegation_count": 0,
                     "stake_cert_count": 0, "pool_update_count": 0, "pool_retire_count": 0,
-                    "asset_mint_or_burn_count": placed.facts.mint.len(), "redeemer_count": 0,
+                    "asset_mint_or_burn_count": if placed.facts.valid { placed.facts.mint.len() } else { 0 },
+                    "redeemer_count": 0,
                     "valid_contract": placed.facts.valid, "treasury_donation": "0"}),
             ),
             None => not_found(),
@@ -398,9 +444,13 @@ pub fn answer(index: &Index, parts: &[&str], query_text: &str) -> Option<(u16, V
     Some(answer)
 }
 
-/// `/txs/{hash}/utxos`: every input with the output it names (a collateral
-/// input without its native assets, as the backend may render it), then the
-/// body outputs and the collateral return, which is flagged.
+/// `/txs/{hash}/utxos` as the backend renders db-sync's rows. A valid
+/// transaction: its body inputs, its reference inputs (`reference`), then its
+/// collateral inputs (`collateral`, without native assets); its body outputs
+/// with the transaction that spent each, then its collateral return
+/// (`collateral`, without native assets, never spent). An invalid transaction:
+/// its collateral inputs as ordinary inputs, and its collateral return as its
+/// one ordinary output, at the index after the body's outputs.
 fn utxos(index: &Index, transaction: &str, facts: &Facts) -> Value {
     let unknown = Output::new(UNKNOWN_ORIGIN_ADDRESS.to_vec(), 5_000_000);
     let input = |input: &Input, collateral: bool, reference: bool| {
@@ -411,31 +461,53 @@ fn utxos(index: &Index, transaction: &str, facts: &Facts) -> Value {
             "inline_datum": inline, "reference_script_hash": null, "collateral": collateral,
             "reference": reference})
     };
-    let mut inputs: Vec<Value> = facts
-        .inputs
-        .iter()
-        .map(|i| input(i, false, false))
-        .collect();
-    inputs.extend(facts.collateral.iter().map(|i| input(i, true, false)));
-    inputs.extend(facts.references.iter().map(|i| input(i, false, true)));
     let output = |output_index: usize, output: &Output, collateral: bool| {
         let (data_hash, inline) = datum_fields(output);
-        let consumed = index
-            .spent_by
-            .get(&(transaction.to_owned(), output_index as u16))
-            .cloned();
-        json!({"address": address_text(&output.address), "amount": amount(output, true),
+        let consumed = if collateral {
+            None
+        } else {
+            index
+                .spent_by
+                .get(&(transaction.to_owned(), output_index as u16))
+                .cloned()
+        };
+        json!({"address": address_text(&output.address), "amount": amount(output, !collateral),
             "output_index": output_index, "data_hash": data_hash, "inline_datum": inline,
             "collateral": collateral, "reference_script_hash": null, "consumed_by_tx": consumed})
     };
-    let mut outputs: Vec<Value> = facts
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(n, o)| output(n, o, false))
-        .collect();
-    if let Some(collateral_return) = &facts.collateral_return {
-        outputs.push(output(facts.outputs.len(), collateral_return, true));
-    }
+    let (inputs, outputs): (Vec<Value>, Vec<Value>) = if facts.valid {
+        let inputs = facts
+            .inputs
+            .iter()
+            .map(|i| input(i, false, false))
+            .chain(facts.references.iter().map(|i| input(i, false, true)))
+            .chain(facts.collateral.iter().map(|i| input(i, true, false)))
+            .collect();
+        let outputs = facts
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(n, o)| output(n, o, false))
+            .chain(
+                facts
+                    .collateral_return
+                    .iter()
+                    .map(|o| output(facts.outputs.len(), o, true)),
+            )
+            .collect();
+        (inputs, outputs)
+    } else {
+        let inputs = facts
+            .collateral
+            .iter()
+            .map(|i| input(i, false, false))
+            .collect();
+        let outputs = facts
+            .collateral_return
+            .iter()
+            .map(|o| output(facts.outputs.len(), o, false))
+            .collect();
+        (inputs, outputs)
+    };
     json!({"hash": transaction, "inputs": inputs, "outputs": outputs})
 }
