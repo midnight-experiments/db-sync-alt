@@ -129,8 +129,78 @@ struct Totals {
     markers: u64,
     revealed_at_spend: usize,
     invalid: usize,
+    burns: Burns,
     requests: BTreeMap<String, u64>,
     calls: i64,
+    /// The chains whose build was refused or differs from the conversion.
+    failures: Vec<serde_json::Value>,
+}
+
+/// Complete burns of an eligible unit (a valid transaction that burns it and
+/// creates no output holding it), by their height against H and T.
+#[derive(Default, Debug, Clone, Copy)]
+struct Burns {
+    below_horizon: usize,
+    in_window: usize,
+    after_target: usize,
+    /// At or after H, of an output created at or after H.
+    created_since_horizon: usize,
+}
+
+impl Burns {
+    fn add(&mut self, other: Burns) {
+        self.below_horizon += other.below_horizon;
+        self.in_window += other.in_window;
+        self.after_target += other.after_target;
+        self.created_since_horizon += other.created_since_horizon;
+    }
+
+    fn of(case: &Case) -> Burns {
+        let rule = dsa_chain::assets::AssetRule::from_profile(&case.profile);
+        let mut created_at: BTreeMap<&str, u32> = BTreeMap::new();
+        let mut burns = Burns::default();
+        for block in &case.g.blocks {
+            for built in &block.transactions {
+                created_at.insert(&built.hash, block.height);
+                let Some(facts) = case.g.facts.get(&built.hash) else {
+                    continue;
+                };
+                if !facts.valid {
+                    continue;
+                }
+                let mut net: BTreeMap<(&str, &str), i128> = BTreeMap::new();
+                for token in &facts.mint {
+                    *net.entry((&token.policy, &token.name)).or_default() += token.quantity;
+                }
+                for ((policy, name), quantity) in net {
+                    let held = facts.created().iter().any(|(_, output)| {
+                        output.tokens.iter().any(|token| {
+                            token.policy == policy && token.name == name && token.quantity > 0
+                        })
+                    });
+                    if quantity >= 0 || held || !rule.allows(policy, name) {
+                        continue;
+                    }
+                    if block.height < case.horizon {
+                        burns.below_horizon += 1;
+                    } else {
+                        if block.height <= case.target {
+                            burns.in_window += 1;
+                        } else {
+                            burns.after_target += 1;
+                        }
+                        let young = facts.spent().iter().any(|input| {
+                            created_at
+                                .get(input.hash.as_str())
+                                .is_some_and(|height| *height >= case.horizon)
+                        });
+                        burns.created_since_horizon += usize::from(young);
+                    }
+                }
+            }
+        }
+        burns
+    }
 }
 
 /// A generated chain, its full history and a source written through T.
@@ -192,7 +262,9 @@ async fn marker_count(database: &Database) -> Result<i64> {
         .get(0))
 }
 
-/// One property case: the build equals the conversion.
+/// One property case: the build equals the conversion. A build that is
+/// refused or differs is recorded in `totals.failures`; an error of the test's
+/// own databases ends the case with an error.
 async fn equivalence(
     seed: u64,
     source: &mut Source,
@@ -202,12 +274,17 @@ async fn equivalence(
 ) -> Result {
     let mut random = Random::new(seed ^ 0x0d2b_d2b0);
     let case = Case::new(seed, &mut random).await?;
+    let burns = Burns::of(&case);
     let conversion = case.convert(source, converted).await?;
     empty(rebuilt, &case.profile).await?;
     let fake = Fake::start(&case.g, &case.profile).await;
     let (_stopper, stop) = Stop::new();
     let context = format!("seed {seed} at H {} T {}", case.horizon, case.target);
-    let report = build(
+    let failure = |kind: &str, code: &str, detail: serde_json::Value| {
+        json!({"seed": seed, "horizon": case.horizon, "target": case.target, "kind": kind,
+            "code": code, "burns": format!("{burns:?}"), "detail": detail})
+    };
+    let report = match build(
         &case.profile,
         &fake,
         rebuilt,
@@ -216,12 +293,35 @@ async fn equivalence(
         stop,
     )
     .await
-    .map_err(|error| format!("{context}: {}", error.report()))?;
+    {
+        Ok(report) => report,
+        Err(error) => {
+            let report = error.report();
+            let failed = failure("refused", &code(&error), report);
+            println!(
+                "{}",
+                json!({"event":"rebuild_equivalence_failure","failure":failed})
+            );
+            totals.failures.push(failed);
+            return Ok(());
+        }
+    };
     if let Err(error) = same(&report.verified, &conversion, &context) {
         let rows = harness::diff(&rebuilt.config, &converted.config).await?;
-        return Err(format!("{error}; rows (rebuild as follower) {rows}").into());
+        let failed = failure(
+            "differs",
+            "differs",
+            json!({"same": error.to_string(), "rows": rows}),
+        );
+        println!(
+            "{}",
+            json!({"event":"rebuild_equivalence_failure","failure":failed})
+        );
+        totals.failures.push(failed);
+        return Ok(());
     }
     totals.chains += 1;
+    totals.burns.add(burns);
     let window_spent = common::connect(&rebuilt.config)
         .await?
         .query_one(
@@ -259,7 +359,8 @@ async fn a_build_from_the_provider_equals_a_conversion() -> Result {
         let mut seed = start + worker;
         while seed < start + cases {
             equivalence(seed, &mut source, &converted, &rebuilt, &mut totals).await?;
-            if (totals.chains * parallel).is_multiple_of(50) {
+            let ran = totals.chains + totals.failures.len() as u64;
+            if (ran * parallel).is_multiple_of(50) {
                 println!(
                     "{}",
                     json!({"worker":worker,"chains":totals.chains,"seed":seed,"seconds":began.elapsed().as_secs_f64()})
@@ -280,17 +381,34 @@ async fn a_build_from_the_provider_equals_a_conversion() -> Result {
         totals.markers += result.markers;
         totals.revealed_at_spend += result.revealed_at_spend;
         totals.invalid += result.invalid;
+        totals.burns.add(result.burns);
         totals.calls += result.calls;
         for (family, count) in result.requests {
             *totals.requests.entry(family).or_default() += count;
         }
+        totals.failures.extend(result.failures);
     }
+    let mut by_code: BTreeMap<String, u64> = BTreeMap::new();
+    for failure in &totals.failures {
+        *by_code
+            .entry(failure["code"].as_str().unwrap_or_default().to_owned())
+            .or_default() += 1;
+    }
+    let burns = totals.burns;
     println!(
         "{}",
         json!({"event":"rebuild_equivalence","cases":cases,"chains":totals.chains,
+            "failed":totals.failures.len(),"failed_by_code":by_code,
             "quiet_windows":totals.quiet_windows,"markers":totals.markers,
             "datums_revealed_at_spend":totals.revealed_at_spend,"invalid_transactions":totals.invalid,
+            "complete_burns":{"below_horizon":burns.below_horizon,"in_window":burns.in_window,
+                "after_target":burns.after_target,"of_outputs_created_since_horizon":burns.created_since_horizon},
             "calls":totals.calls,"requests":totals.requests,"seconds":began.elapsed().as_secs_f64()})
+    );
+    assert!(
+        totals.failures.is_empty(),
+        "{} of {cases} chains refused or differ: {by_code:?}",
+        totals.failures.len()
     );
     assert_eq!(totals.chains, cases);
     Ok(())
