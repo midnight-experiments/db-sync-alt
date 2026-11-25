@@ -109,15 +109,43 @@ const LISTING_KINDS: [&str; 6] = [
 ];
 const LISTING_CURSORS: [&str; 6] = ["units", "unit:", "address:", "since:", "burns", "history:"];
 
+/// The version of the software that begins a build; a build is continued
+/// only by the same version.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The choices of a build.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub horizon_block: Option<u32>,
     pub target_block: Option<u32>,
-    /// The initial window: H is the newest block at or before the target's
-    /// time minus this. The retention when not given.
+    /// The initial window when the horizon is not given: H is the newest
+    /// block at or before the target's time minus this. The retention when
+    /// not given.
     pub window_seconds: Option<i64>,
     pub retention_seconds: i64,
+    /// The shortest window from H's time to T's that a build accepts.
+    pub shortest_window_seconds: i64,
+}
+
+/// The choices a build began with; a stopped build continues only with the
+/// same.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flags {
+    pub horizon_block: Option<u32>,
+    pub target_block: Option<u32>,
+    pub window_seconds: Option<i64>,
+    pub retention_seconds: i64,
+}
+
+impl Flags {
+    fn of(options: &Options) -> Self {
+        Self {
+            horizon_block: options.horizon_block,
+            target_block: options.target_block,
+            window_seconds: options.window_seconds,
+            retention_seconds: options.retention_seconds,
+        }
+    }
 }
 
 /// The positions a build works for, fixed when it starts.
@@ -127,8 +155,12 @@ pub struct Plan {
     pub horizon: u32,
     pub target: u32,
     pub tip: u32,
+    /// Seconds of chain time from H to T.
     pub window_seconds: i64,
     pub retention_seconds: i64,
+    /// The version that began the build.
+    pub version: String,
+    pub flags: Flags,
 }
 
 pub struct Context<'a> {
@@ -151,8 +183,10 @@ pub struct Report {
     pub verified: Verification,
     /// Provider requests of the whole build, earlier runs included.
     pub calls: i64,
-    /// Requests of this run per endpoint family.
+    /// Requests of the whole build per endpoint family, the window and its
+    /// stake and earlier runs included.
     pub requests: BTreeMap<String, u64>,
+    /// What the base holds.
     pub counts: Value,
     pub seconds: f64,
 }
@@ -241,7 +275,8 @@ async fn check_network(asker: &Asker, profile: &Profile) -> Result<(), Error> {
 
 /// The positions of a new build: T = the given target or the provider's tip
 /// − k; H = the given horizon or the newest block at or before T's time −
-/// the window.
+/// the window. The window from H's time to T's must be at least the
+/// shortest; above the retention only with a given horizon.
 async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Plan, Error> {
     let provider = asker.provider.clone();
     let k = profile.cardano.security_parameter;
@@ -259,30 +294,44 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
             json!({"target": target, "provider_final": final_height}),
         ));
     }
-    let window = options.window_seconds.unwrap_or(options.retention_seconds);
-    if window < 86_400 || window > options.retention_seconds {
-        return Err(refusal(
+    let time_of = |height: u32| {
+        let provider = provider.clone();
+        async move {
+            asker
+                .ask("headers", || provider.block_at(height))
+                .await?
+                .map(|header| header.time)
+                .ok_or_else(|| Error::answer("provider_block_missing", json!({"height": height})))
+        }
+    };
+    let window_refused = |window: i64| {
+        refusal(
             "invalid_window",
-            json!({"window_seconds": window, "retention_seconds": options.retention_seconds}),
-        ));
-    }
-    let horizon = match options.horizon_block {
-        Some(horizon) => horizon,
+            json!({"window_seconds": window, "shortest_window_seconds": options.shortest_window_seconds,
+                "retention_seconds": options.retention_seconds}),
+        )
+    };
+    let (horizon, target_time) = match options.horizon_block {
+        Some(horizon) => {
+            if horizon == 0 || horizon > target {
+                return Err(refusal(
+                    "invalid_horizon",
+                    json!({"horizon": horizon, "target": target}),
+                ));
+            }
+            (horizon, time_of(target).await?)
+        }
         None => {
-            let time_of = |height: u32| {
-                let provider = provider.clone();
-                async move {
-                    asker
-                        .ask("headers", || provider.block_at(height))
-                        .await?
-                        .map(|header| header.time)
-                        .ok_or_else(|| {
-                            Error::answer("provider_block_missing", json!({"height": height}))
-                        })
-                }
-            };
-            let cutoff = time_of(target).await?.saturating_sub(window as u64);
-            let (mut low, mut high) = (target.saturating_sub(window as u32).max(1), target);
+            let window = options.window_seconds.unwrap_or(options.retention_seconds);
+            if window < options.shortest_window_seconds || window > options.retention_seconds {
+                return Err(window_refused(window));
+            }
+            let target_time = time_of(target).await?;
+            let cutoff = target_time.saturating_sub(u64::try_from(window).unwrap_or(0));
+            // Blocks are at least a second apart: the horizon is within
+            // `window` heights below the target.
+            let span = u32::try_from(window).unwrap_or(u32::MAX);
+            let (mut low, mut high) = (target.saturating_sub(span).max(1), target);
             while low < high {
                 let middle = low + (high - low).div_ceil(2);
                 if time_of(middle).await? <= cutoff {
@@ -291,14 +340,17 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
                     high = middle - 1;
                 }
             }
-            low
+            if time_of(low).await? > cutoff {
+                // The chain is younger than the window.
+                return Err(window_refused(window));
+            }
+            (low, target_time)
         }
     };
-    if horizon == 0 || horizon > target {
-        return Err(refusal(
-            "invalid_horizon",
-            json!({"horizon": horizon, "target": target}),
-        ));
+    let window =
+        i64::try_from(target_time.saturating_sub(time_of(horizon).await?)).unwrap_or(i64::MAX);
+    if window < options.shortest_window_seconds {
+        return Err(window_refused(window));
     }
     Ok(Plan {
         network: profile.network.clone(),
@@ -307,6 +359,8 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
         tip: target + k,
         window_seconds: window,
         retention_seconds: options.retention_seconds,
+        version: VERSION.to_owned(),
+        flags: Flags::of(options),
     })
 }
 
@@ -323,7 +377,10 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         connect: Box::new(move || connect()),
         ..context
     };
-    let result = run(context).await;
+    // This run's requests per family, the window's included: recorded also
+    // when the run ends without publishing.
+    let requests = Requests::default();
+    let result = run(context, requests.clone()).await;
     if let Err(error) = &result {
         let report = error.report();
         let code = report["error"]
@@ -347,6 +404,9 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
             }
             let _ = store.record_calls(&provider.counts()).await;
             let _ = store
+                .put_building_items("requests", &[("run".to_owned(), json!(requests.get()))])
+                .await;
+            let _ = store
                 .record_state("stopped", &code, &json!({}), Some(&report))
                 .await;
         }
@@ -354,7 +414,34 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
     result
 }
 
-async fn run(context: Context<'_>) -> Result<Report, Error> {
+/// The requests per family of the runs of a build before this one: the
+/// stored total of the earlier runs and the last run's own count, folded
+/// into one total before this run sends a request or refuses.
+async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Error> {
+    let stored = store.building_items("requests").await?;
+    let mut earlier: BTreeMap<String, u64> = BTreeMap::new();
+    for kind in ["earlier", "run"] {
+        let counts: BTreeMap<String, u64> = stored
+            .get(kind)
+            .cloned()
+            .map_or(Ok(BTreeMap::new()), parse)?;
+        for (family, count) in counts {
+            *earlier.entry(family).or_default() += count;
+        }
+    }
+    store
+        .put_building_items(
+            "requests",
+            &[
+                ("earlier".to_owned(), json!(earlier)),
+                ("run".to_owned(), json!({})),
+            ],
+        )
+        .await?;
+    Ok(earlier)
+}
+
+async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> {
     let started = Instant::now();
     let Context {
         profile,
@@ -369,13 +456,14 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
     let connect = Arc::new(connect);
     let asker = Asker {
         provider: provider.clone(),
-        requests: Requests::default(),
+        requests,
         time,
         stop,
         fatal_after: settings.fatal_after,
     };
     let mut store = connect().await?;
     store.lock_writer().await?;
+    let mut earlier = BTreeMap::new();
     let (plan, phase, resumed) = match store.building(profile).await? {
         Building::Empty => {
             check_network(&asker, profile).await?;
@@ -384,16 +472,19 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
             (plan, "listing".to_owned(), false)
         }
         Building::Stopped { plan, phase, .. } => {
+            earlier = earlier_requests(&mut store).await?;
+            if plan["version"] != json!(VERSION) {
+                return Err(refusal(
+                    "rebuild_version_mismatch",
+                    json!({"stored": plan["version"], "running": VERSION}),
+                ));
+            }
             let plan: Plan = parse(plan)?;
-            if plan.network != profile.network
-                || options.horizon_block.is_some_and(|h| h != plan.horizon)
-                || options.target_block.is_some_and(|t| t != plan.target)
-                || options.retention_seconds != plan.retention_seconds
-            {
+            let given = Flags::of(&options);
+            if plan.network != profile.network || plan.flags != given {
                 return Err(refusal(
                     "rebuild_plan_mismatch",
-                    json!({"stored": plan, "given": {"horizon": options.horizon_block,
-                        "target": options.target_block, "retention_seconds": options.retention_seconds}}),
+                    json!({"stored": plan.flags, "given": given}),
                 ));
             }
             // The requests of the earlier runs, as they recorded them per day,
@@ -418,7 +509,6 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
         "{}",
         json!({"event":"rebuild_started","plan":plan,"phase":build.phase,"resumed":resumed})
     );
-    let mut counts = json!({});
     let start_at = phase_index(&build.phase).max(1);
     for phase in PHASES.iter().skip(start_at) {
         build.reach(phase).await?;
@@ -440,7 +530,7 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
             }
             "epochs" => build.epochs().await?,
             "base" => {
-                counts = build.base().await?;
+                build.base().await?;
                 build.phase = "window".to_owned();
             }
             "window" => build.window(&settings, &progress).await?,
@@ -448,13 +538,24 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
             _ => {}
         }
     }
+    let counts = build
+        .items("counts")
+        .await?
+        .remove("base")
+        .unwrap_or_else(|| json!({}));
     let (verified, calls) = build.publish().await?;
     Ok(Report {
         plan,
         resumed,
         verified,
         calls,
-        requests: build.asker.requests.get(),
+        requests: {
+            let mut requests = earlier;
+            for (family, count) in build.asker.requests.get() {
+                *requests.entry(family).or_default() += count;
+            }
+            requests
+        },
         counts,
         seconds: started.elapsed().as_secs_f64(),
     })

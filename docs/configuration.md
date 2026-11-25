@@ -99,9 +99,14 @@ checks it and opens the gate ([rebuild](rebuild.md)). It takes the
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
 | `--retention-seconds` | — | `604800` | Seconds an event stays after it is first served, stored in the built database, at least 86,400. A stopped build continues only with the same value. |
-| `--window-seconds` | — | `--retention-seconds` | Seconds of chain time from the horizon to the target, from 86,400 to `--retention-seconds`. Without `--horizon-block`, the horizon is the newest block at or before the target's time minus this. |
-| `--horizon-block` | — | the newest block at or before the target's time minus `--window-seconds` | The height of the horizon, the oldest block of the window. |
+| `--window-seconds` | — | `--retention-seconds` | Seconds of chain time from the horizon to the target, from 86,400 to `--retention-seconds`: the horizon is the newest block at or before the target's time minus this. Not with `--horizon-block`. |
+| `--horizon-block` | — | the newest block at or before the target's time minus `--window-seconds` | The height of the horizon, the oldest block of the window. The chain time from it to the target must be at least 86,400 seconds and may be more than `--retention-seconds`. |
 | `--target-block` | — | the provider's tip minus k | The height of the target, the newest block whose events the built database serves; at most the provider's tip minus k. |
+
+A stopped build continues only with the same four flags and by the same
+version of `db-sync-alt`. The provider limits the requests of a key, not of a
+process: a build's `--requests-per-second` and those of any service that uses
+the same key share that limit.
 
 ## `create`
 

@@ -17,6 +17,9 @@ use crate::{
     wrapper::{Effect, Job, Operation, Session},
 };
 
+/// The shortest window from the horizon's time to the target's: one day.
+const SHORTEST_WINDOW_SECONDS: i64 = 86_400;
+
 #[derive(Args, Clone, Debug)]
 pub(crate) struct RebuildArguments {
     /// Seconds an event stays after it is first served, stored in the built
@@ -26,14 +29,15 @@ pub(crate) struct RebuildArguments {
         value_parser = clap::value_parser!(i64).range(86_400..))]
     pub(crate) retention_seconds: i64,
     /// Seconds of chain time from the horizon to the target, at least 86400
-    /// and at most --retention-seconds; sets the horizon when
-    /// --horizon-block is not given [default: --retention-seconds].
+    /// and at most --retention-seconds; sets the horizon. Not with
+    /// --horizon-block [default: --retention-seconds].
     #[arg(long,
         value_parser = clap::value_parser!(i64).range(86_400..))]
     pub(crate) window_seconds: Option<i64>,
-    /// The height of the horizon, the oldest block of the window [default:
-    /// the newest block at or before the target's time minus
-    /// --window-seconds].
+    /// The height of the horizon, the oldest block of the window. The chain
+    /// time from it to the target must be at least 86400 seconds and may be
+    /// more than --retention-seconds [default: the newest block at or before
+    /// the target's time minus --window-seconds].
     #[arg(long)]
     pub(crate) horizon_block: Option<u32>,
     /// The height of the target, the newest block whose events the built
@@ -63,6 +67,9 @@ pub(crate) fn command(
         .is_some_and(|window| window > choices.retention_seconds)
     {
         return Err(crate::usage("window_above_retention", "--window-seconds"));
+    }
+    if choices.window_seconds.is_some() && choices.horizon_block.is_some() {
+        return Err(crate::usage("window_with_horizon", "--window-seconds"));
     }
     if let (Some(horizon), Some(target)) = (choices.horizon_block, choices.target_block)
         && horizon > target
@@ -104,6 +111,7 @@ pub(crate) fn command(
                         target_block: choices.target_block,
                         window_seconds: choices.window_seconds,
                         retention_seconds: choices.retention_seconds,
+                        shortest_window_seconds: SHORTEST_WINDOW_SECONDS,
                     },
                     time: Arc::new(WallTime),
                     stop,

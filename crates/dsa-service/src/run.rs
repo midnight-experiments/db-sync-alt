@@ -1017,6 +1017,7 @@ pub async fn run(context: Context) -> Result<Report, Error> {
                 time: Arc::clone(&time),
                 stop: stop.clone(),
                 progress: shared.progress.clone(),
+                requests: None,
             },
             Some(Box::new(between)),
         )

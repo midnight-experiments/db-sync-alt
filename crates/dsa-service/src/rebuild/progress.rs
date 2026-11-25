@@ -145,8 +145,12 @@ impl Build<'_> {
         });
         let transactions = (count("since") - count("moved")).max(0);
         let detail = detail(phase, calls, &self.plan, transactions, window);
+        let run = json!(self.asker.requests.get());
         let store = self.store().await?;
         store.record_calls(&per_day).await?;
+        store
+            .put_building_items("requests", &[("run".to_owned(), run)])
+            .await?;
         store.record_building(phase, &detail, calls).await?;
         store
             .record_state("rebuilding", phase, &detail, None)
@@ -198,6 +202,13 @@ mod tests {
             tip: 2359,
             window_seconds: 604_800,
             retention_seconds: 604_800,
+            version: "0".to_owned(),
+            flags: super::super::Flags {
+                horizon_block: None,
+                target_block: None,
+                window_seconds: None,
+                retention_seconds: 604_800,
+            },
         };
         let value = detail("window", 566, &plan, 35, 100);
         assert_eq!(

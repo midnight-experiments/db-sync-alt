@@ -194,6 +194,7 @@ pub(crate) fn command(
                     time: Arc::new(WallTime),
                     stop,
                     progress,
+                    requests: None,
                 }));
                 let result = tokio::select! {
                     result = &mut run => result,

@@ -96,6 +96,7 @@ async fn build(
         target_block: Some(target),
         window_seconds: None,
         retention_seconds: DAY,
+        shortest_window_seconds: 0,
     };
     build_with(profile, fake, database, options, stop).await
 }
@@ -2096,6 +2097,7 @@ async fn a_build_without_positions_takes_them_from_the_provider() -> Result {
         target_block: None,
         window_seconds: None,
         retention_seconds: DAY,
+        shortest_window_seconds: DAY,
     };
     let report = build_with(&profile, &fake, &rebuilt, options, stop)
         .await
@@ -2127,6 +2129,7 @@ async fn positions_out_of_range_refuse_the_build_before_it_starts() -> Result {
         target_block: target,
         window_seconds: window,
         retention_seconds: 2 * DAY,
+        shortest_window_seconds: DAY,
     };
     let mut outcomes = Vec::new();
     for (name, choices, expected) in [
@@ -2239,6 +2242,234 @@ async fn facts_the_provider_denies_refuse_the_build() -> Result {
     for (expected, outcome) in &outcomes {
         assert_eq!(outcome["code"], *expected, "{outcome}");
         assert_eq!(outcome["serving"], false, "{outcome}");
+    }
+    Ok(())
+}
+
+/// A build stopped in its window continues only with the choices it began
+/// with and by the version that began it: another retention, window or
+/// horizon is `rebuild_plan_mismatch`, another version
+/// `rebuild_version_mismatch`. Continued with the same choices it equals
+/// the conversion, and its report holds the real window, the base's counts
+/// and the requests of the whole build by family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_stopped_build_continues_only_as_it_began() -> Result {
+    let profile = profile(1);
+    let edges = edges(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &edges.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), None).await;
+    let choices = |retention: i64, window: Option<i64>, horizon: u32| Options {
+        horizon_block: Some(horizon),
+        target_block: Some(EDGE_TARGET),
+        window_seconds: window,
+        retention_seconds: retention,
+        shortest_window_seconds: 0,
+    };
+    let (stopper, stop) = Stop::new();
+    let run = build_with(
+        &profile,
+        &fake,
+        &rebuilt,
+        choices(DAY, None, EDGE_HORIZON),
+        stop,
+    );
+    let stopping = async {
+        let mut from = None;
+        loop {
+            let answered = fake.paths().len();
+            if from.is_none() && stored_phase(&rebuilt).await.as_deref() == Some("window") {
+                from = Some(answered);
+            }
+            if from.is_some_and(|from| answered >= from + 5) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = stopper.send(true);
+    };
+    let (result, ()) = tokio::join!(run, stopping);
+    assert_eq!(
+        code(&result.err().ok_or("the stopped build published")?),
+        "stop_requested"
+    );
+    let mut outcomes = Vec::new();
+    for (name, other, expected) in [
+        (
+            "retention",
+            choices(2 * DAY, None, EDGE_HORIZON),
+            "rebuild_plan_mismatch",
+        ),
+        (
+            "window",
+            choices(DAY, Some(DAY), EDGE_HORIZON),
+            "rebuild_plan_mismatch",
+        ),
+        (
+            "horizon",
+            choices(DAY, None, EDGE_HORIZON + 1),
+            "rebuild_plan_mismatch",
+        ),
+    ] {
+        let (_stopper, stop) = Stop::new();
+        let outcome = match build_with(&profile, &fake, &rebuilt, other, stop).await {
+            Ok(_) => json!({"case":name,"code":null}),
+            Err(error) => json!({"case":name,"code":code(&error),"error":error.report()}),
+        };
+        outcomes.push((expected, outcome));
+    }
+    let client = common::connect(&rebuilt.config).await?;
+    client
+        .execute(
+            "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}','\"0.0.1\"') WHERE id=1",
+            &[],
+        )
+        .await?;
+    let (_stopper, stop) = Stop::new();
+    let outcome = match build_with(
+        &profile,
+        &fake,
+        &rebuilt,
+        choices(DAY, None, EDGE_HORIZON),
+        stop,
+    )
+    .await
+    {
+        Ok(_) => json!({"case":"version","code":null}),
+        Err(error) => json!({"case":"version","code":code(&error),"error":error.report()}),
+    };
+    outcomes.push(("rebuild_version_mismatch", outcome));
+    client
+        .execute(
+            "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}',to_jsonb($1::text)) WHERE id=1",
+            &[&env!("CARGO_PKG_VERSION")],
+        )
+        .await?;
+    let (_stopper, stop) = Stop::new();
+    let report = build_with(
+        &profile,
+        &fake,
+        &rebuilt,
+        choices(DAY, None, EDGE_HORIZON),
+        stop,
+    )
+    .await
+    .map_err(|error| format!("continued: {}", error.report()))?;
+    same(&report.verified, &conversion, "continued as it began")?;
+    let time = |height: u32| edges.g.block(height).map(|block| block.time).unwrap_or(0);
+    let window = (time(EDGE_TARGET) - time(EDGE_HORIZON)) as i64;
+    let requests: u64 = report.requests.values().sum();
+    println!(
+        "{}",
+        json!({"event":"continued_as_it_began","refused":outcomes.iter().map(|(_, o)| o).collect::<Vec<_>>(),
+            "window_seconds":report.plan.window_seconds,"counts":report.counts,
+            "requests":report.requests,"requests_total":requests,"calls":report.calls,
+            "answered":fake.paths().len()})
+    );
+    for (expected, outcome) in &outcomes {
+        assert_eq!(outcome["code"], *expected, "{outcome}");
+    }
+    assert!(report.resumed);
+    assert_eq!(report.plan.window_seconds, window, "the real window");
+    assert!(
+        report.counts["unspent_at_horizon"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "counts {}",
+        report.counts
+    );
+    assert!(
+        requests as i64 >= report.calls - IN_FLIGHT,
+        "requests by family {requests} against {} sent",
+        report.calls
+    );
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// The window of a given horizon is the chain time from it to the target:
+/// stored as such, refused below the shortest, and allowed above the
+/// retention. Without a horizon, a chain younger than the window is
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn the_window_of_a_build_is_its_chain_time() -> Result {
+    let profile = profile(1);
+    let slow = slow_chain(&profile);
+    let target = EDGE_END - K;
+    let converted = Database::new().await?;
+    let (source, conversion) = conversion_at(&profile, &slow, &converted, 20, target).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &slow, EDGE_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    let long = Options {
+        horizon_block: Some(20),
+        target_block: Some(target),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: DAY,
+    };
+    let report = build_with(&profile, &fake, &rebuilt, long, stop)
+        .await
+        .map_err(|error| format!("a window above the retention: {}", error.report()))?;
+    same(
+        &report.verified,
+        &conversion,
+        "a window above the retention",
+    )?;
+    let long_window = report.plan.window_seconds;
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await?;
+    let edges = edges(&profile);
+    let mut outcomes = Vec::new();
+    for (name, g, options) in [
+        (
+            "a given horizon less than a day below the target",
+            &edges.g,
+            Options {
+                horizon_block: Some(EDGE_HORIZON),
+                target_block: Some(EDGE_TARGET),
+                window_seconds: None,
+                retention_seconds: DAY,
+                shortest_window_seconds: DAY,
+            },
+        ),
+        (
+            "a chain younger than the window",
+            &slow,
+            Options {
+                horizon_block: None,
+                target_block: None,
+                window_seconds: None,
+                retention_seconds: 7 * DAY,
+                shortest_window_seconds: DAY,
+            },
+        ),
+    ] {
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &profile).await?;
+        let fake = Fake::with_chain(edge_chain(&profile, g, EDGE_END), None).await;
+        let (_stopper, stop) = Stop::new();
+        let outcome = match build_with(&profile, &fake, &rebuilt, options, stop).await {
+            Ok(report) => json!({"case":name,"code":null,"plan":report.plan}),
+            Err(error) => json!({"case":name,"code":code(&error),"error":error.report()}),
+        };
+        rebuilt.cleanup().await?;
+        outcomes.push(outcome);
+    }
+    println!(
+        "{}",
+        json!({"event":"window_is_chain_time","above_retention":long_window,"refused":outcomes})
+    );
+    assert_eq!(long_window, 28 * 7_200, "the window above the retention");
+    for outcome in &outcomes {
+        assert_eq!(outcome["code"], "invalid_window", "{outcome}");
     }
     Ok(())
 }
@@ -2772,8 +3003,9 @@ async fn a_rebuilt_database_follows_through_a_horizon_advance() -> Result {
     Ok(())
 }
 
-/// The command refuses a window longer than the retention and a horizon
-/// above the target before it connects anywhere.
+/// The command refuses a window longer than the retention, a horizon above
+/// the target and a window given with a horizon before it connects
+/// anywhere.
 #[test]
 fn the_command_checks_its_positions_before_connecting() {
     for (arguments, error, flag) in [
@@ -2786,6 +3018,11 @@ fn the_command_checks_its_positions_before_connecting() {
             vec!["--horizon-block", "10", "--target-block", "5"],
             "horizon_above_target",
             "--horizon-block",
+        ),
+        (
+            vec!["--horizon-block", "10", "--window-seconds", "86400"],
+            "window_with_horizon",
+            "--window-seconds",
         ),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_db-sync-alt"))

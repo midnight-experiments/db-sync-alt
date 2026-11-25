@@ -205,7 +205,7 @@ impl Build<'_> {
     }
 
     /// The base: rows below H, supply at H after the proof, the position.
-    pub(super) async fn base(&mut self) -> Result<Value, Error> {
+    pub(super) async fn base(&mut self) -> Result<(), Error> {
         let unspent = self.unspent_at_horizon().await?;
         let valid: BTreeMap<String, bool> = self.typed("valid").await?;
         let datums = self.items("datum").await?;
@@ -264,12 +264,13 @@ impl Build<'_> {
             supply,
             state: ServingState::of_headers(&horizon, &target, &tip, self.plan.retention_seconds),
         };
+        self.put_one("counts", "base", &counts).await?;
         let profile = self.profile;
         self.store()
             .await?
             .write_building_base(profile, &base)
             .await?;
-        Ok(counts)
+        Ok(())
     }
 
     /// Proof: for every unit that has a reading, the unspent amount at H

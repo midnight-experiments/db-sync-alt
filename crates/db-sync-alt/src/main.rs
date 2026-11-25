@@ -279,6 +279,10 @@ enum Command {
     ///
     /// The provider, follower and database flags are those of `run`, also as
     /// DSA_ variables; the four flags of the build itself have no variable.
+    #[command(mut_arg("requests_per_second", |flag| flag.help(
+        "Requests sent per second at most (at most 10). The provider's limit \
+         is per key: a service that uses the same key shares it with the build"
+    )))]
     Rebuild {
         #[command(flatten)]
         database: DatabaseArguments,
