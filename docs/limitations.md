@@ -81,11 +81,10 @@ A database built with `rebuild` ([rebuild](rebuild.md#limits)):
   target, which a database that followed to the same target does not hold
   yet; none was found at the profile addresses of Mainnet and Preprod, where
   the datums read are inline in their outputs;
-- takes the outputs at the profile addresses that hold no fixed-supply asset
-  from the provider's listings alone: the supply check covers the quantities
-  of the fixed-supply assets only, and an output missing from a listing and
-  not spent after the horizon is missing from the database without any check
-  finding it.
+- rests on the provider where all its answers agree: an output that every
+  listing, list and history of the provider leaves out alike is missing from
+  the database without any check finding it
+  ([what rests on the provider](rebuild.md#what-rests-on-the-provider)).
 
 ## Networks and node release
 

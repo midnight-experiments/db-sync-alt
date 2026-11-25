@@ -232,7 +232,8 @@ output carries only a command's result.
 - While catching up, one `update` line at most every 10 seconds; each line
   carries the update's report.
 - `rebuild` logs `rebuild_started`, `rebuild_phase`, `rebuild_waiting`,
-  `rebuild_listing_moving` and `rebuild_published`
+  `rebuild_listing_moving`, `rebuild_reading_again`, `rebuild_tip_left_chain`,
+  `rebuild_listings_discarded` and `rebuild_published`
   ([rebuild](rebuild.md#progress)), and in its window the lines of following.
 - Conditions: `database_unreachable` and `database_reachable`, `writer_busy`
   and `writer_lock_taken`,

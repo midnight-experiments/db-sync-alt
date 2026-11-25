@@ -39,6 +39,7 @@ exit status.
 | `invalid_database_fatal_after` | `--database-fatal-after-seconds` below 60. | |
 | `overall_timeout_not_supported` | `run` was given `--overall-timeout-seconds` or `DSA_OVERALL_TIMEOUT_SECONDS`. | Remove it: the service runs until it is stopped. |
 | `window_above_retention` | `rebuild` was given a `--window-seconds` above `--retention-seconds`. | |
+| `window_with_horizon` | `rebuild` was given `--window-seconds` and `--horizon-block`: with a horizon, the window is the chain time from it to the target. | |
 | `horizon_above_target` | `rebuild` was given a `--horizon-block` above `--target-block`. | |
 
 An empty `DSA_` variable is a value: the command-line parser refuses
@@ -220,16 +221,24 @@ and of [`verify`](#verify) at its publication. Nothing is served in any case
 
 | Code | Cause | What to do |
 | --- | --- | --- |
-| `rebuild_supply_mismatch` | The unspent amount of a fixed-supply asset at the horizon differs from the provider's quantity minus the net mint since the horizon; `detail` names the unit and the amounts. | Drop the database and build again; report it if it repeats. |
+| `rebuild_supply_mismatch` | The unspent amount of an asset unit at the horizon differs from the provider's quantity minus the net mint since the horizon; `detail` names the unit and the amounts. | Run the same command again: it reads the listings, the readings of the units and the lists from the horizon on again. Report it if it repeats. |
+| `rebuild_listing_incomplete` | An output unspent at the horizon whose creating transaction no list below the horizon places, or a listed output created from the horizon on by a transaction that no list from the horizon on names; `detail` names the output. | As above. |
+| `rebuild_address_outputs_mismatch` | The outputs unspent at the horizon at a profile address differ between the listings and the address's own history; `detail` names the address and the outputs found on one side only. | As above. |
+| `provider_tip_left_chain` | The block at the provider's tip that the lists from the horizon on were read up to had left the chain after them, four readings in a row. | As above. |
 | `provider_mint_history_mismatch` | An asset's history (`/assets/{unit}/history`) and its answer (`/assets/{unit}`) did not agree in five readings: a transaction listed twice, another number of rows than the answer's `mint_or_burn_count`, or amounts that do not add up to its quantity; `detail` names the unit and the numbers. | Run the same command again: the assets already read are kept. Report it if it repeats. |
 | `rebuild_refused` | A check closed the gate of the build in the database (`asset_conservation` or another), so it cannot go on. | Drop the database and build again; report the check's `last_error` if it repeats. |
-| `rebuild_plan_mismatch` | The database holds a stopped build started with other choices: `detail.stored` and `detail.given`. | Run the build with the stored choices, or drop the database. |
+| `rebuild_plan_mismatch` | The database holds a stopped build started with other flags: `detail.stored` and `detail.given`. | Run the build with the stored flags, given or left out as stored, or drop the database. |
+| `rebuild_version_mismatch` | The database holds a stopped build that another version of db-sync-alt began: `detail.stored` and `detail.running`. | Continue it with that version, or drop the database. |
 | `target_above_provider_final` | `--target-block` is above the provider's tip minus k. | Give a lower target, or leave it out. |
 | `invalid_horizon` | The horizon is 0 or above the target. | Give another `--horizon-block`. |
+| `invalid_window` | The chain time from the horizon to the target is shorter than 86,400 seconds, or `--window-seconds` is not between 86,400 and the retention, or the chain is younger than the window. | Give another `--horizon-block` or `--window-seconds`. |
+| `provider_unit_unknown` | The provider answered 404 for an asset unit of the network's table of fixed-supply assets, which exists on the network, for 30 minutes in a row. | Check `--provider-url` and `--network`; report it if it repeats. |
+| `provider_epoch_parameters_missing` | The provider has no parameters of one of the two epochs before the horizon's. | Run the same command again later; report it if it repeats. |
+| `provider_epoch_blocks_missing` | The provider lists no block in an epoch before the horizon's nor in the fifteen before it. | As above. |
 | `provider_chain_shorter` | The provider's chain is shorter than the build needs: its tip is below k, or it lists fewer than k blocks after the block below the horizon. | Run the same command again later. |
 | `provider_block_missing` | The provider does not know a block the build asked for by height or hash. | Run the same command again; if the code stays, drop the database and build again. |
 | `provider_fork_point_unknown` | The provider does not know the block below the horizon whose next blocks the build reads. | As above. |
-| `provider_transaction_unknown` | The provider does not know a transaction that one of its lists named. | As above. |
+| `provider_transaction_unknown` | The provider answered 404 for a transaction the build needs (one that a list or a history named) for 30 minutes in a row. | Run the same command again: before the window it reads the listings and lists again; report it if it repeats. |
 | `provider_position_mismatch` | A transaction's block and position differ between a list and `/txs/{hash}`. | As above. |
 | `provider_list_too_long` | A list has more pages than the build reads. | Report it. |
 | `provider_quantity_invalid` | The provider's quantity of an asset is not a number. | Report it. |
@@ -241,8 +250,8 @@ Codes that name a fault of the build's own records or of an answer's form:
 `rebuild_header_missing`, `rebuild_validity_missing`, `rebuild_invalid_row`,
 `rebuild_asset_descriptor_missing`, `rebuild_base_already_written`,
 `rebuild_not_publishable`, `rebuild_position_mismatch`,
-`rebuild_position_out_of_range`, `provider_output_index` and
-`invalid_transaction_hash`. Drop the database, build again, and report the
+`rebuild_position_out_of_range`, `rebuild_reading_missing`,
+`provider_output_index` and `invalid_transaction_hash`. Drop the database, build again, and report the
 code with its `detail`.
 
 ## `compare`

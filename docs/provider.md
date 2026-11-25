@@ -109,12 +109,14 @@ transactions, and the epoch requests. At the default poll of 20 seconds that is
 
 `rebuild` builds a database without a snapshot file and sends its own
 requests ([rebuild](rebuild.md#what-it-reads)): the listings of the profile's
-assets and addresses, the quantities and the mints and burns of the assets,
-the transactions since the horizon with their inputs and outputs, the full
-transaction lists below the horizon, then every block of the window as the
-service reads it. Measured on Preprod, a build of 34,653 blocks
-sent 26,490 requests. On Mainnet a build has not been run; the expected
-request count for a 7-day window is an estimate of about 270,000 requests.
+assets and addresses, the mints and burns and the quantity of each asset unit,
+the transactions since the horizon with their inputs, the full transaction
+lists below the horizon (of each profile address with the outputs of every
+transaction in it), then every block of the window as the service reads it.
+Measured on Preprod, a build of 34,653 blocks sent 26,490 requests. On Mainnet
+a build has not been run; the expected request count for a 7-day window is an
+estimate of about 270,000 requests, and the histories of the profile
+addresses on top.
 Check the daily allowance of the key's plan before such a build
 ([rebuild](rebuild.md#cost)).
 
