@@ -101,7 +101,7 @@ The gate stays closed for the whole build. Before it opens:
 
 The supply check covers the quantities of the fixed-supply assets. The outputs
 at the profile addresses that hold none of them rest on the provider's
-listings.
+listings ([limits](#limits)).
 
 ## Progress
 
@@ -202,7 +202,8 @@ Compare `verified.content_digest` of the build's report with the file's
 content digest. When they differ, `verify` on the built database and on a
 restore of the file prints the digest and row count of each table
 (`families`), which shows where they differ; [`compare`](comparison.md) runs
-the node's queries against both.
+the node's queries against both. The [limits](#limits) below say when a build
+cannot give the file's digest.
 
 ## Cost
 
@@ -226,3 +227,26 @@ and goes on, as the service does
 ([provider](provider.md#refusals-and-outages)). The pace is
 `--requests-per-second`; lower it when the service of another database shares
 the key.
+
+## Limits
+
+- **The same horizon and target.** A build's content digest can equal a
+  snapshot file's only when the build has the file's horizon and target. It
+  also needs the provider to still hold the file's k headers above the target:
+  the newest of them may have been the provider's tip when the file was
+  written, and a short fork can replace them later. And the database that
+  wrote the file must have stored the stake distribution of the target's
+  epoch: a build stores the stake of every epoch up to the target's before it
+  publishes.
+- **Datums revealed after the target.** A datum given only by its hash and
+  revealed by a spend after the target: a build holds it, a database that
+  followed to the same target does not yet. None was found at the profile
+  addresses of Mainnet and Preprod, where the datums read are inline in their
+  outputs.
+- **Outputs at the profile addresses.** The supply check covers the
+  quantities of the fixed-supply assets. An output at a profile address that
+  holds none of them rests on the provider's listing of that address alone: an
+  output missing from the listing and not spent after H is missing from the
+  built database, and no check finds it.
+- **Networks.** Mainnet and Preprod only, as for every command
+  ([limitations](limitations.md#networks-and-node-release)).
