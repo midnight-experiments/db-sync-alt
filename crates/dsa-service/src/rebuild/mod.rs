@@ -160,9 +160,7 @@ pub struct Report {
 /// A running build: its phases are the methods of the modules above.
 struct Build<'a> {
     profile: &'a Profile,
-    rule: AssetRule,
-    addresses: BTreeSet<String>,
-    permissioned: String,
+    relevance: Relevance,
     asker: Asker,
     max_in_flight: usize,
     store: Option<Store>,
@@ -173,7 +171,27 @@ struct Build<'a> {
     recorded: Instant,
 }
 
-impl Build<'_> {
+/// What makes an output one the node reads, and one whose datum it reads:
+/// the eligible units, the profile's addresses and the permissioned unit.
+struct Relevance {
+    rule: AssetRule,
+    addresses: BTreeSet<String>,
+    permissioned: String,
+}
+
+impl Relevance {
+    fn of(profile: &Profile) -> Self {
+        Self {
+            rule: AssetRule::from_profile(profile),
+            addresses: profile
+                .addresses
+                .iter()
+                .map(|(_, address)| address.to_owned())
+                .collect(),
+            permissioned: profile.assets.permissioned_candidates.unit(),
+        }
+    }
+
     fn relevant(&self, content: &Content) -> bool {
         self.addresses.contains(&content.address)
             || content
@@ -188,6 +206,16 @@ impl Build<'_> {
                 .amount
                 .iter()
                 .any(|amount| amount.unit == self.permissioned && amount.quantity.0 > 0)
+    }
+}
+
+impl Build<'_> {
+    fn relevant(&self, content: &Content) -> bool {
+        self.relevance.relevant(content)
+    }
+
+    fn needs_datum(&self, content: &Content) -> bool {
+        self.relevance.needs_datum(content)
     }
 }
 
@@ -375,16 +403,9 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
             (plan, phase, true)
         }
     };
-    let rule = AssetRule::from_profile(profile);
     let mut build = Build {
         profile,
-        addresses: profile
-            .addresses
-            .iter()
-            .map(|(_, address)| address.to_owned())
-            .collect(),
-        permissioned: profile.assets.permissioned_candidates.unit(),
-        rule,
+        relevance: Relevance::of(profile),
         asker,
         max_in_flight: settings.max_in_flight.max(1),
         store: Some(store),

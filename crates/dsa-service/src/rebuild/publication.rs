@@ -3,7 +3,7 @@
 //! window holds no spend, the pruned form of the keep rule, `verify` and the
 //! open gate in one transaction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::DateTime;
 use dsa_chain::{
@@ -21,9 +21,9 @@ use dsa_store::{
 use serde_json::{Value, json};
 
 use super::{
-    Build,
+    Build, Relevance,
     asker::{check, index16, invalid, refusal},
-    content::{Carried, Content, Event, Place},
+    content::{Carried, Content, Event, Place, Unspent},
 };
 use crate::follow::Error;
 
@@ -41,11 +41,29 @@ fn block_row(header: &Header) -> BlockRow {
     }
 }
 
-impl Build<'_> {
-    /// The rows of one kept output below H with its creating transaction.
-    pub(super) fn output_rows(
-        &self,
-        rows: &mut Rows,
+/// The rows of kept outputs below H and of their creating transactions,
+/// with the keys written so far: each row is written once, found by key.
+#[derive(Debug, Default)]
+pub(super) struct Collected {
+    pub(super) rows: Rows,
+    transactions: HashSet<i64>,
+    outputs: HashSet<i64>,
+    datums: HashSet<String>,
+}
+
+impl Collected {
+    /// A transaction row, written once.
+    pub(super) fn transaction(&mut self, row: TxRow) {
+        if self.transactions.insert(row.id) {
+            self.rows.tx.push(row);
+        }
+    }
+
+    /// The rows of one kept output below H with its creating transaction,
+    /// each written once.
+    pub(super) fn output(
+        &mut self,
+        relevance: &Relevance,
         point: &(String, u16),
         content: &Content,
         place: Place,
@@ -53,20 +71,18 @@ impl Build<'_> {
         datums: &BTreeMap<String, Value>,
     ) -> Result<(), Error> {
         let tx_id = ids::transaction_id(place.height, place.index).map_err(invalid)?;
-        if !rows.tx.iter().any(|row| row.id == tx_id) {
-            rows.tx.push(TxRow {
-                id: tx_id,
-                hash: point.0.clone(),
-                block_id: i64::from(place.height),
-                block_index: place.index,
-                valid_contract: valid,
-            });
-        }
+        self.transaction(TxRow {
+            id: tx_id,
+            hash: point.0.clone(),
+            block_id: i64::from(place.height),
+            block_index: place.index,
+            valid_contract: valid,
+        });
         let output_id = ids::output_id(place.height, place.index, point.1).map_err(invalid)?;
-        if rows.tx_out.iter().any(|row| row.id == output_id) {
+        if !self.outputs.insert(output_id) {
             return Ok(());
         }
-        rows.tx_out.push(OutputRow {
+        self.rows.tx_out.push(OutputRow {
             id: output_id,
             tx_id,
             index: point.1,
@@ -76,11 +92,11 @@ impl Build<'_> {
             consumed_by_tx_id: None,
         });
         for (ordinal, (policy, name, quantity)) in content.assets().into_iter().enumerate() {
-            if !self.rule.allows(&policy, &name) {
+            if !relevance.rule.allows(&policy, &name) {
                 continue;
             }
             let ordinal = index16(ordinal)?;
-            rows.ma_tx_out.push(AssetRow {
+            self.rows.ma_tx_out.push(AssetRow {
                 id: ids::asset_id(place.height, place.index, point.1, ordinal).map_err(invalid)?,
                 quantity: quantity.to_string(),
                 tx_out_id: output_id,
@@ -88,12 +104,12 @@ impl Build<'_> {
                 name,
             });
         }
-        if self.needs_datum(content)
-            && let Some(bytes) = Self::datum_bytes(content, datums)?
+        if relevance.needs_datum(content)
+            && let Some(bytes) = Build::datum_bytes(content, datums)?
         {
             let data_hash = content.data_hash.clone().expect("hash of the bytes");
-            if !rows.datum.iter().any(|row| row.hash == data_hash) {
-                rows.datum.push(DatumRow {
+            if self.datums.insert(data_hash.clone()) {
+                self.rows.datum.push(DatumRow {
                     hash: data_hash,
                     value: dsa_chain::datum::render(&bytes).map_err(|error| {
                         Error::answer(error.code, json!({"datum": content.data_hash}))
@@ -103,7 +119,56 @@ impl Build<'_> {
         }
         Ok(())
     }
+}
 
+/// The rows below H with the carried transactions' headers by height and
+/// the outputs marked spent before H.
+pub(super) struct Below {
+    pub(super) rows: Collected,
+    pub(super) headers: BTreeMap<u32, BlockRow>,
+    pub(super) markers: Vec<i64>,
+}
+
+/// The rows below H: every output unspent at H with its creating
+/// transaction, and the outputs of the carried transactions, those of them
+/// spent before H marked.
+pub(super) fn rows_below_horizon(
+    relevance: &Relevance,
+    unspent: &Unspent,
+    valid: &BTreeMap<String, bool>,
+    datums: &BTreeMap<String, Value>,
+    carried: &BTreeMap<String, Vec<Carried>>,
+) -> Result<Below, Error> {
+    let mut rows = Collected::default();
+    for (point, (content, place)) in unspent {
+        let valid = *valid
+            .get(&point.0)
+            .ok_or_else(|| refusal("rebuild_validity_missing", json!({"transaction": point.0})))?;
+        rows.output(relevance, point, content, *place, valid, datums)?;
+    }
+    let mut block_rows: BTreeMap<u32, BlockRow> = BTreeMap::new();
+    let mut markers = Vec::new();
+    for carry in carried.values().flatten() {
+        block_rows.insert(carry.header.height, block_row(&carry.header));
+        for (index, content) in &carry.outputs {
+            let point = (carry.tx.clone(), *index);
+            rows.output(relevance, &point, content, carry.place, carry.valid, datums)?;
+            if !unspent.contains_key(&point) {
+                markers.push(
+                    ids::output_id(carry.place.height, carry.place.index, *index)
+                        .map_err(invalid)?,
+                );
+            }
+        }
+    }
+    Ok(Below {
+        rows,
+        headers: block_rows,
+        markers,
+    })
+}
+
+impl Build<'_> {
     /// Descriptor IDs: the fixed ones of the network's table when their unit
     /// was first minted at or below T, the others in chain order after them.
     async fn descriptors(&mut self, rows: &Rows) -> Result<Vec<(i64, String, String)>, Error> {
@@ -120,18 +185,17 @@ impl Build<'_> {
             }
         }
         let mut next = table.iter().map(|(_, id)| *id).max().unwrap_or(0) + 1;
+        let fixed: HashSet<&str> = table.iter().map(|(unit, _)| unit.as_str()).collect();
         let mut others: Vec<(i64, String)> = rows
             .ma_tx_out
             .iter()
             .map(|row| (row.id, format!("{}{}", row.policy, row.name)))
-            .filter(|(_, unit)| !table.iter().any(|(known, _)| known == unit))
+            .filter(|(_, unit)| !fixed.contains(unit.as_str()))
             .collect();
         others.sort();
+        let mut written: HashSet<String> = HashSet::new();
         for (_, unit) in others {
-            if descriptors
-                .iter()
-                .any(|(_, policy, name)| format!("{policy}{name}") == unit)
-            {
+            if !written.insert(unit.clone()) {
                 continue;
             }
             descriptors.push((next, unit[..56].to_owned(), unit[56..].to_owned()));
@@ -148,35 +212,12 @@ impl Build<'_> {
         let carried: BTreeMap<String, Vec<Carried>> = self.typed("carried").await?;
         let headers: BTreeMap<String, Header> = self.typed("header").await?;
         let params = self.items("param").await?;
-        let mut rows = Rows::default();
-        for (point, (content, place)) in &unspent {
-            let valid = *valid.get(&point.0).ok_or_else(|| {
-                refusal("rebuild_validity_missing", json!({"transaction": point.0}))
-            })?;
-            self.output_rows(&mut rows, point, content, *place, valid, &datums)?;
-        }
-        let mut block_rows: BTreeMap<u32, BlockRow> = BTreeMap::new();
-        let mut markers = Vec::new();
-        for carry in carried.values().flatten() {
-            block_rows.insert(carry.header.height, block_row(&carry.header));
-            for (index, content) in &carry.outputs {
-                let point = (carry.tx.clone(), *index);
-                self.output_rows(
-                    &mut rows,
-                    &point,
-                    content,
-                    carry.place,
-                    carry.valid,
-                    &datums,
-                )?;
-                if !unspent.contains_key(&point) {
-                    markers.push(
-                        ids::output_id(carry.place.height, carry.place.index, *index)
-                            .map_err(invalid)?,
-                    );
-                }
-            }
-        }
+        let Below {
+            rows,
+            headers: mut block_rows,
+            markers,
+        } = rows_below_horizon(&self.relevance, &unspent, &valid, &datums, &carried)?;
+        let rows = rows.rows;
         for (key, header) in &headers {
             if key.starts_with("epoch:") || key.starts_with("chain:") {
                 block_rows.insert(header.height, block_row(header));
@@ -237,10 +278,7 @@ impl Build<'_> {
     /// H on or by their own answer, whatever their height: the quantity holds
     /// every event of the history. Returns the supply at H of the fixed
     /// units.
-    async fn proof(
-        &mut self,
-        unspent: &BTreeMap<(String, u16), (Content, Place)>,
-    ) -> Result<BTreeMap<String, String>, Error> {
+    async fn proof(&mut self, unspent: &Unspent) -> Result<BTreeMap<String, String>, Error> {
         let readings = self.items("quantity").await?;
         let since: BTreeMap<String, Place> = self.typed("since").await?;
         let fixed = fixed_units(self.profile);
@@ -332,5 +370,97 @@ impl Build<'_> {
             json!({"event":"rebuild_published","content_digest":verified.content_digest,"calls":calls})
         );
         Ok((verified, calls))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use dsa_chain::profiles::Profile;
+    use dsa_provider::types::{AssetAmount, Quantity};
+
+    use super::*;
+
+    /// `count` outputs of cNIGHT at addresses of no profile, two to a
+    /// creating transaction, each transaction at a place of its own.
+    fn outputs(profile: &Profile, count: usize) -> (Unspent, BTreeMap<String, bool>) {
+        let unit = profile.assets.cnight.unit();
+        let mut unspent = BTreeMap::new();
+        let mut valid = BTreeMap::new();
+        for n in 0..count {
+            let transaction = n / 2;
+            let hash = format!("{transaction:064x}");
+            let place = Place {
+                height: 1_000 + (transaction / 100) as u32,
+                index: (transaction % 100) as u16,
+            };
+            let content = Content {
+                address: format!("addr_test1q{n}"),
+                amount: vec![
+                    AssetAmount {
+                        unit: "lovelace".to_owned(),
+                        quantity: Quantity(1_000_000),
+                    },
+                    AssetAmount {
+                        unit: unit.clone(),
+                        quantity: Quantity(1),
+                    },
+                ],
+                data_hash: None,
+                inline_datum: None,
+            };
+            unspent.insert((hash.clone(), (n % 2) as u16), (content, place));
+            valid.insert(hash, true);
+        }
+        (unspent, valid)
+    }
+
+    fn collect(count: usize) -> (Collected, f64) {
+        let profile = Profile::load("mainnet").expect("the profile");
+        let relevance = Relevance::of(&profile);
+        let (unspent, valid) = outputs(&profile, count);
+        let started = Instant::now();
+        let below = rows_below_horizon(
+            &relevance,
+            &unspent,
+            &valid,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("the rows");
+        assert!(below.markers.is_empty());
+        (below.rows, started.elapsed().as_secs_f64())
+    }
+
+    #[test]
+    fn the_rows_below_the_horizon_hold_each_row_once() {
+        let (rows, _) = collect(1_000);
+        assert_eq!(
+            (
+                rows.rows.tx.len(),
+                rows.rows.tx_out.len(),
+                rows.rows.ma_tx_out.len()
+            ),
+            (500, 1_000, 1_000)
+        );
+    }
+
+    /// The rows of the base for 250,000 outputs (DSA_BASE_OUTPUTS sets the
+    /// number), timed: about the unspent cNIGHT outputs of Mainnet.
+    #[test]
+    #[ignore = "a timing, run on its own"]
+    fn the_rows_of_many_outputs_are_collected() {
+        let count = std::env::var("DSA_BASE_OUTPUTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(250_000);
+        let (rows, seconds) = collect(count);
+        println!(
+            "{}",
+            json!({"event":"base_rows","outputs":count,"transactions":rows.rows.tx.len(),
+                "seconds":seconds})
+        );
+        assert_eq!(rows.rows.tx_out.len(), count);
     }
 }

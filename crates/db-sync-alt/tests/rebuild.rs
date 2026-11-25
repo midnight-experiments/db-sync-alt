@@ -89,6 +89,23 @@ async fn build(
     target: u32,
     stop: Stop,
 ) -> std::result::Result<Report, follow::Error> {
+    let options = Options {
+        horizon_block: Some(horizon),
+        target_block: Some(target),
+        window_seconds: None,
+        retention_seconds: DAY,
+    };
+    build_with(profile, fake, database, options, stop).await
+}
+
+/// One build into `database` from `fake` with the given choices.
+async fn build_with(
+    profile: &Profile,
+    fake: &Fake,
+    database: &Database,
+    options: Options,
+    stop: Stop,
+) -> std::result::Result<Report, follow::Error> {
     let (progress, _view) = watch::channel(Progress::default());
     rebuild::rebuild(rebuild::Context {
         profile,
@@ -99,12 +116,7 @@ async fn build(
             fatal_after: Duration::from_secs(600),
             ..Settings::default()
         },
-        options: Options {
-            horizon_block: Some(horizon),
-            target_block: Some(target),
-            window_seconds: None,
-            retention_seconds: DAY,
-        },
+        options,
         time: fake.clock.clone(),
         stop,
         progress,
@@ -420,10 +432,16 @@ async fn a_build_from_the_provider_equals_a_conversion() -> Result {
 struct Script {
     g: Generated,
     next_fund: u64,
+    /// Slots from one block to the next.
+    step: u64,
 }
 
 impl Script {
     fn new() -> Self {
+        Self::with_step(20)
+    }
+
+    fn with_step(step: u64) -> Self {
         Self {
             g: Generated {
                 blocks: Vec::new(),
@@ -435,6 +453,7 @@ impl Script {
                 counts: Counts::default(),
             },
             next_fund: 0,
+            step,
         }
     }
 
@@ -482,7 +501,7 @@ impl Script {
             built.push(done);
         }
         let previous = self.g.blocks.last().map(|block| block.hash.clone());
-        let slot = 1_000 + u64::from(height) * 20;
+        let slot = 1_000 + u64::from(height) * self.step;
         let mut seed = format!("script block {height} {previous:?}").into_bytes();
         for tx in &built {
             seed.extend(tx.hash.as_bytes());
@@ -678,13 +697,24 @@ async fn edge_conversion(
     g: &Generated,
     converted: &Database,
 ) -> Result<(Source, dsa_store::verify::Verification)> {
+    conversion_at(profile, g, converted, EDGE_HORIZON, EDGE_TARGET).await
+}
+
+/// A scripted chain converted at `horizon` and `target` into `converted`.
+async fn conversion_at(
+    profile: &Profile,
+    g: &Generated,
+    converted: &Database,
+    horizon: u32,
+    target: u32,
+) -> Result<(Source, dsa_store::verify::Verification)> {
     let history = derive(profile, g).await?;
     let mut source = Source::new().await?;
-    let headers = (1..=EDGE_TARGET + K)
+    let headers = (1..=target + K)
         .map(|height| header(g.block(height).unwrap()))
         .collect::<Vec<_>>();
-    source.start(g, &history, EDGE_TARGET, &headers).await?;
-    let conversion = convert(converted, &source.database, profile, EDGE_HORIZON, DAY).await?;
+    source.start(g, &history, target, &headers).await?;
+    let conversion = convert(converted, &source.database, profile, horizon, DAY).await?;
     Ok((source, conversion))
 }
 
@@ -1987,6 +2017,147 @@ async fn a_refused_proof_is_read_again_by_the_same_command() -> Result {
     rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await
+}
+
+/// Mainnet profile, k 12, sixty blocks two hours apart. Height 1 mints 10
+/// cNIGHT into five outputs at ordinary addresses; heights 10 and 40 each
+/// spend one of them into a new cNIGHT output.
+fn slow_chain(profile: &Profile) -> Generated {
+    let ordinary = |index: u8| {
+        let mut key = [0x6e; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let cnight = profile.assets.cnight.clone();
+    let mut s = Script::with_step(7_200);
+    let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
+            &cnight.policy,
+            &cnight.name,
+            2,
+        ));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    for height in 2..=EDGE_END {
+        let transaction = matches!(height, 10 | 40).then(|| {
+            s.tx()
+                .input(&minted, (height / 10) as u16)
+                .output(Output::new(ordinary(5), 1_400_000).token(&cnight.policy, &cnight.name, 2))
+        });
+        s.block(transaction.into_iter().collect());
+    }
+    s.g
+}
+
+/// The command as an operator types it, without a position: the target is
+/// the provider's tip less k (60 − 12 = 48) and the horizon the newest block
+/// at or before the target's time less the retention of one day (twelve
+/// blocks of two hours: 36). The build equals a conversion at those
+/// positions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_without_positions_takes_them_from_the_provider() -> Result {
+    let profile = profile(1);
+    let g = slow_chain(&profile);
+    let (horizon, target) = (36, EDGE_END - K);
+    let converted = Database::new().await?;
+    let (source, conversion) = conversion_at(&profile, &g, &converted, horizon, target).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    let options = Options {
+        horizon_block: None,
+        target_block: None,
+        window_seconds: None,
+        retention_seconds: DAY,
+    };
+    let report = build_with(&profile, &fake, &rebuilt, options, stop)
+        .await
+        .map_err(|error| error.report().to_string())?;
+    println!(
+        "{}",
+        json!({"event":"positions_from_the_provider","plan":report.plan,"calls":report.calls})
+    );
+    assert_eq!((report.plan.horizon, report.plan.target), (horizon, target));
+    if let Err(error) = same(&report.verified, &conversion, "positions from the provider") {
+        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+        return Err(format!("{error}; rows {rows}").into());
+    }
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// Positions a build refuses before it changes the database: a target above
+/// the provider's tip less k, a window shorter than a day or longer than the
+/// retention, a horizon of 0 or above the target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn positions_out_of_range_refuse_the_build_before_it_starts() -> Result {
+    let profile = profile(1);
+    let g = slow_chain(&profile);
+    let options = |horizon, target, window| Options {
+        horizon_block: horizon,
+        target_block: target,
+        window_seconds: window,
+        retention_seconds: 2 * DAY,
+    };
+    let mut outcomes = Vec::new();
+    for (name, choices, expected) in [
+        (
+            "target above the provider's tip less k",
+            options(None, Some(EDGE_END - K + 1), None),
+            "target_above_provider_final",
+        ),
+        (
+            "window shorter than a day",
+            options(None, None, Some(DAY - 1)),
+            "invalid_window",
+        ),
+        (
+            "window longer than the retention",
+            options(None, None, Some(2 * DAY + 1)),
+            "invalid_window",
+        ),
+        (
+            "horizon 0",
+            options(Some(0), Some(40), None),
+            "invalid_horizon",
+        ),
+        (
+            "horizon above the target",
+            options(Some(41), Some(40), None),
+            "invalid_horizon",
+        ),
+    ] {
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &profile).await?;
+        let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), None).await;
+        let (_stopper, stop) = Stop::new();
+        let error = build_with(&profile, &fake, &rebuilt, choices, stop)
+            .await
+            .err()
+            .ok_or_else(|| format!("{name}: the build ran"))?;
+        let blank: bool = common::connect(&rebuilt.config)
+            .await?
+            .query_one(
+                "SELECT to_regclass('dsa.identity') IS NULL AND to_regnamespace('dsa_rebuild') IS NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        outcomes.push(json!({"case":name,"error":error.report(),"blank":blank}));
+        assert_eq!(code(&error), expected, "{name}: {}", error.report());
+        assert!(blank, "{name}: the build changed the database");
+        rebuilt.cleanup().await?;
+    }
+    println!(
+        "{}",
+        json!({"event":"positions_refused","outcomes":outcomes})
+    );
+    Ok(())
 }
 
 /// A provider of another network ends a build at its first request,

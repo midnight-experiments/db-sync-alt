@@ -189,7 +189,7 @@ impl Build<'_> {
             self.put_one("carried", body.name, &found).await?;
         }
         if !known.contains_key("permissioned_candidates") {
-            let unit = self.permissioned.clone();
+            let unit = self.relevance.permissioned.clone();
             let source = format!("unit:{unit}");
             let mut found = Vec::new();
             let mut page = Page::first();

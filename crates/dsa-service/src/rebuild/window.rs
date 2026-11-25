@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use dsa_chain::{
-    block::{InputRow, Rows, TxRow},
+    block::{InputRow, TxRow},
     ids,
 };
 use dsa_provider::types::{Hash32, Heights, Page};
@@ -16,6 +16,7 @@ use super::{
     Build,
     asker::{hash32, index16, info, invalid, utxos},
     content::{Content, NewestSpend, Place},
+    publication::Collected,
 };
 use crate::follow::{self, Connect, Error, Progress, Settings};
 
@@ -72,10 +73,10 @@ impl Build<'_> {
             }
         };
         let datums = self.items("datum").await?;
-        let mut rows = Rows::default();
+        let mut rows = Collected::default();
         let point = (spend.origin.clone(), spend.origin_index);
-        self.output_rows(
-            &mut rows,
+        rows.output(
+            &self.relevance,
             &point,
             &spend.content,
             spend.origin_place,
@@ -83,15 +84,14 @@ impl Build<'_> {
             &datums,
         )?;
         let tx_id = ids::transaction_id(spend.place.height, spend.place.index).map_err(invalid)?;
-        if !rows.tx.iter().any(|row| row.id == tx_id) {
-            rows.tx.push(TxRow {
-                id: tx_id,
-                hash: spend.tx.clone(),
-                block_id: i64::from(spend.place.height),
-                block_index: spend.place.index,
-                valid_contract: spend.valid,
-            });
-        }
+        rows.transaction(TxRow {
+            id: tx_id,
+            hash: spend.tx.clone(),
+            block_id: i64::from(spend.place.height),
+            block_index: spend.place.index,
+            valid_contract: spend.valid,
+        });
+        let mut rows = rows.rows;
         let origin_tx = ids::transaction_id(spend.origin_place.height, spend.origin_place.index)
             .map_err(invalid)?;
         rows.tx_in.push(InputRow {
@@ -121,7 +121,12 @@ impl Build<'_> {
             .into_iter()
             .map(|unit| format!("unit:{unit}"))
             .collect();
-        sources.extend(self.addresses.iter().map(|a| format!("address:{a}")));
+        sources.extend(
+            self.relevance
+                .addresses
+                .iter()
+                .map(|a| format!("address:{a}")),
+        );
         let mut best: Option<NewestSpend> = None;
         let below = Heights {
             from: None,

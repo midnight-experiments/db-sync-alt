@@ -45,8 +45,8 @@ impl Build<'_> {
         if self.cursor("units").await?.done {
             return Ok(self.items("unit").await?.into_keys().collect());
         }
-        let mut units: BTreeSet<String> = self.rule.exact_units().clone();
-        for policy in self.rule.governance_policies().clone() {
+        let mut units: BTreeSet<String> = self.relevance.rule.exact_units().clone();
+        for policy in self.relevance.rule.governance_policies().clone() {
             let provider = self.asker.provider.clone();
             let rows = every_page(&self.asker, "listings", |page| {
                 let (provider, policy) = (provider.clone(), policy.clone());
@@ -65,7 +65,7 @@ impl Build<'_> {
         for unit in self.units().await? {
             self.list_unit(&unit).await?;
         }
-        for address in self.addresses.clone() {
+        for address in self.relevance.addresses.clone() {
             self.list_address(&address).await?;
         }
         Ok(())
@@ -337,7 +337,7 @@ impl Build<'_> {
         loop {
             // A reading of the lists stopped while the address listings were
             // read again continues with them.
-            for address in self.addresses.clone() {
+            for address in self.relevance.addresses.clone() {
                 self.list_address(&address).await?;
             }
             let tip = self.since_tip().await?;
@@ -392,7 +392,12 @@ impl Build<'_> {
             .into_keys()
             .map(|unit| format!("unit:{unit}"))
             .collect();
-        sources.extend(self.addresses.iter().map(|a| format!("address:{a}")));
+        sources.extend(
+            self.relevance
+                .addresses
+                .iter()
+                .map(|a| format!("address:{a}")),
+        );
         for source in sources {
             let key = format!("since:{source}");
             let mut cursor = self.cursor(&key).await?;

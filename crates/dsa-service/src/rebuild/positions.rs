@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use super::{
     BATCH, Build,
     asker::{pages_below, utxos},
-    content::{Content, Held, Place, outpoint},
+    content::{Content, Held, Place, Unspent, outpoint},
 };
 use crate::follow::Error;
 
@@ -81,11 +81,11 @@ impl Build<'_> {
     /// unit it holds.
     fn sources_of(&self, content: &Content) -> Vec<String> {
         let mut sources = Vec::new();
-        if self.addresses.contains(&content.address) {
+        if self.relevance.addresses.contains(&content.address) {
             sources.push(format!("address:{}", content.address));
         }
         for (policy, name, _) in content.assets() {
-            if self.rule.allows(&policy, &name) {
+            if self.relevance.rule.allows(&policy, &name) {
                 sources.push(format!("unit:{policy}{name}"));
             }
         }
@@ -162,9 +162,7 @@ impl Build<'_> {
     /// The candidates, each with the place of its creating transaction below
     /// H. A candidate that no list places is a listing that misses an output
     /// and refuses the build.
-    pub(super) async fn unspent_at_horizon(
-        &mut self,
-    ) -> Result<BTreeMap<(String, u16), (Content, Place)>, Error> {
+    pub(super) async fn unspent_at_horizon(&mut self) -> Result<Unspent, Error> {
         let candidates = self.candidates().await?;
         let placed: BTreeMap<String, Place> = self.typed("position").await?;
         let mut unspent = BTreeMap::new();
@@ -190,7 +188,7 @@ impl Build<'_> {
     /// it placed, and the outputs at profile addresses that each of those
     /// transactions created, with the transaction that spent each one.
     pub(super) async fn addresses(&mut self) -> Result<(), Error> {
-        for address in self.addresses.clone() {
+        for address in self.relevance.addresses.clone() {
             let source = format!("address:{address}");
             let key = format!("held:{source}");
             let mut cursor = self.cursor(&key).await?;
@@ -242,7 +240,7 @@ impl Build<'_> {
             let held: Vec<Held> = answer
                 .outputs
                 .iter()
-                .filter(|row| !row.collateral && self.addresses.contains(&row.address))
+                .filter(|row| !row.collateral && self.relevance.addresses.contains(&row.address))
                 .map(|row| {
                     Ok(Held {
                         index: u16::try_from(row.output_index)
@@ -264,10 +262,7 @@ impl Build<'_> {
     /// full list below H: the outputs its transactions created there that
     /// no transaction of the list spent. They must be the outputs at the
     /// address that the listings and the lists from H on gave.
-    async fn check_addresses(
-        &mut self,
-        unspent: &BTreeMap<(String, u16), (Content, Place)>,
-    ) -> Result<(), Error> {
+    async fn check_addresses(&mut self, unspent: &Unspent) -> Result<(), Error> {
         let mut lists: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for key in self.items("address_tx").await?.into_keys() {
             if let Some((address, transaction)) = key.split_once(' ') {
@@ -278,7 +273,7 @@ impl Build<'_> {
             }
         }
         let held: BTreeMap<String, Vec<Held>> = self.typed("held").await?;
-        for address in self.addresses.clone() {
+        for address in self.relevance.addresses.clone() {
             let list = lists.remove(&address).unwrap_or_default();
             let mut derived: BTreeMap<String, Value> = BTreeMap::new();
             for transaction in &list {

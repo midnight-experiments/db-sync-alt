@@ -149,6 +149,10 @@ pub(super) struct Place {
     pub(super) index: u16,
 }
 
+/// The relevant outputs unspent at H by outpoint, with the place of the
+/// transaction that created each.
+pub(super) type Unspent = std::collections::BTreeMap<(String, u16), (Content, Place)>;
+
 /// A transaction kept below H by K5 or K6, with the outputs it keeps.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Carried {
