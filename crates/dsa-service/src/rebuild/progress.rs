@@ -12,7 +12,7 @@ use dsa_store::Store;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use super::{BATCH, Build, Plan, asker::refusal};
+use super::{Build, Plan, asker::refusal};
 use crate::follow::Error;
 
 /// The progress is recorded at least this often while a phase runs.
@@ -109,7 +109,7 @@ impl Build<'_> {
         kind: &str,
         items: Vec<(String, Value)>,
     ) -> Result<(), Error> {
-        for chunk in items.chunks(BATCH) {
+        for chunk in items.chunks(self.batch) {
             self.store().await?.put_building_items(kind, chunk).await?;
         }
         if self.recorded.elapsed() >= RECORD_INTERVAL {
@@ -156,6 +156,8 @@ impl Build<'_> {
             .await?;
         self.phase = phase.to_owned();
         self.recorded = Instant::now();
+        self.progress
+            .send_modify(|progress| progress.reason = phase.to_owned());
         eprintln!(
             "{}",
             json!({"event":"rebuild_phase","phase":phase,"calls":calls,"detail":detail})

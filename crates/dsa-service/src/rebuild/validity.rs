@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use futures_util::StreamExt;
 use serde_json::json;
 
-use super::{BATCH, Build, asker::info, content::Place};
+use super::{Build, asker::info, content::Place};
 use crate::follow::Error;
 
 impl Build<'_> {
@@ -54,7 +54,7 @@ impl Build<'_> {
                 ));
             }
             batch.push((transaction, json!(info.valid_contract)));
-            if batch.len() >= BATCH {
+            if batch.len() >= self.batch {
                 self.put("valid", std::mem::take(&mut batch)).await?;
             }
         }

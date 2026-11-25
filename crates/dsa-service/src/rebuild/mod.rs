@@ -81,7 +81,7 @@ use self::{
     progress::{PHASES, parse, phase_index, to_value},
 };
 
-/// Items stored at once.
+/// Items a phase holds before it stores them, unless the options say.
 const BATCH: usize = 200;
 
 /// Refusals of a build before its window whose cause can be a moment at
@@ -124,6 +124,8 @@ pub struct Options {
     pub retention_seconds: i64,
     /// The shortest window from H's time to T's that a build accepts.
     pub shortest_window_seconds: i64,
+    /// Items a phase holds before it stores them; 200 when 0.
+    pub batch_items: usize,
 }
 
 /// The choices a build began with; a stopped build continues only with the
@@ -202,6 +204,11 @@ struct Build<'a> {
     phase: String,
     /// When the progress was last recorded.
     recorded: Instant,
+    /// Items a phase holds before it stores them.
+    batch: usize,
+    /// The build's phase is its progress's reason until the window, whose
+    /// follower reports its own.
+    progress: watch::Sender<Progress>,
 }
 
 /// What makes an output one the node reads, and one whose datum it reads:
@@ -503,6 +510,12 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         plan: plan.clone(),
         phase,
         recorded: Instant::now(),
+        batch: if options.batch_items == 0 {
+            BATCH
+        } else {
+            options.batch_items
+        },
+        progress,
     };
     eprintln!(
         "{}",
@@ -531,7 +544,7 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
                 build.base().await?;
                 build.phase = "window".to_owned();
             }
-            "window" => build.window(&settings, &progress).await?,
+            "window" => build.window(&settings).await?,
             "publish" => {}
             _ => {}
         }

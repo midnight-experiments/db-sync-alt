@@ -112,6 +112,7 @@ pub(crate) fn command(
                         window_seconds: choices.window_seconds,
                         retention_seconds: choices.retention_seconds,
                         shortest_window_seconds: SHORTEST_WINDOW_SECONDS,
+                        batch_items: 0,
                     },
                     time: Arc::new(WallTime),
                     stop,

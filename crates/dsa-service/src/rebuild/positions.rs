@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use super::{
-    BATCH, Build,
+    Build,
     asker::{pages_below, utxos},
     content::{Content, Held, Place, Unspent, outpoint},
 };
@@ -253,7 +253,7 @@ impl Build<'_> {
                 })
                 .collect::<Result<_, Error>>()?;
             batch.push((transaction, json!(held)));
-            if batch.len() >= BATCH {
+            if batch.len() >= self.batch {
                 self.put("held", std::mem::take(&mut batch)).await?;
             }
         }

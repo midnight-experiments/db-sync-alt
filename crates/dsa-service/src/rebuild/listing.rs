@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use super::{
-    BATCH, Build,
+    Build,
     asker::{PASSES, every_page, index16, info, required, stable, transactions_page, utxos},
     content::{Content, Event, Moved, Spent, outpoint},
     progress::{Cursor, parse, to_value},
@@ -540,7 +540,7 @@ impl Build<'_> {
             let (transaction, answer) = result?;
             let moved = self.moved(answer)?;
             batch.push((transaction, to_value(moved)?));
-            if batch.len() >= BATCH {
+            if batch.len() >= self.batch {
                 self.put("moved", std::mem::take(&mut batch)).await?;
             }
         }

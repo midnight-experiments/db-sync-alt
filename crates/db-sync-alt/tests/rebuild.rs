@@ -4,8 +4,9 @@
 //! the provider's listings at the same H and T, give the same content and
 //! state digests, supply and position. DSA_REBUILD_CASES sets the number of
 //! generated chains of the property test (default 16), DSA_REBUILD_PARALLEL
-//! how many run at once (default 4), DSA_REBUILD_KILL_POINTS where a build
-//! is stopped and continued (default 6) and DSA_REBUILD_FOLLOW_CASES the
+//! how many run at once (default 4), DSA_REBUILD_KILL_POINTS how many more
+//! points, spread over the requests, a build is stopped at besides one in
+//! every phase (default 0) and DSA_REBUILD_FOLLOW_CASES the
 //! chains followed on after their build (default 4).
 
 #[path = "common/legacy.rs"]
@@ -41,6 +42,7 @@ use dsa_testkit::{
     server::Behavior,
     tx::{Datum, Output, Tx, enterprise_address, hash, int_datum},
 };
+use futures_util::StreamExt;
 use harness::{
     K, Random, Result, Source, convert, derive, generated, header, profile, reset, same,
 };
@@ -70,6 +72,23 @@ async fn empty(database: &Database, profile: &Profile) -> Result {
 /// a stopped build may have counted these without the provider answering.
 const IN_FLIGHT: i64 = 4;
 
+/// Requests a continued run sends before it reaches the phase it stopped
+/// in: the provider's network, and the tip a stopped window starts from.
+const RUN_START: usize = 4;
+
+/// The choices of the kill test's builds: its case's H and T, `batch` items
+/// stored at once (0: the default).
+fn kill_options(case: &Case, batch: usize) -> Options {
+    Options {
+        horizon_block: Some(case.horizon),
+        target_block: Some(case.target),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: 0,
+        batch_items: batch,
+    }
+}
+
 /// The phase a build in `database` recorded, if any.
 async fn stored_phase(database: &Database) -> Option<String> {
     common::connect(&database.config)
@@ -97,6 +116,7 @@ async fn build(
         window_seconds: None,
         retention_seconds: DAY,
         shortest_window_seconds: 0,
+        batch_items: 0,
     };
     build_with(profile, fake, database, options, stop).await
 }
@@ -110,6 +130,19 @@ async fn build_with(
     stop: Stop,
 ) -> std::result::Result<Report, follow::Error> {
     let (progress, _view) = watch::channel(Progress::default());
+    build_observed(profile, fake, database, options, stop, progress).await
+}
+
+/// `build_with`, the build's progress (its phase until the window) sent to
+/// `progress`.
+async fn build_observed(
+    profile: &Profile,
+    fake: &Fake,
+    database: &Database,
+    options: Options,
+    stop: Stop,
+    progress: watch::Sender<Progress>,
+) -> std::result::Result<Report, follow::Error> {
     rebuild::rebuild(rebuild::Context {
         profile,
         provider: fake.provider(),
@@ -362,13 +395,20 @@ async fn equivalence(
             return Ok(());
         }
     };
-    if let Err(error) = same(&report.verified, &conversion, &context) {
-        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
-        let failed = failure(
-            "differs",
-            "differs",
-            json!({"same": error.to_string(), "rows": rows}),
-        );
+    // The digests, then every row with its ID: the digest holds natural keys
+    // only, so the IDs and ordinals of the rows below H are compared here.
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let compared = same(&report.verified, &conversion, &context)
+        .map_err(|error| error.to_string())
+        .and_then(|()| {
+            if rows == json!({}) {
+                Ok(())
+            } else {
+                Err("rows differ".to_owned())
+            }
+        });
+    if let Err(error) = compared {
+        let failed = failure("differs", "differs", json!({"same": error, "rows": rows}));
         println!(
             "{}",
             json!({"event":"rebuild_equivalence_failure","failure":failed})
@@ -516,6 +556,8 @@ struct Script {
     step: u64,
     table: Vec<String>,
     network: u8,
+    /// Epochs left without a block so far.
+    skipped: u32,
 }
 
 impl Script {
@@ -543,7 +585,38 @@ impl Script {
             step,
             table: table.into_iter().collect(),
             network: u8::from(profile.network == "mainnet"),
+            skipped: 0,
         }
+    }
+
+    /// The epoch of `height`, eight blocks to an epoch from 200, after the
+    /// skipped ones.
+    fn epoch(&self, height: u32) -> u32 {
+        200 + (height - 1) / 8 + self.skipped
+    }
+
+    /// The next block starts an epoch one later than it would: the epoch
+    /// between has no block, and so, as db-sync writes them at an epoch's
+    /// first block, no parameters and no stake.
+    fn skip_epoch(&mut self) {
+        self.skipped += 1;
+    }
+
+    fn register(&mut self, epoch: u32) {
+        self.g
+            .epochs
+            .entry(epoch)
+            .or_insert_with(|| (hash(format!("nonce {epoch}").as_bytes()), 16_384));
+        self.g.stake.entry(epoch).or_insert_with(|| {
+            (0..2_u64)
+                .map(|n| {
+                    (
+                        hash(format!("script pool {n}").as_bytes())[..56].to_owned(),
+                        1_000_000 + n * 1_000 + u64::from(epoch),
+                    )
+                })
+                .collect()
+        });
     }
 
     /// A transaction funded by an input the chain does not know.
@@ -568,21 +641,8 @@ impl Script {
             }
             transactions.push(tx.output(output));
         }
-        let epoch = 200 + (height - 1) / 8;
-        self.g
-            .epochs
-            .entry(epoch)
-            .or_insert_with(|| (hash(format!("nonce {epoch}").as_bytes()), 16_384));
-        self.g.stake.entry(epoch).or_insert_with(|| {
-            (0..2_u64)
-                .map(|n| {
-                    (
-                        hash(format!("script pool {n}").as_bytes())[..56].to_owned(),
-                        1_000_000 + n * 1_000 + u64::from(epoch),
-                    )
-                })
-                .collect()
-        });
+        let epoch = self.epoch(height);
+        self.register(epoch);
         let mut built = Vec::new();
         for tx in transactions {
             let facts = tx.facts();
@@ -826,6 +886,14 @@ fn edge_chain(profile: &Profile, g: &Generated, through: u32) -> Chain {
 /// raises SQLSTATE 55000.
 async fn serving(database: &Database) -> Result<bool> {
     let client = common::connect(&database.config).await?;
+    // A build stopped before it laid out the database has no gate.
+    let laid_out: bool = client
+        .query_one("SELECT to_regclass('dsa.position') IS NOT NULL", &[])
+        .await?
+        .get(0);
+    if !laid_out {
+        return Ok(false);
+    }
     let position: bool = client
         .query_one("SELECT serving FROM dsa.position WHERE id=1", &[])
         .await?
@@ -1542,6 +1610,107 @@ async fn the_newest_spend_ranks_its_input_among_its_inputs_only() -> Result {
     Ok(())
 }
 
+/// Mainnet profile, k 12, the edge chain's H, T and length: cNIGHT minted
+/// at height 1 and spent at 10 and 36; at height 35, 110 transactions that
+/// create cNIGHT outputs; with `empty_epoch`, the epoch of heights 25–32
+/// starts one later, so that epoch(H) − 2 has no block.
+fn shapes_chain(profile: &Profile, empty_epoch: bool) -> Script {
+    let ordinary = |index: u8| {
+        let mut key = [0x2b; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let cnight = profile.assets.cnight.clone();
+    let mut s = Script::new(profile);
+    let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
+            &cnight.policy,
+            &cnight.name,
+            2,
+        ));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    for height in 2..=EDGE_END {
+        if height == 25 && empty_epoch {
+            s.skip_epoch();
+        }
+        let transactions =
+            match height {
+                10 => vec![s.tx().input(&minted, 1).output(
+                    Output::new(ordinary(5), 1_400_000).token(&cnight.policy, &cnight.name, 2),
+                )],
+                35 => (0..110_u64)
+                    .map(|n| {
+                        s.tx().mint(&cnight.policy, &cnight.name, 1).output(
+                            Output::new(ordinary((n % 5) as u8), 1_200_000 + n).token(
+                                &cnight.policy,
+                                &cnight.name,
+                                1,
+                            ),
+                        )
+                    })
+                    .collect(),
+                36 => vec![s.tx().input(&minted, 2).output(
+                    Output::new(ordinary(6), 1_400_000).token(&cnight.policy, &cnight.name, 2),
+                )],
+                _ => Vec::new(),
+            };
+        s.block(transactions);
+    }
+    s
+}
+
+/// 110 transactions that create cNIGHT outputs at one height from H on: the
+/// list from H on is read for that height on its own, two pages, until two
+/// readings agree. The build equals the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_crowded_height_since_the_horizon_gives_the_conversion() -> Result {
+    let profile = profile(1);
+    let s = shapes_chain(&profile, false);
+    let fake = Fake::with_chain(edge_chain(&profile, &s.g, EDGE_END), None).await;
+    built_equal(&profile, &s.g, &fake, "crowded height").await?;
+    let crowded = format!(
+        "/assets/{}/transactions?count=100&page=2&order=asc&from=35&to=35",
+        profile.assets.cnight.unit()
+    );
+    println!(
+        "{}",
+        json!({"event":"crowded_height","second_pages":fake.requests(&crowded)})
+    );
+    assert!(fake.requests(&crowded) > 0, "no request {crowded}");
+    Ok(())
+}
+
+/// An epoch without a block two epochs before H's has no parameters at the
+/// provider, as db-sync writes an epoch's parameters at its first block: the
+/// build refuses with `provider_epoch_parameters_missing` and nothing serves.
+/// (Every epoch of Mainnet and Preprod has blocks.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_epoch_without_a_block_below_the_horizon_refuses_the_build() -> Result {
+    let profile = profile(1);
+    let s = shapes_chain(&profile, true);
+    let empty = s.epoch(EDGE_HORIZON) - 2;
+    assert!(s.g.blocks.iter().all(|block| block.epoch != empty));
+    let (error, serves) =
+        refused(&profile, &s.g, Arc::new(|_: &str, _: &mut Chain, _| None)).await?;
+    println!(
+        "{}",
+        json!({"event":"empty_epoch","epoch":empty,"refusal":error.report(),"serving":serves})
+    );
+    assert_eq!(
+        code(&error),
+        "provider_epoch_parameters_missing",
+        "{}",
+        error.report()
+    );
+    assert_eq!(error.report()["detail"]["epoch"], empty);
+    assert!(!serves, "the database serves");
+    Ok(())
+}
+
 // ----- phase-2-invalid transactions ------------------------------------------
 
 /// What the invalid-transaction chain's test refers to.
@@ -2214,6 +2383,7 @@ async fn a_build_without_positions_takes_them_from_the_provider() -> Result {
         window_seconds: None,
         retention_seconds: DAY,
         shortest_window_seconds: DAY,
+        batch_items: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, options, stop)
         .await
@@ -2246,6 +2416,7 @@ async fn positions_out_of_range_refuse_the_build_before_it_starts() -> Result {
         window_seconds: window,
         retention_seconds: 2 * DAY,
         shortest_window_seconds: DAY,
+        batch_items: 0,
     };
     let mut outcomes = Vec::new();
     for (name, choices, expected) in [
@@ -2384,6 +2555,7 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         window_seconds: window,
         retention_seconds: retention,
         shortest_window_seconds: 0,
+        batch_items: 0,
     };
     let (stopper, stop) = Stop::new();
     let run = build_with(
@@ -2529,6 +2701,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
         window_seconds: None,
         retention_seconds: DAY,
         shortest_window_seconds: DAY,
+        batch_items: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, long, stop)
         .await
@@ -2554,6 +2727,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
                 window_seconds: None,
                 retention_seconds: DAY,
                 shortest_window_seconds: DAY,
+                batch_items: 0,
             },
         ),
         (
@@ -2565,6 +2739,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
                 window_seconds: None,
                 retention_seconds: 7 * DAY,
                 shortest_window_seconds: DAY,
+                batch_items: 0,
             },
         ),
     ] {
@@ -2588,6 +2763,334 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
         assert_eq!(outcome["code"], "invalid_window", "{outcome}");
     }
     Ok(())
+}
+
+/// Stops a build of the edge chain into `rebuilt` five requests into its
+/// window.
+async fn stopped_in_window(profile: &Profile, fake: &Fake, rebuilt: &Database) -> Result {
+    let (stopper, stop) = Stop::new();
+    let run = build(profile, fake, rebuilt, EDGE_HORIZON, EDGE_TARGET, stop);
+    let stopping = async {
+        let mut from = None;
+        loop {
+            let answered = fake.paths().len();
+            if from.is_none() && stored_phase(rebuilt).await.as_deref() == Some("window") {
+                from = Some(answered);
+            }
+            if from.is_some_and(|from| answered >= from + 5) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = stopper.send(true);
+    };
+    let (result, ()) = tokio::join!(run, stopping);
+    let error = result.err().ok_or("the stopped build published")?;
+    assert_eq!(code(&error), "stop_requested");
+    Ok(())
+}
+
+/// The code of a store's refusal.
+fn refused_with(error: &dsa_store::Error) -> String {
+    error.report()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Every other command against a database whose build stopped in its
+/// window, through the functions the commands run (the test profile's k is
+/// not the network's, so the binary would refuse the profile first):
+/// `verify` and `snapshot` meet the closed gate, `restore` and `convert`
+/// refuse a database that is not empty, `grant-reader` grants and the reader
+/// still cannot read, `run` and `follow` refuse a database that does not
+/// serve, `compare` cannot read side A, and `status` calls it unready. A
+/// second build beside a running one is refused by the writer lock, and a
+/// build into a database that serves as not empty. The stopped build then
+/// continues to the conversion's digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn the_other_commands_refuse_a_database_being_built() -> Result {
+    use dsa_service::{config, retry::WallTime, run, status, upkeep::IndexPolicy};
+    use dsa_store::{Store, compare};
+    let profile = profile(1);
+    let edges = edges(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &edges.g, &converted).await?;
+    let files = tempfile::tempdir()?;
+    let file = files.path().join("conversion.snapshot");
+    Store::connect(converted.config.clone(), None)
+        .await?
+        .snapshot(&profile, &file)
+        .await
+        .map_err(harness::named)?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), None).await;
+    stopped_in_window(&profile, &fake, &rebuilt).await?;
+    let mut outcomes: BTreeMap<&str, String> = BTreeMap::new();
+    // The whole report of the refusals that wrap the gate's.
+    let mut reports: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    let mut store = Store::connect(rebuilt.config.clone(), None).await?;
+    let outcome = |result: std::result::Result<(), dsa_store::Error>| match result {
+        Ok(()) => "ok".to_owned(),
+        Err(error) => refused_with(&error),
+    };
+    if let Err(error) = store.verify(&profile).await {
+        reports.insert("verify", error.report());
+    }
+    if let Err(error) = store
+        .snapshot(&profile, &files.path().join("built.snapshot"))
+        .await
+    {
+        reports.insert("snapshot", error.report());
+    }
+    outcomes.insert(
+        "restore",
+        outcome(store.restore(&profile, &file, None).await.map(|_| ())),
+    );
+    outcomes.insert(
+        "grant-reader",
+        outcome(
+            store
+                .grant_reader(&profile, &rebuilt.reader)
+                .await
+                .map(|_| ()),
+        ),
+    );
+    drop(store);
+    let reader_gate = common::connect(&rebuilt.reader_config())
+        .await?
+        .query_one("SELECT count(*) FROM block", &[])
+        .await
+        .err()
+        .and_then(|error| error.code().map(|code| code.code().to_owned()));
+    outcomes.insert("reader after grant-reader", reader_gate.unwrap_or_default());
+    // `convert` itself, not the harness's helper, which empties its
+    // destination first.
+    let mut legacy =
+        dsa_store::convert::LegacySource::connect(source.database.reader_config(), None).await?;
+    let converting = Store::connect(rebuilt.config.clone(), None)
+        .await?
+        .convert(
+            &profile,
+            &mut legacy,
+            &dsa_store::convert::ConvertOptions {
+                horizon_block: Some(EDGE_HORIZON),
+                retention_seconds: DAY,
+                ..dsa_store::convert::ConvertOptions::default()
+            },
+        )
+        .await;
+    outcomes.insert(
+        "convert",
+        converting
+            .err()
+            .map_or("ok".to_owned(), |error| refused_with(&error)),
+    );
+    let followed = support::follow_to(
+        &profile,
+        &fake,
+        &rebuilt.config,
+        support::until(EDGE_TARGET),
+    )
+    .await;
+    outcomes.insert(
+        "follow",
+        followed.err().map_or("ok".to_owned(), |error| code(&error)),
+    );
+    let open: run::Open = {
+        let config = rebuilt.config.clone();
+        Arc::new(move |_| {
+            let config = config.clone();
+            Box::pin(async move { Store::connect(config, None).await })
+        })
+    };
+    let settings = config::Settings::check(config::Input {
+        listen: "127.0.0.1:0".to_owned(),
+        reader: rebuilt.reader.clone(),
+        snapshot: None,
+        expect_content_digest: None,
+        retention_seconds: None,
+        change_retention: false,
+        snapshot_dir: None,
+        snapshot_keep: 3,
+        snapshot_at: "00:30".to_owned(),
+        health_max_lag_blocks: 9,
+        database_fatal_after_seconds: 60,
+    })
+    .map_err(|invalid| format!("{invalid:?}"))?;
+    let (_stopper, stop) = Stop::new();
+    let service = run::run(run::Context {
+        profile: profile.clone(),
+        provider: fake.provider(),
+        open,
+        settings,
+        follower: Settings::default(),
+        index_policy: IndexPolicy::default(),
+        refresh_interval: Duration::from_secs(20),
+        upkeep_tick: Duration::from_secs(60),
+        listener: tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+        time: Arc::new(WallTime),
+        stop,
+    });
+    outcomes.insert(
+        "run",
+        tokio::time::timeout(Duration::from_secs(120), service)
+            .await?
+            .err()
+            .map_or("ok".to_owned(), |error| code(&error)),
+    );
+    // Side B, the conversion, is open to its reader.
+    Store::connect(converted.config.clone(), None)
+        .await?
+        .grant_reader(&profile, &converted.reader)
+        .await
+        .map_err(harness::named)?;
+    let compared = compare::compare_databases(
+        compare::Request {
+            profile: profile.clone(),
+            a: compare::SideA::Database {
+                config: Box::new(rebuilt.reader_config()),
+                root: None,
+            },
+            b: converted.reader_config(),
+            b_root: None,
+            positions: None,
+            horizon_block: Some(EDGE_HORIZON),
+            max_pairs: 50,
+            statement_timeout_seconds: None,
+            idle_transaction_timeout_seconds: None,
+            a_verify_unbounded: false,
+            candidate_address: None,
+            max_differing_rows: 100,
+        },
+        |_| {},
+    )
+    .await;
+    if let Err(error) = compared {
+        reports.insert("compare", error.report());
+    }
+    let view = Store::connect(rebuilt.config.clone(), None)
+        .await?
+        .service_view(&profile, None)
+        .await?;
+    let document = serde_json::to_value(status::compose(
+        Some(&view),
+        None,
+        &status::Settings::new(&profile.network),
+        0,
+    ))?;
+    outcomes.insert(
+        "status",
+        format!(
+            "{} {}",
+            document["serving"].as_str().unwrap_or_default(),
+            document["position"]["reason"].as_str().unwrap_or_default()
+        ),
+    );
+    // A second build beside a running one: the first holds the writer
+    // lock while its listing waits four seconds for its first answer, longer
+    // than the second waits for the lock.
+    let beside = Database::new().await?;
+    empty(&beside, &profile).await?;
+    let slowed = Arc::new(AtomicBool::new(false));
+    let slow: Hook = Arc::new(move |path: &str, chain: &mut Chain, _| {
+        (path.contains("/assets/policy/") && !slowed.swap(true, Ordering::SeqCst)).then(|| {
+            Behavior {
+                delay: Duration::from_secs(4),
+                ..chain.answer(path)
+            }
+        })
+    });
+    let slow_fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), Some(slow)).await;
+    let (_stopper, stop) = Stop::new();
+    let first = build(
+        &profile,
+        &slow_fake,
+        &beside,
+        EDGE_HORIZON,
+        EDGE_TARGET,
+        stop,
+    );
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (_stopper, stop) = Stop::new();
+        build(
+            &profile,
+            &slow_fake,
+            &beside,
+            EDGE_HORIZON,
+            EDGE_TARGET,
+            stop,
+        )
+        .await
+    };
+    let (first, second) = tokio::join!(first, second);
+    outcomes.insert(
+        "second rebuild beside a running one",
+        second.err().map_or("ok".to_owned(), |error| code(&error)),
+    );
+    let first = first.map_err(|error| format!("the first build: {}", error.report()))?;
+    same(
+        &first.verified,
+        &conversion,
+        "the build beside which another ran",
+    )?;
+    beside.cleanup().await?;
+    // A build into a database that serves.
+    let (_stopper, stop) = Stop::new();
+    outcomes.insert(
+        "rebuild into a serving database",
+        build(&profile, &fake, &converted, EDGE_HORIZON, EDGE_TARGET, stop)
+            .await
+            .err()
+            .map_or("ok".to_owned(), |error| code(&error)),
+    );
+    println!(
+        "{}",
+        json!({"event":"other_commands","outcomes":outcomes,"reports":reports})
+    );
+    // `verify`, `snapshot` and `compare` (on side A) meet the gate's own
+    // refusal.
+    assert_eq!(reports["compare"]["side"], "a", "{}", reports["compare"]);
+    for command in ["verify", "snapshot", "compare"] {
+        let report = reports
+            .get(command)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            report.contains("55000") || report.contains("not_serving"),
+            "{command}: {report}"
+        );
+    }
+    let expected = BTreeMap::from([
+        ("restore", "destination_not_empty"),
+        ("convert", "destination_not_empty"),
+        ("grant-reader", "ok"),
+        ("reader after grant-reader", "55000"),
+        ("follow", "database_not_serving"),
+        ("run", "database_not_serving"),
+        ("status", "unready rebuilding"),
+        ("second rebuild beside a running one", "writer_busy"),
+        ("rebuild into a serving database", "destination_not_empty"),
+    ]);
+    for (command, code) in expected {
+        assert_eq!(outcomes[command], code, "{command}: {outcomes:?}");
+    }
+    // The stopped build continues.
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("continued: {}", error.report()))?;
+    same(
+        &report.verified,
+        &conversion,
+        "continued after the commands",
+    )?;
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
 }
 
 /// A provider of another network ends a build at its first request,
@@ -2723,103 +3226,190 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
     let mut source = Source::new().await?;
     let converted = Database::new().await?;
     let conversion = case.convert(&mut source, &converted).await?;
-    // An uninterrupted build counts the requests.
+    // An uninterrupted build: the phase each request was sent in.
     let whole = Database::new().await?;
     empty(&whole, &case.profile).await?;
-    let fake = Fake::start(&case.g, &case.profile).await;
+    let (progress, view) = watch::channel(Progress::default());
+    let sent_in = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hook: Hook = {
+        let sent_in = sent_in.clone();
+        Arc::new(move |_: &str, _: &mut Chain, _| {
+            let phase = view.borrow().reason.clone();
+            sent_in.lock().unwrap().push(if phase.is_empty() {
+                "plan".to_owned()
+            } else {
+                phase
+            });
+            None
+        })
+    };
+    let fake = Fake::with_chain(
+        Chain::from_generated(&case.g, stake_prefix(&case.profile.network)),
+        Some(hook),
+    )
+    .await;
     let (_stopper, stop) = Stop::new();
-    build(
+    build_observed(
         &case.profile,
         &fake,
         &whole,
-        case.horizon,
-        case.target,
+        kill_options(&case, 0),
         stop,
+        progress,
     )
     .await
     .map_err(|error| error.report().to_string())?;
-    let total = fake.paths().len();
+    let sent_in = sent_in.lock().unwrap().clone();
+    let total = sent_in.len();
     whole.cleanup().await?;
-    let points = setting("DSA_REBUILD_KILL_POINTS", 6) as usize;
-    let mut outcomes = Vec::new();
-    for point in 1..=points {
-        let kill_at = (total * point / (points + 1)).max(1);
-        let rebuilt = Database::new().await?;
-        empty(&rebuilt, &case.profile).await?;
-        let seen = Arc::new(AtomicUsize::new(0));
-        let (killer, mut killed) = watch::channel(false);
-        let hook: Hook = {
-            let seen = seen.clone();
-            Arc::new(move |_: &str, _: &mut Chain, _| {
-                if seen.fetch_add(1, Ordering::SeqCst) + 1 == kill_at {
-                    let _ = killer.send(true);
-                }
-                None
-            })
-        };
-        let fake = Fake::with_chain(
-            Chain::from_generated(&case.g, stake_prefix(&case.profile.network)),
-            Some(hook),
-        )
-        .await;
-        let (_stopper, stop) = Stop::new();
-        let first = tokio::select! {
-            result = build(&case.profile, &fake, &rebuilt, case.horizon, case.target, stop) => Some(result),
-            _ = killed.wait_for(|killed| *killed) => None,
-        };
-        if first.is_some() {
-            return Err(format!("kill point {kill_at} of {total} came after the end").into());
+    // The phases in their order, with the first request of each.
+    let mut phases: Vec<(String, usize, usize)> = Vec::new();
+    for (index, phase) in sent_in.iter().enumerate() {
+        match phases.last_mut() {
+            Some((last, _, end)) if last == phase => *end = index,
+            _ => phases.push((phase.clone(), index, index)),
         }
-        let client = common::connect(&rebuilt.config).await?;
-        let phase: Option<String> = client
-            .query_opt("SELECT phase FROM dsa_rebuild.progress WHERE id=1", &[])
-            .await
-            .ok()
-            .flatten()
-            .map(|row| row.get(0));
-        let serves = serving(&rebuilt).await.unwrap_or(false);
-        assert!(!serves, "kill at {kill_at}: the database serves");
-        // What `status` prints of a build: the stored service state.
-        let stored = client
-            .query_opt(
-                "SELECT state,reason,detail FROM dsa.service_state WHERE id=1",
-                &[],
-            )
-            .await?
-            .map(|row| {
-                json!({"state": row.get::<_, String>(0), "reason": row.get::<_, String>(1),
-                    "detail": row.get::<_, serde_json::Value>(2)})
-            });
-        let (_stopper, stop) = Stop::new();
-        let report = build(
-            &case.profile,
-            &fake,
-            &rebuilt,
-            case.horizon,
-            case.target,
-            stop,
-        )
-        .await
-        .map_err(|error| format!("resume after {kill_at}: {}", error.report()))?;
-        same(
-            &report.verified,
-            &conversion,
-            &format!("killed at request {kill_at}"),
-        )?;
-        assert!(serving(&rebuilt).await?);
-        // A request is counted once: never more than the provider answered.
-        let answered = fake.paths().len() as i64;
-        assert!(
-            report.calls <= answered + IN_FLIGHT,
-            "kill at {kill_at}: {} requests counted, {answered} answered",
-            report.calls
-        );
-        let outcome = json!({"kill_at_request":kill_at,"phase":phase,"stored_state":stored,
-            "resumed":report.resumed,"calls":report.calls,"answered":answered});
-        println!("{}", json!({"event":"kill","outcome":outcome}));
-        outcomes.push(outcome);
-        rebuilt.cleanup().await?;
     }
+    // A kill in the middle of every phase at the default batch size, one in
+    // the middle of each phase that stores its answers in batches with a
+    // batch of 2 (a continuation from a partly stored phase), and the
+    // points DSA_REBUILD_KILL_POINTS spreads over the requests.
+    let mut points: Vec<(usize, usize)> = phases
+        .iter()
+        .map(|(_, start, end)| (1 + start + (end - start) / 2, 0))
+        .collect();
+    for (phase, start, end) in &phases {
+        if ["transactions", "addresses", "validity"].contains(&phase.as_str()) && end - start >= 3 {
+            points.push((1 + start + (end - start) / 2, 2));
+        }
+    }
+    let extra = setting("DSA_REBUILD_KILL_POINTS", 0) as usize;
+    points.extend((1..=extra).map(|point| ((total * point / (extra + 1)).max(1), 0)));
+    let point = |(kill_at, batch): (usize, usize)| {
+        let (case, conversion, phases, sent_in) = (&case, &conversion, &phases, &sent_in);
+        async move {
+            let phase = sent_in[kill_at - 1].clone();
+            let phase_start = phases
+                .iter()
+                .find(|(name, start, end)| {
+                    *name == phase && (*start..=*end).contains(&(kill_at - 1))
+                })
+                .map_or(0, |(_, start, _)| *start);
+            let rebuilt = Database::new().await?;
+            empty(&rebuilt, &case.profile).await?;
+            let seen = Arc::new(AtomicUsize::new(0));
+            let (killer, mut killed) = watch::channel(false);
+            let hook: Hook = {
+                let seen = seen.clone();
+                Arc::new(move |_: &str, _: &mut Chain, _| {
+                    if seen.fetch_add(1, Ordering::SeqCst) + 1 == kill_at {
+                        let _ = killer.send(true);
+                    }
+                    None
+                })
+            };
+            let fake = Fake::with_chain(
+                Chain::from_generated(&case.g, stake_prefix(&case.profile.network)),
+                Some(hook),
+            )
+            .await;
+            let (_stopper, stop) = Stop::new();
+            let first = tokio::select! {
+                result = build_with(&case.profile, &fake, &rebuilt, kill_options(case, batch), stop) => Some(result),
+                _ = killed.wait_for(|killed| *killed) => None,
+            };
+            if first.is_some() {
+                return Err(format!("kill point {kill_at} of {total} came after the end").into());
+            }
+            let client = common::connect(&rebuilt.config).await?;
+            let stored_phase: Option<String> = client
+                .query_opt("SELECT phase FROM dsa_rebuild.progress WHERE id=1", &[])
+                .await
+                .ok()
+                .flatten()
+                .map(|row| row.get(0));
+            assert!(
+                !serving(&rebuilt).await?,
+                "kill at {kill_at}: the database serves"
+            );
+            // What `status` prints of a build: the stored service state.
+            let stored = client
+                .query_opt(
+                    "SELECT state,reason,detail FROM dsa.service_state WHERE id=1",
+                    &[],
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|row| {
+                    json!({"state": row.get::<_, String>(0), "reason": row.get::<_, String>(1),
+                    "detail": row.get::<_, serde_json::Value>(2)})
+                });
+            let (_stopper, stop) = Stop::new();
+            let report = build_with(
+                &case.profile,
+                &fake,
+                &rebuilt,
+                kill_options(case, batch),
+                stop,
+            )
+            .await
+            .map_err(|error| format!("resume after {kill_at}: {}", error.report()))?;
+            same(
+                &report.verified,
+                conversion,
+                &format!("killed at request {kill_at}"),
+            )?;
+            assert!(serving(&rebuilt).await?);
+            let answered = fake.paths().len();
+            // A request is counted once: never more than the provider answered.
+            assert!(
+                report.calls <= answered as i64 + IN_FLIGHT,
+                "kill at {kill_at}: {} requests counted, {answered} answered",
+                report.calls
+            );
+            // A build that stopped before it wrote anything starts anew; any
+            // other continues, and asks again at most what its phase had asked
+            // before the kill, the requests in flight and the few a run starts
+            // with.
+            let asked_again = answered.saturating_sub(total);
+            let bound = (kill_at - phase_start) + IN_FLIGHT as usize + RUN_START;
+            let outcome = json!({"kill_at_request":kill_at,"phase":phase,"batch":batch,
+            "stored_phase":stored_phase,"stored_state":stored,"resumed":report.resumed,
+            "calls":report.calls,"answered":answered,"asked_again":asked_again,"bound":bound});
+            println!("{}", json!({"event":"kill","outcome":outcome}));
+            assert_eq!(report.resumed, stored_phase.is_some(), "{outcome}");
+            assert!(asked_again <= bound, "{outcome}");
+            rebuilt.cleanup().await?;
+            Result::<serde_json::Value>::Ok(outcome)
+        }
+    };
+    // Four points at once: each has its own database and provider.
+    let outcomes = futures_util::stream::iter(points.clone())
+        .map(point)
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let covered: std::collections::BTreeSet<String> = outcomes
+        .iter()
+        .map(|outcome| outcome["phase"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    println!(
+        "{}",
+        json!({"event":"kill_points","phases":phases.iter().map(|(p, s, e)| json!([p, s, e])).collect::<Vec<_>>(),
+            "covered":covered,"points":outcomes.len()})
+    );
+    assert_eq!(
+        covered.len(),
+        phases
+            .iter()
+            .map(|(name, _, _)| name)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        "a phase without a kill"
+    );
     // A build stopped by request, before the window and inside it, then
     // continued, reports the requests the provider answered, and at most
     // those in flight at the stop more. While it is stopped, the service, a
@@ -2937,7 +3527,7 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
         json!({"event":"kills","requests_whole_build":total,"points":outcomes.len(),
             "discarded_state":stopped})
     );
-    assert_eq!(outcomes.len(), points);
+    assert_eq!(outcomes.len(), points.len());
     converted.cleanup().await?;
     source.database.cleanup().await
 }
@@ -2989,7 +3579,12 @@ async fn fixed_descriptor_ids_are_those_of_the_published_files() -> Result {
             .filter(|(unit, id)| stored.get(unit) != Some(id))
             .map(|(unit, id)| json!({"unit": unit, "table": id, "file": stored.get(unit)}))
             .collect();
-        compared.push(json!({"file": name, "fixed": table.len(), "differing": differing}));
+        let ids: BTreeMap<&String, Option<&i64>> = table
+            .iter()
+            .map(|(unit, _)| (unit, stored.get(unit)))
+            .collect();
+        compared
+            .push(json!({"file": name, "fixed": table.len(), "differing": differing, "ids": ids}));
         drop(store);
         database.cleanup().await?;
         assert!(differing.is_empty(), "{name}: {differing:?}");
@@ -3000,6 +3595,30 @@ async fn fixed_descriptor_ids_are_those_of_the_published_files() -> Result {
     );
     assert!(!compared.is_empty(), "no snapshot file in {directory}");
     Ok(())
+}
+
+/// The table of fixed descriptor IDs of Mainnet and Preprod is the one read
+/// from the published snapshot files (`fixtures/published-fixed-descriptors.json`,
+/// recorded by the test above with DSA_RELEASE_FILES).
+#[test]
+fn the_fixed_descriptor_ids_are_those_recorded_from_the_published_files() {
+    let recorded: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/published-fixed-descriptors.json"))
+            .expect("the fixture");
+    let files = recorded["files"].as_object().expect("the files");
+    for network in ["mainnet", "preprod"] {
+        let profile = Profile::load(network).expect("the profile");
+        let table: BTreeMap<String, i64> = dsa_chain::profiles::fixed_descriptor_ids(&profile)
+            .into_iter()
+            .collect();
+        let (name, ids) = files
+            .iter()
+            .find(|(name, _)| name.starts_with(&format!("{network}-")))
+            .expect("a file of the network");
+        let ids: BTreeMap<String, i64> =
+            serde_json::from_value(ids.clone()).expect("the recorded IDs");
+        assert_eq!(table, ids, "{name}");
+    }
 }
 
 /// A rebuilt database follows on: after the build, the follower makes more

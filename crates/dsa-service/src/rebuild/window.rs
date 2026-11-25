@@ -10,7 +10,6 @@ use dsa_chain::{
 use dsa_provider::types::{Hash32, Heights, Page};
 use dsa_store::rebuild::BuiltRows;
 use serde_json::json;
-use tokio::sync::watch;
 
 use super::{
     Build,
@@ -18,7 +17,7 @@ use super::{
     content::{Content, NewestSpend, Place},
     publication::Collected,
 };
-use crate::follow::{self, Connect, Error, Progress, Settings};
+use crate::follow::{self, Connect, Error, Settings};
 
 impl Build<'_> {
     /// The follower in its building mode up to T: the database does not
@@ -26,11 +25,7 @@ impl Build<'_> {
     /// applies; the conservation check proves the unspent outputs at H for
     /// each spend in the window. The follower takes the writer lock on its
     /// own connection.
-    pub(super) async fn window(
-        &mut self,
-        settings: &Settings,
-        progress: &watch::Sender<Progress>,
-    ) -> Result<(), Error> {
+    pub(super) async fn window(&mut self, settings: &Settings) -> Result<(), Error> {
         self.store = None;
         let follower: Connect = {
             let connect = Arc::clone(&self.connect);
@@ -47,7 +42,7 @@ impl Build<'_> {
             },
             time: Arc::clone(&self.asker.time),
             stop: self.asker.stop.clone(),
-            progress: progress.clone(),
+            progress: self.progress.clone(),
             requests: Some(self.asker.requests.clone()),
         })
         .await?;
