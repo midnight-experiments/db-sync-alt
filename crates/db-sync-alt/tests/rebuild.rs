@@ -1955,6 +1955,151 @@ async fn movement_while_listing_keeps_the_conversion() -> Result {
     source.database.cleanup().await
 }
 
+/// The last height of the moving chain.
+const MOVING_END: u32 = 100;
+
+/// Mainnet profile, k 12, the edge chain's H and T. Heights 1 to 60 as the
+/// reserve chain without its spend at 61: cNIGHT minted at 1 into five
+/// outputs at ordinary addresses, five outputs at the reserve address at 2,
+/// spends of reserve outputs at 35 and 50 and of a cNIGHT output at 36.
+/// From 61 to `MOVING_END` every block spends the newest output at the
+/// reserve address that is still unspent (first the reserve output 2) and
+/// creates another there; height 65 also mints 4 cNIGHT into an output at
+/// an ordinary address, height 70 also spends the cNIGHT output 2 of height
+/// 1 and burns its 2 cNIGHT whole.
+fn moving_chain(profile: &Profile) -> Generated {
+    let ordinary = |index: u8| {
+        let mut key = [0x5c; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let reserve = profile.addresses.reserve.clone();
+    let mut s = Script::new(profile);
+    let mut tx = s.tx().mint(&policy, &name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(&policy, &name, 2));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    let mut tx = s.tx();
+    for index in 0..5_u64 {
+        tx = tx.output(Output::to(&reserve, 3_000_000 + index));
+    }
+    let creator = s.block(vec![tx])[0].clone();
+    let mut newest = (creator.clone(), 2_u16);
+    for height in 3..=MOVING_END {
+        let mut transactions = Vec::new();
+        match height {
+            35 | 50 => transactions.push(
+                s.tx()
+                    .input(&creator, if height == 35 { 0 } else { 1 })
+                    .output(Output::new(ordinary(9), 2_500_000)),
+            ),
+            36 => transactions.push(
+                s.tx()
+                    .input(&minted, 1)
+                    .output(Output::new(ordinary(5), 1_400_000).token(&policy, &name, 2)),
+            ),
+            _ => {}
+        }
+        if height > EDGE_END {
+            transactions.push(
+                s.tx()
+                    .input(&newest.0, newest.1)
+                    .output(Output::to(&reserve, 2_000_000 + u64::from(height))),
+            );
+        }
+        if height == 65 {
+            transactions.push(
+                s.tx()
+                    .mint(&policy, &name, 4)
+                    .output(Output::new(ordinary(6), 1_600_000).token(&policy, &name, 4)),
+            );
+        }
+        if height == 70 {
+            transactions.push(
+                s.tx()
+                    .input(&minted, 2)
+                    .mint(&policy, &name, -2)
+                    .output(Output::new(ordinary(8), 1_300_000)),
+            );
+        }
+        let hashes = s.block(transactions);
+        if height > EDGE_END {
+            newest = (hashes[0].clone(), 0);
+        }
+    }
+    s.g
+}
+
+/// The provider's chain moves while the build reads: served through 60 at
+/// first, a block joins before every answer of the reserve address's
+/// listing, each moving an output at that address, so that no two of its
+/// eight reads agree and the build takes their union; then a block joins
+/// before every answer of a list from H on (the burn at 70 among them, after
+/// every history was read). The build equals the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn movement_during_the_address_passes_and_the_lists_keeps_the_conversion() -> Result {
+    let profile = profile(1);
+    let g = moving_chain(&profile);
+    let all = g.blocks.clone();
+    let listing = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    let during_passes = Arc::new(AtomicUsize::new(0));
+    let during_lists = Arc::new(AtomicUsize::new(0));
+    let hook: Hook = {
+        let (listing, during_passes, during_lists) =
+            (listing.clone(), during_passes.clone(), during_lists.clone());
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            let joined = if path.contains(&listing) {
+                &during_passes
+            } else if path.contains("/transactions?") && path.contains("from=") {
+                &during_lists
+            } else {
+                return None;
+            };
+            let blocks = chain.blocks_mut();
+            let height = blocks.last().map_or(0, |block| block.height);
+            if let Some(block) = all.get(height as usize) {
+                blocks.push(block.clone());
+                joined.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), Some(hook)).await;
+    let report = built_equal(&profile, &g, &fake, "movement during passes and lists").await?;
+    let reads = fake.requests(&listing);
+    let (during_passes, during_lists) = (
+        during_passes.load(Ordering::SeqCst),
+        during_lists.load(Ordering::SeqCst),
+    );
+    let served = fake
+        .chain
+        .lock()
+        .unwrap()
+        .blocks_mut()
+        .last()
+        .map_or(0, |block| block.height);
+    println!(
+        "{}",
+        json!({"event":"movement_during_passes_and_lists","reserve_listings":reads,
+            "blocks_during_address_passes":during_passes,"blocks_during_lists":during_lists,
+            "served_through":served,"calls":report.calls})
+    );
+    // Eight reads of one page each, every one after a block that moved an
+    // output at the address: no two agreed, so the union was taken.
+    assert_eq!(reads, 8, "reads of the reserve address's listing");
+    assert_eq!(during_passes, 8, "blocks joined during the reads");
+    assert!(
+        during_lists >= 2,
+        "blocks joined during the lists from H on"
+    );
+    assert!(served >= 70, "the burn at 70 did not join");
+    Ok(())
+}
+
 /// One refused build of the edge chain under `hook`: the error and a
 /// database that does not serve.
 async fn refused(profile: &Profile, g: &Generated, hook: Hook) -> Result<(follow::Error, bool)> {
