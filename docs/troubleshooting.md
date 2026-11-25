@@ -38,6 +38,8 @@ exit status.
 | `invalid_snapshot_at` | `--snapshot-at` is not `HH:MM`. | |
 | `invalid_database_fatal_after` | `--database-fatal-after-seconds` below 60. | |
 | `overall_timeout_not_supported` | `run` was given `--overall-timeout-seconds` or `DSA_OVERALL_TIMEOUT_SECONDS`. | Remove it: the service runs until it is stopped. |
+| `window_above_retention` | `rebuild` was given a `--window-seconds` above `--retention-seconds`. | |
+| `horizon_above_target` | `rebuild` was given a `--horizon-block` above `--target-block`. | |
 
 An empty `DSA_` variable is a value: the command-line parser refuses
 `DSA_SNAPSHOT=` because `--snapshot` needs a value, and `DSA_MAX_IN_FLIGHT=` as
@@ -87,12 +89,13 @@ If no db-sync-alt process runs on that client any more, end the session with
 | `network_mismatch` | The database belongs to another network. | Check `--network` and `--database`. |
 | `profile_hash_mismatch` | The database was made with another profile. | Restore a file made by this release into a new database. |
 | `keep_rule_version_mismatch` | The database was made with another keep rule. | As above. |
-| `destination_not_empty` | `restore` or `create` was given a database that holds data. | Use an empty database. |
-| `database_not_serving` | The gate is closed, or the database never served. | See `position.reason` in `db-sync-alt status`; for a closed gate, [restore a snapshot file](operations.md#a-closed-gate). |
+| `destination_not_empty` | `restore` or `create` was given a database that holds data, also one that a build fills; `rebuild` a database that holds data other than its own stopped build. | Use an empty database. |
+| `database_not_serving` | The gate is closed, the database never served, or a build fills it (`detail.reason` `rebuilding`). | See `position.reason` in `db-sync-alt status`; for a closed gate, [restore a snapshot file](operations.md#a-closed-gate); for a build, let it end ([rebuild](rebuild.md#stop-continue-discard)). |
 | `stored_headers_incomplete` | The headers between the target and the tip are not all stored. | Run `verify`; restore a snapshot file into a new database. |
 
 `run` also refuses an empty database without `--snapshot`
-(`snapshot_required`), a `--snapshot` file that is missing or unreadable when a
+(`snapshot_required`; restore a file or [build the database](rebuild.md)
+first), a `--snapshot` file that is missing or unreadable when a
 restore is needed (`snapshot_file_unreadable`, with the flag and the kind of
 failure; the file is not read when the database serves), a
 `--retention-seconds` that differs from the stored one (`retention_mismatch`,
@@ -126,7 +129,7 @@ address that is in use (`listen_address_unavailable`).
 | Code | Cause | What to do |
 | --- | --- | --- |
 | `provider_key_rejected` | The provider answered 401 or 403: the key is wrong, revoked, or for another network. The service stops. | Fix the key file. |
-| `provider_network_mismatch` | The provider's `/genesis` names another network's magic (`expected_magic` and `received_magic` in the detail): `--provider-url` points at a provider of another network. Checked when the follower starts and again before a contradiction of a final block would close the gate. The service stops with exit status 1; the gate is not touched and no update is written. | Fix `--provider-url`. |
+| `provider_network_mismatch` | The provider's `/genesis` names another network's magic (`expected_magic` and `received_magic` in the detail): `--provider-url` points at a provider of another network. Checked when the follower starts, when `rebuild` starts, and again before a contradiction of a final block would close the gate. The service or the build stops with exit status 1; the gate is not touched and no update is written. | Fix `--provider-url`. |
 | `quota_exhausted` | 402: the key's daily allowance is spent. Waited out until the next UTC day. | Nothing; a larger plan if it repeats ([provider](provider.md#refusals-and-outages)). |
 | `provider_rate_limited` | 429. Waited out. | Lower `--requests-per-second` if another program shares the key. |
 | `provider_banned` | 418. Waited out, 1 to 24 hours. | Check what else uses the key. |
@@ -206,6 +209,42 @@ file into a new database. The faults include:
 | `unspent_count_mismatch` | The count of unspent outputs at a profile address differs from a recount. |
 | `header_gap` | A header between the horizon and the tip is missing. |
 | `missing_supply` | A fixed-supply asset has no recorded supply. |
+
+## `rebuild`
+
+A build ends with exit status 1 and one of these codes, besides those of the
+provider, of [answers the follower refuses](#answers-the-follower-refuses) in
+its window, of the [checks that close the gate](#checks-that-close-the-gate)
+and of [`verify`](#verify) at its publication. Nothing is served in any case
+([rebuild](rebuild.md)).
+
+| Code | Cause | What to do |
+| --- | --- | --- |
+| `rebuild_supply_mismatch` | The unspent amount of a fixed-supply asset at the horizon differs from the provider's quantity minus the net mint since the horizon; `detail` names the unit and the amounts. | Drop the database and build again; report it if it repeats. |
+| `provider_mint_while_quantity_read` | A transaction of a fixed-supply asset changed its quantity between the two readings of the provider's tip around the quantity. | Drop the database and build again. |
+| `rebuild_refused` | A check closed the gate of the build in the database (`asset_conservation` or another), so it cannot go on. | Drop the database and build again; report the check's `last_error` if it repeats. |
+| `rebuild_plan_mismatch` | The database holds a stopped build started with other choices: `detail.stored` and `detail.given`. | Run the build with the stored choices, or drop the database. |
+| `target_above_provider_final` | `--target-block` is above the provider's tip minus k. | Give a lower target, or leave it out. |
+| `invalid_horizon` | The horizon is 0 or above the target. | Give another `--horizon-block`. |
+| `provider_chain_shorter` | The provider's chain is shorter than the build needs: its tip is below k, or it lists fewer than k blocks after the block below the horizon. | Run the same command again later. |
+| `provider_block_missing` | The provider does not know a block the build asked for by height or hash. | Run the same command again; if the code stays, drop the database and build again. |
+| `provider_fork_point_unknown` | The provider does not know the block below the horizon whose next blocks the build reads. | As above. |
+| `provider_transaction_unknown` | The provider does not know a transaction that one of its lists named. | As above. |
+| `provider_origin_unknown` | The output that a collateral input spends is not in its transaction's answer. | As above. |
+| `provider_position_mismatch` | A transaction's block and position differ between a list and `/txs/{hash}`. | As above. |
+| `provider_list_too_long` | A list has more pages than the build reads. | Report it. |
+| `provider_quantity_invalid` | The provider's quantity of an asset is not a number. | Report it. |
+| `provider_datum_invalid` | A datum's bytes are not hexadecimal. | Report it. |
+| `provider_datum_hash_mismatch` | A datum's bytes do not hash to the datum's hash. | Report it. |
+
+Codes that name a fault of the build's own records or of an answer's form:
+`rebuild_progress_invalid`, `rebuild_progress_missing`,
+`rebuild_header_missing`, `rebuild_validity_missing`, `rebuild_invalid_row`,
+`rebuild_asset_descriptor_missing`, `rebuild_base_already_written`,
+`rebuild_not_publishable`, `rebuild_position_mismatch`,
+`rebuild_position_out_of_range`, `provider_output_index` and
+`invalid_transaction_hash`. Drop the database, build again, and report the
+code with its `detail`.
 
 ## `compare`
 

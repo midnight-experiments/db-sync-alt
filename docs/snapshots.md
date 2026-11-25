@@ -3,8 +3,9 @@
 A snapshot file holds one whole database: every row the node can read, the
 outputs spent before the horizon that the keep rule needs, and a description
 that binds them. A new database starts from one, and a pruned database is
-backed up as one: it cannot be rebuilt from the provider's history at a
-practical cost.
+backed up as one. A database can also be built from the provider alone
+([rebuild](rebuild.md)), with many more requests and in hours instead of
+seconds.
 
 ## Where files come from
 
@@ -14,9 +15,15 @@ practical cost.
   content digest in the release notes.
 - **`db-sync-alt snapshot`** on any serving database.
 
+The service and `snapshot` write a file from a serving database. A database
+built with [`rebuild`](rebuild.md) writes files as one that was restored
+does.
+
 Anyone with a database of the same network can check a file: restore it and
 compare its content digest with the digest of their own database at the same
-blocks, or run [`compare`](comparison.md) against it.
+blocks, or run [`compare`](comparison.md) against it. Without a database,
+`rebuild` with the file's horizon and target builds the same blocks from the
+provider ([check a published file](rebuild.md#check-a-published-file)).
 
 ## What a file contains
 

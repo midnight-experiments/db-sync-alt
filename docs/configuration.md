@@ -44,7 +44,7 @@ server on the same host; `--tls-root-cert` is then refused.
 
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `--provider-url` | `DSA_PROVIDER_URL` | Blockfrost for `--network` | The provider's base URL: `https://cardano-mainnet.blockfrost.io/api/v0` or `https://cardano-preprod.blockfrost.io/api/v0` unless given. The provider must serve `--network`: the network magic of its `/genesis` is checked, and another one ends `run` with exit status 1 (`provider_network_mismatch`). |
+| `--provider-url` | `DSA_PROVIDER_URL` | Blockfrost for `--network` | The provider's base URL: `https://cardano-mainnet.blockfrost.io/api/v0` or `https://cardano-preprod.blockfrost.io/api/v0` unless given. The provider must serve `--network`: the network magic of its `/genesis` is checked, and another one ends `run` or `rebuild` with exit status 1 (`provider_network_mismatch`). |
 | `--provider-key-file` | `DSA_PROVIDER_KEY_FILE` | required | A file holding the provider key. |
 | `--provider-root-cert` | `DSA_PROVIDER_ROOT_CERT` | none | PEM certificates trusted for the provider in addition to the public authorities. |
 | `--requests-per-second` | `DSA_REQUESTS_PER_SECOND` | `8` | Requests sent per second at most; above 0 and at most 10. |
@@ -92,7 +92,7 @@ no others. It refuses `--overall-timeout-seconds` and
 ## `rebuild`
 
 Builds an empty database from the provider alone, without a snapshot file,
-checks it and opens the gate. It takes the
+checks it and opens the gate ([rebuild](rebuild.md)). It takes the
 [database flags](#database-flags), the [provider flags](#provider-flags), the
 [follower flags](#follower-flags) and these, which have no variable:
 
