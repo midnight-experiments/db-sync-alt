@@ -100,12 +100,8 @@ checks it and opens the gate. It takes the
 | --- | --- | --- | --- |
 | `--retention-seconds` | — | `604800` | Seconds an event stays after it is first served, stored in the built database, at least 86,400. A stopped build continues only with the same value. |
 | `--window-seconds` | — | `--retention-seconds` | Seconds of chain time from the horizon to the target, from 86,400 to `--retention-seconds`. Without `--horizon-block`, the horizon is the newest block at or before the target's time minus this. |
-| `--horizon-block` | — | the newest block at or before the target's time minus `--window-seconds` | The height of the horizon, the oldest block of the window. Not above `--target-block`. |
+| `--horizon-block` | — | the newest block at or before the target's time minus `--window-seconds` | The height of the horizon, the oldest block of the window. |
 | `--target-block` | — | the provider's tip minus k | The height of the target, the newest block whose events the built database serves; at most the provider's tip minus k. |
-
-A stopped build continues with the same command; `--horizon-block` and
-`--target-block` may then be left out, and when given they must name the
-stored horizon and target (`rebuild_plan_mismatch` otherwise).
 
 ## `create`
 
