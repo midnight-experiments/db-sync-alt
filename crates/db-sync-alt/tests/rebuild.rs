@@ -843,6 +843,53 @@ async fn incomplete_answers_refuse_the_build_and_nothing_serves() -> Result {
     Ok(())
 }
 
+/// A provider of another network ends a build at its first request,
+/// before the database changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_provider_of_another_network_ends_the_build_before_it_starts() -> Result {
+    let seed = 7;
+    let mut random = Random::new(seed ^ 0x0d2b_d2b0);
+    let case = Case::new(seed, &mut random).await?;
+    let (expected, other) = if case.profile.network == "mainnet" {
+        (764_824_073, 1)
+    } else {
+        (1, 764_824_073)
+    };
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &case.profile).await?;
+    let fake = Fake::start(&case.g, &case.profile).await;
+    fake.chain.lock().unwrap().network_magic = Some(other);
+    let (_stopper, stop) = Stop::new();
+    let error = build(
+        &case.profile,
+        &fake,
+        &rebuilt,
+        case.horizon,
+        case.target,
+        stop,
+    )
+    .await
+    .err()
+    .ok_or("the build ran on a provider of another network")?;
+    let report = error.report();
+    assert_eq!(code(&error), "provider_network_mismatch", "{report}");
+    assert_eq!(report["detail"]["expected_magic"], expected, "{report}");
+    assert_eq!(report["detail"]["received_magic"], other, "{report}");
+    assert_eq!(fake.paths(), vec!["/api/v0/genesis".to_owned()]);
+    // The new database is still blank: no layout, no build.
+    let blank: bool = common::connect(&rebuilt.config)
+        .await?
+        .query_one(
+            "SELECT to_regclass('dsa.identity') IS NULL AND to_regnamespace('dsa_rebuild') IS NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(blank, "the build changed the database");
+    rebuilt.cleanup().await
+}
+
 /// What the other commands make of a stopped build, before its rows below
 /// the horizon are written and after: the service refuses to start on it as
 /// not serving with the reason `rebuilding`, also with a snapshot file to

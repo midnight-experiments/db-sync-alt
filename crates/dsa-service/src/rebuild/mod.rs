@@ -52,7 +52,10 @@ use std::{
 };
 
 use chrono::NaiveDate;
-use dsa_chain::{assets::AssetRule, profiles::Profile};
+use dsa_chain::{
+    assets::AssetRule,
+    profiles::{Profile, network_magic},
+};
 use dsa_provider::Provider;
 use dsa_store::{Store, rebuild::Building, verify::Verification};
 use serde::{Deserialize, Serialize};
@@ -153,6 +156,26 @@ impl Build<'_> {
                 .iter()
                 .any(|amount| amount.unit == self.permissioned && amount.quantity.0 > 0)
     }
+}
+
+/// The provider serves the profile's network: its `/genesis` names the
+/// network's magic. Read first, before a new build changes the database, so
+/// a provider of another network ends the build with
+/// `provider_network_mismatch` before any listing.
+async fn check_network(asker: &Asker, profile: &Profile) -> Result<(), Error> {
+    let Some(expected) = network_magic(&profile.network) else {
+        return Ok(());
+    };
+    let provider = asker.provider.clone();
+    let genesis = asker.ask("genesis", || provider.genesis()).await?;
+    if genesis.network_magic != expected {
+        return Err(refusal(
+            "provider_network_mismatch",
+            json!({"network": profile.network, "expected_magic": expected,
+                "received_magic": genesis.network_magic}),
+        ));
+    }
+    Ok(())
 }
 
 /// The positions of a new build: T = the given target or the provider's tip
@@ -280,6 +303,7 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
     store.lock_writer().await?;
     let (plan, phase, resumed) = match store.building(profile).await? {
         Building::Empty => {
+            check_network(&asker, profile).await?;
             let plan = plan(&asker, profile, &options).await?;
             store.start_building(profile, &to_value(&plan)?).await?;
             (plan, "listing".to_owned(), false)
@@ -297,8 +321,10 @@ async fn run(context: Context<'_>) -> Result<Report, Error> {
                         "target": options.target_block, "retention_seconds": options.retention_seconds}}),
                 ));
             }
-            // The requests of the earlier runs, as they recorded them per day.
+            // The requests of the earlier runs, as they recorded them per day,
+            // before this run sends one.
             provider.seed_counts(&store.calls(NaiveDate::default()).await?);
+            check_network(&asker, profile).await?;
             (plan, phase, true)
         }
     };
