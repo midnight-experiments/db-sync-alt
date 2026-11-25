@@ -12,7 +12,7 @@ use dsa_store::Store;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use super::{BATCH, Build, asker::refusal};
+use super::{BATCH, Build, Plan, asker::refusal};
 use crate::follow::Error;
 
 /// The progress is recorded at least this often while a phase runs.
@@ -56,6 +56,23 @@ pub(super) fn to_value(value: impl Serialize) -> Result<Value, Error> {
 
 pub(super) fn parse<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
     serde_json::from_value(value).map_err(|_| refusal("rebuild_progress_invalid", json!({})))
+}
+
+/// The detail of a progress record: the requests so far and the work left,
+/// with an estimate of the requests still to send of one per transaction to
+/// read and one per window block to make final. Empty blocks cost less, the
+/// stake distributions at the window's end more.
+pub(super) fn detail(
+    phase: &str,
+    calls: i64,
+    plan: &Plan,
+    transactions: i64,
+    window_blocks: u32,
+) -> Value {
+    json!({"phase": phase, "provider_requests": calls,
+        "horizon": plan.horizon, "target": plan.target,
+        "remaining": {"transactions_to_read": transactions, "window_blocks": window_blocks},
+        "expected_remaining_requests": transactions + i64::from(window_blocks)})
 }
 
 impl Build<'_> {
@@ -126,10 +143,7 @@ impl Build<'_> {
                 .saturating_sub(stored.max(self.plan.horizon - 1))
         });
         let transactions = (count("since") - count("moved")).max(0);
-        let detail = json!({"phase": phase, "provider_requests": calls,
-            "horizon": self.plan.horizon, "target": self.plan.target,
-            "remaining": {"transactions_to_read": transactions, "window_blocks": window},
-            "expected_remaining_requests_at_least": transactions + i64::from(window)});
+        let detail = detail(phase, calls, &self.plan, transactions, window);
         let store = self.store().await?;
         store.record_calls(&per_day).await?;
         store.record_building(phase, &detail, calls).await?;
@@ -171,6 +185,27 @@ impl Build<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The remaining requests are an estimate, not a bound: on Preprod a
+    /// window of 34,653 blocks cost 25,924 requests with its stake.
+    #[test]
+    fn the_progress_record_estimates_the_remaining_requests() {
+        let plan = Plan {
+            network: "preprod".to_owned(),
+            horizon: 100,
+            target: 199,
+            tip: 2359,
+            window_seconds: 604_800,
+            retention_seconds: 604_800,
+        };
+        let value = detail("window", 566, &plan, 35, 100);
+        assert_eq!(
+            value,
+            json!({"phase": "window", "provider_requests": 566, "horizon": 100, "target": 199,
+                "remaining": {"transactions_to_read": 35, "window_blocks": 100},
+                "expected_remaining_requests": 135})
+        );
+    }
 
     #[test]
     fn phases_run_in_their_order() {
