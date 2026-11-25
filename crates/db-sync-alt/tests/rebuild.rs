@@ -41,7 +41,9 @@ use dsa_testkit::{
     server::Behavior,
     tx::{Datum, Output, Tx, enterprise_address, hash, int_datum},
 };
-use harness::{K, Random, Result, Source, chain, convert, derive, header, profile, reset, same};
+use harness::{
+    K, Random, Result, Source, convert, derive, generated, header, profile, reset, same,
+};
 use serde_json::json;
 use support::{DAY, Fake, Hook, connect};
 use tokio::sync::watch;
@@ -228,7 +230,8 @@ impl Case {
     async fn new(seed: u64, random: &mut Random) -> Result<Self> {
         let profile = profile(seed);
         let blocks = 45 + random.below(30) as u32;
-        let g = chain(&profile, seed, 1, blocks, seed.is_multiple_of(4)).known_from_start();
+        let g =
+            generated(&profile, seed, 1, blocks, seed.is_multiple_of(4), true).known_from_start();
         let history = derive(&profile, &g).await?;
         let last_target = blocks - K;
         let low = third_epoch(&g).min(last_target);
@@ -429,19 +432,29 @@ async fn a_build_from_the_provider_equals_a_conversion() -> Result {
 // ----- a scripted chain for the listing edges ------------------------------
 
 /// Blocks of hand-built transactions, eight to an epoch, from height 1.
+/// Block 1 ends with a transaction that mints one of every unit of the
+/// network's table of fixed descriptors, as the real networks hold each of
+/// them, into an output of no profile.
 struct Script {
     g: Generated,
     next_fund: u64,
     /// Slots from one block to the next.
     step: u64,
+    table: Vec<String>,
+    network: u8,
 }
 
 impl Script {
-    fn new() -> Self {
-        Self::with_step(20)
+    fn new(profile: &Profile) -> Self {
+        Self::with_step(profile, 20)
     }
 
-    fn with_step(step: u64) -> Self {
+    fn with_step(profile: &Profile, step: u64) -> Self {
+        let table: std::collections::BTreeSet<String> =
+            dsa_chain::profiles::fixed_descriptor_ids(profile)
+                .into_iter()
+                .map(|(unit, _)| unit)
+                .collect();
         Self {
             g: Generated {
                 blocks: Vec::new(),
@@ -454,6 +467,8 @@ impl Script {
             },
             next_fund: 0,
             step,
+            table: table.into_iter().collect(),
+            network: u8::from(profile.network == "mainnet"),
         }
     }
 
@@ -468,8 +483,17 @@ impl Script {
             .fee(170_000 + self.next_fund)
     }
 
-    fn block(&mut self, transactions: Vec<Tx>) -> Vec<String> {
+    fn block(&mut self, mut transactions: Vec<Tx>) -> Vec<String> {
         let height = 1 + self.g.blocks.len() as u32;
+        if height == 1 {
+            let mut output = Output::new(enterprise_address(self.network, [0x7e; 28]), 2_000_000);
+            let mut tx = self.tx();
+            for unit in self.table.clone() {
+                tx = tx.mint(&unit[..56], &unit[56..], 1);
+                output = output.token(&unit[..56], &unit[56..], 1);
+            }
+            transactions.push(tx.output(output));
+        }
         let epoch = 200 + (height - 1) / 8;
         self.g
             .epochs
@@ -558,7 +582,7 @@ fn edges(profile: &Profile) -> Edges {
     let council_policy = profile.assets.council.policy.clone();
     let council_name = profile.assets.council.name.clone();
     let addresses = &profile.addresses;
-    let mut s = Script::new();
+    let mut s = Script::new(profile);
     // 1
     let mut tx = s.tx().mint(&cn_policy, &cn_name, 250);
     for index in 0..250_u32 {
@@ -854,7 +878,7 @@ fn burn_script(profile: &Profile, at: BurnAt) -> (Script, String) {
     };
     let policy = profile.assets.cnight.policy.clone();
     let name = profile.assets.cnight.name.clone();
-    let mut s = Script::new();
+    let mut s = Script::new(profile);
     let mut tx = s.tx().mint(&policy, &name, 10);
     for index in 0..5_u8 {
         tx = tx.output(Output::new(ordinary(index), 1_500_000).token(&policy, &name, 2));
@@ -1148,7 +1172,7 @@ fn mints_chain(profile: &Profile, burns: &[u32]) -> (Generated, Vec<String>) {
         enterprise_address(1, key)
     };
     let cnight = profile.assets.cnight.clone();
-    let mut s = Script::new();
+    let mut s = Script::new(profile);
     let mut minted = Vec::new();
     for block in 0..17_u32 {
         let mut transactions = Vec::new();
@@ -1304,7 +1328,7 @@ async fn a_governance_output_missing_from_its_listing_refuses_the_build() -> Res
     };
     let cnight = profile.assets.cnight.clone();
     let council = profile.assets.council.policy.clone();
-    let mut s = Script::new();
+    let mut s = Script::new(&profile);
     let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
     for index in 0..5_u8 {
         tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
@@ -1365,7 +1389,7 @@ async fn the_newest_spend_below_the_horizon_brings_its_descriptor() -> Result {
     };
     let cnight = profile.assets.cnight.clone();
     let council = profile.assets.council.policy.clone();
-    let mut s = Script::new();
+    let mut s = Script::new(&profile);
     let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
     for index in 0..5_u8 {
         tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
@@ -1436,7 +1460,7 @@ fn invalid_chain(profile: &Profile) -> Invalids {
     let name = profile.assets.cnight.name.clone();
     let council = profile.assets.council.clone();
     let council_address = profile.addresses.council.clone();
-    let mut s = Script::new();
+    let mut s = Script::new(profile);
     let mut tx = s.tx().mint(&policy, &name, 10);
     for index in 0..5_u8 {
         tx = tx.output(Output::new(ordinary(index), 1_500_000).token(&policy, &name, 2));
@@ -1760,7 +1784,7 @@ fn reserve_chain(profile: &Profile, tip_spend: bool) -> Reserve {
     let policy = profile.assets.cnight.policy.clone();
     let name = profile.assets.cnight.name.clone();
     let reserve = profile.addresses.reserve.clone();
-    let mut s = Script::new();
+    let mut s = Script::new(profile);
     let mut tx = s.tx().mint(&policy, &name, 10);
     for index in 0..5_u8 {
         tx = tx.output(Output::new(ordinary(index), 1_500_000).token(&policy, &name, 2));
@@ -2029,7 +2053,7 @@ fn slow_chain(profile: &Profile) -> Generated {
         enterprise_address(1, key)
     };
     let cnight = profile.assets.cnight.clone();
-    let mut s = Script::with_step(7_200);
+    let mut s = Script::with_step(profile, 7_200);
     let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
     for index in 0..5_u8 {
         tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
@@ -2157,6 +2181,65 @@ async fn positions_out_of_range_refuse_the_build_before_it_starts() -> Result {
         "{}",
         json!({"event":"positions_refused","outcomes":outcomes})
     );
+    Ok(())
+}
+
+/// Facts the provider must have and denies refuse the build, and the gate
+/// stays closed: a unit of the network's table of fixed descriptors (every
+/// request about the permissioned-candidates unit answered 404), the
+/// parameters of epoch(H) − 2, and the blocks of the epochs whose newest
+/// block the build keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn facts_the_provider_denies_refuse_the_build() -> Result {
+    let profile = profile(1);
+    let edges = edges(&profile);
+    let permissioned = format!("/assets/{}", profile.assets.permissioned_candidates.unit());
+    let unknown_unit: Hook = Arc::new(move |path: &str, _: &mut Chain, _| {
+        path.contains(&permissioned).then(|| Behavior::status(404))
+    });
+    let horizon_epoch = edges
+        .g
+        .block(EDGE_HORIZON)
+        .map(|block| block.epoch)
+        .ok_or("no horizon block")?;
+    let parameters = format!("/epochs/{}/parameters", horizon_epoch - 2);
+    let no_parameters: Hook = Arc::new(move |path: &str, _: &mut Chain, _| {
+        path.ends_with(&parameters).then(|| Behavior::status(404))
+    });
+    let no_blocks: Hook = Arc::new(move |path: &str, _: &mut Chain, _| {
+        (path.contains("/epochs/") && path.contains("/blocks?")).then(|| Behavior::json(json!([])))
+    });
+    let mut outcomes = Vec::new();
+    for (name, hook, expected) in [
+        ("fixed unit unknown", unknown_unit, "provider_unit_unknown"),
+        (
+            "parameters of epoch(H) - 2 missing",
+            no_parameters,
+            "provider_epoch_parameters_missing",
+        ),
+        (
+            "epochs without blocks",
+            no_blocks,
+            "provider_epoch_blocks_missing",
+        ),
+    ] {
+        let outcome = match refused(&profile, &edges.g, hook).await {
+            Ok((error, serves)) => {
+                json!({"case":name,"code":code(&error),"error":error.report(),"serving":serves})
+            }
+            Err(error) => json!({"case":name,"code":null,"failure":error.to_string()}),
+        };
+        outcomes.push((expected, outcome));
+    }
+    println!(
+        "{}",
+        json!({"event":"denied_facts","outcomes":outcomes.iter().map(|(_, o)| o).collect::<Vec<_>>()})
+    );
+    for (expected, outcome) in &outcomes {
+        assert_eq!(outcome["code"], *expected, "{outcome}");
+        assert_eq!(outcome["serving"], false, "{outcome}");
+    }
     Ok(())
 }
 

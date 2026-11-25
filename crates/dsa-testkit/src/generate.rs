@@ -42,6 +42,10 @@ pub struct Settings {
     /// The most transactions in one block.
     pub transactions: usize,
     pub large_datums: bool,
+    /// The first block also mints one of every unit of the profile's roles
+    /// into an output that stays unspent, as the real networks hold each of
+    /// them.
+    pub every_role_minted: bool,
 }
 
 /// How often each shape occurs in a chain.
@@ -382,6 +386,31 @@ impl Generator<'_> {
         };
         draft.spent.push(point.clone());
         utxo
+    }
+
+    /// One of every unit of the profile's roles minted into one output of
+    /// no profile that no later transaction spends.
+    fn every_role(&mut self) -> Built {
+        let fee = 170_000 + self.unique();
+        let mut draft = Draft::new(fee);
+        let funding = self.funding();
+        draft.tx = std::mem::take(&mut draft.tx).input(&funding, 0);
+        let units: BTreeSet<Unit> = self.roles.units.values().cloned().collect();
+        let mut tokens = BTreeMap::new();
+        for unit in units {
+            self.mint(&mut draft, &unit, 1);
+            tokens.insert(unit, 1);
+        }
+        draft.outputs.push(Utxo {
+            place: Place::Ordinary(5),
+            coin: 2_000_000,
+            tokens,
+            datum: Datum::None,
+            special: Special::Plain,
+        });
+        let built = self.finish(draft);
+        self.utxos.retain(|(hash, _), _| *hash != built.hash);
+        built
     }
 
     fn mint(&mut self, draft: &mut Draft, unit: &Unit, quantity: i128) {
@@ -922,6 +951,9 @@ pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
                 },
             }
             transactions.push(g.finish(draft));
+        }
+        if offset == 0 && settings.every_role_minted {
+            transactions.push(g.every_role());
         }
         let previous = blocks.last().map(|block| block.hash.clone());
         let mut seed = format!("block {} {height} {:?}", settings.seed, previous).into_bytes();

@@ -107,11 +107,11 @@ pub(super) fn index16(value: impl TryInto<u16>) -> Result<u16, Error> {
 
 /// An answer the build needs: a 404 is asked again with the outcome rules
 /// of every other refused answer, and once that has lasted `fatal_after`
-/// the build ends with `provider_transaction_unknown`.
-async fn required<T, F, Fut>(
+/// the build ends with `code`.
+pub(super) async fn required<T, F, Fut>(
     asker: &Asker,
     family: &'static str,
-    transaction: &str,
+    (code, mut detail): (&'static str, Value),
     call: F,
 ) -> Result<T, Error>
 where
@@ -137,10 +137,8 @@ where
         Err(Error::Lasting { seconds, error })
             if error.report()["error"] == "provider_not_found" =>
         {
-            Err(Error::answer(
-                "provider_transaction_unknown",
-                json!({"transaction": transaction, "lasted_seconds": seconds}),
-            ))
+            detail["lasted_seconds"] = json!(seconds);
+            Err(Error::answer(code, detail))
         }
         other => other,
     }
@@ -150,7 +148,11 @@ where
 pub(super) async fn utxos(asker: &Asker, transaction: &str) -> Result<TransactionUtxos, Error> {
     let key = hash32(transaction)?;
     let provider = asker.provider.clone();
-    required(asker, "outputs", transaction, || {
+    let unknown = (
+        "provider_transaction_unknown",
+        json!({"transaction": transaction}),
+    );
+    required(asker, "outputs", unknown, || {
         provider.transaction_utxos(&key)
     })
     .await
@@ -160,7 +162,11 @@ pub(super) async fn utxos(asker: &Asker, transaction: &str) -> Result<Transactio
 pub(super) async fn info(asker: &Asker, transaction: &str) -> Result<TransactionInfo, Error> {
     let key = hash32(transaction)?;
     let provider = asker.provider.clone();
-    required(asker, "transactions", transaction, || {
+    let unknown = (
+        "provider_transaction_unknown",
+        json!({"transaction": transaction}),
+    );
+    required(asker, "transactions", unknown, || {
         provider.transaction(&key)
     })
     .await

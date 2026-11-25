@@ -62,6 +62,7 @@ fn the_fake_renders_listings_with_the_backends_members() {
             blocks: 80,
             transactions: 5,
             large_datums: false,
+            every_role_minted: false,
         },
     );
     let mut chain = Chain::from_generated(&g, "stake_test1");
@@ -197,6 +198,7 @@ fn the_fake_lists_as_the_backends_queries() {
                 blocks: 80,
                 transactions: 5,
                 large_datums: false,
+                every_role_minted: false,
             },
         );
         let mut chain = Chain::from_generated(&g, "stake_test1");

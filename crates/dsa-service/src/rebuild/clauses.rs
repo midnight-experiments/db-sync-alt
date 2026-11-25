@@ -264,6 +264,7 @@ impl Build<'_> {
                 continue;
             };
             let mut epoch_number = cutoff;
+            let mut found = false;
             loop {
                 let last = self
                     .asker
@@ -278,6 +279,7 @@ impl Build<'_> {
                             Error::answer("provider_block_missing", json!({"block": block}))
                         })?;
                     headers.push((format!("epoch:{cutoff}"), to_value(header)?));
+                    found = true;
                     break;
                 }
                 match epoch_number.checked_sub(1) {
@@ -285,19 +287,29 @@ impl Build<'_> {
                     _ => break,
                 }
             }
+            if !found {
+                return Err(Error::answer(
+                    "provider_epoch_blocks_missing",
+                    json!({"epoch": cutoff, "epochs_read": cutoff - epoch_number + 1}),
+                ));
+            }
             let requests = self.asker.requests.clone();
             let params = self
                 .asker
                 .ask("epochs", || epoch::parameters(&provider, &requests, cutoff))
                 .await?;
-            if let Some(params) = params {
-                self.put_one(
-                    "param",
-                    &cutoff.to_string(),
-                    json!({"nonce": params.nonce, "max_tx_size": params.max_tx_size}),
+            let params = params.ok_or_else(|| {
+                Error::answer(
+                    "provider_epoch_parameters_missing",
+                    json!({"epoch": cutoff}),
                 )
-                .await?;
-            }
+            })?;
+            self.put_one(
+                "param",
+                &cutoff.to_string(),
+                json!({"nonce": params.nonce, "max_tx_size": params.max_tx_size}),
+            )
+            .await?;
         }
         // H − 1 and the k headers after it, linked.
         let k = self.profile.cardano.security_parameter;

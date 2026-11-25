@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dsa_chain::assets::fixed_units;
+use dsa_chain::{assets::fixed_units, profiles::fixed_descriptor_ids};
 use dsa_provider::types::{
     AddressText, Header, Heights, ListedOutput, ListedTransaction, Page, TransactionUtxos, Unit,
 };
@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use super::{
     BATCH, Build,
-    asker::{PASSES, every_page, index16, info, stable, transactions_page, utxos},
+    asker::{PASSES, every_page, index16, info, required, stable, transactions_page, utxos},
     content::{Content, Event, Moved, Spent, outpoint},
     progress::{Cursor, parse, to_value},
 };
@@ -214,6 +214,10 @@ impl Build<'_> {
     /// is stored on its own: a continued phase reads the units without one.
     pub(super) async fn quantities(&mut self) -> Result<(), Error> {
         let fixed = fixed_units(self.profile);
+        let known: BTreeSet<String> = fixed_descriptor_ids(self.profile)
+            .into_iter()
+            .map(|(unit, _)| unit)
+            .collect();
         let mut units: BTreeSet<String> = self.units().await?.into_iter().collect();
         units.extend(fixed.iter().cloned());
         let read = self.items("quantity").await?;
@@ -221,7 +225,9 @@ impl Build<'_> {
             if read.contains_key(&unit) {
                 continue;
             }
-            let reading = self.reading(&unit, fixed.contains(&unit)).await?;
+            let reading = self
+                .reading(&unit, fixed.contains(&unit), known.contains(&unit))
+                .await?;
             self.put_one("quantity", &unit, reading).await?;
         }
         Ok(())
@@ -232,8 +238,9 @@ impl Build<'_> {
     /// history, the history has as many rows as the quantity's answer counts
     /// and its amounts add up to the quantity; otherwise the unit is read
     /// again, `READINGS` times in all, and the build ends with
-    /// `provider_mint_history_mismatch`.
-    async fn reading(&self, unit: &str, fixed: bool) -> Result<Value, Error> {
+    /// `provider_mint_history_mismatch`. A unit of the network's table of
+    /// fixed descriptors exists on the network: the provider must know it.
+    async fn reading(&self, unit: &str, fixed: bool, known: bool) -> Result<Value, Error> {
         let parsed: Unit = unit.parse().map_err(Error::Provider)?;
         let provider = self.asker.provider.clone();
         let mut last = json!({});
@@ -243,7 +250,12 @@ impl Build<'_> {
                 async move { provider.asset_history(&parsed, page).await }
             })
             .await?;
-            let answer = self.asker.ask("assets", || provider.asset(&parsed)).await?;
+            let answer = if known {
+                let unknown = ("provider_unit_unknown", json!({"unit": unit}));
+                Some(required(&self.asker, "assets", unknown, || provider.asset(&parsed)).await?)
+            } else {
+                self.asker.ask("assets", || provider.asset(&parsed)).await?
+            };
             let count = answer.as_ref().map_or(0, |info| info.mint_or_burn_count);
             let quantity: Option<i128> = answer
                 .as_ref()
