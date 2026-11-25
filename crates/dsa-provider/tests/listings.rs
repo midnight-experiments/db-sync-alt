@@ -203,3 +203,50 @@ async fn the_history_call_reads_mints_and_burns() {
     let (_server, _key, provider) = provider_of(move |_| Behavior::raw(wrong.clone())).await;
     assert!(provider.asset_history(&unit, Page::first()).await.is_err());
 }
+
+/// The transaction that spent an output is read by the build's
+/// `/txs/{hash}/utxos` only, where every output row must name it (null while
+/// the output is unspent); the follower's reading of the same answer leaves
+/// the member unread, whatever it holds.
+#[tokio::test]
+async fn only_a_build_reads_the_spending_transaction_of_an_output() {
+    let transaction = "24db5990d78fc8c273854fcf4e0e290a419529680d6e6a837104c91f3a3c2f3a";
+    let spender = "f74215250265a6d5be00d8e3bf1ecb9dc40e5a85f6c9309c8160be77fea7950f";
+    let answer = |consumed: Option<Value>| {
+        let mut row = serde_json::json!({
+            "address": "addr_test1wraevj382xaeeww85mg5whg75j3evzpq5re33zpkgagzgfsgag5wv",
+            "amount": [{"unit": "lovelace", "quantity": "1000000"}], "output_index": 0,
+            "data_hash": null, "inline_datum": null, "collateral": false,
+            "reference_script_hash": null});
+        if let Some(consumed) = consumed {
+            row["consumed_by_tx"] = consumed;
+        }
+        serde_json::json!({"hash": transaction, "inputs": [], "outputs": [row]}).to_string()
+    };
+    let hash: Hash32 = transaction.parse().unwrap();
+    for (name, body) in [
+        (
+            "unreadable",
+            answer(Some(Value::from("not a transaction hash"))),
+        ),
+        ("absent", answer(None)),
+        ("spent", answer(Some(Value::from(spender)))),
+        ("unspent", answer(Some(Value::Null))),
+    ] {
+        let (_server, _key, provider) = provider_of(move |_| Behavior::raw(body.clone())).await;
+        let follower = provider.transaction_outputs(&hash).await;
+        assert!(
+            follower.is_ok(),
+            "{name}: the follower refused {follower:?}"
+        );
+        let build = provider.transaction_utxos(&hash).await;
+        match name {
+            "spent" => assert_eq!(
+                build.unwrap().unwrap().outputs[0].consumed_by_tx,
+                Some(spender.parse().unwrap())
+            ),
+            "unspent" => assert_eq!(build.unwrap().unwrap().outputs[0].consumed_by_tx, None),
+            _ => assert!(build.is_err(), "{name}: the build read {build:?}"),
+        }
+    }
+}

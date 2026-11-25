@@ -269,9 +269,6 @@ pub struct Output {
     pub data_hash: Option<Hash32>,
     pub inline_datum: Option<Hex>,
     pub collateral: bool,
-    /// The transaction that spent the output, as far as the provider knows.
-    #[serde(default)]
-    pub consumed_by_tx: Option<Hash32>,
 }
 
 /// A transaction's outputs. The provider's input rendering is discarded
@@ -421,13 +418,27 @@ pub struct InputRow {
     pub reference: bool,
 }
 
+/// One output row of `/txs/{hash}/utxos` as a build reads it: every row
+/// names the transaction that spent the output, null while it is unspent.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UtxoOutput {
+    pub address: String,
+    pub output_index: u32,
+    pub amount: Vec<AssetAmount>,
+    pub data_hash: Option<Hash32>,
+    pub inline_datum: Option<Hex>,
+    pub collateral: bool,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub consumed_by_tx: Option<Hash32>,
+}
+
 /// `/txs/{hash}/utxos` with its inputs: collateral and reference inputs are
 /// flagged, the collateral return is an output flagged `collateral`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TransactionUtxos {
     pub hash: Hash32,
     pub inputs: Vec<InputRow>,
-    pub outputs: Vec<Output>,
+    pub outputs: Vec<UtxoOutput>,
 }
 
 /// `/txs/{hash}`: the transaction's block, position and phase-2 validity.
