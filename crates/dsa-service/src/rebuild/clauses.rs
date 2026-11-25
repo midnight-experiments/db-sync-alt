@@ -93,8 +93,10 @@ impl Build<'_> {
         Ok(Some(bytes))
     }
 
-    /// The outputs `transaction` creates, per its validity, from its
-    /// `/txs/{hash}/utxos` answer.
+    /// The outputs `transaction` creates, from its `/txs/{hash}/utxos`
+    /// answer: the rows not flagged `collateral`, which are a valid
+    /// transaction's outputs and an invalid one's collateral return, and the
+    /// transaction's validity.
     async fn created(&self, transaction: &str) -> Result<(bool, Vec<(u16, Content)>), Error> {
         let key = hash32(transaction)?;
         let provider = self.asker.provider.clone();
@@ -121,7 +123,7 @@ impl Build<'_> {
         let outputs = answer
             .outputs
             .iter()
-            .filter(|row| row.collateral != info.valid_contract)
+            .filter(|row| !row.collateral)
             .map(|row| {
                 (
                     u16::try_from(row.output_index).unwrap_or(u16::MAX),

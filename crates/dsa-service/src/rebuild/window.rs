@@ -189,40 +189,24 @@ impl Build<'_> {
                     json!({"transaction": transaction}),
                 )
             })?;
-        let mut contents = Vec::new();
-        for input in answer.inputs.iter().filter(|input| !input.reference) {
-            let content = if input.collateral {
-                let origin = input.tx_hash.clone();
-                let origin_answer = self
-                    .asker
-                    .ask("outputs", || provider.transaction_utxos(&origin))
-                    .await?;
-                origin_answer.and_then(|answer| {
-                    answer
-                        .outputs
-                        .iter()
-                        .find(|output| output.output_index == input.output_index)
-                        .map(|output| Content {
-                            address: output.address.clone(),
-                            amount: output.amount.clone(),
-                            data_hash: output.data_hash.as_ref().map(ToString::to_string),
-                            inline_datum: output.inline_datum.as_ref().map(|b| hex::encode(&b.0)),
-                        })
-                })
-            } else {
-                Some(Content {
+        // The transaction's spends are its rows not flagged `reference` or
+        // `collateral`: a valid transaction's inputs, an invalid one's
+        // collateral, which the provider shows as ordinary inputs.
+        let contents: Vec<_> = answer
+            .inputs
+            .iter()
+            .filter(|input| !input.reference && !input.collateral)
+            .map(|input| {
+                let content = Content {
                     address: input.address.clone(),
                     amount: input.amount.clone(),
                     data_hash: input.data_hash.as_ref().map(ToString::to_string),
                     inline_datum: input.inline_datum.as_ref().map(|b| hex::encode(&b.0)),
-                })
-            };
-            contents.push((input, content));
-        }
-        if !contents
-            .iter()
-            .any(|(_, content)| content.as_ref().is_some_and(|c| self.relevant(c)))
-        {
+                };
+                (input, content)
+            })
+            .collect();
+        if !contents.iter().any(|(_, content)| self.relevant(content)) {
             return Ok(None);
         }
         let info = self
@@ -237,14 +221,13 @@ impl Build<'_> {
             })?;
         let mut effective: Vec<_> = contents
             .into_iter()
-            .filter(|(input, _)| input.collateral != info.valid_contract)
             .map(|(input, content)| ((input.tx_hash.to_string(), input.output_index), content))
             .collect();
         effective.sort_by(|a, b| a.0.cmp(&b.0));
         let Some((ordinal, ((origin, origin_index), content))) = effective
             .iter()
             .enumerate()
-            .filter(|(_, (_, content))| content.as_ref().is_some_and(|c| self.relevant(c)))
+            .filter(|(_, (_, content))| self.relevant(content))
             .last()
         else {
             return Ok(None);
@@ -260,7 +243,7 @@ impl Build<'_> {
                     json!({"transaction": origin}),
                 )
             })?;
-        let content = content.clone().expect("relevant");
+        let content = content.clone();
         if self.needs_datum(&content) && content.inline_datum.is_none() {
             self.fetch_datums(content.data_hash.iter().cloned().collect())
                 .await?;

@@ -116,8 +116,10 @@ impl Build<'_> {
 
     /// The unspent outputs of `unit` created at one height that holds 100
     /// or more of them: the unit's transactions at that height (final: below
-    /// H) and the outputs each one created that no transaction has spent.
-    /// No page of a moving list is involved.
+    /// H) and the outputs each one created that no transaction has spent,
+    /// the rows not flagged `collateral` (a valid transaction's outputs, an
+    /// invalid one's collateral return). No page of a moving list is
+    /// involved.
     async fn outputs_at_height(
         &self,
         unit: &Unit,
@@ -143,22 +145,12 @@ impl Build<'_> {
                 .ok_or_else(|| {
                     Error::answer("provider_transaction_unknown", json!({"transaction": key}))
                 })?;
-            let info = self
-                .asker
-                .ask("transactions", || provider.transaction(&key))
-                .await?
-                .ok_or_else(|| {
-                    Error::answer("provider_transaction_unknown", json!({"transaction": key}))
-                })?;
             for output in answer.outputs {
                 let holds = output
                     .amount
                     .iter()
                     .any(|amount| amount.unit == unit.as_str() && amount.quantity.0 > 0);
-                if output.collateral == info.valid_contract
-                    || output.consumed_by_tx.is_some()
-                    || !holds
-                {
+                if output.collateral || output.consumed_by_tx.is_some() || !holds {
                     continue;
                 }
                 rows.push(ListedOutput {

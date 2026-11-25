@@ -960,6 +960,163 @@ async fn a_complete_burn_below_the_horizon_gives_the_conversion() -> Result {
     burn_case(BurnAt::BelowHorizon).await
 }
 
+// ----- phase-2-invalid transactions ------------------------------------------
+
+/// What the invalid-transaction chain's test refers to.
+struct Invalids {
+    g: Generated,
+    /// The invalid transaction at height 3, beside 120 outputs of cNIGHT.
+    wide: String,
+    /// The invalid transaction whose collateral return is the newest council
+    /// record.
+    record: String,
+    /// The invalid transaction whose collateral is the newest relevant spend
+    /// below H.
+    newest: String,
+}
+
+/// Mainnet profile, k 12, the edge chain's H, T and length; no relevant
+/// transaction from H on. Height 1 mints 10 cNIGHT into five outputs of 2 at
+/// ordinary addresses; 2: a council record at the council address; 3: 120
+/// outputs of cNIGHT and, in the same block, an invalid transaction whose
+/// collateral return holds 2 cNIGHT (one height with more than 100 outputs
+/// of cNIGHT, read through its transactions); 10: a valid spend of a cNIGHT
+/// output; 12: an invalid transaction whose collateral is the council record
+/// and whose collateral return is a newer record at the council address;
+/// 20: an invalid transaction whose collateral holds cNIGHT, the newest
+/// relevant spend below H.
+fn invalid_chain(profile: &Profile) -> Invalids {
+    let ordinary = |index: u8| {
+        let mut key = [0x4c; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let council = profile.assets.council.clone();
+    let council_address = profile.addresses.council.clone();
+    let mut s = Script::new();
+    let mut tx = s.tx().mint(&policy, &name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(&policy, &name, 2));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    let tx = s.tx().mint(&council.policy, &council.name, 1).output(
+        Output::to(&council_address, 2_000_000)
+            .token(&council.policy, &council.name, 1)
+            .inline_datum(int_datum(2_001)),
+    );
+    let first_record = s.block(vec![tx])[0].clone();
+    let mut many = s.tx().mint(&policy, &name, 120);
+    for index in 0..120_u32 {
+        many = many.output(
+            Output::new(ordinary((index % 5) as u8), 1_200_000 + u64::from(index))
+                .token(&policy, &name, 1),
+        );
+    }
+    let failing = s
+        .tx()
+        .invalid()
+        .collateral(&minted, 2)
+        .output(Output::new(ordinary(8), 2_000_000).token(&policy, &name, 3))
+        .collateral_return(Output::new(ordinary(9), 1_400_000).token(&policy, &name, 2));
+    let wide = s.block(vec![many, failing])[1].clone();
+    let (mut record, mut newest) = (String::new(), String::new());
+    for height in 4..=EDGE_END {
+        let transaction = match height {
+            10 => Some(
+                s.tx()
+                    .input(&minted, 1)
+                    .output(Output::new(ordinary(5), 1_400_000).token(&policy, &name, 2)),
+            ),
+            12 => Some(
+                s.tx()
+                    .invalid()
+                    .collateral(&first_record, 0)
+                    .output(Output::new(ordinary(8), 2_000_000))
+                    .collateral_return(
+                        Output::to(&council_address, 1_900_000)
+                            .token(&council.policy, &council.name, 1)
+                            .inline_datum(int_datum(2_002)),
+                    ),
+            ),
+            20 => Some(
+                s.tx()
+                    .invalid()
+                    .collateral(&minted, 0)
+                    .output(Output::new(ordinary(8), 2_000_000))
+                    .collateral_return(
+                        Output::new(ordinary(9), 1_300_000).token(&policy, &name, 2),
+                    ),
+            ),
+            _ => None,
+        };
+        let hashes = s.block(transaction.into_iter().collect());
+        match height {
+            12 => record = hashes[0].clone(),
+            20 => newest = hashes[0].clone(),
+            _ => {}
+        }
+    }
+    Invalids {
+        g: s.g,
+        wide,
+        record,
+        newest,
+    }
+}
+
+/// Phase-2-invalid transactions as the backend renders them (their
+/// collateral inputs as ordinary inputs, their collateral return as their
+/// one ordinary output): a return at a height with more than 100 outputs of
+/// cNIGHT is found through its transaction, a return at the council address
+/// is the newest council record (K5), and an invalid transaction's
+/// collateral is the newest relevant spend below H (K10). The build equals
+/// the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn invalid_transactions_are_read_as_the_backend_renders_them() -> Result {
+    let profile = profile(1);
+    let chain = invalid_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &chain.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| error.report().to_string())?;
+    if let Err(error) = same(&report.verified, &conversion, "invalid") {
+        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+        return Err(format!("{error}; rows {rows}").into());
+    }
+    let client = common::connect(&rebuilt.config).await?;
+    let outputs = "SELECT count(*) FROM serve.tx_out o JOIN serve.tx t ON t.id=o.tx_id \
+        WHERE t.hash=$1 AND NOT t.valid_contract";
+    let inputs = "SELECT count(*) FROM serve.tx_in i JOIN serve.tx t ON t.id=i.tx_in_id \
+        WHERE t.hash=$1 AND NOT t.valid_contract";
+    let mut found = Vec::new();
+    for (sql, transaction) in [
+        (outputs, &chain.wide),
+        (outputs, &chain.record),
+        (inputs, &chain.newest),
+    ] {
+        let hash = hex::decode(transaction)?;
+        found.push(client.query_one(sql, &[&hash]).await?.get::<_, i64>(0));
+    }
+    println!(
+        "{}",
+        json!({"event":"invalid_transactions","return_beside_many_outputs":found[0],
+            "council_record_return":found[1],"newest_spend_collateral":found[2],
+            "requests":fake.paths().len(),"calls":report.calls})
+    );
+    assert_eq!(found, [1, 1, 1]);
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
 /// Blocks arrive and a branch replaces the provider's tip while
 /// the listings are read; outputs listed on one page are spent before the
 /// next one, outputs are created and spent again. The build still equals
