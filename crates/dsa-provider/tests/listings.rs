@@ -382,6 +382,11 @@ async fn the_build_calls_refuse_answers_out_of_shape() {
             "input given twice",
             utxos(vec![input(&lovelace), input(&lovelace)], vec![]),
         ),
+        ("input without its reference member", {
+            let mut row = input(&lovelace);
+            row.as_object_mut().unwrap().remove("reference");
+            utxos(vec![row], vec![output(0, &lovelace)])
+        }),
     ] {
         let (_server, _key, provider) = provider_of(move |_| Behavior::raw(body.clone())).await;
         refused.push((name, provider.transaction_utxos(&hash).await.err()));

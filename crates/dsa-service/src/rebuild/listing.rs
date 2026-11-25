@@ -328,16 +328,31 @@ impl Build<'_> {
                 }
             }
         }
-        for transaction in wanted {
-            let info = info(&self.asker, &transaction).await?;
+        let asker = self.asker.clone();
+        let mut answers = futures_util::stream::iter(wanted.into_iter().map(|transaction| {
+            let asker = asker.clone();
+            async move {
+                let answer = info(&asker, &transaction).await?;
+                Ok::<_, Error>((transaction, answer))
+            }
+        }))
+        .buffered(self.max_in_flight);
+        let (mut from_horizon, mut below) = (Vec::new(), Vec::new());
+        while let Some(result) = answers.next().await {
+            let (transaction, info) = result?;
             let place = json!({"height": info.block_height, "index": info.index});
-            let kind = if info.block_height >= self.plan.horizon {
-                "since"
+            if info.block_height >= self.plan.horizon {
+                from_horizon.push((transaction, place));
             } else {
-                "burn"
-            };
-            self.put_one(kind, &transaction, place).await?;
+                below.push((transaction, place));
+            }
+            if from_horizon.len() + below.len() >= self.batch {
+                self.put("since", std::mem::take(&mut from_horizon)).await?;
+                self.put("burn", std::mem::take(&mut below)).await?;
+            }
         }
+        self.put("since", from_horizon).await?;
+        self.put("burn", below).await?;
         self.finished("burns").await
     }
 

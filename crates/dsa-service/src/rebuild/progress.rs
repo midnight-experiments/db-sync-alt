@@ -7,13 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dsa_provider::Provider;
 use dsa_store::Store;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use super::{Build, Plan, asker::refusal};
-use crate::follow::Error;
+use crate::follow::{Error, sent};
 
 /// The progress is recorded at least this often while a phase runs.
 const RECORD_INTERVAL: Duration = Duration::from_secs(30);
@@ -23,10 +22,6 @@ pub(super) struct Cursor {
     pub(super) from: u32,
     pub(super) page: u32,
     pub(super) done: bool,
-}
-
-pub(super) fn sent(provider: &Provider) -> i64 {
-    provider.counts().iter().map(|(_, count)| count).sum()
 }
 
 pub(super) const PHASES: [&str; 14] = [
@@ -76,10 +71,11 @@ pub(super) fn detail(
 }
 
 impl Build<'_> {
-    /// The provider requests of the whole build: a continued build's
-    /// provider starts from the counts the database holds.
+    /// The provider requests of the whole build: those the earlier runs
+    /// recorded and those this run has sent. (The client's own counts keep
+    /// eight days only.)
     pub(super) fn calls(&self) -> i64 {
-        sent(&self.asker.provider)
+        self.calls_before + sent(&self.asker.provider) - self.sent_at_start
     }
 
     pub(super) async fn store(&mut self) -> Result<&mut Store, Error> {

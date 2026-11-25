@@ -436,7 +436,6 @@ pub struct InputRow {
     pub data_hash: Option<Hash32>,
     pub inline_datum: Option<Hex>,
     pub collateral: bool,
-    #[serde(default)]
     pub reference: bool,
 }
 

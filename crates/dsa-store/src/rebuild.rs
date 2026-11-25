@@ -59,25 +59,19 @@ CREATE TABLE dsa_rebuild.item (
 pub enum Building {
     /// Nothing yet: a build can start here.
     Empty,
-    /// A build that stopped: its plan, phase, detail and calls so far.
+    /// A build that stopped: its plan, phase and provider requests so far.
     Stopped {
         plan: Value,
         phase: String,
-        detail: Value,
         calls: i64,
     },
 }
 
-/// The progress record a status document shows.
+/// A build's phase and the position's reason.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Progress {
     pub phase: String,
     pub reason: String,
-    pub plan: Value,
-    pub detail: Value,
-    pub calls: i64,
-    pub started_at: String,
-    pub updated_at: String,
 }
 
 /// Rows a build writes outside the follower's updates: the rows below the
@@ -338,15 +332,14 @@ impl Store {
                 let row = self
                     .client
                     .query_one(
-                        "SELECT plan,phase,detail,calls FROM dsa_rebuild.progress WHERE id=1",
+                        "SELECT plan,phase,calls FROM dsa_rebuild.progress WHERE id=1",
                         &[],
                     )
                     .await?;
                 return Ok(Building::Stopped {
                     plan: row.get(0),
                     phase: row.get(1),
-                    detail: row.get(2),
-                    calls: row.get(3),
+                    calls: row.get(2),
                 });
             }
         }
@@ -632,21 +625,14 @@ impl Store {
         let row = self
             .client
             .query_opt(
-                "SELECT g.phase,p.reason,g.plan,g.detail,g.calls,
-                 to_char(g.started_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                 to_char(g.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
-                 FROM dsa_rebuild.progress g CROSS JOIN dsa.position p WHERE g.id=1 AND p.id=1",
+                "SELECT g.phase,p.reason FROM dsa_rebuild.progress g CROSS JOIN dsa.position p
+                 WHERE g.id=1 AND p.id=1",
                 &[],
             )
             .await?;
         Ok(row.map(|row| Progress {
             phase: row.get(0),
             reason: row.get(1),
-            plan: row.get(2),
-            detail: row.get(3),
-            calls: row.get(4),
-            started_at: row.get(5),
-            updated_at: row.get(6),
         }))
     }
 }

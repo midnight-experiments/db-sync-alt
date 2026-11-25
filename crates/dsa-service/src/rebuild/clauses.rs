@@ -14,7 +14,7 @@ use super::{
     content::{Carried, Content, Place},
     progress::to_value,
 };
-use crate::{epoch, follow::Error};
+use crate::follow::Error;
 
 impl Build<'_> {
     /// The datum of each kept output the node reads one for, unless inline.
@@ -293,12 +293,14 @@ impl Build<'_> {
                     json!({"epoch": cutoff, "epochs_read": cutoff - epoch_number + 1}),
                 ));
             }
-            let requests = self.asker.requests.clone();
+            // Asked and counted here once: not through the follower's
+            // reader, which counts the request itself.
             let params = self
                 .asker
-                .ask("epochs", || epoch::parameters(&provider, &requests, cutoff))
-                .await?;
-            let params = params.ok_or_else(|| {
+                .ask("epochs", || provider.epoch_parameters(cutoff))
+                .await?
+                .and_then(|params| params.nonce.map(|nonce| (nonce, params.max_tx_size)));
+            let (nonce, max_tx_size) = params.ok_or_else(|| {
                 Error::answer(
                     "provider_epoch_parameters_missing",
                     json!({"epoch": cutoff}),
@@ -307,7 +309,7 @@ impl Build<'_> {
             self.put_one(
                 "param",
                 &cutoff.to_string(),
-                json!({"nonce": params.nonce, "max_tx_size": params.max_tx_size}),
+                json!({"nonce": nonce.to_string(), "max_tx_size": max_tx_size}),
             )
             .await?;
         }

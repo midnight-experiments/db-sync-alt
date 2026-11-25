@@ -414,7 +414,7 @@ async fn load(store: &Store, profile: &Profile, building: bool) -> Result<Stored
 }
 
 /// Requests the client has counted, over the days it keeps.
-fn sent(provider: &Provider) -> i64 {
+pub(crate) fn sent(provider: &Provider) -> i64 {
     provider.counts().iter().map(|(_, count)| count).sum()
 }
 
@@ -423,7 +423,7 @@ fn hash32(hash: &str) -> Result<Hash32, Error> {
         .map_err(|_| Error::answer("invalid_block_hash", json!({"hash":hash})))
 }
 
-fn block_row(header: &Header) -> BlockRow {
+pub(crate) fn block_row(header: &Header) -> BlockRow {
     BlockRow {
         height: header.height,
         hash: header.hash.to_string(),

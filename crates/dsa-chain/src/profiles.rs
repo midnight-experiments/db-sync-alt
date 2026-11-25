@@ -222,8 +222,6 @@ pub enum ProfileError {
     Invalid(#[from] serde_json::Error),
 }
 
-/// The Cardano network magic of a supported network, as a provider's
-/// `/genesis` names it.
 /// The `multi_asset` IDs of the fixed descriptors of a network, by unit.
 /// Mainnet and Preprod carry the IDs their converted databases and published
 /// snapshot files hold; another network numbers its units in bytewise order.
@@ -266,6 +264,8 @@ pub fn fixed_descriptor_ids(profile: &Profile) -> Vec<(String, i64)> {
     ids
 }
 
+/// The Cardano network magic of a supported network, as a provider's
+/// `/genesis` names it.
 pub fn network_magic(network: &str) -> Option<u32> {
     match network {
         "mainnet" => Some(764_824_073),

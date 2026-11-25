@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::DateTime;
 use dsa_chain::{
     assets::fixed_units,
     block::{AssetRow, DatumRow, OutputRow, Rows, TxRow},
@@ -25,21 +24,7 @@ use super::{
     asker::{check, index16, invalid, refusal},
     content::{Carried, Content, Event, Place, Unspent},
 };
-use crate::follow::Error;
-
-fn block_row(header: &Header) -> BlockRow {
-    BlockRow {
-        height: header.height,
-        hash: header.hash.to_string(),
-        epoch: header.epoch,
-        slot: header.slot,
-        time: i64::try_from(header.time)
-            .ok()
-            .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
-            .map_or(chrono::NaiveDateTime::MIN, |time| time.naive_utc()),
-        transaction_count: header.tx_count,
-    }
-}
+use crate::follow::{Error, block_row};
 
 /// The rows of kept outputs below H and of their creating transactions,
 /// with the keys written so far: each row is written once, found by key.

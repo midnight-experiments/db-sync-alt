@@ -185,7 +185,8 @@ pub struct Report {
     /// Provider requests of the whole build, earlier runs included.
     pub calls: i64,
     /// Requests of the whole build per endpoint family, the window and its
-    /// stake and earlier runs included.
+    /// stake and earlier runs included; a request sent again after a failed
+    /// attempt counts again.
     pub requests: BTreeMap<String, u64>,
     /// What the base holds.
     pub counts: Value,
@@ -204,6 +205,10 @@ struct Build<'a> {
     phase: String,
     /// When the progress was last recorded.
     recorded: Instant,
+    /// The provider requests of the earlier runs of the build.
+    calls_before: i64,
+    /// The client's count of requests when this run began.
+    sent_at_start: i64,
     /// Items a phase holds before it stores them.
     batch: usize,
     /// The build's phase is its progress's reason until the window, whose
@@ -470,6 +475,7 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
     let mut store = connect().await?;
     store.lock_writer().await?;
     let mut earlier = BTreeMap::new();
+    let (mut calls_before, mut sent_at_start) = (0, crate::follow::sent(&provider));
     let (plan, phase, resumed) = match store.building(profile).await? {
         Building::Empty => {
             check_network(&asker, profile).await?;
@@ -477,7 +483,7 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
             store.start_building(profile, &to_value(&plan)?).await?;
             (plan, "listing".to_owned(), false)
         }
-        Building::Stopped { plan, phase, .. } => {
+        Building::Stopped { plan, phase, calls } => {
             earlier = earlier_requests(&mut store).await?;
             if plan["version"] != json!(VERSION) {
                 return Err(refusal(
@@ -493,9 +499,12 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
                     json!({"stored": plan.flags, "given": given}),
                 ));
             }
-            // The requests of the earlier runs, as they recorded them per day,
-            // before this run sends one.
-            provider.seed_counts(&store.calls(NaiveDate::default()).await?);
+            // The requests of the earlier runs, as they recorded them per day
+            // and in total, before this run sends one.
+            let per_day = store.calls(NaiveDate::default()).await?;
+            calls_before = calls.max(per_day.iter().map(|(_, count)| count).sum());
+            provider.seed_counts(&per_day);
+            sent_at_start = crate::follow::sent(&provider);
             check_network(&asker, profile).await?;
             (plan, phase, true)
         }
@@ -510,6 +519,8 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         plan: plan.clone(),
         phase,
         recorded: Instant::now(),
+        calls_before,
+        sent_at_start,
         batch: if options.batch_items == 0 {
             BATCH
         } else {
@@ -522,7 +533,11 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         json!({"event":"rebuild_started","plan":plan,"phase":build.phase,"resumed":resumed})
     );
     let start_at = phase_index(&build.phase).max(1);
-    for phase in PHASES.iter().skip(start_at) {
+    for phase in PHASES
+        .iter()
+        .skip(start_at)
+        .take_while(|phase| **phase != "publish")
+    {
         build.reach(phase).await?;
         match *phase {
             "listing" => build.listing().await?,
@@ -545,8 +560,9 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
                 build.phase = "window".to_owned();
             }
             "window" => build.window(&settings).await?,
-            "publish" => {}
-            _ => {}
+            other => {
+                return Err(refusal("rebuild_progress_invalid", json!({"phase": other})));
+            }
         }
     }
     let counts = build

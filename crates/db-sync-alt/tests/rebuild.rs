@@ -1101,11 +1101,16 @@ async fn burn_case(at: BurnAt) -> Result {
         paths.iter().any(|path| path.contains(&history)),
         "{name}: the history of cNIGHT was not read"
     );
+    // The burn is placed by its own answer in the lists' phase, before the
+    // epochs are read; the search for the newest spend below H, which asks
+    // the same path, comes after the window.
+    let placed = paths
+        .iter()
+        .position(|path| path.ends_with(&format!("/txs/{burn}")));
+    let epochs = paths.iter().position(|path| path.contains("/epochs/"));
     assert!(
-        paths
-            .iter()
-            .any(|path| path.ends_with(&format!("/txs/{burn}"))),
-        "{name}: the burning transaction was not placed by its own answer"
+        placed.is_some() && placed < epochs,
+        "{name}: the burning transaction was not placed by its own answer: {placed:?} {epochs:?}"
     );
     // The burn's input is a row of the built database: in the window, or
     // below H as the newest relevant spend (the keep rule's clause K10).
@@ -3463,6 +3468,19 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
         refused_while_building(&case, &rebuilt, &file)
             .await
             .map_err(|error| format!("stopped in {phase:?}: {error}"))?;
+        // The requests recorded per day, spread over ten days with the same
+        // total, as a build whose runs span ten days records them: the
+        // client keeps the counts of eight days, the build's total all.
+        common::connect(&rebuilt.config)
+            .await?
+            .batch_execute(
+                "CREATE TEMP TABLE spread AS SELECT max(day) AS day,sum(requests)::bigint AS n FROM dsa.calls;
+                 DELETE FROM dsa.calls;
+                 INSERT INTO dsa.calls(day,requests)
+                 SELECT s.day-g,CASE WHEN g=0 THEN s.n-9*(s.n/10) ELSE s.n/10 END
+                 FROM spread s CROSS JOIN generate_series(0,9) g",
+            )
+            .await?;
         let (_stopper, stop) = Stop::new();
         let report = build(
             &case.profile,
