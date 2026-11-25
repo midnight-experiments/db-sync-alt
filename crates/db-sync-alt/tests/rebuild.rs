@@ -3,7 +3,7 @@
 //! its full history at horizon H and target T, and the same chain built from
 //! the provider's listings at the same H and T, give the same content and
 //! state digests, supply and position. DSA_REBUILD_CASES sets the number of
-//! generated chains of the property test (default 8), DSA_REBUILD_PARALLEL
+//! generated chains of the property test (default 16), DSA_REBUILD_PARALLEL
 //! how many run at once (default 4), DSA_REBUILD_KILL_POINTS where a build
 //! is stopped and continued (default 6) and DSA_REBUILD_FOLLOW_CASES the
 //! chains followed on after their build (default 4).
@@ -144,11 +144,51 @@ struct Totals {
     markers: u64,
     revealed_at_spend: usize,
     invalid: usize,
+    /// The flagged rows of the generated chains.
+    flagged: Flagged,
     burns: Burns,
     requests: BTreeMap<String, u64>,
     calls: i64,
     /// The chains whose build was refused or differs from the conversion.
     failures: Vec<serde_json::Value>,
+}
+
+/// The rows of the generated chains that a transaction's answer flags or
+/// that an invalid transaction does not spend.
+#[derive(Default, Debug, Clone, Copy)]
+struct Flagged {
+    collateral_also_spent: usize,
+    collateral_not_spent: usize,
+    unspent_returns: usize,
+    references: usize,
+    invalid_relevant_inputs: usize,
+}
+
+impl Flagged {
+    fn of(counts: &Counts) -> Self {
+        Self {
+            collateral_also_spent: counts.collateral_also_spent,
+            collateral_not_spent: counts.collateral_not_spent,
+            unspent_returns: counts.unspent_returns,
+            references: counts.references,
+            invalid_relevant_inputs: counts.invalid_relevant_inputs,
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({"collateral_also_spent": self.collateral_also_spent,
+            "collateral_not_spent": self.collateral_not_spent,
+            "unspent_returns": self.unspent_returns, "references": self.references,
+            "invalid_relevant_inputs": self.invalid_relevant_inputs})
+    }
+
+    fn add(&mut self, other: Flagged) {
+        self.collateral_also_spent += other.collateral_also_spent;
+        self.collateral_not_spent += other.collateral_not_spent;
+        self.unspent_returns += other.unspent_returns;
+        self.references += other.references;
+        self.invalid_relevant_inputs += other.invalid_relevant_inputs;
+    }
 }
 
 /// Complete burns of an eligible unit (a valid transaction that burns it and
@@ -350,6 +390,7 @@ async fn equivalence(
     totals.markers += marker_count(rebuilt).await? as u64;
     totals.revealed_at_spend += case.g.counts.revealed_at_spend;
     totals.invalid += case.g.counts.invalid;
+    totals.flagged.add(Flagged::of(&case.g.counts));
     totals.calls += report.calls;
     for (family, count) in &report.requests {
         *totals.requests.entry(family.clone()).or_default() += count;
@@ -363,7 +404,7 @@ async fn equivalence(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_build_from_the_provider_equals_a_conversion() -> Result {
-    let cases = setting("DSA_REBUILD_CASES", 8);
+    let cases = setting("DSA_REBUILD_CASES", 16);
     let parallel = setting("DSA_REBUILD_PARALLEL", 4).clamp(1, 16);
     let start = setting("DSA_REBUILD_SEED_START", 0);
     let began = Instant::now();
@@ -397,6 +438,7 @@ async fn a_build_from_the_provider_equals_a_conversion() -> Result {
         totals.markers += result.markers;
         totals.revealed_at_spend += result.revealed_at_spend;
         totals.invalid += result.invalid;
+        totals.flagged.add(result.flagged);
         totals.burns.add(result.burns);
         totals.calls += result.calls;
         for (family, count) in result.requests {
@@ -417,6 +459,7 @@ async fn a_build_from_the_provider_equals_a_conversion() -> Result {
             "failed":totals.failures.len(),"failed_by_code":by_code,
             "quiet_windows":totals.quiet_windows,"markers":totals.markers,
             "datums_revealed_at_spend":totals.revealed_at_spend,"invalid_transactions":totals.invalid,
+            "flagged_rows":totals.flagged.json(),
             "complete_burns":{"below_horizon":burns.below_horizon,"in_window":burns.in_window,
                 "after_target":burns.after_target,"of_outputs_created_since_horizon":burns.created_since_horizon},
             "calls":totals.calls,"requests":totals.requests,"seconds":began.elapsed().as_secs_f64()})
@@ -427,6 +470,36 @@ async fn a_build_from_the_provider_equals_a_conversion() -> Result {
         totals.failures.len()
     );
     assert_eq!(totals.chains, cases);
+    // The paths the build's design names are reached at the size the
+    // integration job runs (sixteen chains), so that a change of the
+    // generator cannot take one of them out unnoticed.
+    if cases >= 16 {
+        let f = totals.flagged;
+        for (path, count) in [
+            ("window without a spend", totals.quiet_windows as usize),
+            (
+                "output spent before the horizon marked",
+                totals.markers as usize,
+            ),
+            ("datum revealed at its spend", totals.revealed_at_spend),
+            ("phase-2-invalid transaction", totals.invalid),
+            ("complete burn below the horizon", burns.below_horizon),
+            ("complete burn after the target", burns.after_target),
+            ("collateral input also spent", f.collateral_also_spent),
+            ("collateral input not spent", f.collateral_not_spent),
+            (
+                "collateral return of a valid transaction",
+                f.unspent_returns,
+            ),
+            ("reference input at a profile address", f.references),
+            (
+                "relevant input of an invalid transaction",
+                f.invalid_relevant_inputs,
+            ),
+        ] {
+            assert!(count > 0, "no {path} in {cases} chains");
+        }
+    }
     Ok(())
 }
 
@@ -1423,6 +1496,49 @@ async fn the_newest_spend_below_the_horizon_brings_its_descriptor() -> Result {
     }
     let fake = Fake::with_chain(edge_chain(&profile, &s.g, EDGE_END), None).await;
     built_equal(&profile, &s.g, &fake, "newest spend with its descriptor").await?;
+    Ok(())
+}
+
+/// The newest relevant spend below H, before a window without one, is a
+/// valid transaction at height 20 that spends a cNIGHT output and also names
+/// a collateral input and a reference input whose transactions sort before
+/// it: the input row it keeps has the ordinal of the spent output among the
+/// transaction's inputs, the flagged rows not counted, and the build equals
+/// the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn the_newest_spend_ranks_its_input_among_its_inputs_only() -> Result {
+    let profile = profile(1);
+    let ordinary = |index: u8| {
+        let mut key = [0x37; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let cnight = profile.assets.cnight.clone();
+    let mut s = Script::new(&profile);
+    let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
+    for index in 0..5_u8 {
+        tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
+            &cnight.policy,
+            &cnight.name,
+            2,
+        ));
+    }
+    let minted = s.block(vec![tx])[0].clone();
+    let first = |last: char| format!("{}{last}", "0".repeat(63));
+    for height in 2..=EDGE_END {
+        let transaction = (height == 20).then(|| {
+            s.tx()
+                .input(&minted, 0)
+                .collateral(&first('1'), 0)
+                .reference(&first('2'), 0)
+                .collateral_return(Output::new(ordinary(7), 1_000_000))
+                .output(Output::new(ordinary(6), 1_400_000).token(&cnight.policy, &cnight.name, 2))
+        });
+        s.block(transaction.into_iter().collect());
+    }
+    let fake = Fake::with_chain(edge_chain(&profile, &s.g, EDGE_END), None).await;
+    built_equal(&profile, &s.g, &fake, "flagged rows of the newest spend").await?;
     Ok(())
 }
 

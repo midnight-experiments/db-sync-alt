@@ -110,6 +110,71 @@ async fn the_listing_calls_read_the_backends_answers() {
             .all(|input| !input.collateral && !input.reference)
     );
     assert!(!moved.outputs.is_empty());
+    // A valid transaction with collateral: the collateral input repeats an
+    // input, flagged and lovelace only; the collateral return is flagged,
+    // lovelace only and names no spending transaction.
+    let flagged = provider
+        .transaction_utxos(&hash(
+            "35c1ecdf3d0c1e55a70b5dea93b99aa1c93e64f52131790f0ed8f44a1abbb7a9",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let collateral: Vec<_> = flagged.inputs.iter().filter(|row| row.collateral).collect();
+    assert_eq!(collateral.len(), 1);
+    assert_eq!(collateral[0].amount.len(), 1);
+    assert!(flagged.inputs.iter().any(|row| !row.collateral
+        && (&row.tx_hash, row.output_index)
+            == (&collateral[0].tx_hash, collateral[0].output_index)));
+    let unspent_return = flagged
+        .outputs
+        .iter()
+        .find(|row| row.collateral)
+        .expect("a collateral return");
+    assert_eq!(
+        (unspent_return.amount.len(), &unspent_return.consumed_by_tx),
+        (1, &None)
+    );
+    // The unit listing in a height range (Mainnet).
+    let mainnet_cnight: Unit = "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854"
+        .parse()
+        .unwrap();
+    let ranged = provider
+        .asset_outputs(
+            &mainnet_cnight,
+            Heights {
+                from: Some(13_211_938),
+                to: Some(14_211_937),
+            },
+            Page::first(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ranged
+            .iter()
+            .map(|row| row.block_height)
+            .collect::<Vec<_>>(),
+        [Some(13_211_957), Some(13_211_961), Some(13_212_002)]
+    );
+    // An address's list from a height on.
+    let mapping: AddressText = "addr_test1wplxjzranravtp574s2wz00md7vz9rzpucu252je68u9a8qzjheng"
+        .parse()
+        .unwrap();
+    let listed = provider
+        .address_transactions(
+            &mapping,
+            Heights {
+                from: Some(5_414_627),
+                to: None,
+            },
+            Page::first(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 4);
+    assert_eq!(listed[0].block_height, 5_416_735);
     let info = provider
         .transaction(&hash(
             "f74215250265a6d5be00d8e3bf1ecb9dc40e5a85f6c9309c8160be77fea7950f",

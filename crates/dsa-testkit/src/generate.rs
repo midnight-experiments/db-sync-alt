@@ -46,6 +46,13 @@ pub struct Settings {
     /// into an output that stays unspent, as the real networks hold each of
     /// them.
     pub every_role_minted: bool,
+    /// Rows a valid transaction's answer flags: some transfers also name a
+    /// collateral input that is one of their inputs, a collateral input
+    /// they do not spend (another relevant output, left for a later
+    /// transaction), a collateral return (never created) and a reference
+    /// input at a profile address; some invalid transactions also name a
+    /// relevant output as an input, which they do not spend.
+    pub flagged_rows: bool,
 }
 
 /// How often each shape occurs in a chain.
@@ -65,6 +72,16 @@ pub struct Counts {
     pub quiet_blocks: usize,
     pub pointer_outputs: usize,
     pub large_datums: usize,
+    /// Valid transactions with a collateral input that is also an input.
+    pub collateral_also_spent: usize,
+    /// Valid transactions with a collateral input they do not spend.
+    pub collateral_not_spent: usize,
+    /// Valid transactions with a collateral return.
+    pub unspent_returns: usize,
+    /// Reference inputs at a profile address.
+    pub references: usize,
+    /// Invalid transactions with a relevant output as an input.
+    pub invalid_relevant_inputs: usize,
 }
 
 pub struct Generated {
@@ -229,6 +246,8 @@ struct Utxo {
 
 struct Generator<'r> {
     roles: &'r Roles,
+    /// `Settings::flagged_rows`.
+    flagged: bool,
     random: Random,
     seed: u64,
     counter: u64,
@@ -254,6 +273,8 @@ struct Draft {
     ics_metadata: Option<Vec<u8>>,
     /// Net mint per unit: a mint map holds each unit once.
     mint: BTreeMap<Unit, i128>,
+    /// A valid transaction's collateral return: never created.
+    unused_return: Option<Utxo>,
 }
 
 impl Draft {
@@ -266,6 +287,7 @@ impl Draft {
             witness: Vec::new(),
             ics_metadata: None,
             mint: BTreeMap::new(),
+            unused_return: None,
         }
     }
 }
@@ -543,6 +565,48 @@ impl Generator<'_> {
         }
         let count = 1 + self.random.below(3) as usize;
         draft.outputs.extend(self.split(&tokens, count));
+        if self.flagged && self.random.chance(3) {
+            self.flag(draft);
+        }
+    }
+
+    /// The flagged rows of a valid transaction (`Settings::flagged_rows`).
+    fn flag(&mut self, draft: &mut Draft) {
+        if let Some(point) = draft.spent.first().cloned() {
+            draft.tx = std::mem::take(&mut draft.tx).collateral(&point.0, point.1);
+            self.counts.collateral_also_spent += 1;
+        }
+        let others: Vec<Point> = self
+            .candidates()
+            .into_iter()
+            .filter(|point| !draft.spent.contains(point))
+            .collect();
+        if !others.is_empty() {
+            let point = others[self.random.below(others.len() as u64) as usize].clone();
+            draft.tx = std::mem::take(&mut draft.tx).collateral(&point.0, point.1);
+            self.counts.collateral_not_spent += 1;
+        }
+        draft.unused_return = Some(Utxo {
+            place: Place::Ordinary(self.random.below(4) as u8),
+            coin: 1_000_000 + self.random.below(1_000_000),
+            tokens: BTreeMap::new(),
+            datum: Datum::None,
+            special: Special::Plain,
+        });
+        self.counts.unspent_returns += 1;
+        let at_profile: Vec<Point> = self
+            .utxos
+            .iter()
+            .filter(|(point, utxo)| {
+                matches!(utxo.place, Place::Role(_)) && !draft.spent.contains(point)
+            })
+            .map(|(point, _)| point.clone())
+            .collect();
+        if !at_profile.is_empty() {
+            let point = at_profile[self.random.below(at_profile.len() as u64) as usize].clone();
+            draft.tx = std::mem::take(&mut draft.tx).reference(&point.0, point.1);
+            self.counts.references += 1;
+        }
     }
 
     fn invalid(&mut self, draft: &mut Draft) {
@@ -554,6 +618,20 @@ impl Generator<'_> {
         let funding = self.funding();
         draft.tx = std::mem::take(&mut draft.tx).input(&funding, 0).invalid();
         let utxo = self.spend(draft, point, true);
+        if self.flagged && self.random.chance(2) {
+            // A relevant output as an input of a transaction that fails:
+            // it stays unspent.
+            let others: Vec<Point> = self
+                .candidates()
+                .into_iter()
+                .filter(|other| other != point)
+                .collect();
+            if !others.is_empty() {
+                let other = others[self.random.below(others.len() as u64) as usize].clone();
+                draft.tx = std::mem::take(&mut draft.tx).input(&other.0, other.1);
+                self.counts.invalid_relevant_inputs += 1;
+            }
+        }
         // Body outputs and the mint take no effect.
         let ignored = self.place();
         draft.outputs.push(Utxo {
@@ -765,6 +843,9 @@ impl Generator<'_> {
                 _ => {}
             }
         }
+        if let Some(utxo) = &draft.unused_return {
+            tx = tx.collateral_return(self.output(utxo));
+        }
         if let Some(utxo) = &draft.collateral_return {
             tx = tx.collateral_return(self.output(utxo));
             match &utxo.datum {
@@ -852,6 +933,7 @@ impl Generator<'_> {
 pub fn generate(roles: &Roles, settings: &Settings) -> Generated {
     let mut g = Generator {
         roles,
+        flagged: settings.flagged_rows,
         random: Random(settings.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1),
         seed: settings.seed,
         counter: 0,

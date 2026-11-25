@@ -1,5 +1,5 @@
 {
- "source": "Preprod answers of the provider recorded on 2026-11-24 (public chain data), rows cut to a few",
+ "source": "Answers of the provider (public chain data), rows cut to a few: Preprod recorded on 2026-11-24, the ranged unit listing on Mainnet recorded on 2026-11-25",
  "asset_utxos": {
   "path": "/assets/d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1/utxos?count=100&page=4&order=asc",
   "body": [
@@ -528,5 +528,196 @@
    "next_block": "879f7f599574d7e8976b1693e6893969a22bd6b5032defed46b563f7c0be53e2",
    "confirmations": 49236
   }
+ },
+ "transaction_utxos_flagged": {
+  "path": "/txs/35c1ecdf3d0c1e55a70b5dea93b99aa1c93e64f52131790f0ed8f44a1abbb7a9/utxos",
+  "body": {
+   "hash": "35c1ecdf3d0c1e55a70b5dea93b99aa1c93e64f52131790f0ed8f44a1abbb7a9",
+   "inputs": [
+    {
+     "address": "addr_test1vpw5mvhax5d0603nyszyqsdeq3g4v6v4hf7dtn9cgcjpy2gy2dhuf",
+     "amount": [
+      {
+       "unit": "lovelace",
+       "quantity": "9993455884"
+      }
+     ],
+     "tx_hash": "11a4048233cdbcff73057b4831a75b07c3ec2b8bac173bad1696fba535cfcdf0",
+     "output_index": 1,
+     "data_hash": null,
+     "inline_datum": null,
+     "reference_script_hash": null,
+     "collateral": false,
+     "reference": false
+    },
+    {
+     "address": "addr_test1vpw5mvhax5d0603nyszyqsdeq3g4v6v4hf7dtn9cgcjpy2gy2dhuf",
+     "amount": [
+      {
+       "unit": "lovelace",
+       "quantity": "9993455884"
+      }
+     ],
+     "tx_hash": "11a4048233cdbcff73057b4831a75b07c3ec2b8bac173bad1696fba535cfcdf0",
+     "output_index": 1,
+     "data_hash": null,
+     "inline_datum": null,
+     "reference_script_hash": null,
+     "collateral": true,
+     "reference": false
+    }
+   ],
+   "outputs": [
+    {
+     "address": "addr_test1qzrhsj5tavp0l4ey33adm53exux3wfzc65ezp3x98gfd9qh6queja3gzrge3tn7w9p052yhllt7kaex9hn96qw3af2ks02p46a",
+     "amount": [
+      {
+       "unit": "lovelace",
+       "quantity": "2000000"
+      },
+      {
+       "unit": "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1",
+       "quantity": "1000"
+      }
+     ],
+     "output_index": 0,
+     "data_hash": null,
+     "inline_datum": null,
+     "collateral": false,
+     "reference_script_hash": null,
+     "consumed_by_tx": null
+    },
+    {
+     "address": "addr_test1vpw5mvhax5d0603nyszyqsdeq3g4v6v4hf7dtn9cgcjpy2gy2dhuf",
+     "amount": [
+      {
+       "unit": "lovelace",
+       "quantity": "9991274688"
+      }
+     ],
+     "output_index": 1,
+     "data_hash": null,
+     "inline_datum": null,
+     "collateral": false,
+     "reference_script_hash": null,
+     "consumed_by_tx": null
+    },
+    {
+     "address": "addr_test1vpw5mvhax5d0603nyszyqsdeq3g4v6v4hf7dtn9cgcjpy2gy2dhuf",
+     "amount": [
+      {
+       "unit": "lovelace",
+       "quantity": "9993184090"
+      }
+     ],
+     "output_index": 2,
+     "data_hash": null,
+     "inline_datum": null,
+     "collateral": true,
+     "reference_script_hash": null,
+     "consumed_by_tx": null
+    }
+   ]
+  }
+ },
+ "asset_utxos_ranged": {
+  "path": "/assets/0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854/utxos?count=100&page=1&order=asc&from=13211938&to=14211937",
+  "body": [
+   {
+    "address": "addr1q9nyw4msvh2u76a4hwem0je49anex5g5g7scfwupr840nwpcjcn2nswgd5u5qy32jd8jsztsvsj3l9zfrg3lfar7s6pspf2sn7",
+    "tx_hash": "2a4e4bf9969ddf5a5344f952cb43e6ac70685e09115f2b8551ab20e15581aaa2",
+    "output_index": 1,
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1159390"
+     },
+     {
+      "unit": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854",
+      "quantity": "382231807"
+     }
+    ],
+    "block": "0caf35f7ec9d81b69faeaf3230c2d490a46c435732fda9eeecd20bc079cbdb47",
+    "block_height": 13211957,
+    "block_time": 1774591589,
+    "data_hash": null,
+    "inline_datum": null,
+    "inline_datum_json": null,
+    "reference_script_hash": null
+   },
+   {
+    "address": "addr1qyl4hr6htvv4mct7typy6wf42zdrz5l9qnnk9ls766u3pqvgm5e3u6ps8j957kr9twndf750cqlefq9fq68y7g0sm9sqfw8z69",
+    "tx_hash": "f8f8e6572202c6c314a69d30603cf02319d83f0936f0e1bfc9f830dac5cb811e",
+    "output_index": 1,
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "2000000"
+     },
+     {
+      "unit": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854",
+      "quantity": "34403073360"
+     }
+    ],
+    "block": "18266da2598a1aa079e32b5502b4bffc3ac89295129e015693a7986b76fba7b8",
+    "block_height": 13211961,
+    "block_time": 1774591743,
+    "data_hash": null,
+    "inline_datum": null,
+    "inline_datum_json": null,
+    "reference_script_hash": null
+   },
+   {
+    "address": "addr1q8md4vtv75svm3cna402kyqdejcmstcdc6dgfd5ehcymz69yaamgtdc2gjzq3wlfz4cfws8hm94p630p0a3qfa7z430qthzhvh",
+    "tx_hash": "50d909b6b4e3378d3a43838e900302da113e550475e180f5cd442a3b26424bed",
+    "output_index": 0,
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1159390"
+     },
+     {
+      "unit": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854",
+      "quantity": "81258953"
+     }
+    ],
+    "block": "0a02bfcd603bd826bd313877e6c83403fcb0cd4242721c27a9058aa54f6fd74a",
+    "block_height": 13212002,
+    "block_time": 1774592387,
+    "data_hash": null,
+    "inline_datum": null,
+    "inline_datum_json": null,
+    "reference_script_hash": null
+   }
+  ]
+ },
+ "address_transactions": {
+  "path": "/addresses/addr_test1wplxjzranravtp574s2wz00md7vz9rzpucu252je68u9a8qzjheng/transactions?count=100&page=1&order=asc&from=5414627",
+  "body": [
+   {
+    "tx_hash": "a2b965505f29852ccea571a52401d3fb5984e891a988bf900a7284f421d5813c",
+    "tx_index": 4,
+    "block_height": 5416735,
+    "block_time": 1794776467
+   },
+   {
+    "tx_hash": "34a6cd8f2c847e1388cc34b125b62184105f0cb7fae3b2dab7605eb75ac76966",
+    "tx_index": 0,
+    "block_height": 5416762,
+    "block_time": 1794777195
+   },
+   {
+    "tx_hash": "7813e92b277ebe21bdf43264d59a27eea3961ebd7f5986637bc84affbcb51dac",
+    "tx_index": 0,
+    "block_height": 5433739,
+    "block_time": 1795156140
+   },
+   {
+    "tx_hash": "fbb6b2cfbcb068b384249e0a325a33fd5ff2a6301fd1e3d786de116ddd8f410b",
+    "tx_index": 0,
+    "block_height": 5445620,
+    "block_time": 1795418086
+   }
+  ]
  }
 }

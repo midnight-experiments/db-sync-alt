@@ -108,15 +108,16 @@ pub fn chain(
     generated(profile, seed, first_height, blocks, large, false)
 }
 
-/// `chain`, with the first block minting one of every unit of the profile's
-/// roles when `every_role` is set.
+/// `chain`, or with `build` the chain of the build's tests: its first block
+/// also mints one of every unit of the profile's roles, and transactions
+/// carry the rows a valid transaction's answer flags.
 pub fn generated(
     profile: &Profile,
     seed: u64,
     first_height: u32,
     blocks: u32,
     large: bool,
-    every_role: bool,
+    build: bool,
 ) -> Generated {
     generate::generate(
         &roles(profile),
@@ -126,7 +127,8 @@ pub fn generated(
             blocks,
             transactions: 5,
             large_datums: large,
-            every_role_minted: every_role,
+            every_role_minted: build,
+            flagged_rows: build,
         },
     )
 }

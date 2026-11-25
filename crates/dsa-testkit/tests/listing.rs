@@ -42,11 +42,12 @@ fn members(value: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-fn first(value: &Value) -> &Value {
-    value
-        .as_array()
-        .and_then(|rows| rows.first())
-        .unwrap_or(value)
+/// The member sets of every row of an answer (an object is one row).
+fn shapes(value: &Value) -> BTreeSet<BTreeSet<String>> {
+    match value.as_array() {
+        Some(rows) => rows.iter().map(members).collect(),
+        None => BTreeSet::from([members(value)]),
+    }
 }
 
 #[test]
@@ -63,10 +64,19 @@ fn the_fake_renders_listings_with_the_backends_members() {
             transactions: 5,
             large_datums: false,
             every_role_minted: false,
+            flagged_rows: true,
         },
     );
     let mut chain = Chain::from_generated(&g, "stake_test1");
     let cnight = profile.assets.cnight.unit();
+    let flagged = g
+        .facts
+        .iter()
+        .find(|(_, facts)| {
+            facts.valid && !facts.collateral.is_empty() && facts.collateral_return.is_some()
+        })
+        .map(|(hash, _)| hash.clone())
+        .expect("a valid transaction with collateral");
     let spending = g
         .facts
         .iter()
@@ -97,6 +107,24 @@ fn the_fake_renders_listings_with_the_backends_members() {
             fake(&format!("/assets/{cnight}/transactions{pages}")),
         ),
         ("transaction_utxos", fake(&format!("/txs/{spending}/utxos"))),
+        (
+            "transaction_utxos_flagged",
+            fake(&format!("/txs/{flagged}/utxos")),
+        ),
+        (
+            "asset_utxos_ranged",
+            fake(&format!(
+                "/assets/{cnight}/utxos{pages}&from=1&to={}",
+                last.height
+            )),
+        ),
+        (
+            "address_transactions",
+            fake(&format!(
+                "/addresses/{}/transactions{pages}",
+                profile.addresses.mapping
+            )),
+        ),
         ("transaction", fake(&format!("/txs/{spending}"))),
         ("asset", fake(&format!("/assets/{cnight}"))),
         (
@@ -117,9 +145,12 @@ fn the_fake_renders_listings_with_the_backends_members() {
     ];
     for (name, answer) in cases {
         let real = &recorded[name]["body"];
+        // Every row of the fake's answer and of the recorded one has the
+        // same members.
+        assert_eq!(shapes(real).len(), 1, "{name}: the recorded rows");
         assert_eq!(
-            members(first(&answer)),
-            members(first(real)),
+            shapes(&answer),
+            shapes(real),
             "{name}: the members of a row"
         );
         assert_eq!(
@@ -127,13 +158,42 @@ fn the_fake_renders_listings_with_the_backends_members() {
             real.is_array(),
             "{name}: a list or an object"
         );
-        if name == "transaction_utxos" {
+        if name.starts_with("transaction_utxos") {
             for part in ["inputs", "outputs"] {
+                assert_eq!(shapes(&real[part]).len(), 1, "{name}: the recorded {part}");
                 assert_eq!(
-                    members(first(&answer[part])),
-                    members(first(&real[part])),
+                    shapes(&answer[part]),
+                    shapes(&real[part]),
                     "{name}: the members of its {part}"
                 );
+            }
+        }
+        if name == "transaction_utxos_flagged" {
+            // A valid transaction's collateral input and collateral return
+            // are flagged, the return lovelace only and never spent.
+            for (row, part) in [
+                (&answer, "inputs"),
+                (real, "inputs"),
+                (&answer, "outputs"),
+                (real, "outputs"),
+            ] {
+                let flagged: Vec<&Value> = row[part]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["collateral"] == true)
+                    .collect();
+                assert!(!flagged.is_empty(), "{name}: no flagged row in its {part}");
+                for row in flagged {
+                    assert_eq!(
+                        row["amount"].as_array().map(Vec::len),
+                        Some(1),
+                        "{name}: {row}"
+                    );
+                    if part == "outputs" {
+                        assert!(row["consumed_by_tx"].is_null(), "{name}: {row}");
+                    }
+                }
             }
         }
         if name == "epoch_blocks" {
@@ -199,6 +259,7 @@ fn the_fake_lists_as_the_backends_queries() {
                 transactions: 5,
                 large_datums: false,
                 every_role_minted: false,
+                flagged_rows: false,
             },
         );
         let mut chain = Chain::from_generated(&g, "stake_test1");
