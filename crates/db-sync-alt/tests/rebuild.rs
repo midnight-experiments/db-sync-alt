@@ -396,19 +396,25 @@ async fn equivalence(
         }
     };
     // The digests, then every row with its ID: the digest holds natural keys
-    // only, so the IDs and ordinals of the rows below H are compared here.
+    // only, so the IDs and ordinals of the rows below H are compared here,
+    // and the descriptor IDs held to the build's rule.
     let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let ids = descriptor_ids(&case.profile, rebuilt).await?;
     let compared = same(&report.verified, &conversion, &context)
         .map_err(|error| error.to_string())
         .and_then(|()| {
-            if rows == json!({}) {
+            if rows == json!({}) && ids == json!([]) {
                 Ok(())
             } else {
                 Err("rows differ".to_owned())
             }
         });
     if let Err(error) = compared {
-        let failed = failure("differs", "differs", json!({"same": error, "rows": rows}));
+        let failed = failure(
+            "differs",
+            "differs",
+            json!({"same": error, "rows": rows, "descriptor_ids": ids}),
+        );
         println!(
             "{}",
             json!({"event":"rebuild_equivalence_failure","failure":failed})
@@ -436,6 +442,37 @@ async fn equivalence(
         *totals.requests.entry(family.clone()).or_default() += count;
     }
     Ok(())
+}
+
+/// The descriptor IDs a build wrote, which `harness::diff` leaves out (it
+/// renders an asset row's descriptor by its policy and name). A conversion
+/// of a test chain numbers the descriptors in the order its source first
+/// saw them, which is the order of the network's table of fixed descriptors
+/// only on the real networks; so a build is held to its own rule: each unit
+/// of the table has the table's ID, every other descriptor an ID above the
+/// table's. Returns the descriptors that break it, `[]` when none does.
+async fn descriptor_ids(profile: &Profile, rebuilt: &Database) -> Result<serde_json::Value> {
+    let table: BTreeMap<String, i64> = dsa_chain::profiles::fixed_descriptor_ids(profile)
+        .into_iter()
+        .collect();
+    let highest = table.values().copied().max().unwrap_or(0);
+    let rows = common::connect(&rebuilt.config)
+        .await?
+        .query(
+            "SELECT id,encode(policy,'hex')||encode(name,'hex') FROM serve.multi_asset ORDER BY id",
+            &[],
+        )
+        .await?;
+    let breaking: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|row| {
+            let (id, unit): (i64, String) = (row.get(0), row.get(1));
+            let fixed = table.get(&unit).copied();
+            let holds = fixed.map_or(id > highest, |fixed| id == fixed);
+            (!holds).then(|| json!({"unit": unit, "id": id, "table": fixed}))
+        })
+        .collect();
+    Ok(json!(breaking))
 }
 
 /// Property test: built from the provider's listings, each generated chain
@@ -866,13 +903,32 @@ async fn conversion_at(
     horizon: u32,
     target: u32,
 ) -> Result<(Source, dsa_store::verify::Verification)> {
+    conversion_with(profile, g, converted, (horizon, target), DAY).await
+}
+
+/// A scripted chain converted at `horizon` and `target` with a retention of
+/// `retention_seconds` into `converted`.
+async fn conversion_with(
+    profile: &Profile,
+    g: &Generated,
+    converted: &Database,
+    (horizon, target): (u32, u32),
+    retention_seconds: i64,
+) -> Result<(Source, dsa_store::verify::Verification)> {
     let history = derive(profile, g).await?;
     let mut source = Source::new().await?;
     let headers = (1..=target + K)
         .map(|height| header(g.block(height).unwrap()))
         .collect::<Vec<_>>();
     source.start(g, &history, target, &headers).await?;
-    let conversion = convert(converted, &source.database, profile, horizon, DAY).await?;
+    let conversion = convert(
+        converted,
+        &source.database,
+        profile,
+        horizon,
+        retention_seconds,
+    )
+    .await?;
     Ok((source, conversion))
 }
 
@@ -1188,6 +1244,10 @@ async fn built_equal(profile: &Profile, g: &Generated, fake: &Fake, name: &str) 
     if rows != json!({}) {
         return Err(format!("{name}: rows differ: {rows}").into());
     }
+    let ids = descriptor_ids(profile, &rebuilt).await?;
+    if ids != json!([]) {
+        return Err(format!("{name}: descriptor IDs: {ids}").into());
+    }
     rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await?;
@@ -1408,6 +1468,53 @@ async fn a_history_with_a_row_answered_twice_refuses() -> Result {
         error.report()
     );
     assert_eq!(error.report()["detail"]["distinct_transactions"], false);
+    assert!(!serves, "the database serves");
+    Ok(())
+}
+
+/// A history answered without one mint of 1 and without the burn of 1 after
+/// T (a burn of 1 in the window stays): its transactions are distinct and
+/// its amounts still add up to the quantity, but it has two rows fewer than
+/// the quantity's answer counts. Taken, it would let the build publish a
+/// database without the output burnt after T, whose amount the missing mint
+/// makes up for. Every reading is refused by that count alone, and after
+/// five the build ends with `provider_mint_history_mismatch` while nothing
+/// serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_history_short_of_a_mint_and_a_burn_of_one_refuses() -> Result {
+    let profile = profile(1);
+    let (g, burns) = mints_chain(&profile, &[38, 45]);
+    let burn = burns[1].clone();
+    let history = format!("/assets/{}/history?", profile.assets.cnight.unit());
+    let hook = rows_hook(
+        history.clone(),
+        Arc::new(AtomicBool::new(true)),
+        move |rows| {
+            if let Some(at) = rows.iter().position(|row| row["tx_hash"] == burn.as_str()) {
+                rows.remove(at);
+                if let Some(mint) = rows.iter().position(|row| row["amount"] == "1") {
+                    rows.remove(mint);
+                }
+            }
+        },
+    );
+    let (error, serves) = refused(&profile, &g, hook).await?;
+    let report = error.report();
+    println!(
+        "{}",
+        json!({"event":"history_short_of_two_rows","refusal":report,"serving":serves})
+    );
+    assert_eq!(
+        report["error"], "provider_mint_history_mismatch",
+        "{report}"
+    );
+    let detail = &report["detail"];
+    let count = detail["mint_or_burn_count"].as_u64().ok_or("no count")?;
+    assert_eq!(detail["history_rows"], count - 2, "{detail}");
+    assert_eq!(detail["history_sum"], detail["quantity"], "{detail}");
+    assert_eq!(detail["distinct_transactions"], true, "{detail}");
+    assert_eq!(detail["readings"], 5, "{detail}");
     assert!(!serves, "the database serves");
     Ok(())
 }
@@ -2312,10 +2419,12 @@ async fn refused_then_continued(
     let continued = match build(profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop).await {
         Ok(report) => {
             let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+            let ids = descriptor_ids(profile, &rebuilt).await?;
             let differs = same(&report.verified, conversion, "continued")
                 .err()
                 .map(|error| error.to_string());
-            json!({"code":null,"resumed":report.resumed,"differs":differs,"rows":rows})
+            json!({"code":null,"resumed":report.resumed,"differs":differs,"rows":rows,
+                "descriptor_ids":ids})
         }
         Err(error) => json!({"code":code(&error),"error":error.report()}),
     };
@@ -2339,6 +2448,11 @@ fn refused_then_equal(outcome: &serde_json::Value, expected: &str) {
     assert_eq!(continued["resumed"], true, "continued: {outcome}");
     assert!(continued["differs"].is_null(), "continued: {outcome}");
     assert_eq!(continued["rows"], json!({}), "continued: {outcome}");
+    assert_eq!(
+        continued["descriptor_ids"],
+        json!([]),
+        "continued: {outcome}"
+    );
 }
 
 /// Lists and answers that miss an output relevant by its address alone
@@ -2681,11 +2795,34 @@ async fn a_refused_proof_is_read_again_by_the_same_command() -> Result {
             .filter(|p| p.contains("/api/v0/txs/") && !p.ends_with("/utxos"))
             .count()
     };
+    // The address listings, the lists from H on, and the provider's tip
+    // those lists are read up to, asked before the first of them.
+    let addresses = |paths: &[String]| {
+        paths
+            .iter()
+            .filter(|p| p.contains("/addresses/") && p.contains("/utxos?"))
+            .count()
+    };
+    let from_horizon = format!("from={EDGE_HORIZON}&");
+    let since = |paths: &[String]| {
+        paths
+            .iter()
+            .filter(|p| p.contains("/transactions?") && p.contains(&from_horizon))
+            .count()
+    };
+    let tip_before_lists = |paths: &[String]| {
+        paths
+            .iter()
+            .position(|p| p.contains("/transactions?") && p.contains(&from_horizon))
+            .is_some_and(|at| paths[..at].iter().any(|p| p.ends_with("/blocks/latest")))
+    };
     let outcome = json!({"refusal":error.report(),"resumed":report.resumed,
         "first_run":{"requests":first.len(),"listing":count(&listing, &first),
-            "histories":count("/history?", &first),"lists_below_h":places(&first),"single_transactions":single(&first)},
+            "histories":count("/history?", &first),"lists_below_h":places(&first),"single_transactions":single(&first),
+            "address_listings":addresses(&first),"lists_from_h":since(&first),"tip_before_lists":tip_before_lists(&first)},
         "second_run":{"requests":second.len(),"listing":count(&listing, &second),
-            "histories":count("/history?", &second),"lists_below_h":places(&second),"single_transactions":single(&second)}});
+            "histories":count("/history?", &second),"lists_below_h":places(&second),"single_transactions":single(&second),
+            "address_listings":addresses(&second),"lists_from_h":since(&second),"tip_before_lists":tip_before_lists(&second)}});
     println!("{}", json!({"event":"read_again","outcome":outcome}));
     assert!(report.resumed);
     assert!(
@@ -2695,6 +2832,19 @@ async fn a_refused_proof_is_read_again_by_the_same_command() -> Result {
     assert!(
         count("/history?", &second) > 0,
         "the readings were not read again"
+    );
+    assert!(
+        addresses(&second) >= 2 * profile.addresses.iter().count(),
+        "the address listings were not read again: {outcome}"
+    );
+    assert_eq!(
+        since(&second),
+        since(&first),
+        "the lists from H on were not read again: {outcome}"
+    );
+    assert!(
+        tip_before_lists(&second),
+        "the tip was not read again before the lists: {outcome}"
     );
     assert_eq!(places(&second), 0, "the places below H were read again");
     // Only the first mints of the fixed units are asked again: the
@@ -2776,6 +2926,65 @@ async fn a_build_without_positions_takes_them_from_the_provider() -> Result {
         let rows = harness::diff(&rebuilt.config, &converted.config).await?;
         return Err(format!("{error}; rows {rows}").into());
     }
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// `--window-seconds` below the retention, without a position: the target is
+/// 48 as above; the horizon is the newest block at or before the target's
+/// time less 90,000 seconds (twelve and a half blocks of two hours: 35, not
+/// 36, the oldest at or after it), and the plan and the database's origin
+/// hold the window as the chain time from 35 to 48, 93,600 seconds. The
+/// build equals a conversion at those positions with the build's retention
+/// of two days.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_window_below_the_retention_starts_at_the_newest_block_before_it() -> Result {
+    let profile = profile(1);
+    let g = slow_chain(&profile);
+    let (horizon, target) = (35, EDGE_END - K);
+    let converted = Database::new().await?;
+    let (source, conversion) =
+        conversion_with(&profile, &g, &converted, (horizon, target), 2 * DAY).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    let options = Options {
+        horizon_block: None,
+        target_block: None,
+        window_seconds: Some(90_000),
+        retention_seconds: 2 * DAY,
+        shortest_window_seconds: DAY,
+        batch_items: 0,
+    };
+    let report = build_with(&profile, &fake, &rebuilt, options, stop)
+        .await
+        .map_err(|error| error.report().to_string())?;
+    let origin: serde_json::Value = common::connect(&rebuilt.config)
+        .await?
+        .query_one("SELECT origin FROM dsa.identity WHERE id=1", &[])
+        .await?
+        .get(0);
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let ids = descriptor_ids(&profile, &rebuilt).await?;
+    println!(
+        "{}",
+        json!({"event":"window_below_the_retention","plan":report.plan,"origin":origin,
+            "rows":rows,"descriptor_ids":ids,"calls":report.calls})
+    );
+    assert_eq!((report.plan.horizon, report.plan.target), (horizon, target));
+    assert_eq!(report.plan.window_seconds, 93_600, "the stored window");
+    assert_eq!(origin["window_seconds"], 93_600, "the origin's window");
+    same(
+        &report.verified,
+        &conversion,
+        "a window below the retention",
+    )
+    .map_err(|error| format!("{error}; rows {rows}"))?;
+    assert_eq!(rows, json!({}), "rows differ");
+    assert_eq!(ids, json!([]), "descriptor IDs");
     rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await
