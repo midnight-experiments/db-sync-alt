@@ -16,6 +16,10 @@ use super::{
 };
 use crate::follow::Error;
 
+/// The differing outputs that a difference of an address's two derivations
+/// names, at most.
+const NAMED_OUTPUTS: usize = 10;
+
 /// A listing that misses an output: a candidate whose creating transaction
 /// no list places, or two derivations of an address's outputs that differ.
 fn incomplete(code: &'static str, detail: Value) -> Error {
@@ -263,7 +267,11 @@ impl Build<'_> {
     /// The outputs unspent at H at each profile address, from the address's
     /// full list below H: the outputs its transactions created there that
     /// no transaction of the list spent. They must be the outputs at the
-    /// address that the listings and the lists from H on gave.
+    /// address that the listings and the lists from H on gave. A difference
+    /// names each differing output (`NAMED_OUTPUTS` at most) with what the
+    /// provider said of it: which derivation found it, the spender its
+    /// creating transaction's answer gave, and whether the address's
+    /// listing shows it.
     async fn check_addresses(&mut self, unspent: &Unspent) -> Result<(), Error> {
         let mut lists: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for key in self.items("address_tx").await?.into_keys() {
@@ -275,19 +283,27 @@ impl Build<'_> {
             }
         }
         let held: BTreeMap<String, Vec<Held>> = self.typed("held").await?;
+        let shown: BTreeSet<String> = self.items("address_listed").await?.into_keys().collect();
         for address in self.relevance.addresses.clone() {
             let list = lists.remove(&address).unwrap_or_default();
             let mut derived: BTreeMap<String, Value> = BTreeMap::new();
+            // Each output there that a transaction of the list created, with
+            // the transaction that spent it as the provider answered.
+            let mut spenders: BTreeMap<String, Option<String>> = BTreeMap::new();
             for transaction in &list {
                 for output in held.get(transaction).into_iter().flatten() {
+                    if output.content.address != address {
+                        continue;
+                    }
+                    let point = outpoint(transaction, output.index);
                     let spent_below = output
                         .consumed_by
                         .as_ref()
                         .is_some_and(|spender| list.contains(spender));
-                    if output.content.address == address && !spent_below {
-                        derived
-                            .insert(outpoint(transaction, output.index), output.content.normal());
+                    if !spent_below {
+                        derived.insert(point.clone(), output.content.normal());
                     }
+                    spenders.insert(point, output.consumed_by.clone());
                 }
             }
             let listed: BTreeMap<String, Value> = unspent
@@ -298,19 +314,35 @@ impl Build<'_> {
                 })
                 .collect();
             if derived != listed {
-                let only = |a: &BTreeMap<String, Value>, b: &BTreeMap<String, Value>| {
-                    a.iter()
-                        .filter(|(point, content)| b.get(*point) != Some(content))
-                        .map(|(point, _)| point.clone())
-                        .take(5)
-                        .collect::<Vec<_>>()
-                };
+                let differing: Vec<&String> = listed
+                    .keys()
+                    .chain(derived.keys())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|point| listed.get(*point) != derived.get(*point))
+                    .collect();
+                let outputs: Vec<Value> = differing
+                    .iter()
+                    .take(NAMED_OUTPUTS)
+                    .map(|point| {
+                        let found_by =
+                            match (listed.contains_key(*point), derived.contains_key(*point)) {
+                                (true, false) => "listings",
+                                (false, true) => "address_history",
+                                _ => "both",
+                            };
+                        let spender = spenders.get(*point);
+                        json!({"output": point, "found_by": found_by,
+                            "in_address_history": spender.is_some(),
+                            "consumed_by_tx": spender.cloned().flatten(),
+                            "listed": shown.contains(*point)})
+                    })
+                    .collect();
                 return Err(incomplete(
                     "rebuild_address_outputs_mismatch",
                     json!({"address": address, "from_listings": listed.len(),
-                        "from_address_history": derived.len(),
-                        "only_from_listings": only(&listed, &derived),
-                        "only_from_address_history": only(&derived, &listed)}),
+                        "from_address_history": derived.len(), "differing": differing.len(),
+                        "outputs": outputs}),
                 ));
             }
         }

@@ -2421,6 +2421,101 @@ async fn listings_that_miss_an_address_output_refuse_the_build() -> Result {
     source.database.cleanup().await
 }
 
+/// When the reserve address's two derivations differ, the refusal names
+/// each differing output with what the provider said of it: which
+/// derivation found it, the `consumed_by_tx` that its creating
+/// transaction's answer gave and whether the address's listing shows it.
+/// Three answers of the creating transaction at height 2 that contradict
+/// the chain: output 0 unspent (`consumed_by_tx` null) while its spend in
+/// the window is missing from the list from H on; output 3 spent by a
+/// transaction of the list below H while the listing shows it; output 4
+/// with other lovelace than the listing's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_address_outputs_mismatch_names_what_the_provider_said() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, false);
+    let creator = chain.creator.clone();
+    let outputs = format!("/txs/{creator}/utxos");
+    let rewritten = |index: u64, change: fn(&mut serde_json::Value, &str)| -> Hook {
+        let (outputs, creator) = (outputs.clone(), creator.clone());
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if !path.ends_with(&outputs) {
+                return None;
+            }
+            let mut answer: serde_json::Value =
+                serde_json::from_str(&chain.answer(path).body).ok()?;
+            for output in answer["outputs"].as_array_mut()? {
+                if output["output_index"] == index {
+                    change(output, &creator);
+                }
+            }
+            Some(Behavior::json(answer))
+        })
+    };
+    let since = format!("/addresses/{}/transactions?", profile.addresses.reserve);
+    let spender = chain.spender.clone();
+    let hide_spend: Hook = Arc::new(move |path: &str, chain: &mut Chain, _| {
+        if !path.contains(&since) || !path.contains("from=") {
+            return None;
+        }
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&chain.answer(path).body).ok()?;
+        let kept = rows
+            .into_iter()
+            .filter(|row| row["tx_hash"] != spender.as_str())
+            .collect();
+        Some(Behavior::json(serde_json::Value::Array(kept)))
+    });
+    let unspent_output = rewritten(0, |output, _| output["consumed_by_tx"] = json!(null));
+    let both: Hook = Arc::new(move |path: &str, chain: &mut Chain, now| {
+        hide_spend(path, chain, now).or_else(|| unspent_output(path, chain, now))
+    });
+    let point = |index: u16| format!("{creator}#{index}");
+    let mut outcomes = Vec::new();
+    for (name, hook, expected) in [
+        (
+            "unspent_in_the_history_spent_by_no_list",
+            both,
+            json!({"output": point(0), "found_by": "address_history", "in_address_history": true,
+                "consumed_by_tx": null, "listed": false}),
+        ),
+        (
+            "spent_below_the_horizon_in_the_history_and_listed",
+            rewritten(3, |output, creator| {
+                output["consumed_by_tx"] = json!(creator)
+            }),
+            json!({"output": point(3), "found_by": "listings", "in_address_history": true,
+                "consumed_by_tx": creator.clone(), "listed": true}),
+        ),
+        (
+            "other_lovelace_in_the_history",
+            rewritten(4, |output, _| {
+                output["amount"][0]["quantity"] = json!("2999999")
+            }),
+            json!({"output": point(4), "found_by": "both", "in_address_history": true,
+                "consumed_by_tx": null, "listed": true}),
+        ),
+    ] {
+        let (error, serves) = refused(&profile, &chain.g, hook).await?;
+        let report = error.report();
+        outcomes.push(json!({"case":name,"error":report,"serving":serves}));
+        assert_eq!(
+            report["error"], "rebuild_address_outputs_mismatch",
+            "{name}: {report}"
+        );
+        assert!(!serves, "{name}: the database serves");
+        let detail = &report["detail"];
+        assert_eq!(detail["address"], profile.addresses.reserve, "{name}");
+        assert_eq!(detail["differing"], 1, "{name}: {detail}");
+        assert_eq!(detail["outputs"], json!([expected]), "{name}: {detail}");
+    }
+    println!(
+        "{}",
+        json!({"event":"address_mismatch_detail","outcomes":outcomes})
+    );
+    Ok(())
+}
+
 /// The provider's tip block is replaced each time the build checks it
 /// after the lists from H on: the address listings and the lists are read
 /// again three times, and the fourth reading ends the build with
