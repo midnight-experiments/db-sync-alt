@@ -1,6 +1,6 @@
 # Compatibility
 
-What db-sync-alt 0.5.1 works with. Anything else is refused or unsupported.
+What db-sync-alt 0.6.0 works with. Anything else is refused or unsupported.
 
 | Component | Supported | Notes |
 | --- | --- | --- |

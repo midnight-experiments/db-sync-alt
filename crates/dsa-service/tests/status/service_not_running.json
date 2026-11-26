@@ -255,7 +255,7 @@
     "state": "following",
     "updated_at": 1795003190
   },
-  "service_version": "0.5.1",
+  "service_version": "0.6.0",
   "serving": "ready",
   "state": "stopped",
   "state_reason": "service_not_running",

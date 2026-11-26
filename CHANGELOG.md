@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0
+
+- **`rebuild`.** `db-sync-alt rebuild` builds a database from the provider
+  alone, without a snapshot file, checks it and opens it for the node; `run`
+  then follows the chain from it ([rebuild](docs/rebuild.md)). Before the gate
+  opens, the unspent amount of each asset unit at the horizon equals the
+  provider's quantity less the mints and plus the burns from the horizon on,
+  every output unspent at the horizon is placed in the provider's transaction
+  lists, and the outputs at each profile address are derived a second time
+  from the address's full transaction list below the horizon. Every block of
+  the window passes the checks of following, and `verify` runs with all its
+  checks when the build publishes. A build stopped with SIGINT or SIGTERM is
+  continued by the same command. A database that a build fills never serves
+  until the build has published: the node's queries get SQLSTATE 55000, and
+  `run` and `restore` refuse it. A snapshot file stays the recommended first
+  start; with the horizon and target of a published snapshot file, a build
+  gives the file's content digest ([check a published
+  file](docs/rebuild.md#check-a-published-file)).
+- **Formats.** The database format (1), the snapshot file format (1) and the
+  keep rule (version 2) are those of 0.5.x: this version runs on a 0.5.x
+  database and restores a 0.5.x snapshot file as they are, and it reads and
+  writes a database that follows the chain as 0.5.x does
+  ([compatibility](docs/compatibility.md)).
+- **Checks.** On Preprod, a build with the horizon and target of the Preprod
+  snapshot file of release 0.5.1 gave the file's content digest with 26,653
+  requests in 3 h 46 min at 2 requests a second; a build with the default
+  positions, a 7-day window, sent 20,331 requests in 2 h 53 min, and `run`
+  followed from it to the chain's tip. `verify` passed on both builds, and
+  `compare` found no difference against a restore of the file and against a
+  database that had followed the chain. A Mainnet build is not part of the
+  checks ([rebuild](docs/rebuild.md#cost),
+  [compatibility](docs/compatibility.md#what-the-release-checks-cover)).
+
 ## 0.5.1
 
 - **PostgreSQL 17 or newer.** db-sync-alt accepts PostgreSQL 17 and every

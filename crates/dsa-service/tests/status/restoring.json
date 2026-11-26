@@ -161,7 +161,7 @@
   },
   "served_target": null,
   "service_state": null,
-  "service_version": "0.5.1",
+  "service_version": "0.6.0",
   "serving": "unready",
   "state": "restoring",
   "state_reason": "snapshot_file",
