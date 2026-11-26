@@ -215,9 +215,12 @@ full lists below H go too; in the window the `update` and
 digest and the requests. The report on standard output holds the `plan`
 (network, horizon, target, tip, the window as the chain time from H to T, the
 retention, the `version` that began the build and its `flags`), `resumed`,
-the `verified` report of `verify`, `calls` (the requests of the whole build),
-`requests` (the same by endpoint family; a request sent again after a failed
-attempt counts again), `counts` (what the base holds) and `seconds`.
+the `verified` report of `verify`, `calls` (the requests of the whole build
+that were sent), `requests` (the requests asked, by endpoint family: a request
+sent again after a failed attempt counts again, and a page asked ahead counts
+whether or not it was sent before its list ended, or in the window before its
+update reached a limit, so the sum can be above `calls`), `counts` (what the
+base holds) and `seconds`.
 
 ## Stop, continue, discard
 
