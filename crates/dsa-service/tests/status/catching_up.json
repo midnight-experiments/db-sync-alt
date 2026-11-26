@@ -263,7 +263,7 @@
     "state": "catching_up",
     "updated_at": 1795003190
   },
-  "service_version": "0.5.1",
+  "service_version": "0.6.0",
   "serving": "ready",
   "state": "catching_up",
   "state_reason": "behind_tip",

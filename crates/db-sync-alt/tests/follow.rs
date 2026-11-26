@@ -850,12 +850,81 @@ async fn costed(setup: &mut Setup, plan: &Plan) -> Result<Costs> {
     Ok(costs)
 }
 
+/// A statement's buffers in the update of the small store and in that of the
+/// large store, and its plans in both.
+struct Cost {
+    small: u64,
+    large: u64,
+    plans: String,
+}
+
+impl Cost {
+    /// The large store's count is above twice the small store's plus 32.
+    fn above_bound(&self) -> bool {
+        self.large > self.small * 2 + 32
+    }
+}
+
+/// One update of four new final blocks on each store, with its fork point two
+/// headers below the tip when `fork`, measured statement by statement. No
+/// statement of the large store's update scans a growing relation.
+async fn measure(
+    small: &mut Setup,
+    large: &mut Setup,
+    fork: bool,
+    step: u64,
+) -> Result<BTreeMap<String, Cost>> {
+    let plans = [&*small, &*large].map(|setup| {
+        let f = &setup.follower;
+        let mut plan = advance(&setup.g, f, 4, None);
+        if fork {
+            plan.fork_point = f.tip.height - 2;
+            plan.headers = (plan.fork_point + 1..=f.tip.height + 4)
+                .map(|height| header(setup.g.block(height).unwrap()))
+                .collect();
+        }
+        plan
+    });
+    let [small_plan, large_plan] = plans;
+    let small_cost = costed(small, &small_plan).await?;
+    let large_cost = costed(large, &large_plan).await?;
+    let mut costs = BTreeMap::new();
+    for (label, (large_buffers, scans, large_plans)) in large_cost {
+        assert!(
+            scans.is_empty(),
+            "step {step} {label}: sequential scans {scans:?}"
+        );
+        let (small_buffers, small_plans) = small_cost
+            .get(&label)
+            .map_or((0, Vec::new()), |cost| (cost.0, cost.2.clone()));
+        let plans = format!(
+            "small {} large {}",
+            serde_json::to_string(&small_plans)?,
+            serde_json::to_string(&large_plans)?
+        );
+        costs.insert(
+            label,
+            Cost {
+                small: small_buffers,
+                large: large_buffers,
+                plans,
+            },
+        );
+    }
+    Ok(costs)
+}
+
 /// Every statement of an update and the held-output lookup use indexes, and
 /// their buffer count does not follow the size of the store: with ten times
 /// more rows outside the update an index can be one level deeper and a page
 /// can split, which costs a few buffers per row, while a statement that read
-/// the other rows would cost ten times more. The horizon advance is timed on
-/// a Mainnet-size store.
+/// the other rows would cost ten times more. A plan also counts the catalogue
+/// entries that its statement reads again after a cache invalidation (an
+/// autoanalyze, for example), so a statement above its bound is measured once
+/// more, in the next update of the same shape on both stores: the test fails
+/// when the statement is above its bound in both measurements or the second
+/// update does not run it. The horizon advance is timed on a Mainnet-size
+/// store.
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn update_cost_is_bounded_by_the_update() -> Result {
@@ -867,35 +936,41 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
     fill(&large.database.config, &large.profile, 1_000, 500, window).await?;
     let mut results = Vec::new();
     for step in 0..3u64 {
-        let plans = [&small, &large].map(|setup| {
-            let f = &setup.follower;
-            let mut plan = advance(&setup.g, f, 4, None);
-            if step == 1 {
-                plan.fork_point = f.tip.height - 2;
-                plan.headers = (plan.fork_point + 1..=f.tip.height + 4)
-                    .map(|height| header(setup.g.block(height).unwrap()))
-                    .collect();
-            }
-            plan
-        });
-        let [small_plan, large_plan] = plans;
-        let small_cost = costed(&mut small, &small_plan).await?;
-        let large_cost = costed(&mut large, &large_plan).await?;
-        for (label, (large_buffers, scans, large_plans)) in &large_cost {
-            let (small_buffers, small_plans) = small_cost
-                .get(label)
-                .map_or((0, Vec::new()), |cost| (cost.0, cost.2.clone()));
+        let fork = step == 1;
+        let costs = measure(&mut small, &mut large, fork, step).await?;
+        let above = costs
+            .iter()
+            .filter(|(_, cost)| cost.above_bound())
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        let again = if above.is_empty() {
+            BTreeMap::new()
+        } else {
+            measure(&mut small, &mut large, fork, step).await?
+        };
+        for label in &above {
+            let (cost, repeat) = (&costs[label], again.get(label));
             assert!(
-                scans.is_empty(),
-                "step {step} {label}: sequential scans {scans:?}"
+                repeat.is_some_and(|repeat| !repeat.above_bound()),
+                "step {step} {label}: {} buffers grew to {}; measured again: {}: {}{}",
+                cost.small,
+                cost.large,
+                repeat.map_or("the statement did not run".to_owned(), |repeat| format!(
+                    "{} buffers grew to {}",
+                    repeat.small, repeat.large
+                )),
+                cost.plans,
+                repeat.map_or(String::new(), |repeat| format!(
+                    " measured again: {}",
+                    repeat.plans
+                ))
             );
-            assert!(
-                *large_buffers <= small_buffers * 2 + 32,
-                "step {step} {label}: {small_buffers} buffers grew to {large_buffers}: small {} large {}",
-                serde_json::to_string(&small_plans)?,
-                serde_json::to_string(large_plans)?
-            );
-            results.push(json!({"step":step,"statement":label,"buffers_small":small_buffers,"buffers_large":large_buffers}));
+        }
+        for (label, cost) in &costs {
+            results.push(json!({"step":step,"statement":label,"buffers_small":cost.small,"buffers_large":cost.large}));
+        }
+        for (label, cost) in &again {
+            results.push(json!({"step":step,"repeat":true,"statement":label,"buffers_small":cost.small,"buffers_large":cost.large}));
         }
     }
     let client = connect(&large.database.config).await?;
