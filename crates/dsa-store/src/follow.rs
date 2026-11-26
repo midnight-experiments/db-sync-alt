@@ -352,69 +352,69 @@ fn source_text(source: &Source) -> String {
 }
 
 #[derive(Default)]
-struct TxColumns {
-    id: Vec<i64>,
-    hash: Vec<Vec<u8>>,
-    block: Vec<i64>,
-    index: Vec<i32>,
-    valid: Vec<bool>,
+pub(crate) struct TxColumns {
+    pub(crate) id: Vec<i64>,
+    pub(crate) hash: Vec<Vec<u8>>,
+    pub(crate) block: Vec<i64>,
+    pub(crate) index: Vec<i32>,
+    pub(crate) valid: Vec<bool>,
 }
 
 #[derive(Default)]
-struct OutputColumns {
-    id: Vec<i64>,
-    tx: Vec<i64>,
-    index: Vec<i32>,
-    address: Vec<String>,
-    value: Vec<String>,
-    data_hash: Vec<Option<Vec<u8>>>,
+pub(crate) struct OutputColumns {
+    pub(crate) id: Vec<i64>,
+    pub(crate) tx: Vec<i64>,
+    pub(crate) index: Vec<i32>,
+    pub(crate) address: Vec<String>,
+    pub(crate) value: Vec<String>,
+    pub(crate) data_hash: Vec<Option<Vec<u8>>>,
 }
 
 #[derive(Default)]
-struct AssetColumns {
-    id: Vec<i64>,
-    quantity: Vec<String>,
-    output: Vec<i64>,
-    policy: Vec<Vec<u8>>,
-    name: Vec<Vec<u8>>,
+pub(crate) struct AssetColumns {
+    pub(crate) id: Vec<i64>,
+    pub(crate) quantity: Vec<String>,
+    pub(crate) output: Vec<i64>,
+    pub(crate) policy: Vec<Vec<u8>>,
+    pub(crate) name: Vec<Vec<u8>>,
 }
 
 #[derive(Default)]
-struct InputColumns {
-    id: Vec<i64>,
-    tx: Vec<i64>,
-    output_tx: Vec<i64>,
-    output_index: Vec<i32>,
+pub(crate) struct InputColumns {
+    pub(crate) id: Vec<i64>,
+    pub(crate) tx: Vec<i64>,
+    pub(crate) output_tx: Vec<i64>,
+    pub(crate) output_index: Vec<i32>,
 }
 
 #[derive(Default)]
-struct DatumColumns {
-    hash: Vec<Vec<u8>>,
-    value: Vec<Option<String>>,
+pub(crate) struct DatumColumns {
+    pub(crate) hash: Vec<Vec<u8>>,
+    pub(crate) value: Vec<Option<String>>,
 }
 
 #[derive(Default)]
-struct MetadataColumns {
-    id: Vec<i64>,
-    key: Vec<i64>,
-    tx: Vec<i64>,
-    json: Vec<Option<String>>,
+pub(crate) struct MetadataColumns {
+    pub(crate) id: Vec<i64>,
+    pub(crate) key: Vec<i64>,
+    pub(crate) tx: Vec<i64>,
+    pub(crate) json: Vec<Option<String>>,
 }
 
 /// The rows of all final blocks as statement parameters, one array per
 /// column.
 #[derive(Default)]
-struct Columns {
-    tx: TxColumns,
-    out: OutputColumns,
-    asset: AssetColumns,
-    input: InputColumns,
-    datum: DatumColumns,
-    metadata: MetadataColumns,
+pub(crate) struct Columns {
+    pub(crate) tx: TxColumns,
+    pub(crate) out: OutputColumns,
+    pub(crate) asset: AssetColumns,
+    pub(crate) input: InputColumns,
+    pub(crate) datum: DatumColumns,
+    pub(crate) metadata: MetadataColumns,
 }
 
 impl Columns {
-    fn new(blocks: &[FinalBlock]) -> Result<Self, Error> {
+    pub(crate) fn new(blocks: &[FinalBlock]) -> Result<Self, Error> {
         let mut c = Self::default();
         for rows in blocks.iter().map(|block| &block.rows) {
             for row in &rows.tx {
@@ -467,34 +467,35 @@ impl Columns {
     }
 }
 
-const INSERT_HEADERS: &str = "INSERT INTO serve.block(id,hash,epoch_no,slot_no,block_no,time,tx_count)
+pub(crate) const INSERT_HEADERS: &str = "INSERT INTO serve.block(id,hash,epoch_no,slot_no,block_no,time,tx_count)
  SELECT h,hash,epoch,slot,h,time,txs
  FROM unnest($1::bigint[],$2::bytea[],$3::integer[],$4::bigint[],$5::timestamp[],$6::bigint[]) u(h,hash,epoch,slot,time,txs)";
-const INSERT_ASSETS: &str = "INSERT INTO serve.multi_asset(id,policy,name)
+pub(crate) const INSERT_ASSETS: &str = "INSERT INTO serve.multi_asset(id,policy,name)
  SELECT nextval('dsa.multi_asset_id_seq'),u.policy,u.name
  FROM (SELECT DISTINCT policy,name FROM unnest($1::bytea[],$2::bytea[]) u(policy,name)) u
  WHERE NOT EXISTS(SELECT 1 FROM serve.multi_asset m WHERE m.policy=u.policy AND m.name=u.name)";
-const INSERT_DATUMS: &str = "INSERT INTO serve.datum(id,hash,value)
+pub(crate) const INSERT_DATUMS: &str = "INSERT INTO serve.datum(id,hash,value)
  SELECT nextval('dsa.datum_id_seq'),u.hash,u.value::jsonb
  FROM (SELECT DISTINCT ON (hash) hash,value FROM unnest($1::bytea[],$2::text[]) u(hash,value) ORDER BY hash) u
  WHERE NOT EXISTS(SELECT 1 FROM serve.datum d WHERE d.hash=u.hash)";
-const INSERT_TRANSACTIONS: &str =
+pub(crate) const INSERT_TRANSACTIONS: &str =
     "INSERT INTO serve.tx(id,hash,block_id,block_index,valid_contract)
  SELECT * FROM unnest($1::bigint[],$2::bytea[],$3::bigint[],$4::integer[],$5::boolean[])";
-const INSERT_OUTPUTS: &str = "INSERT INTO serve.tx_out(id,tx_id,index,address,value,data_hash,consumed_by_tx_id)
+pub(crate) const INSERT_OUTPUTS: &str = "INSERT INTO serve.tx_out(id,tx_id,index,address,value,data_hash,consumed_by_tx_id)
  SELECT id,tx_id,index::smallint,address,value::numeric,data_hash,NULL
  FROM unnest($1::bigint[],$2::bigint[],$3::integer[],$4::text[],$5::text[],$6::bytea[]) u(id,tx_id,index,address,value,data_hash)";
-const INSERT_ASSET_ROWS: &str = "INSERT INTO serve.ma_tx_out(id,quantity,tx_out_id,ident)
+pub(crate) const INSERT_ASSET_ROWS: &str = "INSERT INTO serve.ma_tx_out(id,quantity,tx_out_id,ident)
  SELECT u.id,u.quantity::numeric,u.tx_out_id,m.id
  FROM unnest($1::bigint[],$2::text[],$3::bigint[],$4::bytea[],$5::bytea[]) u(id,quantity,tx_out_id,policy,name)
  JOIN serve.multi_asset m ON m.policy=u.policy AND m.name=u.name";
-const INSERT_INPUTS: &str = "INSERT INTO serve.tx_in(id,tx_in_id,tx_out_id,tx_out_index)
+pub(crate) const INSERT_INPUTS: &str = "INSERT INTO serve.tx_in(id,tx_in_id,tx_out_id,tx_out_index)
  SELECT id,tx_in_id,tx_out_id,tx_out_index::smallint
  FROM unnest($1::bigint[],$2::bigint[],$3::bigint[],$4::integer[]) u(id,tx_in_id,tx_out_id,tx_out_index)";
-const INSERT_METADATA: &str = "INSERT INTO serve.tx_metadata(id,key,tx_id,json)
+pub(crate) const INSERT_METADATA: &str = "INSERT INTO serve.tx_metadata(id,key,tx_id,json)
  SELECT id,key::numeric,tx_id,json::jsonb
  FROM unnest($1::bigint[],$2::bigint[],$3::bigint[],$4::text[]) u(id,key,tx_id,json)";
-const INSERT_EPOCH_PARAMS: &str = "INSERT INTO serve.epoch_param(epoch_no,nonce,max_tx_size)
+pub(crate) const INSERT_EPOCH_PARAMS: &str =
+    "INSERT INTO serve.epoch_param(epoch_no,nonce,max_tx_size)
  SELECT * FROM unnest($1::integer[],$2::bytea[],$3::integer[])";
 const INSERT_FIRST_SERVED: &str = "INSERT INTO dsa.first_served(height,first_served_at)
  SELECT h,n.at FROM generate_series($1::integer,$2::integer) h CROSS JOIN (SELECT clock_timestamp() AS at) n";
@@ -940,11 +941,11 @@ async fn apply(
         .query(
             transaction,
             "position",
-            "SELECT p.serving,p.target_height::bigint,encode(p.target_hash,'hex'),p.tip_height::bigint,
+            "SELECT p.serving OR p.reason=$1,p.target_height::bigint,encode(p.target_hash,'hex'),p.tip_height::bigint,
              encode(p.tip_hash,'hex'),p.horizon_height::bigint,h.epoch_no::bigint,i.profile_hash
              FROM dsa.position p CROSS JOIN dsa.identity i LEFT JOIN serve.block h ON h.id=p.horizon_height
              WHERE p.id=1 AND i.id=1 FOR UPDATE OF p",
-            &[],
+            &[&crate::rebuild::REBUILDING],
         )
         .await?
         .pop()

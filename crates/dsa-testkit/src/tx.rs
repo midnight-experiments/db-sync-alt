@@ -220,6 +220,48 @@ fn inputs(out: &mut Vec<u8>, inputs: &[Input]) {
     }
 }
 
+/// What a built transaction holds, as its builder knows it: the fake
+/// provider renders its listings from these facts, not from the CBOR.
+#[derive(Clone, Debug)]
+pub struct Facts {
+    pub valid: bool,
+    pub inputs: Vec<Input>,
+    pub collateral: Vec<Input>,
+    pub references: Vec<Input>,
+    pub outputs: Vec<Output>,
+    pub collateral_return: Option<Output>,
+    pub mint: Vec<Token>,
+}
+
+impl Facts {
+    /// The inputs the transaction spends: its inputs, or its collateral when
+    /// it fails phase 2.
+    pub fn spent(&self) -> &[Input] {
+        if self.valid {
+            &self.inputs
+        } else {
+            &self.collateral
+        }
+    }
+
+    /// The outputs it creates, by index: its outputs, or its collateral
+    /// return at the index after them when it fails phase 2.
+    pub fn created(&self) -> Vec<(u16, &Output)> {
+        if self.valid {
+            self.outputs
+                .iter()
+                .enumerate()
+                .map(|(index, output)| (index as u16, output))
+                .collect()
+        } else {
+            self.collateral_return
+                .iter()
+                .map(|output| (self.outputs.len() as u16, output))
+                .collect()
+        }
+    }
+}
+
 /// A built transaction: its hash and the complete CBOR envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Built {
@@ -401,6 +443,18 @@ impl Tx {
             out.extend_from_slice(value);
         }
         Some(out)
+    }
+
+    pub fn facts(&self) -> Facts {
+        Facts {
+            valid: self.valid,
+            inputs: self.inputs.clone(),
+            collateral: self.collateral.clone(),
+            references: self.references.clone(),
+            outputs: self.outputs.clone(),
+            collateral_return: self.collateral_return.clone(),
+            mint: self.mint.clone(),
+        }
     }
 
     pub fn build(&self) -> Built {

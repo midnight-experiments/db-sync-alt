@@ -39,8 +39,10 @@ flowchart LR
 - Linux x86-64 with glibc 2.39 or newer, or Docker.
 - PostgreSQL 17+ ([setup](docs/postgresql.md)).
 - A Blockfrost API key.
-- A database snapshot file for the first start, from the
+- Recommended: a database snapshot file for the first start, from the
   [release page](https://github.com/midnight-experiments/db-sync-alt/releases).
+  Without one, `db-sync-alt rebuild` builds the database from the provider
+  ([rebuild](docs/rebuild.md)).
 
 | Program | Version | Memory | Disk |
 | --- | --- | --- | --- |
@@ -95,8 +97,9 @@ deployment runs it next to its own PostgreSQL server:
 
 ## First start
 
-Get the snapshot file of your network and its content digest from the release
-page. Then start the service on the empty database:
+The recommended first start restores a snapshot file. Get the file of your
+network and its content digest from the release page. Then start the service
+on the empty database:
 
 ```sh
 db-sync-alt run --network mainnet \
@@ -126,6 +129,11 @@ Good to know:
   belongs to the rotation.
 - Every flag can also be given as an environment variable
   ([configuration](docs/configuration.md)).
+
+Without a snapshot file, build the database from the provider with
+`db-sync-alt rebuild`, then start `run` on it without `--snapshot`. A build
+sends many more requests than a restore and runs for hours
+([rebuild](docs/rebuild.md)).
 
 ```sh
 curl -i http://127.0.0.1:18080/health
@@ -163,7 +171,7 @@ A Rust workspace. What each folder holds:
 | `crates/dsa-chain` | Cardano, without any I/O: reads blocks and transactions, knows each network's addresses and assets, and decides what is kept. |
 | `crates/dsa-provider` | The Blockfrost client: one method per request, pacing and limits. |
 | `crates/dsa-store` | The PostgreSQL database: its tables and the node's read-only access, restore, snapshot files, verification, pruning and the comparison. |
-| `crates/dsa-service` | The running service: follows the chain, retries, upkeep, `/health` and `/status`. |
+| `crates/dsa-service` | The running service: follows the chain, retries, upkeep, `/health` and `/status`; the build from the provider. |
 | `crates/dsa-testkit` | Test support only: a transaction builder, a fake provider and generated chains. |
 
 Around them: `deploy` (the container image and the Compose deployment), `docs`,
@@ -179,6 +187,8 @@ assets are compiled into the binary from `crates/dsa-chain/profiles`. More in
 - [Operations](docs/operations.md): states, `/health`, `/status`, logs, exit
   statuses, upkeep, the retention, a closed gate.
 - [Snapshot files](docs/snapshots.md): restore, write, verify.
+- [Rebuild](docs/rebuild.md): a database from the provider alone, without a
+  snapshot file.
 - [Comparison](docs/comparison.md): the node's queries against two databases.
 - [Provider](docs/provider.md): requests, pace, refusals, measured costs.
 - [PostgreSQL](docs/postgresql.md) and [connect a node](docs/connect-a-node.md).

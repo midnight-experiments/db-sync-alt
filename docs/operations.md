@@ -26,10 +26,15 @@ At start the service:
    within about a minute and frees the lock
    ([troubleshooting](troubleshooting.md#connecting-to-postgresql)).
 5. On an empty database, restores the `--snapshot` file (state `restoring`).
-   Without `--snapshot` an empty database is refused (`snapshot_required`).
-   What an interrupted restore left (its build, not yet published) is
-   restored again from `--snapshot`. A database whose gate is closed is
-   refused (`database_not_serving`): see [a closed gate](#a-closed-gate).
+   Without `--snapshot` an empty database is refused (`snapshot_required`):
+   restore a file, or build the database first with
+   [`rebuild`](rebuild.md). What an interrupted restore left (its build, not
+   yet published) is restored again from `--snapshot`. A database whose gate
+   is closed is refused (`database_not_serving`): see
+   [a closed gate](#a-closed-gate). So is a database that `rebuild` fills,
+   with the reason `rebuilding`, until the build has published. While the
+   build runs it holds the writer lock: the service waits at step 4 and ends
+   with `writer_busy`.
 6. Compares `--retention-seconds`, when given, with the stored retention
    ([change the retention](#change-the-retention)).
 7. Grants the `--reader` login the node's rights and checks that it has no
@@ -56,6 +61,11 @@ waiting state also gives the time the wait ends in `wait_until`.
 | `following` | The database holds every final block the provider has. One poll every `--poll-interval-seconds`. | `following` |
 | `waiting` | A condition that ends by itself, or a retry. | see below |
 | `stopped` | The service ended, or is not running. | `stop_requested`, the code that ended it, or `service_not_running` |
+
+No service runs on a database that `rebuild` fills. `status` shows the build
+in `service_state`: `state` `rebuilding` with the phase as `reason` before the
+window, and the follower's own record while the window is made final
+([rebuild](rebuild.md#progress)).
 
 Reasons of `waiting`:
 
@@ -113,7 +123,7 @@ that fails, each with its own code; the list is empty when the answer is 200.
 
 | Reason code | Condition that fails |
 | --- | --- |
-| `serving_unready` | The database has not served yet: empty, or restoring. |
+| `serving_unready` | The database has not served yet: empty, restoring, or being built. |
 | `serving_revoked` | A check closed the gate ([a closed gate](#a-closed-gate)). |
 | `serving_unknown` | The database has not been read yet. |
 | `state_restoring` | The state is `restoring`. |
@@ -158,7 +168,7 @@ composed. Times are Unix seconds unless stated. A position (`provider_head`,
 | `state` | `restoring`, `catching_up`, `following`, `waiting` or `stopped` ([states](#states)). |
 | `state_reason` | The reason of the state. |
 | `wait_until` | When the current wait or retry ends. |
-| `serving` | The gate: `ready` (open), `unready` (not served yet), `revoked` (closed by a check) or `unknown` (not read yet). |
+| `serving` | The gate: `ready` (open), `unready` (not served yet, also while a build fills the database), `revoked` (closed by a check) or `unknown` (not read yet). |
 | `sync` | The follower's activity: `idle` (at the tip), `syncing` (catching up or restoring), `backoff` (retrying), `quota_wait` (waiting for the next UTC day), `halted` (stopped) or `unknown` (no follower runs). |
 | `error_code` | The condition that keeps the service from following: the reason of a `waiting` state, or of a `stopped` state other than a requested stop. |
 | `poll_error_code` | The provider's refusal (`quota_exhausted`, `provider_rate_limited`, `provider_banned`) while its wait lasts. |
@@ -180,7 +190,7 @@ composed. Times are Unix seconds unless stated. A position (`provider_head`,
 | `database` | `observed_at` and `observation_age_seconds` of the last read; `size_bytes`; `tls_available`, whether the server offers TLS; `reader_check`, with `role`, `passed`, `error`, `violations` and `warnings`; `index_rebuilds`, each index's size after its last rebuild. |
 | `identity` | The stored identity: `database_format`, `network`, `profile_hash`, `keep_rule_version`, `tool_version`, `node_release`, `origin` (where the data came from) and `created_at`. |
 | `position` | The stored position row: `serving`, `reason`, target, tip and horizon heights, hashes and times, `retention_seconds` and `updated_at`. |
-| `service_state` | The stored state row that the service writes on every state change and with every update: `state`, `reason`, `detail`, `last_update`, `last_error` and their times. |
+| `service_state` | The stored state row that the service, or a build, writes on every state change and with every update: `state`, `reason`, `detail`, `last_update`, `last_error` and their times. |
 | `first_observations` | For each rare shape (`stored_pointer_address`, `stored_large_datum`, `stored_bridge_metadata`), the first one the follower stored on this database, with its block, transaction and the provider answers that held it; `null` until one is stored. |
 | `capabilities` | What the database serves to node 2.1.101's operator commands: registered-candidate results are `unsupported` ([limitations](limitations.md)). |
 | `limitations` | The [limitations](limitations.md), each with a `code` and a `description`. |
@@ -223,6 +233,10 @@ output carries only a command's result.
   and `snapshot_file`, each end with its `outcome` and `seconds`.
 - While catching up, one `update` line at most every 10 seconds; each line
   carries the update's report.
+- `rebuild` logs `rebuild_started`, `rebuild_phase`, `rebuild_waiting`,
+  `rebuild_listing_moving`, `rebuild_reading_again`, `rebuild_tip_left_chain`,
+  `rebuild_listings_discarded`, `rebuild_published` and `rebuild_failed`
+  ([rebuild](rebuild.md#progress)), and in its window the lines of following.
 - Conditions: `database_unreachable` and `database_reachable`, `writer_busy`
   and `writer_lock_taken`,
   `follower_retry` with the error and the time of the next attempt,
@@ -338,9 +352,10 @@ The `--snapshot` and `--expect-content-digest` of the first start may stay
 set: the file is read only when a restore is needed, so a start on a serving
 database does not need it, also after the rotation removed it.
 
-These files are the backups of a pruned database: a database cannot be rebuilt
-from the provider's history at a practical cost. Copy them off the host.
-Restoring one is described in [snapshots](snapshots.md#restore).
+These files are the backups of a pruned database: restoring one takes
+seconds, a build from the provider ([rebuild](rebuild.md)) many requests and
+hours. Copy them off the host. Restoring one is described in
+[snapshots](snapshots.md#restore).
 
 ## Change the retention
 
@@ -374,7 +389,8 @@ and `state_reason` and `last_error` name the check:
 
 The service stops, and refuses to start on that database
 (`database_not_serving`). Nothing in it is repaired in place. Recover by
-restoring a snapshot file into an empty database:
+restoring a snapshot file into an empty database, or, without a file, by
+building a new one with [`rebuild`](rebuild.md) and starting `run` on it:
 
 1. Keep the closed database for diagnosis, or drop it.
 2. Create an empty database for the same owner

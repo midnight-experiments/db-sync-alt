@@ -499,6 +499,43 @@ fn the_document_names_its_state_and_never_claims_following_without_a_follower() 
     }
 }
 
+/// A database that a build fills holds a target before it ever served: it
+/// is `unready` in every phase, not `revoked`, and `status` shows the
+/// build's stored state; a check that closed a build's gate makes it
+/// `revoked`.
+#[test]
+fn a_database_being_built_is_unready() {
+    let mut building = serving_view();
+    building.position.serving = false;
+    building.position.reason = "rebuilding".to_owned();
+    building.identity.origin = json!({"kind": "rebuilding"});
+    for (state, reason) in [("rebuilding", "validity"), ("catching_up", "catching_up")] {
+        let stored = building.service_state.as_mut().unwrap();
+        stored.state = state.to_owned();
+        stored.reason = reason.to_owned();
+        let status = compose(Some(&building), None, &settings(), NOW);
+        let value = document(&status);
+        assert_eq!(value["serving"], "unready", "{state}");
+        assert!(status.reason_codes.contains(&"serving_unready"), "{state}");
+        assert!(!status.reason_codes.contains(&"serving_revoked"), "{state}");
+        assert_eq!(value["state"], "stopped", "{state}");
+        assert_eq!(value["state_reason"], "service_not_running", "{state}");
+        assert_eq!(value["service_state"]["state"], state);
+        assert_eq!(value["position"]["reason"], "rebuilding");
+    }
+    // Before its rows below the horizon are written it has no target.
+    let mut early = building.clone();
+    early.target = None;
+    let status = compose(Some(&early), None, &settings(), NOW);
+    assert_eq!(document(&status)["serving"], "unready");
+    // A check that closed the gate of a build.
+    let mut closed = building;
+    closed.position.reason = "asset_conservation".to_owned();
+    let status = compose(Some(&closed), None, &settings(), NOW);
+    assert_eq!(document(&status)["serving"], "revoked");
+    assert!(status.reason_codes.contains(&"serving_revoked"));
+}
+
 /// The target's epoch without stake for more than ten minutes at the tip is
 /// a warning that names the epoch, not a reason of `/health`; the last
 /// stake failure is shown with its cause.

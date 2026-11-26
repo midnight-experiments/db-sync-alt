@@ -9,6 +9,7 @@ pub mod follow;
 pub mod horizon;
 pub mod keep;
 mod load;
+pub mod rebuild;
 mod restore;
 pub mod service_view;
 pub mod snapshot;

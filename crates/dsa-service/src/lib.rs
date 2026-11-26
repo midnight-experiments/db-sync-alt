@@ -6,6 +6,7 @@ pub mod config;
 pub mod epoch;
 pub mod follow;
 pub mod http;
+pub mod rebuild;
 pub mod retry;
 pub mod run;
 pub mod status;

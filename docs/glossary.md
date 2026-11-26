@@ -30,8 +30,9 @@ here.
 | Term | Meaning |
 | --- | --- |
 | served tables | The eleven tables the node reads, shaped as cardano-db-sync shapes them: `block`, `tx`, `tx_out`, `tx_in`, `ma_tx_out`, `multi_asset`, `datum`, `epoch_param`, `pool_hash`, `epoch_stake`, `tx_metadata`. They live in schema `serve`; the node reads them through views of the same names in schema `public`. |
-| gate | The check every view runs. While the database is not serving (empty, restoring, or closed by a check), every view raises SQLSTATE 55000 (`db_sync_alt_not_serving`), so the node never takes an empty answer for a real one. |
-| closed gate | The gate after a check found a fault: `canonical_conflict`, `asset_conservation` or `supply_mismatch`. The node keeps getting 55000 until the database is restored from a snapshot file ([operations](operations.md#a-closed-gate)). |
+| gate | The check every view runs. While the database is not serving (empty, restoring, being built, or closed by a check), every view raises SQLSTATE 55000 (`db_sync_alt_not_serving`), so the node never takes an empty answer for a real one. |
+| closed gate | The gate after a check found a fault: `canonical_conflict`, `asset_conservation` or `supply_mismatch`. The node keeps getting 55000 until the database is restored from a snapshot file or built again ([operations](operations.md#a-closed-gate)). |
+| build | A database that `rebuild` fills from the provider alone. It serves nothing until the build has published ([rebuild](rebuild.md)). |
 | positional ID | The `id` of a row in `tx`, `tx_out`, `ma_tx_out` and `tx_in`, computed from the row's position on the chain, so that two databases at the same blocks hold the same IDs. |
 | owner login | The PostgreSQL login db-sync-alt runs as. It owns the database and has no superuser rights. |
 | reader login | The PostgreSQL login of the Midnight node. It may read the eleven views and call the gate, nothing else. |
@@ -43,7 +44,7 @@ here.
 | Term | Meaning |
 | --- | --- |
 | snapshot file | One file holding a whole database and its description, for publishing and restoring ([snapshots](snapshots.md)). |
-| content digest | A SHA-256 over every row the node can read, by natural key. Two databases at the same horizon, target and tip have the same content digest, whether they were restored or followed. |
+| content digest | A SHA-256 over every row the node can read, by natural key. Two databases at the same horizon, target and tip have the same content digest, whether they were restored or followed. A build from the provider can be compared with them by it ([rebuild](rebuild.md#check-a-published-file)). |
 | state digest | A SHA-256 over the database's record of outputs spent below the horizon, which the node cannot read but the keep rule needs. |
 
 ## Profile

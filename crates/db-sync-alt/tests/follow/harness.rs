@@ -105,6 +105,20 @@ pub fn chain(
     blocks: u32,
     large: bool,
 ) -> Generated {
+    generated(profile, seed, first_height, blocks, large, false)
+}
+
+/// `chain`, or with `build` the chain of the build's tests: its first block
+/// also mints one of every unit of the profile's roles, and transactions
+/// carry the rows a valid transaction's answer flags.
+pub fn generated(
+    profile: &Profile,
+    seed: u64,
+    first_height: u32,
+    blocks: u32,
+    large: bool,
+    build: bool,
+) -> Generated {
     generate::generate(
         &roles(profile),
         &Settings {
@@ -113,6 +127,8 @@ pub fn chain(
             blocks,
             transactions: 5,
             large_datums: large,
+            every_role_minted: build,
+            flagged_rows: build,
         },
     )
 }

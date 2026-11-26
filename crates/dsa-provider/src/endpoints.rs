@@ -1,7 +1,9 @@
 //! One method per endpoint. `Ok(None)` stands for an answer that has a
 //! meaning: no block at that height yet, a block that left the chain, an
 //! unknown datum, an epoch that is not ready. Lists use pages of 100 in
-//! ascending order, except retired pools and pool history (descending).
+//! ascending order, except retired pools and pool history (descending) and
+//! the transaction lists a caller reads backward. A list of an asset or
+//! address the provider has never seen (404) is empty.
 
 use bytes::Bytes;
 
@@ -10,9 +12,10 @@ use crate::{
     client::Family,
     pages::{PAGE_SIZE, TransactionPage},
     types::{
-        Datum, EpochInfo, EpochParameters, Genesis, Hash32, Header, Hex, Metadata, MetadataEntry,
-        Page, PoolHistory, PoolId, PoolStake, RetiredPool, StakeAddress, TransactionCbor,
-        TransactionOutputs,
+        AddressText, AssetEvent, AssetInfo, Datum, EpochInfo, EpochParameters, Genesis, Hash32,
+        Header, Heights, Hex, ListedOutput, ListedTransaction, Metadata, MetadataEntry, Page,
+        PolicyAsset, PoolHistory, PoolId, PoolStake, RetiredPool, StakeAddress, TransactionCbor,
+        TransactionInfo, TransactionOutputs, TransactionUtxos, Unit,
     },
 };
 
@@ -280,6 +283,260 @@ impl Provider {
         let body = self.found(self.get("/genesis", Family::Small).await?)?;
         self.parsed(parse::json(&body))
     }
+
+    /// One page of a list; a 404 is an empty list (an asset or address the
+    /// provider has never seen).
+    async fn list_page<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, Error> {
+        match self.get(path, Family::List).await? {
+            Some(body) => self.parsed(parse::list(&body, PAGE_SIZE)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// One page of `/assets/{unit}/utxos`, oldest first, restricted to
+    /// outputs created in `heights`: valid rows, each output once, in
+    /// ascending order of their heights.
+    pub async fn asset_outputs(
+        &self,
+        unit: &Unit,
+        heights: Heights,
+        page: Page,
+    ) -> Result<Vec<ListedOutput>, Error> {
+        let path = ranged(&format!("/assets/{unit}/utxos"), heights, page, false)?;
+        let rows: Vec<ListedOutput> = self.list_page(&path).await?;
+        if rows.iter().any(|row| {
+            row.block_height.is_none_or(|height| {
+                heights.from.is_some_and(|from| height < from)
+                    || heights.to.is_some_and(|to| height > to)
+            })
+        }) || !rows
+            .windows(2)
+            .all(|pair| pair[0].block_height <= pair[1].block_height)
+            || !outputs_valid(&rows)
+        {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(rows)
+    }
+
+    /// One page of `/addresses/{address}/utxos`, oldest first: valid rows of
+    /// the address, each output once.
+    pub async fn address_outputs(
+        &self,
+        address: &AddressText,
+        page: Page,
+    ) -> Result<Vec<ListedOutput>, Error> {
+        let rows: Vec<ListedOutput> = self
+            .list_page(&paged(&format!("/addresses/{address}/utxos"), page, false))
+            .await?;
+        if rows.iter().any(|row| row.address != address.to_string()) || !outputs_valid(&rows) {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(rows)
+    }
+
+    /// One page of `/assets/{unit}/transactions` in `heights`.
+    pub async fn asset_transactions(
+        &self,
+        unit: &Unit,
+        heights: Heights,
+        page: Page,
+        descending: bool,
+    ) -> Result<Vec<ListedTransaction>, Error> {
+        let path = ranged(
+            &format!("/assets/{unit}/transactions"),
+            heights,
+            page,
+            descending,
+        )?;
+        self.checked_transactions(&path, heights, descending).await
+    }
+
+    /// One page of `/addresses/{address}/transactions` in `heights`.
+    pub async fn address_transactions(
+        &self,
+        address: &AddressText,
+        heights: Heights,
+        page: Page,
+        descending: bool,
+    ) -> Result<Vec<ListedTransaction>, Error> {
+        let path = ranged(
+            &format!("/addresses/{address}/transactions"),
+            heights,
+            page,
+            descending,
+        )?;
+        self.checked_transactions(&path, heights, descending).await
+    }
+
+    /// A page of a transaction list: rows in `heights`, at places a
+    /// positional ID can hold, each place once and in the asked order.
+    async fn checked_transactions(
+        &self,
+        path: &str,
+        heights: Heights,
+        descending: bool,
+    ) -> Result<Vec<ListedTransaction>, Error> {
+        let rows: Vec<ListedTransaction> = self.list_page(path).await?;
+        let place = |row: &ListedTransaction| (row.block_height, row.tx_index);
+        if rows.iter().any(|row| {
+            row.block_height >= HEIGHT_LIMIT
+                || row.tx_index >= u32::from(dsa_chain::ids::INDEX_LIMIT)
+                || heights.from.is_some_and(|from| row.block_height < from)
+                || heights.to.is_some_and(|to| row.block_height > to)
+        }) || !rows.windows(2).all(|pair| {
+            if descending {
+                place(&pair[0]) > place(&pair[1])
+            } else {
+                place(&pair[0]) < place(&pair[1])
+            }
+        }) {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(rows)
+    }
+
+    /// `/txs/{hash}/utxos` with its inputs; `None` for an unknown transaction.
+    pub async fn transaction_utxos(
+        &self,
+        transaction: &Hash32,
+    ) -> Result<Option<TransactionUtxos>, Error> {
+        let body = self
+            .get(&format!("/txs/{transaction}/utxos"), Family::Outputs)
+            .await?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let answer: TransactionUtxos = self.parsed(parse::json(&body))?;
+        answer
+            .validate(transaction)
+            .map_err(|code| self.invalid(code))?;
+        Ok(Some(answer))
+    }
+
+    /// `/txs/{hash}`; `None` for an unknown transaction.
+    pub async fn transaction(
+        &self,
+        transaction: &Hash32,
+    ) -> Result<Option<TransactionInfo>, Error> {
+        let body = self
+            .get(&format!("/txs/{transaction}"), Family::Small)
+            .await?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let answer: TransactionInfo = self.parsed(parse::json(&body))?;
+        if answer.hash != *transaction
+            || answer.block_height >= HEIGHT_LIMIT
+            || answer.index >= u32::from(dsa_chain::ids::INDEX_LIMIT)
+        {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(Some(answer))
+    }
+
+    /// `/assets/{unit}`; `None` for an asset that was never minted.
+    pub async fn asset(&self, unit: &Unit) -> Result<Option<AssetInfo>, Error> {
+        let body = self.get(&format!("/assets/{unit}"), Family::Small).await?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let answer: AssetInfo = self.parsed(parse::json(&body))?;
+        if answer.asset != unit.as_str()
+            || answer.quantity.is_empty()
+            || !answer.quantity.bytes().all(|byte| byte.is_ascii_digit())
+            || answer.quantity.len() > 39
+        {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(Some(answer))
+    }
+
+    /// One page of `/assets/{unit}/history`, oldest first: the unit's mints
+    /// and burns.
+    pub async fn asset_history(&self, unit: &Unit, page: Page) -> Result<Vec<AssetEvent>, Error> {
+        let rows: Vec<AssetEvent> = self
+            .list_page(&paged(&format!("/assets/{unit}/history"), page, false))
+            .await?;
+        if rows.iter().any(|row| row.quantity().is_none()) {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(rows)
+    }
+
+    /// One page of `/assets/policy/{policy}`.
+    pub async fn policy_assets(&self, policy: &str, page: Page) -> Result<Vec<PolicyAsset>, Error> {
+        if policy.len() != 56
+            || !policy
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::configuration("request.policy"));
+        }
+        let rows: Vec<PolicyAsset> = self
+            .list_page(&paged(&format!("/assets/policy/{policy}"), page, false))
+            .await?;
+        if rows
+            .iter()
+            .any(|row| !row.asset.starts_with(policy) || row.asset.parse::<Unit>().is_err())
+        {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(rows)
+    }
+
+    /// The hash of the last block of `epoch`; `None` when the epoch has no
+    /// block.
+    pub async fn epoch_last_block(&self, epoch: u32) -> Result<Option<Hash32>, Error> {
+        let path = format!(
+            "/epochs/{}/blocks?count=1&page=1&order=desc",
+            epoch_path(epoch)?
+        );
+        let rows: Vec<Hash32> = self.list_page(&path).await?;
+        if rows.len() > 1 {
+            return Err(self.invalid("provider_bad_page"));
+        }
+        Ok(rows.into_iter().next())
+    }
+
+    /// The header of the block `hash`; `None` when the provider does not know it.
+    pub async fn block_by_hash(&self, hash: &Hash32) -> Result<Option<Header>, Error> {
+        let body = self.get(&format!("/blocks/{hash}"), Family::Small).await?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let header = self.parsed(parse::header(&body, None))?;
+        if header.hash != *hash {
+            return Err(self.invalid("provider_invalid_response"));
+        }
+        Ok(Some(header))
+    }
+}
+
+/// Valid rows of an output list, each output once.
+fn outputs_valid(rows: &[ListedOutput]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .all(|row| row.valid() && seen.insert((&row.tx_hash, row.output_index)))
+}
+
+/// A list path with a height range: `from` and `to` are block heights.
+fn ranged(path: &str, heights: Heights, page: Page, descending: bool) -> Result<String, Error> {
+    let mut path = paged(path, page, descending);
+    if let (Some(from), Some(to)) = (heights.from, heights.to)
+        && from > to
+    {
+        return Err(Error::configuration("request.heights"));
+    }
+    for (name, value) in [("from", heights.from), ("to", heights.to)] {
+        if let Some(value) = value {
+            if value >= HEIGHT_LIMIT {
+                return Err(Error::configuration("request.heights"));
+            }
+            path.push_str(&format!("&{name}={value}"));
+        }
+    }
+    Ok(path)
 }
 
 #[cfg(test)]

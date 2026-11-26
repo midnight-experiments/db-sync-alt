@@ -69,6 +69,26 @@ address has to be made by hand: none occurs in the real transactions the tests
 record. If one occurs, a node served by db-sync-alt reads another holder
 address text for that output than a node served by cardano-db-sync.
 
+## A build from the provider
+
+A database built with `rebuild` ([rebuild](rebuild.md#limits)):
+
+- has the content digest of a snapshot file only when it has the file's
+  horizon and target, the provider still holds the file's k headers above the
+  target, and the database that wrote the file had stored the stake
+  distribution of the target's epoch;
+- holds a datum given only by its hash and revealed by a spend after the
+  target, which a database that followed to the same target does not hold
+  yet; none was found at the profile addresses of Mainnet and Preprod, where
+  the datums read are inline in their outputs;
+- rests on the provider where all its answers agree: an output that every
+  listing, list and history of the provider leaves out alike is missing from
+  the database without any check finding it, and what every answer states
+  alike is taken as stated, such as an output's address, lovelace, amount and
+  datum hash where one answer alone gives them, and the values read once below
+  the horizon
+  ([what rests on the provider](rebuild.md#what-rests-on-the-provider)).
+
 ## Networks and node release
 
 Mainnet and Preprod only. The keep rule and the profiles are bound to Midnight

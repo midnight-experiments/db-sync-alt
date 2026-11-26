@@ -2,6 +2,7 @@
 //! command to the store through the wrapper of `wrapper.rs`.
 
 mod follow_arguments;
+mod rebuild_arguments;
 mod run_command;
 mod service_arguments;
 mod wrapper;
@@ -258,6 +259,40 @@ enum Command {
         #[arg(long)]
         stop_at_target: Option<u32>,
     },
+    /// Build an empty database from the provider alone, without a snapshot
+    /// file, then verify it and open it for the node.
+    ///
+    /// The build finds the outputs the node needs that were unspent at the
+    /// horizon in the provider's listings of what is unspent now and of
+    /// what moved since, then reads every block from the horizon to the
+    /// target as the service follows them, with the same checks. Before
+    /// the gate opens, the unspent amount at the horizon of every asset unit
+    /// it read must equal the provider's quantity less the net mint since
+    /// then, and `verify` must pass; otherwise the build ends and nothing is
+    /// served. Given the horizon and target of a snapshot file, it builds
+    /// the same blocks, so the two can be compared by their content digests.
+    ///
+    /// The build takes the writer lock and records its progress in the
+    /// database, which serves nothing until the build has published. SIGINT
+    /// or SIGTERM stops it; the same command continues it. `status` on the
+    /// database shows its progress. Then start `run` on the database.
+    ///
+    /// The provider, follower and database flags are those of `run`, also as
+    /// DSA_ variables; the four flags of the build itself have no variable.
+    #[command(mut_arg("requests_per_second", |flag| flag.help(
+        "Requests sent per second at most (at most 10). The provider's limit \
+         is per key: a service that uses the same key shares it with the build"
+    )))]
+    Rebuild {
+        #[command(flatten)]
+        database: DatabaseArguments,
+        #[command(flatten)]
+        provider: follow_arguments::ProviderArguments,
+        #[command(flatten)]
+        follower: follow_arguments::FollowerArguments,
+        #[command(flatten)]
+        choices: rebuild_arguments::RebuildArguments,
+    },
 }
 
 impl Command {
@@ -271,7 +306,8 @@ impl Command {
             | Self::Convert { database, .. }
             | Self::GrantReader { database, .. }
             | Self::Run { database, .. }
-            | Self::Follow { database, .. } => Some(database),
+            | Self::Follow { database, .. }
+            | Self::Rebuild { database, .. } => Some(database),
             Self::Profile { .. } | Self::Compare(_) | Self::Health { .. } => None,
         }
     }
@@ -438,6 +474,12 @@ fn prepare(command: Command) -> Result<(Operation, Job), Usage> {
             follower,
             service,
         } => run_command::command(database, provider, follower, service),
+        Command::Rebuild {
+            database,
+            provider,
+            follower,
+            choices,
+        } => rebuild_arguments::command(database, provider, follower, choices),
         command => database_command(command),
     }
 }
@@ -548,6 +590,7 @@ fn database_command(command: Command) -> Result<(Operation, Job), Usage> {
         | Command::Compare(_)
         | Command::Follow { .. }
         | Command::Run { .. }
+        | Command::Rebuild { .. }
         | Command::Health { .. } => {
             unreachable!("not a database command")
         }
@@ -714,6 +757,7 @@ async fn execute(
         | Command::Compare(_)
         | Command::Follow { .. }
         | Command::Run { .. }
+        | Command::Rebuild { .. }
         | Command::Health { .. } => {
             unreachable!("not a database command")
         }

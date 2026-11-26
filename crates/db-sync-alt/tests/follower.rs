@@ -1370,7 +1370,8 @@ fn follow_command(
 /// blocks (about 120 KB of transaction CBOR each, so the CBOR limit ends
 /// the batches there); its peak resident memory is recorded. SIGTERM ends a
 /// run within 5 seconds without a partial update, and a new run continues.
-/// A stop target below the stored target is refused.
+/// A stop target below the stored target is refused, logged as
+/// `follow_failed` with the code and its detail.
 /// DSA_FOLLOW_COMMAND_BLOCKS sets the blocks of the catch-up (default 300).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
@@ -1524,7 +1525,13 @@ async fn the_follow_command_catches_up_stops_and_is_stopped() -> Result {
     .wait_with_output()
     .await?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("stop_target_below_stored_target"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("stop_target_below_stored_target"));
+    // The command's failure line, byte for byte.
+    let failed = json!({"event":"follow_failed","error":{"error":"stop_target_below_stored_target",
+        "detail":{"stop_at_target":t0,"target":stop_at + extra}}})
+    .to_string();
+    assert!(stderr.lines().any(|line| line == failed), "{stderr}");
     store.verify(&profile).await.map_err(named)?;
     drop(store);
     source.database.cleanup().await?;
