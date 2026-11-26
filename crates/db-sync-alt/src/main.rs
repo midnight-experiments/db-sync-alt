@@ -266,8 +266,8 @@ enum Command {
     /// horizon in the provider's listings of what is unspent now and of
     /// what moved since, then reads every block from the horizon to the
     /// target as the service follows them, with the same checks. Before
-    /// the gate opens, the unspent amount of each fixed-supply asset at the
-    /// horizon must equal the provider's quantity less the net mint since
+    /// the gate opens, the unspent amount at the horizon of every asset unit
+    /// it read must equal the provider's quantity less the net mint since
     /// then, and `verify` must pass; otherwise the build ends and nothing is
     /// served. Given the horizon and target of a snapshot file, it builds
     /// the same blocks, so the two can be compared by their content digests.

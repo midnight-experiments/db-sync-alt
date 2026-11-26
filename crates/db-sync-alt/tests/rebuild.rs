@@ -2681,8 +2681,8 @@ async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
 
 /// A tip block that spends an output relevant by its address alone is
 /// served while the listings are read and replaced for good when the lists
-/// from H on begin: the address listing no longer shows the output and no
-/// list names the spend. The tip the lists were read up to has left the
+/// from H on begin: the address listing did not show the output, which was
+/// spent when it was read, and no list names the spend. The tip the lists were read up to has left the
 /// chain, the address listings and the lists from H on are read again, and
 /// the build equals the conversion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3121,10 +3121,25 @@ async fn facts_the_provider_denies_refuse_the_build() -> Result {
     Ok(())
 }
 
+/// The request counts a build in `database` stored, by key.
+async fn stored_requests(database: &Database) -> Result<Vec<(String, serde_json::Value)>> {
+    Ok(common::connect(&database.config)
+        .await?
+        .query(
+            "SELECT key,value FROM dsa_rebuild.item WHERE kind='requests' ORDER BY key",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
 /// A build stopped in its window continues only with the choices it began
-/// with and by the version that began it: another retention, window or
-/// horizon is `rebuild_plan_mismatch`, another version
-/// `rebuild_version_mismatch`. Continued with the same choices it equals
+/// with and by the version that began it: another version is
+/// `rebuild_version_mismatch` and leaves the build's stored request counts
+/// as they are; another retention, window or horizon is
+/// `rebuild_plan_mismatch`. Continued with the same choices it equals
 /// the conversion, and its report holds the real window, the base's counts
 /// and the requests of the whole build by family.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3172,7 +3187,38 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         code(&result.err().ok_or("the stopped build published")?),
         "stop_requested"
     );
-    let mut outcomes = Vec::new();
+    // Another version refuses the build and changes none of its stored
+    // request counts.
+    let client = common::connect(&rebuilt.config).await?;
+    let other_version = format!("{}+other", env!("CARGO_PKG_VERSION"));
+    client
+        .execute(
+            "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}',to_jsonb($1::text)) WHERE id=1",
+            &[&other_version],
+        )
+        .await?;
+    let before_version = stored_requests(&rebuilt).await?;
+    let (_stopper, stop) = Stop::new();
+    let outcome = match build_with(
+        &profile,
+        &fake,
+        &rebuilt,
+        choices(DAY, None, EDGE_HORIZON),
+        stop,
+    )
+    .await
+    {
+        Ok(_) => json!({"case":"version","code":null}),
+        Err(error) => json!({"case":"version","code":code(&error),"error":error.report()}),
+    };
+    let after_version = stored_requests(&rebuilt).await?;
+    let mut outcomes = vec![("rebuild_version_mismatch", outcome)];
+    client
+        .execute(
+            "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}',to_jsonb($1::text)) WHERE id=1",
+            &[&env!("CARGO_PKG_VERSION")],
+        )
+        .await?;
     for (name, other, expected) in [
         (
             "retention",
@@ -3197,33 +3243,6 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         };
         outcomes.push((expected, outcome));
     }
-    let client = common::connect(&rebuilt.config).await?;
-    client
-        .execute(
-            "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}','\"0.0.1\"') WHERE id=1",
-            &[],
-        )
-        .await?;
-    let (_stopper, stop) = Stop::new();
-    let outcome = match build_with(
-        &profile,
-        &fake,
-        &rebuilt,
-        choices(DAY, None, EDGE_HORIZON),
-        stop,
-    )
-    .await
-    {
-        Ok(_) => json!({"case":"version","code":null}),
-        Err(error) => json!({"case":"version","code":code(&error),"error":error.report()}),
-    };
-    outcomes.push(("rebuild_version_mismatch", outcome));
-    client
-        .execute(
-            "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}',to_jsonb($1::text)) WHERE id=1",
-            &[&env!("CARGO_PKG_VERSION")],
-        )
-        .await?;
     let (_stopper, stop) = Stop::new();
     let report = build_with(
         &profile,
@@ -3243,11 +3262,21 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         json!({"event":"continued_as_it_began","refused":outcomes.iter().map(|(_, o)| o).collect::<Vec<_>>(),
             "window_seconds":report.plan.window_seconds,"counts":report.counts,
             "requests":report.requests,"requests_total":requests,"calls":report.calls,
-            "answered":fake.paths().len()})
+            "answered":fake.paths().len(),
+            "stored_requests":{"before_other_version":format!("{before_version:?}"),
+                "after_other_version":format!("{after_version:?}")}})
     );
     for (expected, outcome) in &outcomes {
         assert_eq!(outcome["code"], *expected, "{outcome}");
     }
+    assert!(
+        before_version.iter().any(|(key, _)| key == "run"),
+        "the stopped run recorded no requests"
+    );
+    assert_eq!(
+        before_version, after_version,
+        "another version changed the stored request counts"
+    );
     assert!(report.resumed);
     assert_eq!(report.plan.window_seconds, window, "the real window");
     assert!(

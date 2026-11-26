@@ -29,8 +29,9 @@ fn incomplete(code: &'static str, detail: Value) -> Error {
 impl Build<'_> {
     /// The relevant outputs unspent at H, before their creating transactions
     /// are placed: listed outputs and relevant inputs from H on, without the
-    /// outputs of transactions from H on. A listed output created from H on
-    /// must be an output of a transaction from H on.
+    /// outputs of transactions from H on. A listed output whose creating
+    /// transaction no list from H on names must be placed below H, or the
+    /// build refuses when the candidates are placed.
     async fn candidates(&mut self) -> Result<BTreeMap<(String, u16), Content>, Error> {
         let since = self.items("since").await?;
         let mut listed: BTreeMap<String, ListedOutput> = self.typed("listed").await?;
@@ -41,16 +42,6 @@ impl Build<'_> {
             let transaction = row.tx_hash.to_string();
             if since.contains_key(&transaction) {
                 continue;
-            }
-            if let Some(height) = row
-                .block_height
-                .filter(|height| *height >= self.plan.horizon)
-            {
-                return Err(incomplete(
-                    "rebuild_listing_incomplete",
-                    json!({"output": outpoint(&transaction, row.output_index), "height": height,
-                        "reason": "created from the horizon on by a transaction no list from the horizon on names"}),
-                ));
             }
             let content = Content::of_listed(row);
             if self.relevant(&content) {

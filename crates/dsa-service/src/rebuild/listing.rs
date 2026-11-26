@@ -293,10 +293,12 @@ impl Build<'_> {
                 "history_sum": sum.map(|sum| sum.to_string()),
                 "quantity": answer.as_ref().map(|info| info.quantity.clone()),
                 "distinct_transactions": distinct, "readings": attempt});
-            eprintln!(
-                "{}",
-                json!({"event":"rebuild_reading_again","reading":last})
-            );
+            if attempt < READINGS {
+                eprintln!(
+                    "{}",
+                    json!({"event":"rebuild_reading_again","reading":last})
+                );
+            }
         }
         Err(Error::answer("provider_mint_history_mismatch", last))
     }

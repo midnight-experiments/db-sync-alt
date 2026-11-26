@@ -203,7 +203,7 @@ pub(super) async fn transactions_page(
 }
 
 /// Pages `first`, `first + 1`, … of the list of `source` up to `below`,
-/// `in_flight` of them at once (a list below H no longer changes), up to
+/// `in_flight` of them at once (a list below H is final), up to
 /// and including the first page with fewer than 100 rows. Returns the pages
 /// read and whether the list ended.
 pub(super) async fn pages_below(

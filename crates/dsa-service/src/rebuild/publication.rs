@@ -220,8 +220,9 @@ impl Build<'_> {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        // Proof: the unspent amount at H of each fixed unit equals the
-        // provider's quantity minus the net mint since H up to its tip.
+        // Proof: for every unit that has a reading, the unspent amount at H
+        // equals the provider's quantity minus the net mint of the events of
+        // its history whose transactions are placed from H on.
         let supply = self.proof(&unspent).await?;
         let descriptors = self.descriptors(&rows).await?;
         let k = self.profile.cardano.security_parameter;

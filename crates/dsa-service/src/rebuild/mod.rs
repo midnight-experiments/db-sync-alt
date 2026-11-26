@@ -6,11 +6,12 @@
 //!    one page each, so that a spend between two pages cannot shift a row out
 //!    of the listing; per profile address `/addresses/{address}/utxos`, read
 //!    until two passes agree.
-//! 2. The quantity and the mints and burns (`/assets/{unit}/history`) of each
-//!    unit with the provider's tip around them, then every transaction from H
-//!    on that created an output of a unit or touched an address, and every
-//!    mint or burn from H on (a burn of a unit's whole input amount is in no
-//!    list of the unit), with its resolved inputs (`/txs/{hash}/utxos`).
+//! 2. Each unit's mints and burns (`/assets/{unit}/history`) and then its
+//!    quantity, read again until the two agree; then, up to the provider's
+//!    tip read after them, every transaction from H on that created an
+//!    output of a unit or touched an address, and every burn of a history
+//!    that no list names (a burn of a unit's whole input amount is in no list
+//!    of the unit), with their resolved inputs (`/txs/{hash}/utxos`).
 //! 3. Unspent at H: the listed outputs and the relevant inputs of those
 //!    transactions, without the outputs they created; each one's creating
 //!    transaction placed below H by the full transaction lists (`to` H − 1),
@@ -22,10 +23,10 @@
 //! 4. K5 and K6 from the governance addresses' and the permissioned unit's
 //!    lists read backward from H − 1, K7 and K8 from the epochs, the headers
 //!    H − 1 … H − 1 + k.
-//! 5. Proof: per fixed unit the unspent amount at H equals the provider's
-//!    quantity minus the mints and plus the burns of its history from H to
-//!    the tip the quantity was read at. Then the base is written with the
-//!    gate closed.
+//! 5. Proof: for every unit that has a reading, the unspent amount at H
+//!    equals the provider's quantity minus the mints and plus the burns of
+//!    its history whose transactions are placed from H on. Then the base is
+//!    written with the gate closed.
 //! 6. The window H … T through the follower's own updates and checks.
 //! 7. K10 when the window holds no spend, from the lists and the burns
 //!    below H; publication with `verify`.
@@ -434,9 +435,14 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
                 }
             }
             let _ = store.record_calls(&provider.counts()).await;
-            let _ = store
-                .put_building_items("requests", &[("run".to_owned(), json!(requests.get()))])
-                .await;
+            // A run that sent no request leaves the stored counts as they
+            // are: the build of another version keeps its own.
+            let run = requests.get();
+            if !run.is_empty() {
+                let _ = store
+                    .put_building_items("requests", &[("run".to_owned(), json!(run))])
+                    .await;
+            }
             let _ = store
                 .record_state("stopped", &code, &json!({}), Some(&report))
                 .await;
@@ -447,7 +453,8 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
 
 /// The requests per family of the runs of a build before this one: the
 /// stored total of the earlier runs and the last run's own count, folded
-/// into one total before this run sends a request or refuses.
+/// into one total once this version continues the build, before this run
+/// sends a request.
 async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Error> {
     let stored = store.building_items("requests").await?;
     let mut earlier: BTreeMap<String, u64> = BTreeMap::new();
@@ -504,13 +511,13 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
             (plan, "listing".to_owned(), false)
         }
         Building::Stopped { plan, phase, calls } => {
-            earlier = earlier_requests(&mut store).await?;
             if plan["version"] != json!(VERSION) {
                 return Err(refusal(
                     "rebuild_version_mismatch",
                     json!({"stored": plan["version"], "running": VERSION}),
                 ));
             }
+            earlier = earlier_requests(&mut store).await?;
             let plan: Plan = parse(plan)?;
             let given = Flags::of(&options);
             if plan.network != profile.network || plan.flags != given {
