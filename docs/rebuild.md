@@ -291,12 +291,23 @@ cannot give the file's digest.
 
 ## Cost
 
-Measured on Preprod: a build with the horizon and target of the Preprod
-snapshot file of release 0.5.1 (5,414,627 and 5,449,279: 34,653 blocks, about
-9.4 days) gave the file's content digest
-`5a5a4636b1e18c2af73b0bd7c71e1398f38a493f055fca83e631225388572b94`. It sent
-26,490 requests in 2 h 34 min at 3 requests a second. Following real blocks
-from the built database to the chain's tip, and `verify` after it, passed.
+Measured on Preprod, at 2 requests a second:
+
+- A build with the horizon and target of the Preprod snapshot file of release
+  0.5.1 (5,414,627 and 5,449,279: 34,653 blocks, about 8.9 days) gave the
+  file's content digest
+  `5a5a4636b1e18c2af73b0bd7c71e1398f38a493f055fca83e631225388572b94`. It sent
+  26,653 requests in 3 h 46 min: 664 before the window, 108 of them for the
+  full lists of the five profile addresses below H and the outputs of their
+  103 transactions. `verify` passed, and [`compare`](comparison.md) against a
+  restore of the file found no difference.
+- A build with the default positions, a 7-day window of 27,296 blocks, sent
+  20,331 requests in 2 h 53 min. `verify` passed. `run` followed from the
+  built database to the chain's tip, and `compare` against a database that
+  had followed the chain found no difference.
+
+Each build was stopped once with SIGTERM and continued with the same command;
+its time is that of its two runs together.
 
 Mainnet: a build has not been run. The expected request count for a 7-day
 window is an estimate, from Mainnet's counts of outputs and transactions and
