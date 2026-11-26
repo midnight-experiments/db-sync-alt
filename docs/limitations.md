@@ -83,7 +83,10 @@ A database built with `rebuild` ([rebuild](rebuild.md#limits)):
   the datums read are inline in their outputs;
 - rests on the provider where all its answers agree: an output that every
   listing, list and history of the provider leaves out alike is missing from
-  the database without any check finding it
+  the database without any check finding it, and what every answer states
+  alike is taken as stated, such as an output's address, lovelace, amount and
+  datum hash where one answer alone gives them, and the values read once below
+  the horizon
   ([what rests on the provider](rebuild.md#what-rests-on-the-provider)).
 
 ## Networks and node release

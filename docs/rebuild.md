@@ -147,6 +147,16 @@ the build ends with `rebuild_supply_mismatch` rather than with a wrong
 database. The datums, the places of transactions and their validity are the
 provider's answers for each transaction.
 
+For an output that the node needs for its asset alone, the build proves the
+asset's total at H, not how the total is shared among the outputs: each
+output's address, lovelace, amount of the asset and datum hash are one answer
+of the provider, a listing row or an input row, that no other answer is
+compared with. The governance and permissioned-candidates transactions kept
+below H, the epoch values below the window and the newest spend below H are
+each read once. A build with the horizon and target of a published snapshot
+file that gives the file's content digest is the one check of everything a
+build reads ([check a published file](#check-a-published-file)).
+
 ## Progress
 
 `status` prints the progress from the database alone, also while the build
@@ -187,7 +197,8 @@ While a build fills the database, or after it stopped:
   `stopped` and its reason the code that ended it (`stop_requested` after
   SIGINT or SIGTERM); `state_reason` shows the same code.
 
-No process answers `/status` for a database being built: `run` refuses it.
+No process answers `/status` for a database being built: `run` does not
+serve it ([stop, continue, discard](#stop-continue-discard)).
 
 The build logs one JSON line per event on standard error: `rebuild_started`
 with the horizon, target and tip and whether it continues a build;
@@ -195,9 +206,11 @@ with the horizon, target and tip and whether it continues a build;
 `detail`; `rebuild_waiting` while a 402, 418 or 429 of the provider is waited
 out; `rebuild_listing_moving` when an address's outputs kept changing over
 eight reads, whose union is then taken; `rebuild_reading_again` when a unit's
-history and quantity did not agree; `rebuild_tip_left_chain` when the lists
-from H on are read again; `rebuild_listings_discarded` when a refusal makes the
-next run read the listings again; in the window the `update` and
+history and quantity did not agree and the unit is read again;
+`rebuild_tip_left_chain` when the lists from H on are read again;
+`rebuild_listings_discarded` when a refusal makes the next run read the
+listings again, with `address_histories` true when the profile addresses'
+full lists below H go too; in the window the `update` and
 `follower_state` lines of following; `rebuild_published` with the content
 digest and the requests. The report on standard output holds the `plan`
 (network, horizon, target, tip, the window as the chain time from H to T, the
@@ -230,7 +243,11 @@ A database that a build fills never serves until the build has published:
 
 - the node's queries get SQLSTATE 55000 (`db_sync_alt_not_serving`);
 - `run` refuses it with exit status 1 (`database_not_serving`, with the reason
-  `rebuilding`), also with `--snapshot`;
+  `rebuilding`), also with `--snapshot`, while no build runs on it. Beside a
+  running build, `run` waits for the writer lock that the build holds and
+  ends with exit status 1 (`writer_busy`) after 120 seconds; when it gets the
+  lock in a moment in which the build holds no connection, it refuses the
+  database as above and writes nothing;
 - `restore` refuses it unchanged (`destination_not_empty`).
 
 To discard a build, drop the database and create it again
@@ -241,8 +258,13 @@ After `rebuild_supply_mismatch`, `rebuild_listing_incomplete`,
 `provider_transaction_unknown` before the window, the build discards its
 listings, the readings of the units and the lists from H on: the same command
 reads them again, and keeps the places, the validity answers and the other
-results below H. After `provider_mint_history_mismatch`, the same command reads
-the units that have no reading yet. A check that closes the build's gate in
+results below H. After `rebuild_listing_incomplete` and
+`rebuild_address_outputs_mismatch` it also discards each profile address's
+full list below H and the outputs of its transactions, from which the
+address's outputs are derived the second time: the answer that missed an
+output may be on either side, so the same command reads both again. After
+`provider_mint_history_mismatch`, the same command reads the units that have
+no reading yet. A check that closes the build's gate in
 the window (`asset_conservation` or another) ends the build for that database:
 the same command refuses it (`rebuild_refused`); drop the database and build
 again.
@@ -309,8 +331,10 @@ the key.
   followed to the same target does not yet. None was found at the profile
   addresses of Mainnet and Preprod, where the datums read are inline in their
   outputs.
-- **Answers the provider leaves out everywhere.** An output that every
-  listing, list and history leaves out alike is not found
-  ([what rests on the provider](#what-rests-on-the-provider)).
+- **What every answer leaves out or states alike.** An output that every
+  listing, list and history leaves out alike is not found, and what every
+  answer states alike is taken as stated: an output's address, lovelace,
+  amount and datum hash where one answer alone gives them, and the values
+  read once below H ([what rests on the provider](#what-rests-on-the-provider)).
 - **Networks.** Mainnet and Preprod only, as for every command
   ([limitations](limitations.md#networks-and-node-release)).

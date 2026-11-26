@@ -139,8 +139,11 @@ Without a snapshot file, `rebuild` is run with the binary or the image against
 the deployment's PostgreSQL, before the service starts
 ([rebuild](../docs/rebuild.md)). The server publishes no port on the host, and
 the build needs the owner login, its password file, `root-ca.crt` and the
-provider key. Until the build has published, the service refuses the database
-(`snapshot_required` while it is empty) and Compose restarts it.
+provider key. Until the build has published, the service does not run on the
+database and Compose restarts it: it refuses the database
+(`snapshot_required` while it is empty, `database_not_serving` once the build
+has begun), and while the build runs, which holds the writer lock, it waits
+120 seconds for the lock and ends with `writer_busy`.
 
 ### 5. Connect a Midnight node
 

@@ -32,7 +32,9 @@ At start the service:
    yet published) is restored again from `--snapshot`. A database whose gate
    is closed is refused (`database_not_serving`): see
    [a closed gate](#a-closed-gate). So is a database that `rebuild` fills,
-   with the reason `rebuilding`, until the build has published.
+   with the reason `rebuilding`, until the build has published. While the
+   build runs it holds the writer lock: the service waits at step 4 and ends
+   with `writer_busy`.
 6. Compares `--retention-seconds`, when given, with the stored retention
    ([change the retention](#change-the-retention)).
 7. Grants the `--reader` login the node's rights and checks that it has no
