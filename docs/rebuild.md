@@ -212,7 +212,12 @@ history and quantity did not agree and the unit is read again;
 listings again, with `address_histories` true when the profile addresses'
 full lists below H go too; in the window the `update` and
 `follower_state` lines of following; `rebuild_published` with the content
-digest and the requests. The report on standard output holds the `plan`
+digest and the requests; `rebuild_failed` with the error's report, the code
+and any `detail`, when the build ends on an answer of the provider, one of its
+own checks or refusals, or a stop. A code that the database gives, such as
+`destination_not_empty`, `rebuild_refused` or a fault that `verify` finds at
+the publication, is on the failure's own line alone. The report on standard
+output holds the `plan`
 (network, horizon, target, tip, the window as the chain time from H to T, the
 retention, the `version` that began the build and its `flags`), `resumed`,
 the `verified` report of `verify`, `calls` (the requests of the whole build

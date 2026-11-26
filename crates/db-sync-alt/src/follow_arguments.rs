@@ -124,17 +124,18 @@ impl FollowerArguments {
 
 /// The store error the command wrapper reports and maps to an exit status.
 /// A database condition keeps its own error, so one that lasted ends with
-/// the temporary-failure status.
-pub(crate) fn reported(error: follow::Error) -> dsa_store::Error {
+/// the temporary-failure status. Any other failure is first logged as the
+/// command's `event` (`follow_failed`, `rebuild_failed`) with its report.
+pub(crate) fn reported(event: &'static str, error: follow::Error) -> dsa_store::Error {
     let report = error.report();
     match error {
         follow::Error::Store(error) => error,
         follow::Error::Lasting { error, .. } => match *error {
             follow::Error::Store(error) => error,
-            other => reported(other),
+            other => reported(event, other),
         },
         other => {
-            eprintln!("{}", json!({"event":"follow_failed","error":report}));
+            eprintln!("{}", json!({"event":event,"error":report}));
             dsa_store::Error::Refusal(match other {
                 follow::Error::Provider(error) => error.code,
                 follow::Error::Answer { code, .. }
@@ -203,7 +204,7 @@ pub(crate) fn command(
                         run.await
                     }
                 };
-                let report = result.map_err(reported)?;
+                let report = result.map_err(|error| reported("follow_failed", error))?;
                 Ok(serde_json::to_value(report)?)
             })
         }),

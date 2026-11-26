@@ -125,7 +125,7 @@ pub(crate) fn command(
                         run.await
                     }
                 };
-                let report = result.map_err(reported)?;
+                let report = result.map_err(|error| reported("rebuild_failed", error))?;
                 Ok(serde_json::to_value(report)?)
             })
         }),

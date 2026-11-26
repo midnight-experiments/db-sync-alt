@@ -3711,7 +3711,7 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
 }
 
 /// A provider of another network ends a build at its first request,
-/// before the database changes.
+/// before the database changes; the command logs it as `rebuild_failed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_provider_of_another_network_ends_the_build_before_it_starts() -> Result {
@@ -3744,6 +3744,45 @@ async fn a_provider_of_another_network_ends_the_build_before_it_starts() -> Resu
     assert_eq!(report["detail"]["expected_magic"], expected, "{report}");
     assert_eq!(report["detail"]["received_magic"], other, "{report}");
     assert_eq!(fake.paths(), vec!["/api/v0/genesis".to_owned()]);
+    // The command logs the build's failure as `rebuild_failed`, with the
+    // code and its detail, and ends with exit status 1.
+    let key = tempfile::NamedTempFile::new()?;
+    std::fs::write(key.path(), dsa_testkit::server::KEY)?;
+    let output = rebuilt
+        .start_cli(
+            "rebuild",
+            &case.profile.network,
+            &[
+                "--provider-url",
+                &fake.server.url,
+                "--provider-key-file",
+                key.path().to_str().ok_or("a key path")?,
+            ],
+        )?
+        .wait_with_output()
+        .await?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let failed = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| {
+            line["event"]
+                .as_str()
+                .is_some_and(|event| event.ends_with("_failed"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failed.len(), 1, "{stderr}");
+    assert_eq!(failed[0]["event"], "rebuild_failed", "{stderr}");
+    assert_eq!(
+        failed[0]["error"]["error"], "provider_network_mismatch",
+        "{stderr}"
+    );
+    assert_eq!(
+        failed[0]["error"]["detail"]["received_magic"], other,
+        "{stderr}"
+    );
+    assert_eq!(fake.paths(), vec!["/api/v0/genesis".to_owned(); 2]);
     // The new database is still blank: no layout, no build.
     let blank: bool = common::connect(&rebuilt.config)
         .await?
