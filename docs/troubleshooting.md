@@ -234,7 +234,7 @@ and of [`verify`](#verify) at its publication. Nothing is served in any case
 | `invalid_window` | The chain time from the horizon to the target is shorter than 86,400 seconds, or `--window-seconds` is not between 86,400 and the retention, or the chain is younger than the window. | Give another `--horizon-block` or `--window-seconds`. |
 | `provider_unit_unknown` | The provider answered 404 for an asset unit of the network's table of fixed-supply assets, which exists on the network, for 30 minutes in a row. | Check `--provider-url` and `--network`; report it if it repeats. |
 | `provider_epoch_parameters_missing` | The provider has no parameters of one of the two epochs before the horizon's. | Run the same command again later; report it if it repeats. |
-| `provider_epoch_blocks_missing` | The provider lists no block in an epoch before the horizon's nor in the fifteen before it. | As above. |
+| `provider_epoch_blocks_missing` | The provider lists no block in one of the two epochs before the horizon's (`detail.epoch`); such an epoch has no parameters either. | As above. |
 | `provider_chain_shorter` | The provider's chain is shorter than the build needs: its tip is below k, or it lists fewer than k blocks after the block below the horizon. | Run the same command again later. |
 | `provider_block_missing` | The provider does not know a block the build asked for by height or hash. | Run the same command again; if the code stays, drop the database and build again. |
 | `provider_fork_point_unknown` | The provider does not know the block below the horizon whose next blocks the build reads. | As above. |

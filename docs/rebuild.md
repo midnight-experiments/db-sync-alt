@@ -80,7 +80,7 @@ only for what it does not hold yet.
 | `validity` | Whether those transactions passed (`/txs/{hash}`), where their outputs do not already tell. |
 | `datums` | A datum the node reads that is not inline in its output (`/scripts/datum/{hash}/cbor`). |
 | `carried` | The governance and permissioned-candidates transactions below H that the keep rule keeps, from the lists read backward from H − 1. |
-| `epochs` | The epoch values below the window: the newest block (looked for in the epoch and up to fifteen epochs before it) and the parameters of each of the two epochs before H's epoch, and the headers from H − 1 to H − 1 + k. Missing parameters end the build with `provider_epoch_parameters_missing`, a newest block found in none of those epochs with `provider_epoch_blocks_missing`. |
+| `epochs` | The epoch values below the window: the newest block and the parameters of each of the two epochs before H's epoch, and the headers from H − 1 to H − 1 + k. An epoch without a block ends the build with `provider_epoch_blocks_missing`, missing parameters with `provider_epoch_parameters_missing`. |
 | `base` | No new read: the supply proof (below), then the rows below H, written in one transaction. |
 | `window` | Every block from H to T, made final exactly as the service follows the chain, with all its checks; then the stake distributions of the epochs from two before H's through T's. |
 | `publish` | The publication (below). |

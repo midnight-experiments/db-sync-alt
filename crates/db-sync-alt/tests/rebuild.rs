@@ -1803,10 +1803,10 @@ async fn a_crowded_height_since_the_horizon_gives_the_conversion() -> Result {
     Ok(())
 }
 
-/// An epoch without a block two epochs before H's has no parameters at the
-/// provider, as db-sync writes an epoch's parameters at its first block: the
-/// build refuses with `provider_epoch_parameters_missing` and nothing serves.
-/// (Every epoch of Mainnet and Preprod has blocks.)
+/// An epoch without a block two epochs before H's has no newest block and,
+/// at a provider fed by db-sync, no parameters: the build asks once and
+/// refuses with `provider_epoch_blocks_missing` naming the epoch, and
+/// nothing serves. (Every epoch of Mainnet and Preprod has blocks.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn an_epoch_without_a_block_below_the_horizon_refuses_the_build() -> Result {
@@ -1822,11 +1822,11 @@ async fn an_epoch_without_a_block_below_the_horizon_refuses_the_build() -> Resul
     );
     assert_eq!(
         code(&error),
-        "provider_epoch_parameters_missing",
+        "provider_epoch_blocks_missing",
         "{}",
         error.report()
     );
-    assert_eq!(error.report()["detail"]["epoch"], empty);
+    assert_eq!(error.report()["detail"], json!({"epoch": empty}));
     assert!(!serves, "the database serves");
     Ok(())
 }

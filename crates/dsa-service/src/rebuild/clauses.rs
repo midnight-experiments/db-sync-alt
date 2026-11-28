@@ -263,36 +263,21 @@ impl Build<'_> {
             let Some(cutoff) = horizon.epoch.checked_sub(back) else {
                 continue;
             };
-            let mut epoch_number = cutoff;
-            let mut found = false;
-            loop {
-                let last = self
-                    .asker
-                    .ask("epochs", || provider.epoch_last_block(epoch_number))
-                    .await?;
-                if let Some(block) = last {
-                    let header = self
-                        .asker
-                        .ask("headers", || provider.block_by_hash(&block))
-                        .await?
-                        .ok_or_else(|| {
-                            Error::answer("provider_block_missing", json!({"block": block}))
-                        })?;
-                    headers.push((format!("epoch:{cutoff}"), to_value(header)?));
-                    found = true;
-                    break;
-                }
-                match epoch_number.checked_sub(1) {
-                    Some(earlier) if cutoff - earlier < 16 => epoch_number = earlier,
-                    _ => break,
-                }
-            }
-            if !found {
-                return Err(Error::answer(
-                    "provider_epoch_blocks_missing",
-                    json!({"epoch": cutoff, "epochs_read": cutoff - epoch_number + 1}),
-                ));
-            }
+            // An epoch without a block has no parameters at a provider fed
+            // by db-sync, which writes them at the epoch's first block.
+            let block = self
+                .asker
+                .ask("epochs", || provider.epoch_last_block(cutoff))
+                .await?
+                .ok_or_else(|| {
+                    Error::answer("provider_epoch_blocks_missing", json!({"epoch": cutoff}))
+                })?;
+            let header = self
+                .asker
+                .ask("headers", || provider.block_by_hash(&block))
+                .await?
+                .ok_or_else(|| Error::answer("provider_block_missing", json!({"block": block})))?;
+            headers.push((format!("epoch:{cutoff}"), to_value(header)?));
             // Asked and counted here once: not through the follower's
             // reader, which counts the request itself.
             let params = self
