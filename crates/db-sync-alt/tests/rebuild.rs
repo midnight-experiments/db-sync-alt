@@ -452,8 +452,10 @@ async fn equivalence(
 /// of a test chain numbers the descriptors in the order its source first
 /// saw them, which is the order of the network's table of fixed descriptors
 /// only on the real networks; so a build is held to its own rule: each unit
-/// of the table has the table's ID, every other descriptor an ID above the
-/// table's. Returns the descriptors that break it, `[]` when none does.
+/// of the table has the table's ID, and every other descriptor follows the
+/// table's highest ID without a gap, in the chain order of the first row
+/// kept for it (its lowest `ma_tx_out` ID). Returns the descriptors that
+/// break it, `[]` when none does.
 async fn descriptor_ids(profile: &Profile, rebuilt: &Database) -> Result<serde_json::Value> {
     let table: BTreeMap<String, i64> = dsa_chain::profiles::fixed_descriptor_ids(profile)
         .into_iter()
@@ -462,19 +464,29 @@ async fn descriptor_ids(profile: &Profile, rebuilt: &Database) -> Result<serde_j
     let rows = common::connect(&rebuilt.config)
         .await?
         .query(
-            "SELECT id,encode(policy,'hex')||encode(name,'hex') FROM serve.multi_asset ORDER BY id",
+            "SELECT m.id,encode(m.policy,'hex')||encode(m.name,'hex'),
+              (SELECT min(a.id) FROM serve.ma_tx_out a WHERE a.ident=m.id)
+             FROM serve.multi_asset m ORDER BY 3 NULLS LAST,1",
             &[],
         )
         .await?;
-    let breaking: Vec<serde_json::Value> = rows
-        .iter()
-        .filter_map(|row| {
-            let (id, unit): (i64, String) = (row.get(0), row.get(1));
-            let fixed = table.get(&unit).copied();
-            let holds = fixed.map_or(id > highest, |fixed| id == fixed);
-            (!holds).then(|| json!({"unit": unit, "id": id, "table": fixed}))
-        })
-        .collect();
+    let mut next = highest + 1;
+    let mut breaking = Vec::new();
+    for row in &rows {
+        let (id, unit, first): (i64, String, Option<i64>) = (row.get(0), row.get(1), row.get(2));
+        let expected = match table.get(&unit) {
+            Some(fixed) => Some(*fixed),
+            None if first.is_some() => {
+                next += 1;
+                Some(next - 1)
+            }
+            None => None,
+        };
+        if expected != Some(id) {
+            breaking.push(json!({"unit": unit, "id": id, "expected": expected,
+                "table": table.get(&unit), "first_row": first}));
+        }
+    }
     Ok(json!(breaking))
 }
 
@@ -1232,6 +1244,31 @@ async fn a_complete_burn_below_the_horizon_gives_the_conversion() -> Result {
 /// from `fake` into a new database: equal content and state digests,
 /// supply and position, and the same rows table by table.
 async fn built_equal(profile: &Profile, g: &Generated, fake: &Fake, name: &str) -> Result<Report> {
+    Ok(built_equal_ids(profile, g, fake, name).await?.0)
+}
+
+/// The descriptor IDs of a database, by unit.
+async fn unit_ids(database: &Database) -> Result<BTreeMap<String, i64>> {
+    Ok(common::connect(&database.config)
+        .await?
+        .query(
+            "SELECT encode(policy,'hex')||encode(name,'hex'),id FROM serve.multi_asset",
+            &[],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
+/// `built_equal`, with the descriptor IDs of the build and of the
+/// conversion, by unit.
+async fn built_equal_ids(
+    profile: &Profile,
+    g: &Generated,
+    fake: &Fake,
+    name: &str,
+) -> Result<(Report, BTreeMap<String, i64>, BTreeMap<String, i64>)> {
     let converted = Database::new().await?;
     let (source, conversion) = edge_conversion(profile, g, &converted).await?;
     let rebuilt = Database::new().await?;
@@ -1251,10 +1288,11 @@ async fn built_equal(profile: &Profile, g: &Generated, fake: &Fake, name: &str) 
     if ids != json!([]) {
         return Err(format!("{name}: descriptor IDs: {ids}").into());
     }
+    let (built, conversion) = (unit_ids(&rebuilt).await?, unit_ids(&converted).await?);
     rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await?;
-    Ok(report)
+    Ok((report, built, conversion))
 }
 
 /// A hook that rewrites the rows of a list answer whose path holds `part`
@@ -1639,14 +1677,15 @@ async fn a_governance_output_missing_from_its_listing_refuses_the_build() -> Res
     Ok(())
 }
 
-/// The newest relevant spend below H, in a window without one, burns the
-/// only council-policy token of another name: the spent output's asset row
-/// needs a descriptor that nothing else of the build stores. The build
-/// writes it with the row, and equals the conversion.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an isolated PostgreSQL server"]
-async fn the_newest_spend_below_the_horizon_brings_its_descriptor() -> Result {
-    let profile = profile(1);
+/// Mainnet profile, k 12, the edge chain's H, T and length, with
+/// council-policy tokens of names outside the network's table: `01` minted
+/// at 6 and burnt at 20, the newest relevant spend below H before a window
+/// without one, so that only that spend keeps its row and publication
+/// brings its descriptor; `03` minted at 10 and never spent; `02` minted at
+/// 37, in the window, never spent. With `minted_twice`, `04` is minted at 4
+/// into an output that height 8 burns, and minted again at 12 into an
+/// output never spent: the first row a build keeps for it is the one of 12.
+fn descriptor_chain(profile: &Profile, minted_twice: bool) -> Generated {
     let ordinary = |index: u8| {
         let mut key = [0x52; 28];
         key[0] = index;
@@ -1654,7 +1693,7 @@ async fn the_newest_spend_below_the_horizon_brings_its_descriptor() -> Result {
     };
     let cnight = profile.assets.cnight.clone();
     let council = profile.assets.council.policy.clone();
-    let mut s = Script::new(&profile);
+    let mut s = Script::new(profile);
     let mut tx = s.tx().mint(&cnight.policy, &cnight.name, 10);
     for index in 0..5_u8 {
         tx = tx.output(Output::new(ordinary(index), 1_500_000).token(
@@ -1664,29 +1703,116 @@ async fn the_newest_spend_below_the_horizon_brings_its_descriptor() -> Result {
         ));
     }
     s.block(vec![tx]);
-    let mut token = String::new();
+    let minted = |s: &mut Script, name: &str, at: u8| {
+        s.tx()
+            .mint(&council, name, 1)
+            .output(Output::new(ordinary(at), 2_000_000).token(&council, name, 1))
+    };
+    let burnt = |s: &mut Script, created: &str, name: &str, at: u8| {
+        s.tx()
+            .input(created, 0)
+            .mint(&council, name, -1)
+            .output(Output::new(ordinary(at), 1_800_000))
+    };
+    let (mut first, mut once) = (String::new(), String::new());
     for height in 2..=EDGE_END {
         let transaction = match height {
-            6 => Some(
-                s.tx()
-                    .mint(&council, "01", 1)
-                    .output(Output::new(ordinary(8), 2_000_000).token(&council, "01", 1)),
-            ),
-            20 => Some(
-                s.tx()
-                    .input(&token, 0)
-                    .mint(&council, "01", -1)
-                    .output(Output::new(ordinary(9), 1_800_000)),
-            ),
+            4 if minted_twice => Some(minted(&mut s, "04", 10)),
+            6 => Some(minted(&mut s, "01", 8)),
+            8 if minted_twice => Some(burnt(&mut s, &once, "04", 11)),
+            10 => Some(minted(&mut s, "03", 12)),
+            12 if minted_twice => Some(minted(&mut s, "04", 13)),
+            20 => Some(burnt(&mut s, &first, "01", 9)),
+            37 => Some(minted(&mut s, "02", 14)),
             _ => None,
         };
         let hashes = s.block(transaction.into_iter().collect());
-        if height == 6 {
-            token = hashes[0].clone();
+        match height {
+            4 if minted_twice => once = hashes[0].clone(),
+            6 => first = hashes[0].clone(),
+            _ => {}
         }
     }
-    let fake = Fake::with_chain(edge_chain(&profile, &s.g, EDGE_END), None).await;
-    built_equal(&profile, &s.g, &fake, "newest spend with its descriptor").await?;
+    s.g
+}
+
+/// Descriptors outside the network's table, each kept by the build at
+/// another step: council-policy units `01` (kept only by the newest
+/// relevant spend below H, which publication adds), `03` (unspent at H, in
+/// the base) and `02` (minted in the window). A build numbers them after
+/// the table's highest ID in the chain order of the first row it keeps for
+/// each, whichever step wrote them: exactly the conversion's IDs, which
+/// number them in the order the chain first holds them. In the second
+/// chain `04` is minted at 4, burnt at 8 and minted again at 12: the first
+/// row kept for it is the one of 12, so the build numbers it after `03`
+/// while the conversion, which saw it at 4, numbers it first; both
+/// numberings are printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn the_newest_spend_below_the_horizon_brings_its_descriptor() -> Result {
+    let profile = profile(1);
+    let council = profile.assets.council.policy.clone();
+    let highest = dsa_chain::profiles::fixed_descriptor_ids(&profile)
+        .into_iter()
+        .map(|(_, id)| id)
+        .max()
+        .unwrap_or(0);
+    let unit = |name: &str| format!("{council}{name}");
+    let numbered = |ids: &BTreeMap<String, i64>, names: &[&str]| -> serde_json::Value {
+        names
+            .iter()
+            .map(|name| ((*name).to_owned(), json!(ids.get(&unit(name)))))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    };
+    let after = |names: &[&str]| -> serde_json::Value {
+        names
+            .iter()
+            .zip(1..)
+            .map(|(name, step)| ((*name).to_owned(), json!(highest + step)))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    };
+    let mut cases = Vec::new();
+    for (name, minted_twice) in [
+        ("brought_by_the_newest_spend", false),
+        ("minted_twice", true),
+    ] {
+        let g = descriptor_chain(&profile, minted_twice);
+        let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), None).await;
+        let (_, built, converted) = built_equal_ids(&profile, &g, &fake, name).await?;
+        let names: &[&str] = if minted_twice {
+            &["01", "02", "03", "04"]
+        } else {
+            &["01", "02", "03"]
+        };
+        cases.push(json!({"case": name, "table_highest": highest,
+            "build": numbered(&built, names), "conversion": numbered(&converted, names)}));
+    }
+    println!("{}", json!({"event":"descriptor_numbering","cases":cases}));
+    // Each step's descriptor in the chain order of its first kept row, as
+    // the conversion numbers them.
+    assert_eq!(
+        cases[0]["build"],
+        after(&["01", "03", "02"]),
+        "{}",
+        cases[0]
+    );
+    assert_eq!(cases[0]["conversion"], cases[0]["build"], "{}", cases[0]);
+    // A unit whose first rows are not kept: the conversion numbers it where
+    // the chain first held it, a build where it first keeps a row.
+    assert_eq!(
+        cases[1]["build"],
+        after(&["01", "03", "04", "02"]),
+        "{}",
+        cases[1]
+    );
+    assert_eq!(
+        cases[1]["conversion"],
+        after(&["04", "01", "03", "02"]),
+        "{}",
+        cases[1]
+    );
     Ok(())
 }
 
@@ -5703,8 +5829,10 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
 /// The fixed `multi_asset` IDs of Mainnet and Preprod that a build writes
 /// are the IDs the published snapshot files hold: each `*.snapshot` file of
 /// the directory in DSA_RELEASE_FILES is restored and its fixed descriptors
-/// compared with the network's table. Without the variable the test says so
-/// and passes: the files are not part of the repository.
+/// compared with the network's table. The descriptors a file holds outside
+/// the table, which a build numbers by its own rule, are printed with their
+/// IDs. Without the variable the test says so and passes: the files are not
+/// part of the repository.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn fixed_descriptor_ids_are_those_of_the_published_files() -> Result {
@@ -5751,8 +5879,14 @@ async fn fixed_descriptor_ids_are_those_of_the_published_files() -> Result {
             .iter()
             .map(|(unit, _)| (unit, stored.get(unit)))
             .collect();
-        compared
-            .push(json!({"file": name, "fixed": table.len(), "differing": differing, "ids": ids}));
+        let outside: BTreeMap<&String, &i64> = stored
+            .iter()
+            .filter(|(unit, _)| !table.iter().any(|(fixed, _)| fixed == *unit))
+            .collect();
+        compared.push(
+            json!({"file": name, "fixed": table.len(), "differing": differing,
+            "ids": ids, "outside_table": outside}),
+        );
         drop(store);
         database.cleanup().await?;
         assert!(differing.is_empty(), "{name}: {differing:?}");

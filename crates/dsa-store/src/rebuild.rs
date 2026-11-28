@@ -14,7 +14,8 @@
 //! database that builds. A build whose window a check closed is cleared of
 //! its base and window and built again in the same database. Publication is one transaction: the newest spend
 //! below H when the window holds none (K10), the pruned form of the keep rule
-//! applied once, the follower's state rows, the first-served times, `verify`
+//! applied once, the descriptor IDs outside the network's table numbered by
+//! the rows kept, the follower's state rows, the first-served times, `verify`
 //! with every check, the open gate and the end of `dsa_rebuild`.
 
 use std::collections::BTreeMap;
@@ -241,8 +242,8 @@ async fn insert(
     if !c.asset.id.is_empty() {
         if existing {
             // Rows added to stored ones (the newest spend below H) bring the
-            // descriptors they need, numbered as the follower numbers new
-            // ones.
+            // descriptors they need; publication numbers them with the
+            // others outside the table.
             transaction
                 .execute(INSERT_ASSETS, &[&c.asset.policy, &c.asset.name])
                 .await?;
@@ -314,6 +315,49 @@ async fn insert(
             )
             .await?;
     }
+    Ok(())
+}
+
+/// Numbers every descriptor outside the network's table of fixed ones
+/// after the table's highest ID, in the chain order of the first row kept
+/// for it (its lowest `ma_tx_out` ID): the table's IDs, then every other
+/// descriptor in the order its first kept row has on the chain. So a
+/// build's IDs follow from the rows it keeps, whichever step wrote a
+/// descriptor (the base, the window, the newest spend below the horizon)
+/// and whatever sequence values a stopped run took. The descriptors move
+/// through negative IDs, which no descriptor holds; `ma_tx_out.ident`
+/// follows them (it has no foreign key).
+async fn number_descriptors(transaction: &Transaction<'_>, profile: &Profile) -> Result<(), Error> {
+    let table = dsa_chain::profiles::fixed_descriptor_ids(profile);
+    let highest = table.iter().map(|(_, id)| *id).max().unwrap_or(0);
+    let (mut policies, mut names) = (Vec::new(), Vec::new());
+    for (unit, _) in &table {
+        let decoded = |hex_text: &str| {
+            hex::decode(hex_text).map_err(|_| Error::Refusal("rebuild_invalid_row"))
+        };
+        policies.push(decoded(unit.get(..56).unwrap_or_default())?);
+        names.push(decoded(unit.get(56..).unwrap_or_default())?);
+    }
+    transaction
+        .execute(
+            "WITH other AS (
+              SELECT m.id,-row_number() OVER (
+               ORDER BY (SELECT min(a.id) FROM serve.ma_tx_out a WHERE a.ident=m.id),m.id) AS step
+              FROM serve.multi_asset m
+              WHERE NOT EXISTS(SELECT 1 FROM unnest($1::bytea[],$2::bytea[]) f(policy,name)
+               WHERE f.policy=m.policy AND f.name=m.name)),
+             moved AS (UPDATE serve.multi_asset m SET id=o.step FROM other o WHERE m.id=o.id)
+             UPDATE serve.ma_tx_out a SET ident=o.step FROM other o WHERE a.ident=o.id",
+            &[&policies, &names],
+        )
+        .await?;
+    transaction
+        .execute(
+            "WITH moved AS (UPDATE serve.multi_asset SET id=$1::bigint-id WHERE id<0)
+             UPDATE serve.ma_tx_out SET ident=$1::bigint-ident WHERE ident<0",
+            &[&highest],
+        )
+        .await?;
     Ok(())
 }
 
@@ -642,7 +686,8 @@ impl Store {
 
     /// Publishes a build that reached its target: the newest spend below the
     /// horizon when the window holds none, the keep rule applied once, the
-    /// follower's state rows, first-served times now, `verify` with every
+    /// descriptor IDs outside the network's table numbered by the rows kept,
+    /// the follower's state rows, first-served times now, `verify` with every
     /// check, the open gate. Nothing is served unless all of it commits.
     pub async fn publish_building(
         &mut self,
@@ -688,6 +733,7 @@ impl Store {
             },
         )
         .await?;
+        number_descriptors(&transaction, profile).await?;
         transaction
             .batch_execute("DELETE FROM dsa.first_served;DELETE FROM dsa.unspent;DELETE FROM dsa.service_state")
             .await?;

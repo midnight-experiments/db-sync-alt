@@ -390,5 +390,13 @@ the key.
   answer states alike is taken as stated: an output's address, lovelace,
   amount and datum hash where one answer alone gives them, and the values
   read once below H ([what rests on the provider](#what-rests-on-the-provider)).
+- **IDs of other asset descriptors.** A build gives the asset descriptors
+  (`multi_asset` rows) of the network's fixed units the IDs the published
+  files hold, and every other descriptor the next IDs after them, in the
+  chain order of the first row the build keeps for it. A database that
+  followed the chain numbers such a descriptor when it first stores it, so
+  its IDs for them can differ from a build's; the node looks up only the
+  fixed units' IDs and uses the others to join rows. None was found on
+  Mainnet and Preprod.
 - **Networks.** Mainnet and Preprod only, as for every command
   ([limitations](limitations.md#networks-and-node-release)).
