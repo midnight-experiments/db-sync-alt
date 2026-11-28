@@ -71,7 +71,7 @@ only for what it does not hold yet.
 
 | Phase | What it reads |
 | --- | --- |
-| `listing` | The outputs the node needs that are unspent now and were created below H: for each asset unit of the profile (with every unit of the two governance policies, from `/assets/policy/{policy}`) `/assets/{unit}/utxos` by ranges of creation height, read in sequence; for each address of the profile `/addresses/{address}/utxos`, read again until two reads agree, or the union of eight reads. |
+| `listing` | The outputs the node needs that are unspent now and were created below H: for each asset unit of the profile (with every unit of the two governance policies, from `/assets/policy/{policy}`) `/assets/{unit}/utxos` by ranges of creation height: one request for every height below H and, when its page is full, eight segments of the heights left, of equal width, read side by side within `--max-in-flight` and the pace; for each address of the profile `/addresses/{address}/utxos`, read again until two reads agree, or the union of eight reads. |
 | `quantities` | For each asset unit of the listing and each fixed-supply asset, one unit at a time: every page of its mints and burns (`/assets/{unit}/history`), then its quantity (`/assets/{unit}`). A unit's reading is taken when no transaction occurs twice in the history, the history has as many rows as the quantity's answer counts and its amounts add up to the quantity; otherwise the unit is read again, five readings in all, and then the build ends with `provider_mint_history_mismatch`. A unit of the network's table of fixed-supply assets exists on the network: the provider must know it (`provider_unit_unknown`). |
 | `since` | The provider's tip, then every transaction from H up to that tip's height that created an output holding a unit read in `quantities` or touched a profile address (`/assets/{unit}/transactions`, `/addresses/{address}/transactions`). When the tip's block has left the chain by the time these lists are read (another block at its height, or a 404 that lasted as long as any refused answer may), the address listings and the lists are read again, at most three times (`provider_tip_left_chain`). A transaction that burns all it spends of a unit is in no list of the unit, only in its history: each burn that no list names is placed by its own `/txs/{hash}`. A mint creates an output holding its unit, so a mint from H on is in the unit's list: a mint that no list names is below H. |
 | `transactions` | The inputs of those transactions (`/txs/{hash}/utxos`). |
@@ -343,9 +343,12 @@ Mainnet: a build has not been run. The expected request count for a 7-day
 window is an estimate, from Mainnet's counts of outputs and transactions and
 the request pattern measured on Preprod: about 270,000 requests, and the
 histories of the profile addresses on top (about 5,900 requests for the
-mapping address). No duration is given: on Mainnet the unit listing answered
-in about 6.5 seconds a request, whatever the range of heights asked, and a
-build reads it in sequence (about 2,500 requests for cNIGHT). That is about
+mapping address). No duration is given for a whole build. On 2026-11-28 a
+Mainnet unit listing request answered in 0.25 to 7 seconds, slower the
+further its range of heights starts from the unit's first output; a build
+reads cNIGHT's listing (about 2,400 requests) in eight segments side by side,
+which those times put at about 35 to 60 minutes with four requests in flight,
+against about 3.5 hours in one sequence. That is about
 two orders of magnitude more requests than restoring a recent snapshot file
 and catching up from it: a restore sends no request, and catching up sends
 about one request per block ([provider](provider.md#catching-up)).

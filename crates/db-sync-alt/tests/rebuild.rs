@@ -3217,7 +3217,8 @@ fn crowded_listing_chain(profile: &Profile) -> Generated {
 /// one sequence and gives the conversion. Every cNIGHT listing request
 /// answers after `DSA_REBUILD_LISTING_LATENCY_MS` (default 1,000; the
 /// hosted provider's are 0.25–7 s). Two builds into new databases: one
-/// sequence (each request `from` the last to H − 1), and segments. Both
+/// sequence (each request `from` the last to H − 1), and the default
+/// segments. Both
 /// equal the conversion row by row; the listing phase (from `listing` to
 /// `quantities` in the progress) is at least twice as fast in segments,
 /// with at least two and at most the in-flight limit of requests at once,
@@ -3232,9 +3233,10 @@ async fn a_listing_in_segments_is_faster_and_gives_the_conversion() -> Result {
     let (source, conversion) =
         conversion_at(&profile, &g, &converted, LISTING_HORIZON, LISTING_TARGET).await?;
     let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    // The default: eight segments.
     let segmented = 8;
     let mut runs = Vec::new();
-    for segments in [1, segmented] {
+    for segments in [1, 0] {
         let hook: Hook = {
             let listing = listing.clone();
             Arc::new(move |path: &str, chain: &mut Chain, _| {

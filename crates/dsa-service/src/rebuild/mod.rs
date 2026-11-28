@@ -86,8 +86,13 @@ use self::{
 const BATCH: usize = 200;
 
 /// Height segments a unit listing with more than one page is read in, side
-/// by side, unless the options say.
-const LISTING_SEGMENTS: usize = 1;
+/// by side, unless the options say. Measured on the hosted provider's
+/// Mainnet cNIGHT listing with 2, 4 and 8: a request answers in 0.25 to 7
+/// seconds, slower the further its range starts from the unit's first
+/// output and nearly as fast with eight in flight as with two; eight
+/// segments give the shortest listing, at four requests in flight and at
+/// eight.
+const LISTING_SEGMENTS: usize = 8;
 
 /// What is discarded to read the listings again: stored kinds, and cursors
 /// by key prefix.
