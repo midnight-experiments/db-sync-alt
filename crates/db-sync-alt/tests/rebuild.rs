@@ -1932,6 +1932,46 @@ async fn a_crowded_height_since_the_horizon_gives_the_conversion() -> Result {
     Ok(())
 }
 
+/// 110 transactions that create cNIGHT outputs at one height from H on,
+/// the second page of the list at that height answered without another of
+/// its ten rows on each read: no two reads agree, and the build takes the
+/// union of the eight reads, which holds every transaction. Eight reads of
+/// that page; the build equals the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_crowded_height_whose_reads_differ_gives_the_conversion() -> Result {
+    let profile = profile(1);
+    let s = shapes_chain(&profile, false);
+    let second = format!(
+        "/assets/{}/transactions?count=100&page=2&order=asc&from=35&to=35",
+        profile.assets.cnight.unit()
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let hook: Hook = {
+        let (second, reads) = (second.clone(), reads.clone());
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if !path.contains(&second) {
+                return None;
+            }
+            let read = reads.fetch_add(1, Ordering::SeqCst);
+            let mut rows: Vec<serde_json::Value> =
+                serde_json::from_str(&chain.answer(path).body).ok()?;
+            if read < rows.len() {
+                rows.remove(read);
+            }
+            Some(Behavior::json(serde_json::Value::Array(rows)))
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &s.g, EDGE_END), Some(hook)).await;
+    built_equal(&profile, &s.g, &fake, "crowded height whose reads differ").await?;
+    println!(
+        "{}",
+        json!({"event":"crowded_height_reads_differ","second_pages":fake.requests(&second)})
+    );
+    assert_eq!(fake.requests(&second), PASSES, "reads of the second page");
+    Ok(())
+}
+
 /// An epoch without a block two epochs before H's has no newest block and,
 /// at a provider fed by db-sync, no parameters: the build asks once and
 /// refuses with `provider_epoch_blocks_missing` naming the epoch, and
@@ -2585,6 +2625,13 @@ struct Reserve {
 /// reserve output 1; with `tip_spend`, height 61 spends the reserve output
 /// 3. The other blocks are empty.
 fn reserve_chain(profile: &Profile, tip_spend: bool) -> Reserve {
+    reserve_chain_with(profile, tip_spend, false)
+}
+
+/// `reserve_chain`; with `collateral`, the transaction at height 35 is
+/// phase-2-invalid and takes the reserve output 0 as its collateral, which
+/// it consumes whole (no collateral return).
+fn reserve_chain_with(profile: &Profile, tip_spend: bool, collateral: bool) -> Reserve {
     let ordinary = |index: u8| {
         let mut key = [0x3d; 28];
         key[0] = index;
@@ -2618,6 +2665,12 @@ fn reserve_chain(profile: &Profile, tip_spend: bool) -> Reserve {
                 s.tx()
                     .input(&minted, 1)
                     .output(Output::new(ordinary(5), 1_400_000).token(&policy, &name, 2)),
+            ),
+            (35, Some(index)) if collateral => Some(
+                s.tx()
+                    .collateral(&creator, index)
+                    .invalid()
+                    .output(Output::new(ordinary(9), 2_500_000)),
             ),
             (_, Some(index)) => Some(
                 s.tx()
@@ -2812,6 +2865,59 @@ async fn listings_that_miss_an_address_output_refuse_the_build() -> Result {
     }
     converted.cleanup().await?;
     source.database.cleanup().await
+}
+
+/// A reserve output taken as collateral by a phase-2-invalid transaction
+/// in the window, which consumes it whole: the provider answers the
+/// transaction with that output as its one input, not flagged `collateral`,
+/// and the address's listing at the tip leaves the output out, so the
+/// build finds it only through that input. It holds the output at H and
+/// equals the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_output_taken_as_collateral_since_the_horizon_gives_the_conversion() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain_with(&profile, false, true);
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END), None).await;
+    built_equal(&profile, &chain.g, &fake, "collateral since the horizon").await?;
+    let output = json!({"tx_hash": chain.creator, "output_index": 0});
+    let (answer, listing) = {
+        let mut served = fake.chain.lock().unwrap();
+        let answer: serde_json::Value = serde_json::from_str(
+            &served
+                .answer(&format!("/api/v0/txs/{}/utxos", chain.spender))
+                .body,
+        )?;
+        let listing: Vec<serde_json::Value> = serde_json::from_str(
+            &served
+                .answer(&format!(
+                    "/api/v0/addresses/{}/utxos?count=100&page=1&order=asc",
+                    profile.addresses.reserve
+                ))
+                .body,
+        )?;
+        (answer, listing)
+    };
+    println!(
+        "{}",
+        json!({"event":"collateral_since_the_horizon","invalid_transaction":answer,
+            "reserve_listing_rows":listing.len()})
+    );
+    let inputs = answer["inputs"].as_array().ok_or("no inputs")?;
+    assert_eq!(inputs.len(), 1, "{answer}");
+    assert_eq!(
+        json!({"tx_hash": inputs[0]["tx_hash"], "output_index": inputs[0]["output_index"]}),
+        output,
+        "{answer}"
+    );
+    assert_eq!(inputs[0]["collateral"], false, "{answer}");
+    assert_eq!(answer["outputs"], json!([]), "{answer}");
+    assert!(
+        !listing.iter().any(|row| row["tx_hash"] == output["tx_hash"]
+            && row["output_index"] == output["output_index"]),
+        "the listing at the tip holds the output"
+    );
+    Ok(())
 }
 
 /// When the reserve address's two derivations differ, the refusal names
