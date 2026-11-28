@@ -1682,7 +1682,9 @@ async fn a_governance_output_missing_from_its_listing_refuses_the_build() -> Res
 /// at 6 and burnt at 20, the newest relevant spend below H before a window
 /// without one, so that only that spend keeps its row and publication
 /// brings its descriptor; `03` minted at 10 and never spent; `02` minted at
-/// 37, in the window, never spent. With `minted_twice`, `04` is minted at 4
+/// 37, in the window, never spent. Height 10 also moves a cNIGHT output of
+/// height 1 into a new one: an older relevant spend than the burn at 20,
+/// which cNIGHT's list names. With `minted_twice`, `04` is minted at 4
 /// into an output that height 8 burns, and minted again at 12 into an
 /// output never spent: the first row a build keeps for it is the one of 12.
 fn descriptor_chain(profile: &Profile, minted_twice: bool) -> Generated {
@@ -1702,7 +1704,7 @@ fn descriptor_chain(profile: &Profile, minted_twice: bool) -> Generated {
             2,
         ));
     }
-    s.block(vec![tx]);
+    let cnight_minted = s.block(vec![tx])[0].clone();
     let minted = |s: &mut Script, name: &str, at: u8| {
         s.tx()
             .mint(&council, name, 1)
@@ -1716,17 +1718,22 @@ fn descriptor_chain(profile: &Profile, minted_twice: bool) -> Generated {
     };
     let (mut first, mut once) = (String::new(), String::new());
     for height in 2..=EDGE_END {
-        let transaction = match height {
-            4 if minted_twice => Some(minted(&mut s, "04", 10)),
-            6 => Some(minted(&mut s, "01", 8)),
-            8 if minted_twice => Some(burnt(&mut s, &once, "04", 11)),
-            10 => Some(minted(&mut s, "03", 12)),
-            12 if minted_twice => Some(minted(&mut s, "04", 13)),
-            20 => Some(burnt(&mut s, &first, "01", 9)),
-            37 => Some(minted(&mut s, "02", 14)),
-            _ => None,
+        let mut transactions: Vec<Tx> = match height {
+            4 if minted_twice => vec![minted(&mut s, "04", 10)],
+            6 => vec![minted(&mut s, "01", 8)],
+            8 if minted_twice => vec![burnt(&mut s, &once, "04", 11)],
+            10 => vec![minted(&mut s, "03", 12)],
+            12 if minted_twice => vec![minted(&mut s, "04", 13)],
+            20 => vec![burnt(&mut s, &first, "01", 9)],
+            37 => vec![minted(&mut s, "02", 14)],
+            _ => Vec::new(),
         };
-        let hashes = s.block(transaction.into_iter().collect());
+        if height == 10 {
+            transactions.push(s.tx().input(&cnight_minted, 1).output(
+                Output::new(ordinary(15), 1_400_000).token(&cnight.policy, &cnight.name, 2),
+            ));
+        }
+        let hashes = s.block(transactions);
         match height {
             4 if minted_twice => once = hashes[0].clone(),
             6 => first = hashes[0].clone(),
@@ -3986,9 +3993,12 @@ async fn crowded_heights_at_segment_edges_give_the_conversion() -> Result {
 /// killed in its unit listing: the build's future is dropped when the fake
 /// receives the k-th `/assets/{unit}/utxos` request, with the segments'
 /// cursors as the run left them, and the same command continues it. Each
-/// continuation equals the conversion row by row, and at least one kill
-/// leaves open segments. `DSA_REBUILD_SEGMENT_KILL_STEP` (default 4) spaces
-/// the kill points: 1 kills at every listing request.
+/// continuation equals the conversion row by row and its families add up
+/// to `calls`, and at least one kill leaves open segments. The kill at the
+/// second request falls between the statement that stores the segments
+/// and the first segment's step: the segments' answers are held back, so
+/// the run leaves every segment open at its start. `DSA_REBUILD_SEGMENT_KILL_STEP`
+/// (default 4) spaces the kill points: 1 kills at every listing request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_build_killed_inside_its_segments_continues_to_the_conversion() -> Result {
@@ -4023,11 +4033,17 @@ async fn a_build_killed_inside_its_segments_continues_to_the_conversion() -> Res
         let (killer, mut killed) = watch::channel(false);
         let hook: Hook = {
             let (seen, listing) = (seen.clone(), listing.clone());
-            Arc::new(move |path: &str, _: &mut Chain, _| {
-                if path.contains(&listing) && seen.fetch_add(1, Ordering::SeqCst) + 1 == kill_at {
+            Arc::new(move |path: &str, chain: &mut Chain, _| {
+                if !path.contains(&listing) {
+                    return None;
+                }
+                let request = seen.fetch_add(1, Ordering::SeqCst) + 1;
+                if request == kill_at {
                     let _ = killer.send(true);
                 }
-                None
+                // At the second request the segments are stored and none
+                // has stepped: their answers are held back past the kill.
+                (kill_at == 2 && request >= 2).then(|| chain.answer(path).delayed(3_000))
             })
         };
         let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), Some(hook)).await;
@@ -4036,29 +4052,44 @@ async fn a_build_killed_inside_its_segments_continues_to_the_conversion() -> Res
             result = build_with(&profile, &fake, &rebuilt, segment_options(0), stop) => Some(result.is_ok()),
             _ = killed.wait_for(|killed| *killed) => None,
         };
-        let open: i64 = common::connect(&rebuilt.config)
+        let segments: (i64, i64, i64) = common::connect(&rebuilt.config)
             .await?
             .query_one(
-                "SELECT count(*) FROM dsa_rebuild.item WHERE kind='cursor' AND key LIKE 'unit:%@%'
-                 AND NOT (value->>'done')::boolean",
+                "SELECT count(*),count(*) FILTER (WHERE NOT (value->>'done')::boolean),
+                  count(*) FILTER (WHERE NOT (value->>'done')::boolean
+                   AND (value->>'from')::bigint=split_part(key,'@',2)::bigint)
+                 FROM dsa_rebuild.item WHERE kind='cursor' AND key LIKE 'unit:%@%'",
                 &[],
             )
             .await
-            .map(|row| row.get(0))
-            .unwrap_or(0);
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .unwrap_or((0, 0, 0));
+        let open = segments.1;
+        let answered_first = quiet(&fake).await;
+        let recorded = recorded_requests(&rebuilt).await?;
         let (_stopper, stop) = Stop::new();
         let continued = build_with(&profile, &fake, &rebuilt, segment_options(0), stop).await;
-        let outcome = match &continued {
-            Ok(report) => {
-                against_conversion(&profile, report, &rebuilt, &converted, &conversion).await?
-            }
-            Err(error) => json!({"error": error.report()}),
+        let (outcome, counts) = match &continued {
+            Ok(report) => (
+                against_conversion(&profile, report, &rebuilt, &converted, &conversion).await?,
+                counted(report, recorded, fake.paths().len() - answered_first),
+            ),
+            Err(error) => (json!({"error": error.report()}), json!({"holds": false})),
         };
         println!(
             "{}",
             json!({"event":"killed_inside_segments","kill_at":kill_at,"of":total,
-                "first_finished":first,"open_segments":open,"outcome":outcome})
+                "first_finished":first,"segments":[segments.0,segments.1,segments.2],
+                "open_segments":open,"outcome":outcome,"counts":counts})
         );
+        if kill_at == 2 {
+            // The segments stored, every one open and at its start.
+            assert!(
+                segments.0 > 1 && segments == (segments.0, segments.0, segments.0),
+                "kill at 2: segments {segments:?}"
+            );
+        }
+        assert_eq!(counts["holds"], true, "kill at {kill_at}: {counts}");
         outcomes.push((kill_at, open, equals_conversion(&outcome)));
         rebuilt.cleanup().await?;
     }
@@ -5683,9 +5714,210 @@ async fn refused_while_building(
     Ok(())
 }
 
+/// The advisory lock a held statement waits for.
+const HELD_LOCK: (i32, i32) = (2611, 28);
+
+/// A statement of a build held inside its transaction: a trigger on the
+/// build's database calls a function that waits for an advisory lock the
+/// test holds, so the statement that fires it blocks. The trigger and its
+/// function live in a schema of their own (`dsa_test`), which the build's
+/// checks of its layout do not read.
+struct Held {
+    holder: tokio_postgres::Client,
+    table: String,
+}
+
+impl Held {
+    /// Holds the statements of `database` that fire a trigger `spec` (its
+    /// timing, event, table, level and condition) on `table`, once a build
+    /// has laid the table out.
+    async fn on(database: &Database, table: &str, spec: &str) -> Result<Self> {
+        let holder = common::connect(&database.config).await?;
+        for _ in 0..12_000 {
+            let laid_out: bool = holder
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .await?
+                .get(0);
+            if laid_out {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        holder
+            .execute(
+                "SELECT pg_advisory_lock($1,$2)",
+                &[&HELD_LOCK.0, &HELD_LOCK.1],
+            )
+            .await?;
+        holder
+            .batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS dsa_test;
+                 CREATE OR REPLACE FUNCTION dsa_test.held() RETURNS trigger LANGUAGE plpgsql AS
+                 $$BEGIN PERFORM pg_advisory_xact_lock({},{}); RETURN NEW; END$$;
+                 CREATE TRIGGER dsa_test_held {spec} EXECUTE FUNCTION dsa_test.held()",
+                HELD_LOCK.0, HELD_LOCK.1
+            ))
+            .await?;
+        Ok(Self {
+            holder,
+            table: table.to_owned(),
+        })
+    }
+
+    /// The backend that waits for the lock and its statement, once one
+    /// does.
+    async fn waiting(&self) -> Result<(i32, String)> {
+        for _ in 0..12_000 {
+            let row = self
+                .holder
+                .query_opt(
+                    "SELECT a.pid,a.query FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid
+                     WHERE l.locktype='advisory' AND NOT l.granted AND l.classid=$1::integer::oid
+                     AND l.objid=$2::integer::oid AND l.database=(SELECT oid FROM pg_database WHERE datname=current_database())",
+                    &[&HELD_LOCK.0, &HELD_LOCK.1],
+                )
+                .await?;
+            if let Some(row) = row {
+                return Ok((row.get(0), row.get(1)));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err("no statement waited for the held lock".into())
+    }
+
+    /// Ends the held backend (its transaction rolls back), removes the
+    /// trigger and its function, and releases the lock.
+    async fn release(self, pid: i32) -> Result {
+        self.holder
+            .execute("SELECT pg_terminate_backend($1)", &[&pid])
+            .await?;
+        for _ in 0..12_000 {
+            let gone: bool = self
+                .holder
+                .query_one(
+                    "SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)",
+                    &[&pid],
+                )
+                .await?
+                .get(0);
+            if gone {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.holder
+            .batch_execute(&format!(
+                "DROP TRIGGER dsa_test_held ON {};DROP SCHEMA dsa_test CASCADE",
+                self.table
+            ))
+            .await?;
+        self.holder
+            .execute(
+                "SELECT pg_advisory_unlock($1,$2)",
+                &[&HELD_LOCK.0, &HELD_LOCK.1],
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// Runs `build` while a trigger `spec` on `table` holds the statements of
+/// `database` that fire it (`Held::on`), until one waits; then drops the
+/// build, as a killed process ends, and returns the held state with the
+/// waiting backend's pid and statement. An error when the build ends first.
+async fn killed_at_held<F>(
+    database: &Database,
+    (table, spec): (&str, &str),
+    build: F,
+) -> Result<(Held, i32, String)>
+where
+    F: std::future::Future<Output = std::result::Result<Report, follow::Error>>,
+{
+    let hold = async {
+        let held = Held::on(database, table, spec).await?;
+        let (pid, statement) = held.waiting().await?;
+        Result::Ok((held, pid, statement))
+    };
+    tokio::select! {
+        result = build => Err(format!(
+            "the build ended before the held statement: {:?}",
+            result.map(|report| report.calls).map_err(|error| error.report())
+        )
+        .into()),
+        held = hold => held,
+    }
+}
+
+/// The requests the earlier runs of a build recorded, as a continuation
+/// folds them: the larger of the recorded total, the requests per day and
+/// the stored families; 0 when the database holds no build. Also the gap
+/// the continuation reports as `unrecorded`.
+async fn recorded_requests(database: &Database) -> Result<(i64, u64)> {
+    let client = common::connect(&database.config).await?;
+    let Some(progress) = client
+        .query_opt("SELECT calls FROM dsa_rebuild.progress WHERE id=1", &[])
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.get::<_, i64>(0))
+    else {
+        return Ok((0, 0));
+    };
+    let per_day: i64 = client
+        .query_one(
+            "SELECT coalesce(sum(requests),0)::bigint FROM dsa.calls",
+            &[],
+        )
+        .await?
+        .get(0);
+    let families: u64 = stored_requests(database)
+        .await?
+        .iter()
+        .flat_map(|(_, counts)| counts.as_object().cloned().unwrap_or_default())
+        .filter_map(|(_, count)| count.as_u64())
+        .sum();
+    let recorded = u64::try_from(progress.max(per_day))?;
+    Ok((
+        i64::try_from(recorded.max(families))?,
+        recorded.saturating_sub(families),
+    ))
+}
+
+/// Waits until `fake` has had no request for a second: a killed run's
+/// stake read runs in a task of its own and may still ask, as a killed
+/// process does not. Returns the requests answered.
+async fn quiet(fake: &Fake) -> usize {
+    let mut answered = fake.paths().len();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = fake.paths().len();
+        if now == answered {
+            return answered;
+        }
+        answered = now;
+    }
+}
+
+/// A continued build's report counts what the earlier runs recorded and
+/// what it sent: `calls` is exactly `recorded` plus the requests it sent,
+/// the family `unrecorded` is the recorded gap, and the families add up to
+/// `calls`.
+fn counted(report: &Report, recorded: (i64, u64), sent: usize) -> serde_json::Value {
+    let families: u64 = report.requests.values().sum();
+    let unrecorded = report.requests.get("unrecorded").copied().unwrap_or(0);
+    json!({"calls": report.calls, "recorded": recorded.0, "sent": sent,
+        "families": families, "unrecorded": unrecorded, "gap": recorded.1,
+        "holds": report.calls == recorded.0 + sent as i64
+            && families as i64 == report.calls && unrecorded == recorded.1})
+}
+
 /// A build stopped at any point continues to the conversion's
 /// digest; until it publishes the database never serves, and dropping it
-/// discards the build.
+/// discards the build. Each continuation counts what the killed run
+/// recorded and what it sent itself: the record holds every request sent
+/// before the phase the run was killed in began (in the window, before the
+/// window began), so the requests a killed run sends and does not count
+/// are at most those of that phase.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
@@ -5739,23 +5971,59 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             _ => phases.push((phase.clone(), index, index)),
         }
     }
-    // A kill in the middle of every phase at the default batch size, one in
-    // the middle of each phase that stores its answers in batches with a
-    // batch of 2 (a continuation from a partly stored phase), and the
-    // points DSA_REBUILD_KILL_POINTS spreads over the requests.
+    // A kill in the middle of every phase at the default batch size, one
+    // late in each phase that stores its answers in batches with a batch of
+    // 2 (a continuation from a partly stored phase, which asks again only
+    // what the run had not stored), and the points DSA_REBUILD_KILL_POINTS
+    // spreads over the requests.
     let mut points: Vec<(usize, usize)> = phases
         .iter()
         .map(|(_, start, end)| (1 + start + (end - start) / 2, 0))
         .collect();
+    let batched = ["transactions", "addresses", "validity"];
     for (phase, start, end) in &phases {
-        if ["transactions", "addresses", "validity"].contains(&phase.as_str()) && end - start >= 3 {
-            points.push((1 + start + (end - start) / 2, 2));
+        if batched.contains(&phase.as_str()) && end - start >= 3 {
+            points.push((1 + start + 3 * (end - start) / 4, 2));
         }
     }
+    // A run killed late in a batched phase asks again at most a batch, the
+    // requests in flight and those a run starts with; at least one such
+    // phase is longer than twice that, so that asking the phase again
+    // whole breaks the bound.
+    let batch_bound = 2 + IN_FLIGHT as usize + RUN_START;
+    assert!(
+        phases
+            .iter()
+            .any(|(phase, start, end)| batched.contains(&phase.as_str())
+                && end - start + 1 > 2 * batch_bound),
+        "no batched phase longer than twice {batch_bound}: {phases:?}"
+    );
+    // The first request of the window: before it, the build recorded every
+    // request it had sent.
+    let build_phases = [
+        "plan",
+        "positions",
+        "listing",
+        "quantities",
+        "since",
+        "transactions",
+        "addresses",
+        "history",
+        "validity",
+        "datums",
+        "carried",
+        "epochs",
+        "base",
+    ];
+    let window_start = phases
+        .iter()
+        .find(|(phase, _, _)| !build_phases.contains(&phase.as_str()))
+        .map_or(total, |(_, start, _)| *start);
     let extra = setting("DSA_REBUILD_KILL_POINTS", 0) as usize;
     points.extend((1..=extra).map(|point| ((total * point / (extra + 1)).max(1), 0)));
     let point = |(kill_at, batch): (usize, usize)| {
         let (case, conversion, phases, sent_in) = (&case, &conversion, &phases, &sent_in);
+        let build_phases = &build_phases;
         async move {
             let phase = sent_in[kill_at - 1].clone();
             let phase_start = phases
@@ -5790,6 +6058,8 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             if first.is_some() {
                 return Err(format!("kill point {kill_at} of {total} came after the end").into());
             }
+            let answered_first = quiet(&fake).await;
+            let recorded = recorded_requests(&rebuilt).await?;
             let client = common::connect(&rebuilt.config).await?;
             let stored_phase: Option<String> = client
                 .query_opt("SELECT phase FROM dsa_rebuild.progress WHERE id=1", &[])
@@ -5839,16 +6109,37 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             );
             // A build that stopped before it wrote anything starts anew; any
             // other continues, and asks again at most what its phase had asked
-            // before the kill, the requests in flight and the few a run starts
-            // with.
+            // before the kill (with a batch of 2, at most a batch), the
+            // requests in flight and the few a run starts with.
             let asked_again = answered.saturating_sub(total);
-            let bound = (kill_at - phase_start) + IN_FLIGHT as usize + RUN_START;
+            let bound = if batch == 2 {
+                batch_bound
+            } else {
+                (kill_at - phase_start) + IN_FLIGHT as usize + RUN_START
+            };
+            // The killed run recorded every request sent before its phase
+            // began (in the window, before the window began); those it sent
+            // since are the most it can leave uncounted.
+            let floor = if stored_phase.as_deref() == Some("window")
+                || !build_phases.contains(&phase.as_str())
+            {
+                window_start
+            } else {
+                phase_start
+            };
+            let counts = counted(&report, recorded, answered - answered_first);
             let outcome = json!({"kill_at_request":kill_at,"phase":phase,"batch":batch,
             "stored_phase":stored_phase,"stored_state":stored,"resumed":report.resumed,
-            "calls":report.calls,"answered":answered,"asked_again":asked_again,"bound":bound});
+            "calls":report.calls,"answered":answered,"asked_again":asked_again,"bound":bound,
+            "answered_by_the_killed_run":answered_first,"recorded_before_phase":floor,
+            "uncounted":answered_first as i64 - recorded.0,"counts":counts});
             println!("{}", json!({"event":"kill","outcome":outcome}));
             assert_eq!(report.resumed, stored_phase.is_some(), "{outcome}");
             assert!(asked_again <= bound, "{outcome}");
+            assert_eq!(counts["holds"], true, "{outcome}");
+            if stored_phase.is_some() {
+                assert!(recorded.0 >= floor as i64, "{outcome}");
+            }
             rebuilt.cleanup().await?;
             Result::<serde_json::Value>::Ok(outcome)
         }
@@ -5967,6 +6258,11 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             "stopped in {phase:?}: {} requests counted, {answered} answered",
             report.calls
         );
+        let families: u64 = report.requests.values().sum();
+        assert_eq!(
+            families as i64, report.calls,
+            "stopped in {phase:?}: families against calls"
+        );
         assert_eq!(in_window, phase.as_deref() == Some("window"));
         println!(
             "{}",
@@ -6010,6 +6306,401 @@ async fn a_build_killed_at_any_point_continues_to_the_same_digest() -> Result {
             "discarded_state":stopped})
     );
     assert_eq!(outcomes.len(), points.len());
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// Kills at statements that send no request, on the kill test's chain:
+/// the base's first output rows (`INSERT INTO serve.tx_out` while the
+/// stored phase is `base`) and the publication's opening of the gate (the
+/// update of `dsa.position` to serving). Each is held by a trigger until the
+/// build's future is dropped and its backend ended, so its transaction
+/// rolls back whole: the same command continues the stored build, equals
+/// the conversion and serves, and counts what was recorded and what it
+/// sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_in_its_base_or_publication_continues_to_the_same_digest() -> Result {
+    let seed = setting("DSA_REBUILD_KILL_SEED", 5);
+    let mut random = Random::new(seed ^ 0x0d2b_d2b0);
+    let case = Case::new(seed, &mut random).await?;
+    let mut source = Source::new().await?;
+    let converted = Database::new().await?;
+    let conversion = case.convert(&mut source, &converted).await?;
+    let mut outcomes = Vec::new();
+    for (name, table, spec, statement, phase) in [
+        (
+            "base",
+            "serve.tx_out",
+            "BEFORE INSERT ON serve.tx_out FOR EACH STATEMENT",
+            "INSERT INTO serve.tx_out",
+            "base",
+        ),
+        (
+            "publication",
+            "dsa.position",
+            "BEFORE UPDATE ON dsa.position FOR EACH ROW WHEN (NEW.serving AND NOT OLD.serving)",
+            "UPDATE dsa.position SET serving=true",
+            "window",
+        ),
+    ] {
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &case.profile).await?;
+        let fake = Fake::start(&case.g, &case.profile).await;
+        let (_stopper, stop) = Stop::new();
+        let (held, pid, text) = killed_at_held(
+            &rebuilt,
+            (table, spec),
+            build(
+                &case.profile,
+                &fake,
+                &rebuilt,
+                case.horizon,
+                case.target,
+                stop,
+            ),
+        )
+        .await?;
+        let stored = stored_phase(&rebuilt).await;
+        held.release(pid).await?;
+        let killed_serving = serving(&rebuilt).await?;
+        let answered_first = quiet(&fake).await;
+        let recorded = recorded_requests(&rebuilt).await?;
+        let (_stopper, stop) = Stop::new();
+        let report = build(
+            &case.profile,
+            &fake,
+            &rebuilt,
+            case.horizon,
+            case.target,
+            stop,
+        )
+        .await
+        .map_err(|error| format!("continued after the {name} kill: {}", error.report()))?;
+        same(&report.verified, &conversion, &format!("killed in {name}"))?;
+        let counts = counted(&report, recorded, fake.paths().len() - answered_first);
+        let outcome = json!({"point":name,"statement":text,"stored_phase":stored,
+            "serving_after_kill":killed_serving,"resumed":report.resumed,
+            "serving":serving(&rebuilt).await?,"counts":counts});
+        println!(
+            "{}",
+            json!({"event":"killed_at_statement","outcome":outcome})
+        );
+        assert!(text.starts_with(statement), "{outcome}");
+        assert_eq!(stored.as_deref(), Some(phase), "{outcome}");
+        assert!(!killed_serving, "{outcome}");
+        assert!(report.resumed, "{outcome}");
+        assert_eq!(outcome["serving"], true, "{outcome}");
+        assert_eq!(counts["holds"], true, "{outcome}");
+        outcomes.push(outcome);
+        rebuilt.cleanup().await?;
+    }
+    assert_eq!(outcomes.len(), 2);
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// A refused proof's discard killed before it commits: a listing that
+/// lacks a cNIGHT output refuses the build with `rebuild_supply_mismatch`,
+/// and the discard of what the next run reads again (the items, and the
+/// stored phase moved back to `listing`, in one transaction) is held at its
+/// update of the phase until the build's future is dropped and its backend
+/// ended: nothing of it stays. The same command, still answered without the
+/// output, refuses again by the same proof and discards; answered honestly,
+/// it equals the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_in_its_discard_refuses_again_then_continues() -> Result {
+    let profile = profile(1);
+    let edges = edges(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &edges.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let listing = format!("/assets/{}/utxos?", edges.cnight);
+    let cut = Arc::new(AtomicBool::new(true));
+    let hook = rows_hook(listing, cut.clone(), |rows| {
+        if !rows.is_empty() && rows.len() < 100 {
+            rows.pop();
+        }
+    });
+    let fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), Some(hook)).await;
+    // The build's own step from `positions` to `listing` is not a discard.
+    let spec = "BEFORE UPDATE ON dsa_rebuild.progress FOR EACH ROW
+        WHEN (NEW.phase='listing' AND OLD.phase NOT IN ('positions','listing'))";
+    let client = common::connect(&rebuilt.config).await?;
+    let (_stopper, stop) = Stop::new();
+    let (held, pid, text) = killed_at_held(
+        &rebuilt,
+        ("dsa_rebuild.progress", spec),
+        build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop),
+    )
+    .await?;
+    let stored = stored_phase(&rebuilt).await;
+    held.release(pid).await?;
+    let kept: i64 = client
+        .query_one(
+            "SELECT count(*) FROM dsa_rebuild.item WHERE kind='listed'",
+            &[],
+        )
+        .await?
+        .get(0);
+    let (_stopper, stop) = Stop::new();
+    let again = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("a listing without an output was published")?;
+    let after_again = stored_phase(&rebuilt).await;
+    cut.store(false, Ordering::SeqCst);
+    let answered_first = quiet(&fake).await;
+    let recorded = recorded_requests(&rebuilt).await?;
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("continued: {}", error.report()))?;
+    same(&report.verified, &conversion, "after a killed discard")?;
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let counts = counted(&report, recorded, fake.paths().len() - answered_first);
+    let outcome = json!({"statement":text,"stored_phase":stored,"listed_kept":kept,
+        "again":again.report(),"phase_after_again":after_again,"resumed":report.resumed,
+        "rows":rows,"counts":counts});
+    println!("{}", json!({"event":"killed_in_discard","outcome":outcome}));
+    assert!(
+        text.starts_with("UPDATE dsa_rebuild.progress SET phase="),
+        "{outcome}"
+    );
+    assert_ne!(stored.as_deref(), Some("listing"), "{outcome}");
+    assert!(kept > 0, "{outcome}");
+    assert_eq!(code(&again), "rebuild_supply_mismatch", "{outcome}");
+    assert_eq!(after_again.as_deref(), Some("listing"), "{outcome}");
+    assert!(report.resumed, "{outcome}");
+    assert_eq!(rows, json!({}), "{outcome}");
+    assert_eq!(counts["holds"], true, "{outcome}");
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// The item-8 chain (a window without a relevant spend, so publication
+/// adds the newest relevant spend below H) killed in its search for that
+/// spend, at the second transaction list it reads backward (`order=desc`)
+/// after the window: cNIGHT's list has given an older spend (height 10), while the
+/// newest (the burn at 20) is among the burns, read after every list. The
+/// same command searches again and equals the conversion. Killed instead at
+/// publication (held at the opening of the gate), the same command
+/// publishes again. Each build numbers the descriptors outside the table as
+/// the uninterrupted build and the conversion do: no stopped run's sequence
+/// values show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_in_its_newest_spend_search_or_publication_keeps_the_conversion() -> Result {
+    let profile = profile(1);
+    let g = descriptor_chain(&profile, false);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &g, &converted).await?;
+    // The descriptors outside the network's table: the conversion of a test
+    // chain numbers the table's own in the order its source saw them.
+    let table: Vec<String> = dsa_chain::profiles::fixed_descriptor_ids(&profile)
+        .into_iter()
+        .map(|(unit, _)| unit)
+        .collect();
+    let outside = |ids: BTreeMap<String, i64>| -> BTreeMap<String, i64> {
+        ids.into_iter()
+            .filter(|(unit, _)| !table.contains(unit))
+            .collect()
+    };
+    let expected = outside(unit_ids(&converted).await?);
+    // The uninterrupted build and the transaction lists it reads backward
+    // after the window (its first block read), which are the search's.
+    let whole = Database::new().await?;
+    empty(&whole, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    build(&profile, &fake, &whole, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("whole: {}", error.report()))?;
+    let whole_ids = outside(unit_ids(&whole).await?);
+    whole.cleanup().await?;
+    let paths = fake.paths();
+    let window = paths
+        .iter()
+        .position(|path| path.contains("/txs/cbor"))
+        .ok_or("no block read in the window")?;
+    let backward: Vec<String> = paths[window..]
+        .iter()
+        .filter(|path| path.contains("/transactions?") && path.contains("order=desc"))
+        .cloned()
+        .collect();
+    let mut outcomes = Vec::new();
+    for point in ["search", "publication"] {
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &profile).await?;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let in_window = Arc::new(AtomicBool::new(false));
+        let (killer, mut killed) = watch::channel(false);
+        let hook: Hook = {
+            let (seen, in_window) = (seen.clone(), in_window.clone());
+            Arc::new(move |path: &str, _: &mut Chain, _| {
+                if path.contains("/txs/cbor") {
+                    in_window.store(true, Ordering::SeqCst);
+                }
+                if in_window.load(Ordering::SeqCst)
+                    && path.contains("/transactions?")
+                    && path.contains("order=desc")
+                    && seen.fetch_add(1, Ordering::SeqCst) + 1 == 2
+                {
+                    let _ = killer.send(true);
+                }
+                None
+            })
+        };
+        let fake = Fake::with_chain(edge_chain(&profile, &g, EDGE_END), Some(hook)).await;
+        let (_stopper, stop) = Stop::new();
+        let run = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop);
+        let (statement, stored) = if point == "search" {
+            tokio::select! {
+                result = run => {
+                    return Err(format!("the build ended before its search: {:?}",
+                        result.map(|report| report.calls).map_err(|error| error.report())).into());
+                }
+                _ = killed.wait_for(|killed| *killed) => {}
+            }
+            (None, stored_phase(&rebuilt).await)
+        } else {
+            let (held, pid, text) = killed_at_held(
+                &rebuilt,
+                (
+                    "dsa.position",
+                    "BEFORE UPDATE ON dsa.position FOR EACH ROW WHEN (NEW.serving AND NOT OLD.serving)",
+                ),
+                run,
+            )
+            .await?;
+            let stored = stored_phase(&rebuilt).await;
+            held.release(pid).await?;
+            (Some(text), stored)
+        };
+        let answered_first = quiet(&fake).await;
+        let recorded = recorded_requests(&rebuilt).await?;
+        let (_stopper, stop) = Stop::new();
+        let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+            .await
+            .map_err(|error| format!("continued after the {point} kill: {}", error.report()))?;
+        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+        let differs = same(&report.verified, &conversion, point)
+            .err()
+            .map(|error| error.to_string());
+        let ids = outside(unit_ids(&rebuilt).await?);
+        let counts = counted(&report, recorded, fake.paths().len() - answered_first);
+        let outcome = json!({"point":point,"statement":statement,"stored_phase":stored,
+            "resumed":report.resumed,"differs":differs,"rows":rows,"ids":ids,
+            "ids_as_whole":ids == whole_ids,"ids_equal":ids == expected,"counts":counts});
+        println!(
+            "{}",
+            json!({"event":"killed_in_publication_steps","outcome":outcome})
+        );
+        outcomes.push(outcome);
+        rebuilt.cleanup().await?;
+    }
+    println!(
+        "{}",
+        json!({"event":"newest_spend_kills","backward_lists":backward,
+            "ids_conversion":expected,"ids_whole":whole_ids})
+    );
+    assert!(backward.len() >= 2, "fewer than two backward lists");
+    assert!(
+        backward[0].contains(&format!("/assets/{}/", profile.assets.cnight.unit())),
+        "the first backward list is not cNIGHT's: {backward:?}"
+    );
+    assert_eq!(whole_ids, expected, "the uninterrupted build's IDs");
+    for outcome in &outcomes {
+        assert_eq!(outcome["stored_phase"], "window", "{outcome}");
+        assert_eq!(outcome["resumed"], true, "{outcome}");
+        assert!(outcome["differs"].is_null(), "{outcome}");
+        assert_eq!(outcome["rows"], json!({}), "{outcome}");
+        assert_eq!(outcome["ids_as_whole"], true, "{outcome}");
+        assert_eq!(outcome["ids_equal"], true, "{outcome}");
+        assert_eq!(outcome["counts"]["holds"], true, "{outcome}");
+    }
+    assert!(
+        outcomes[1]["statement"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("UPDATE dsa.position SET serving=true")),
+        "{}",
+        outcomes[1]
+    );
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// A build whose window a check closed, killed inside the clear before it
+/// commits (held at its truncation of the served tables): nothing of the
+/// clear stays, the build is still closed by the check, and the same
+/// command clears it again and equals the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_in_its_clear_is_cleared_again() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &ten.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let fake = Fake::with_chain(
+        edge_chain(&profile, &ten.g, EDGE_END),
+        Some(swapped(&profile, &ten, on.clone())),
+    )
+    .await;
+    let (_stopper, stop) = Stop::new();
+    let error = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("the build with swapped amounts published")?;
+    assert_eq!(code(&error), "asset_conservation", "{}", error.report());
+    on.store(false, Ordering::SeqCst);
+    let (_stopper, stop) = Stop::new();
+    let (held, pid, text) = killed_at_held(
+        &rebuilt,
+        (
+            "serve.block",
+            "BEFORE TRUNCATE ON serve.block FOR EACH STATEMENT",
+        ),
+        build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop),
+    )
+    .await?;
+    held.release(pid).await?;
+    let client = common::connect(&rebuilt.config).await?;
+    let (reason, blocks): (String, i64) = client
+        .query_one(
+            "SELECT (SELECT reason FROM dsa.position WHERE id=1),(SELECT count(*) FROM serve.block)",
+            &[],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))?;
+    let stored = stored_phase(&rebuilt).await;
+    let answered_first = quiet(&fake).await;
+    let recorded = recorded_requests(&rebuilt).await?;
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("cleared again: {}", error.report()))?;
+    same(&report.verified, &conversion, "cleared again")?;
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let ids = descriptor_ids(&profile, &rebuilt).await?;
+    let counts = counted(&report, recorded, fake.paths().len() - answered_first);
+    let outcome = json!({"statement":text,"reason_after_kill":reason,"blocks_after_kill":blocks,
+        "stored_phase":stored,"resumed":report.resumed,"rows":rows,"descriptor_ids":ids,
+        "counts":counts});
+    println!("{}", json!({"event":"killed_in_clear","outcome":outcome}));
+    assert!(text.starts_with("TRUNCATE serve."), "{outcome}");
+    assert_eq!(reason, "asset_conservation", "{outcome}");
+    assert!(blocks > 0, "{outcome}");
+    assert!(report.resumed, "{outcome}");
+    assert_eq!(rows, json!({}), "{outcome}");
+    assert_eq!(ids, json!([]), "{outcome}");
+    assert_eq!(counts["holds"], true, "{outcome}");
+    rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await
 }
