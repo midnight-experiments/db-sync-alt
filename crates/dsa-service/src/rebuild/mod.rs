@@ -426,7 +426,8 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
 }
 
 /// Builds the database from the provider, or continues a build that
-/// stopped, and publishes it. A build that ends without publishing records
+/// stopped or whose window a check closed (cleared first), and publishes
+/// it. A build that ends without publishing records
 /// its requests and its error as the stopped service state `status` prints;
 /// after a refusal before the window, the next run of the command reads
 /// again what `read_again` names.
@@ -532,6 +533,27 @@ async fn earlier_requests(store: &mut Store, calls: i64) -> Result<BTreeMap<Stri
     Ok(earlier)
 }
 
+/// The plan of a stored build that this run continues: begun by this
+/// version, for this network and with the same flags. Checked before the
+/// run writes anything or sends a request.
+fn continued_plan(plan: Value, profile: &Profile, options: &Options) -> Result<Plan, Error> {
+    if plan["version"] != json!(VERSION) {
+        return Err(refusal(
+            "rebuild_version_mismatch",
+            json!({"stored": plan["version"], "running": VERSION}),
+        ));
+    }
+    let plan: Plan = parse(plan)?;
+    let given = Flags::of(options);
+    if plan.network != profile.network || plan.flags != given {
+        return Err(refusal(
+            "rebuild_plan_mismatch",
+            json!({"stored": plan.flags, "given": given}),
+        ));
+    }
+    Ok(plan)
+}
+
 async fn run(context: Context<'_>, sent_at_start: BTreeMap<String, u64>) -> Result<Report, Error> {
     let started = Instant::now();
     let Context {
@@ -553,48 +575,44 @@ async fn run(context: Context<'_>, sent_at_start: BTreeMap<String, u64>) -> Resu
     };
     let mut store = connect().await?;
     store.lock_writer().await?;
-    let mut earlier = BTreeMap::new();
-    let (plan, phase, resumed) = match store.building(profile).await? {
-        Building::Closed { reason, .. } => {
-            return Err(dsa_store::Error::Mismatch {
-                error: "rebuild_refused",
-                item: "reason".to_owned(),
-                expected: dsa_store::rebuild::REBUILDING.to_owned(),
-                actual: reason,
-            }
-            .into());
-        }
+    let (plan, phase, calls) = match store.building(profile).await? {
         Building::Empty => {
             check_network(&asker, profile).await?;
             let plan = plan(&asker, profile, &options).await?;
             store.start_building(profile, &to_value(&plan)?).await?;
-            (plan, "listing".to_owned(), false)
+            (plan, "listing".to_owned(), None)
         }
         Building::Stopped { plan, phase, calls } => {
-            if plan["version"] != json!(VERSION) {
-                return Err(refusal(
-                    "rebuild_version_mismatch",
-                    json!({"stored": plan["version"], "running": VERSION}),
-                ));
-            }
-            // The requests of the earlier runs, as they recorded them per day
-            // and in total, before this run sends one.
-            let per_day = store.calls(NaiveDate::default()).await?;
-            let recorded = calls.max(per_day.iter().map(|(_, count)| count).sum());
-            earlier = earlier_requests(&mut store, recorded).await?;
-            let plan: Plan = parse(plan)?;
-            let given = Flags::of(&options);
-            if plan.network != profile.network || plan.flags != given {
-                return Err(refusal(
-                    "rebuild_plan_mismatch",
-                    json!({"stored": plan.flags, "given": given}),
-                ));
-            }
-            provider.seed_counts(&per_day);
-            check_network(&asker, profile).await?;
-            (plan, phase, true)
+            (continued_plan(plan, profile, &options)?, phase, Some(calls))
+        }
+        Building::Closed {
+            plan,
+            calls,
+            reason,
+            service_state,
+            ..
+        } => {
+            let plan = continued_plan(plan, profile, &options)?;
+            // The failed check's record goes with the clear: logged first.
+            eprintln!(
+                "{}",
+                json!({"event":"rebuild_window_cleared","error":reason,"service_state":service_state})
+            );
+            store.clear_building_window().await?;
+            (plan, "listing".to_owned(), Some(calls))
         }
     };
+    let resumed = calls.is_some();
+    let mut earlier = BTreeMap::new();
+    if let Some(calls) = calls {
+        // The requests of the earlier runs, as they recorded them per day
+        // and in total, before this run sends one.
+        let per_day = store.calls(NaiveDate::default()).await?;
+        let recorded = calls.max(per_day.iter().map(|(_, count)| count).sum());
+        earlier = earlier_requests(&mut store, recorded).await?;
+        provider.seed_counts(&per_day);
+        check_network(&asker, profile).await?;
+    }
     let mut build = Build {
         profile,
         relevance: Relevance::of(profile),

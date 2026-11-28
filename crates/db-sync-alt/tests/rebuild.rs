@@ -3054,6 +3054,119 @@ async fn a_cleared_build_holds_what_a_new_build_holds() -> Result {
     fresh.cleanup().await
 }
 
+/// A build whose window a check closed is built again in the same database.
+/// X's and Y's answers give A and B each other's amount, so the supply proof
+/// passes and `asset_conservation` closes the window at X. A run of another
+/// version is refused before it writes (`rebuild_version_mismatch`, every
+/// table and stored item as they were). The same command, answered
+/// honestly, clears the base and the window and equals the conversion row
+/// by row; it asks no `/txs/{hash}` of the ten creating transactions (their
+/// validity answers are kept) and reads no cNIGHT list below H (their places
+/// are kept), and its families add up to `calls`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_window_check_failure_is_built_again_in_the_same_database() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &ten.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let fake = Fake::with_chain(
+        edge_chain(&profile, &ten.g, EDGE_END),
+        Some(swapped(&profile, &ten, on.clone())),
+    )
+    .await;
+    let (_stopper, stop) = Stop::new();
+    let error = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("the build with swapped amounts published")?;
+    assert_eq!(code(&error), "asset_conservation", "{}", error.report());
+    // Another version refuses the closed build and changes nothing.
+    let client = common::connect(&rebuilt.config).await?;
+    let items = "SELECT kind,key,value FROM dsa_rebuild.item ORDER BY kind,key";
+    let stored = |rows: Vec<tokio_postgres::Row>| {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, serde_json::Value>(2),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let other_version = format!("{}+other", env!("CARGO_PKG_VERSION"));
+    let set_version = "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}',to_jsonb($1::text)) WHERE id=1";
+    client.execute(set_version, &[&other_version]).await?;
+    let (rows_before, items_before) = (
+        table_rows(&rebuilt).await?,
+        stored(client.query(items, &[]).await?),
+    );
+    let (_stopper, stop) = Stop::new();
+    let version = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop).await;
+    let (rows_after, items_after) = (
+        table_rows(&rebuilt).await?,
+        stored(client.query(items, &[]).await?),
+    );
+    client
+        .execute(set_version, &[&env!("CARGO_PKG_VERSION")])
+        .await?;
+    on.store(false, Ordering::SeqCst);
+    let first = fake.paths().len();
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("built again: {}", error.report()))?;
+    let paths = fake.paths().split_off(first);
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let ids = descriptor_ids(&profile, &rebuilt).await?;
+    let validity: usize = ten
+        .creators
+        .iter()
+        .map(|creator| {
+            paths
+                .iter()
+                .filter(|path| path.ends_with(&format!("/txs/{creator}")))
+                .count()
+        })
+        .sum();
+    let unit_list = format!("/assets/{}/transactions?", profile.assets.cnight.unit());
+    let below = paths
+        .iter()
+        .filter(|path| path.contains(&unit_list) && !path.contains("from="))
+        .count();
+    let total: u64 = report.requests.values().sum();
+    println!(
+        "{}",
+        json!({"event":"window_check_built_again","refusal":error.report(),
+            "other_version":version.as_ref().err().map(code),"rows":rows,"resumed":report.resumed,
+            "continued_requests":paths.len(),"validity_asked":validity,"unit_lists_below_h":below,
+            "requests":report.requests,"calls":report.calls})
+    );
+    assert_eq!(
+        version.as_ref().err().map(code).as_deref(),
+        Some("rebuild_version_mismatch")
+    );
+    assert_eq!(rows_before, rows_after, "another version changed a table");
+    assert_eq!(
+        items_before, items_after,
+        "another version changed a stored item"
+    );
+    same(&report.verified, &conversion, "built again")?;
+    assert_eq!(rows, json!({}), "rows differ");
+    assert_eq!(ids, json!([]), "descriptor IDs");
+    assert!(report.resumed);
+    assert_eq!(validity, 0, "validity answers asked again");
+    assert_eq!(below, 0, "cNIGHT lists below H read again");
+    assert_eq!(total as i64, report.calls, "families against calls");
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
 /// A tip answered 404 once and then with its block is asked again within
 /// the outcome rules: it has not left the chain, so the address listings
 /// and the lists from H on are not read again, and the build equals the

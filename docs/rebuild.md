@@ -211,12 +211,15 @@ history and quantity did not agree and the unit is read again;
 `rebuild_listings_discarded` when a refusal makes the next run read again
 what its cause requires, with `continue_at` (the phase the next run continues
 at), `unit_listings` true when the unit listings go and `address_histories`
-true when the profile addresses' full lists below H go too; in the window the `update` and
+true when the profile addresses' full lists below H go too;
+`rebuild_window_cleared` with the check's code (`error`) and the service state
+recorded with it (`service_state`) when a build whose window a check closed
+is built again; in the window the `update` and
 `follower_state` lines of following; `rebuild_published` with the content
 digest and the requests; `rebuild_failed` with the error's report, the code
 and any `detail`, when the build ends on an answer of the provider, one of its
 own checks or refusals, or a stop. A code that the database gives, such as
-`destination_not_empty`, `rebuild_refused` or a fault that `verify` finds at
+`destination_not_empty` or a fault that `verify` finds at
 the publication, is on the failure's own line alone. The report on standard
 output holds the `plan`
 (network, horizon, target, tip, the window as the chain time from H to T, the
@@ -283,10 +286,18 @@ command reads that again:
   discards after `rebuild_supply_mismatch`. For a transaction below H it
   discards nothing: the same command asks for that transaction again.
 - After `provider_mint_history_mismatch`, the same command reads the units
-  that have no reading yet. A check that closes the build's gate in
-the window (`asset_conservation` or another) ends the build for that database:
-the same command refuses it (`rebuild_refused`); drop the database and build
-again.
+  that have no reading yet.
+
+A check that closes the build's gate in the window (`asset_conservation` or
+another) ends the run. The same command, with the same flags and version,
+then builds again in the same database: it logs `rebuild_window_cleared`
+with the check's code and the service state recorded with it, clears the base
+and the window (the served tables, the follower's state and every stored
+result except the places, the validity answers, the burns below H, the datums
+and the request counts, which are final facts below H) and continues at
+`listing`. The supply proof, the second derivation, every check of the window
+and `verify` run again. When the same check fails again, an answer kept below
+H may be its cause: drop the database and build again.
 
 ## Check a published file
 
