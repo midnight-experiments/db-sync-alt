@@ -675,13 +675,19 @@ async fn compare_refuses_rule_one_and_declared_stored_mismatch_even_empty() -> R
     Ok(())
 }
 
-/// Dedicated generated TLS/SCRAM Docker server: the normal service has no test
-/// certificate. On-demand validation must provide both public root paths.
+/// A server with TLS for the host name `postgres` (also reachable as
+/// `wrong-host`), SCRAM over TLS and trust without (CONTRIBUTING.md): the
+/// test's own connections stay plain; `convert` and `compare` connect over TLS
+/// with host name verification and a password file.
+/// `DSA_TEST_TLS_ROOT_CERT` names the authority of the server's certificate,
+/// `DSA_TEST_TLS_WRONG_ROOT_CERT` another one. The commands the test starts
+/// inherit its environment, so these names are not the binary's
+/// `DSA_TLS_ROOT_CERT`.
 #[tokio::test]
-#[ignore = "requires a generated TLS/SCRAM PostgreSQL server and DSA_TLS roots"]
+#[ignore = "requires a PostgreSQL server with TLS and SCRAM, DSA_TEST_TLS_ROOT_CERT and DSA_TEST_TLS_WRONG_ROOT_CERT"]
 async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
-    let root = std::env::var("DSA_TLS_ROOT_CERT")?;
-    let wrong_root = std::env::var("DSA_TLS_WRONG_ROOT_CERT")?;
+    let root = std::env::var("DSA_TEST_TLS_ROOT_CERT")?;
+    let wrong_root = std::env::var("DSA_TEST_TLS_WRONG_ROOT_CERT")?;
     let f = fixture(321);
     let source = Database::new().await?;
     source.legacy(&f).await?;
@@ -784,6 +790,25 @@ async fn compare_cli_tls_reader_files_and_certificate_identity() -> Result {
             assert_eq!(report["settings_b"]["ssl"], true);
         } else {
             assert_eq!(out.status.code(), Some(1), "accepted {case}");
+            // The refusal names its cause: the handshake's for another
+            // authority or another host name, the server's SQLSTATE for a
+            // wrong password.
+            let error = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|line| line.get("error").is_some())
+                .ok_or_else(|| format!("{case}: no error line"))?;
+            assert_eq!(
+                error["error"], "comparison_source_failed",
+                "{case}: {error}"
+            );
+            assert_eq!(error["side"], "a", "{case}: {error}");
+            let (field, expected) = match case {
+                "wrong_ca" => ("cause", "tls_unknown_ca"),
+                "wrong_host" => ("cause", "tls_host_name_mismatch"),
+                _ => ("sqlstate", "28P01"),
+            };
+            assert_eq!(error["cause"][field], expected, "{case}: {error}");
         }
         assert!(!String::from_utf8_lossy(&out.stderr).contains("generated-tls-reader-password"));
         println!(

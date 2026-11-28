@@ -54,14 +54,46 @@ docker network rm dsa-test
 ```
 
 `DSA_KEEP_CASES` sets how many generated chains the keep-rule tests check; CI
-uses 64. The three skipped tests are the long ones CI also skips.
-`DSA_TEST_DATABASE_OTHER`, in the same form, names a second disposable server
-of another major version: `snapshot_file_moves_between_major_versions` then
-moves snapshot files between the two servers in both directions; without it,
-that test returns at once. CI gives the jobs of 18 and 19 a second server,
-PostgreSQL 17. CI also sets `DSA_TEST_SERVER_MAJOR`, the major version the
-server must have, and in the jobs of 18 and 19 `DSA_TEST_REQUIRE_OTHER`, with
+uses 64. `keep_rule_realistic_plans` and `convert_scaled_source_cost` are long,
+and CI skips them too. `DSA_TEST_DATABASE_OTHER`, in the same form, names a
+second disposable server of another major version:
+`snapshot_file_moves_between_major_versions` then moves snapshot files between
+the two servers in both directions; without it, that test returns at once.
+Every CI job has a second server, so that each two tested versions are paired:
+17 with 19, 18 with 17 and 19 with 18. CI also sets `DSA_TEST_SERVER_MAJOR`,
+the major version the server must have, and `DSA_TEST_REQUIRE_OTHER`, with
 which that test fails when no second server is given.
+
+`compare_cli_tls_reader_files_and_certificate_identity` runs `convert` and
+`compare` over TLS, with host name verification and a password (SCRAM), while
+its own connections stay plain. It needs a server that takes TLS, and
+`convert_tls_default_refuses_plaintext_explicit_local_works` needs one that
+does not, so the TLS test runs on its own, after the others: CI switches TLS on
+in the running server and then runs it. To run it yourself, give the server:
+
+- a certificate for the host name `postgres`, signed by a test authority;
+- the network aliases `postgres` and `wrong-host`;
+- these `pg_hba.conf` lines:
+
+  ```text
+  local all all trust
+  hostssl all all all scram-sha-256
+  hostnossl all all all trust
+  ```
+
+Then run it with `DSA_TEST_DATABASE='host=postgres port=5432 user=postgres
+dbname=dsa_test'`, `DSA_TEST_TLS_ROOT_CERT` (the test authority's
+certificate) and `DSA_TEST_TLS_WRONG_ROOT_CERT` (the certificate of another
+authority):
+
+```sh
+cargo test --locked --workspace -- --ignored --exact \
+  compare_cli_tls_reader_files_and_certificate_identity
+```
+
+The test expects `tls_unknown_ca` for the other authority,
+`tls_host_name_mismatch` for `wrong-host` and SQLSTATE `28P01` for a wrong
+password.
 
 The binary has a hidden command, `follow`, that runs only the follower and
 stops at `--stop-at-target`; the tests use it to prove catch-ups, and

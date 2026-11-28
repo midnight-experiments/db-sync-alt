@@ -49,18 +49,20 @@ jobs:
     strategy:
       fail-fast: false
       # db-sync-alt runs on PostgreSQL 17 and newer. The PostgreSQL 17 image is
-      # the one deploy/compose.yaml runs. The jobs of 18 and 19 also move
-      # snapshot files to and from a second server, PostgreSQL 17.
+      # the one deploy/compose.yaml runs. Each job also moves snapshot files
+      # to and from a second server of another tested version, so that every
+      # two tested versions are paired: 17 with 19, 18 with 17, 19 with 18.
       matrix:
         include:
           - postgresql: 17
             image: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+            other: postgres:19.0-bookworm@sha256:f8b826440669ad283328d2ac8326682539eddd91867904ad5abf4ec19269d241
           - postgresql: 18
             image: postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35
             other: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
           - postgresql: 19
             image: postgres:19.0-bookworm@sha256:f8b826440669ad283328d2ac8326682539eddd91867904ad5abf4ec19269d241
-            other: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+            other: postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35
     services:
       postgres:
         image: ${{ matrix.image }}
@@ -72,9 +74,9 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-      # A service whose image is empty does not start: the job of 17 has none.
+      # The second server of the snapshot file test.
       other:
-        image: ${{ matrix.other || '' }}
+        image: ${{ matrix.other }}
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: dsa_test
@@ -95,16 +97,64 @@ jobs:
       - name: PostgreSQL integration tests
         env:
           DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
-          # The second server of the snapshot file test; empty in the job of 17.
-          DSA_TEST_DATABASE_OTHER: ${{ matrix.other && 'host=other port=5432 user=postgres dbname=dsa_test' || '' }}
+          # The second server of the snapshot file test.
+          DSA_TEST_DATABASE_OTHER: host=other port=5432 user=postgres dbname=dsa_test
           # The tests fail when the server is not the major version the job
-          # names and, in the jobs of 18 and 19, when no file is moved.
+          # names and when no file is moved.
           DSA_TEST_SERVER_MAJOR: ${{ matrix.postgresql }}
-          DSA_TEST_REQUIRE_OTHER: ${{ matrix.postgresql != 17 && '1' || '' }}
+          DSA_TEST_REQUIRE_OTHER: '1'
           # Deterministic CI sample; the full proof defaults to 10,000 cases
           # when DSA_KEEP_CASES is unset in the on-demand test invocation.
           DSA_KEEP_CASES: 64
         run: cargo test --locked --workspace -- --ignored --nocapture --skip keep_rule_realistic_plans --skip convert_scaled_source_cost --skip compare_cli_tls_reader_files_and_certificate_identity
+      # TLS with host name verification and SCRAM password authentication.
+      # The server is switched to TLS after the suite, whose connections are
+      # plain and one of whose tests expects ssl off: a test certificate for
+      # the host name postgres, SCRAM over TLS and trust without, by SQL as
+      # superuser (the key through a program with umask 077: the server takes
+      # only a key file that group and others cannot read, and COPY TO a file
+      # lets them read it). The test's own connections stay plain; the
+      # commands it runs connect over TLS, verify the host name and send a
+      # password.
+      - name: TLS and SCRAM test
+        shell: bash
+        env:
+          DSA_TEST_DATABASE: host=postgres port=5432 user=postgres dbname=dsa_test
+          DSA_TEST_SERVER_MAJOR: ${{ matrix.postgresql }}
+        run: |
+          apt-get -o Acquire::Retries=3 update
+          apt-get -o Acquire::Retries=3 install -y --no-install-recommends postgresql-client
+          tls="$RUNNER_TEMP/tls"
+          mkdir -p "$tls"
+          ec=(-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes)
+          openssl req -x509 "${ec[@]}" -days 1 -subj "/CN=db-sync-alt test authority" -keyout "$tls/ca.key" -out "$tls/ca.crt"
+          openssl req -x509 "${ec[@]}" -days 1 -subj "/CN=another authority" -keyout "$tls/wrong-ca.key" -out "$tls/wrong-ca.crt"
+          openssl req "${ec[@]}" -subj "/CN=postgres" -keyout "$tls/server.key" -out "$tls/server.csr"
+          printf 'subjectAltName=DNS:postgres\n' > "$tls/san.ext"
+          openssl x509 -req -in "$tls/server.csr" -CA "$tls/ca.crt" -CAkey "$tls/ca.key" -CAcreateserial -days 1 -extfile "$tls/san.ext" -out "$tls/server.crt"
+          admin="host=postgres port=5432 user=postgres dbname=postgres sslmode=disable"
+          psql "$admin" -v ON_ERROR_STOP=1 -v crt="$(cat "$tls/server.crt")" -v key="$(cat "$tls/server.key")" <<'SQL'
+          SELECT current_setting('data_directory') AS data_directory, current_setting('hba_file') AS hba_file \gset
+          \set crt_file :data_directory '/server.crt'
+          \set key_program 'umask 077 && cat > ' :data_directory '/server.key'
+          COPY (SELECT line FROM unnest(string_to_array(:'crt', E'\n')) WITH ORDINALITY AS t(line, n) ORDER BY n) TO :'crt_file';
+          COPY (SELECT line FROM unnest(string_to_array(:'key', E'\n')) WITH ORDINALITY AS t(line, n) ORDER BY n) TO PROGRAM :'key_program';
+          COPY (SELECT line FROM unnest(ARRAY['local all all trust', 'hostssl all all all scram-sha-256', 'hostnossl all all all trust']) WITH ORDINALITY AS t(line, n) ORDER BY n) TO :'hba_file';
+          ALTER SYSTEM SET ssl_cert_file = 'server.crt';
+          ALTER SYSTEM SET ssl_key_file = 'server.key';
+          ALTER SYSTEM SET ssl = on;
+          SELECT pg_reload_conf();
+          SQL
+          for attempt in $(seq 30); do
+            [ "$(psql "$admin" -Atc 'SHOW ssl')" = on ] && break
+            sleep 1
+          done
+          psql "$admin" -c 'SHOW ssl' -c 'SELECT line_number, type, database, user_name, address, auth_method, error FROM pg_hba_file_rules'
+          test "$(psql "$admin" -Atc 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL')" = 0
+          openssl s_client -starttls postgres -connect postgres:5432 -CAfile "$tls/ca.crt" -verify_hostname postgres -verify_return_error < /dev/null
+          echo "$(getent hosts postgres | awk '{ print $1; exit }') wrong-host" >> /etc/hosts
+          DSA_TEST_TLS_ROOT_CERT="$tls/ca.crt" DSA_TEST_TLS_WRONG_ROOT_CERT="$tls/wrong-ca.crt" \
+            cargo test --locked --workspace -- --ignored --exact --nocapture compare_cli_tls_reader_files_and_certificate_identity
 
   release-binary:
     name: release binary (Ubuntu 24.04, glibc 2.39)
