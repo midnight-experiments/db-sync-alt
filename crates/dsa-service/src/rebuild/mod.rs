@@ -555,6 +555,15 @@ async fn run(context: Context<'_>, sent_at_start: BTreeMap<String, u64>) -> Resu
     store.lock_writer().await?;
     let mut earlier = BTreeMap::new();
     let (plan, phase, resumed) = match store.building(profile).await? {
+        Building::Closed { reason, .. } => {
+            return Err(dsa_store::Error::Mismatch {
+                error: "rebuild_refused",
+                item: "reason".to_owned(),
+                expected: dsa_store::rebuild::REBUILDING.to_owned(),
+                actual: reason,
+            }
+            .into());
+        }
         Building::Empty => {
             check_network(&asker, profile).await?;
             let plan = plan(&asker, profile, &options).await?;

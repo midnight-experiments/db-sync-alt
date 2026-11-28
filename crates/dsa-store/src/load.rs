@@ -22,7 +22,7 @@ pub(crate) fn served_tables_ddl() -> &'static str {
 /// A restore builds new tables in `serve` and keeps the empty ones the public
 /// views read in this schema until it publishes.
 pub(crate) const RETIRED: &str = "dsa_retired";
-const STATE_TABLES: &str = "dsa.supply,dsa.consumed_before_horizon,dsa.first_served,dsa.calls,\
+pub(crate) const STATE_TABLES: &str = "dsa.supply,dsa.consumed_before_horizon,dsa.first_served,dsa.calls,\
     dsa.service_state,dsa.unspent,dsa.first_observation,dsa.upkeep";
 const LOAD_KINDS: [&str; 2] = ["restore_failed", "convert_failed"];
 

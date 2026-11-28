@@ -36,6 +36,7 @@ use dsa_service::{
     rebuild::{self, Options, Report},
     retry::Stop,
 };
+use dsa_store::rebuild::Building;
 use dsa_testkit::{
     chain::{Block, Chain},
     generate::{self, Counts, Generated},
@@ -2727,6 +2728,8 @@ struct Ten {
     creators: Vec<String>,
     /// Height 35, in the window: spends the first creator's output (A).
     x: String,
+    /// Height 36, in the window: spends the second creator's output (B).
+    y: String,
 }
 
 /// Mainnet profile, k 12, the edge chain's H and T: ten creating
@@ -2755,7 +2758,7 @@ fn ten_chain(profile: &Profile) -> Ten {
         );
         creators.push(s.block(vec![tx])[0].clone());
     }
-    let mut x = String::new();
+    let (mut x, mut y) = (String::new(), String::new());
     for height in 12..=EDGE_END {
         let spent = match height {
             35 => Some((0, 2)),
@@ -2768,14 +2771,17 @@ fn ten_chain(profile: &Profile) -> Ten {
             )
         });
         let hashes = s.block(transaction.into_iter().collect());
-        if height == 35 {
-            x = hashes[0].clone();
+        match height {
+            35 => x = hashes[0].clone(),
+            36 => y = hashes[0].clone(),
+            _ => {}
         }
     }
     Ten {
         g: s.g,
         creators,
         x,
+        y,
     }
 }
 
@@ -2867,6 +2873,185 @@ async fn an_unknown_transaction_since_the_horizon_reads_the_listings_again() -> 
     );
     converted.cleanup().await?;
     source.database.cleanup().await
+}
+
+/// A hook that, while `on` is set, gives the inputs A and B of X and Y each
+/// other's cNIGHT amount in their `/txs/{hash}/utxos` answers: the amounts
+/// at H still add up to the supply, so the proof passes, and the window's
+/// conservation check of X fails.
+fn swapped(profile: &Profile, ten: &Ten, on: Arc<AtomicBool>) -> Hook {
+    let cnight = profile.assets.cnight.unit();
+    let amounts = [
+        (ten.creators[0].clone(), "3"),
+        (ten.creators[1].clone(), "2"),
+    ];
+    let paths = [
+        format!("/txs/{}/utxos", ten.x),
+        format!("/txs/{}/utxos", ten.y),
+    ];
+    Arc::new(move |path: &str, chain: &mut Chain, _| {
+        if !on.load(Ordering::SeqCst) || !paths.iter().any(|end| path.ends_with(end)) {
+            return None;
+        }
+        let mut answer: serde_json::Value = serde_json::from_str(&chain.answer(path).body).ok()?;
+        for input in answer["inputs"].as_array_mut()? {
+            let Some((_, other)) = amounts
+                .iter()
+                .find(|(hash, _)| input["tx_hash"] == hash.as_str())
+            else {
+                continue;
+            };
+            for amount in input["amount"].as_array_mut()? {
+                if amount["unit"] == cnight.as_str() {
+                    amount["quantity"] = json!(other);
+                }
+            }
+        }
+        Some(Behavior::json(answer))
+    })
+}
+
+/// The rows of every table of the schemas `serve` and `dsa`, by name.
+async fn table_rows(database: &Database) -> Result<BTreeMap<String, i64>> {
+    let client = common::connect(&database.config).await?;
+    let names: Vec<String> = client
+        .query(
+            "SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+             WHERE c.relkind IN ('r','p') AND n.nspname IN ('serve','dsa') ORDER BY 1",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut rows = BTreeMap::new();
+    for name in names {
+        let count: i64 = client
+            .query_one(&format!("SELECT count(*) FROM {name}"), &[])
+            .await?
+            .get(0);
+        rows.insert(name, count);
+    }
+    Ok(rows)
+}
+
+/// The position without its time and the four ID sequences.
+async fn position_and_sequences(database: &Database) -> Result<serde_json::Value> {
+    let client = common::connect(&database.config).await?;
+    let position: serde_json::Value = client
+        .query_one(
+            "SELECT to_jsonb(p)-'updated_at' FROM dsa.position p WHERE id=1",
+            &[],
+        )
+        .await?
+        .get(0);
+    let mut sequences = serde_json::Map::new();
+    for table in ["multi_asset", "datum", "pool_hash", "epoch_stake"] {
+        let row = client
+            .query_one(
+                &format!("SELECT last_value,is_called FROM dsa.{table}_id_seq"),
+                &[],
+            )
+            .await?;
+        sequences.insert(
+            table.to_owned(),
+            json!([row.get::<_, i64>(0), row.get::<_, bool>(1)]),
+        );
+    }
+    Ok(json!({"position": position, "sequences": sequences}))
+}
+
+/// A build whose window a check closed (X's input A stored with B's amount,
+/// so `asset_conservation` fails at X), cleared by the store: every table
+/// of `serve` and `dsa` is empty but `identity`, `position` and `calls`;
+/// the position and the four ID sequences are those a new build starts
+/// with; the stored items are the places, validity answers, burns below H,
+/// datums and request counts, and the build continues at `listing`. A
+/// second clear is refused: a cleared build is not closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_cleared_build_holds_what_a_new_build_holds() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let fake = Fake::with_chain(
+        edge_chain(&profile, &ten.g, EDGE_END),
+        Some(swapped(&profile, &ten, on)),
+    )
+    .await;
+    let (_stopper, stop) = Stop::new();
+    let error = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("the build with swapped amounts published")?;
+    let mut store = connect(&rebuilt.config)().await?;
+    let closed = store.building(&profile).await?;
+    let before = table_rows(&rebuilt).await?;
+    store.clear_building_window().await?;
+    let after = table_rows(&rebuilt).await?;
+    let cleared = position_and_sequences(&rebuilt).await?;
+    let client = common::connect(&rebuilt.config).await?;
+    let kinds: Vec<String> = client
+        .query("SELECT DISTINCT kind FROM dsa_rebuild.item ORDER BY 1", &[])
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let phase: String = client
+        .query_one("SELECT phase FROM dsa_rebuild.progress WHERE id=1", &[])
+        .await?
+        .get(0);
+    let again = store.clear_building_window().await.err();
+    let fresh = Database::new().await?;
+    empty(&fresh, &profile).await?;
+    connect(&fresh.config)()
+        .await?
+        .start_building(&profile, &json!({"version": "fresh"}))
+        .await?;
+    let started = position_and_sequences(&fresh).await?;
+    println!(
+        "{}",
+        json!({"event":"cleared_build","error":error.report(),"closed":format!("{closed:?}"),
+            "rows_before":before,"rows_after":after,"cleared":cleared,"new_build":started,
+            "kinds":kinds,"phase":phase,"second_clear":again.as_ref().map(refused_with)})
+    );
+    let Building::Closed { reason, .. } = closed else {
+        return Err(format!("not a closed build: {closed:?}").into());
+    };
+    assert_eq!(reason, "asset_conservation");
+    assert_eq!(code(&error), "asset_conservation", "{}", error.report());
+    assert!(
+        before["serve.tx_out"] > 0 && before["serve.block"] > 0,
+        "{before:?}"
+    );
+    for (table, rows) in &after {
+        if !["dsa.identity", "dsa.position", "dsa.calls"].contains(&table.as_str()) {
+            assert_eq!(*rows, 0, "{table} after the clear");
+        }
+    }
+    assert!(after["dsa.calls"] > 0, "the request counts per day went");
+    assert_eq!(cleared, started, "position and sequences");
+    assert!(
+        kinds
+            .iter()
+            .all(|kind| ["position", "valid", "burn", "datum", "requests"].contains(&kind.as_str())),
+        "{kinds:?}"
+    );
+    for kept in ["position", "valid", "requests"] {
+        assert!(
+            kinds.iter().any(|kind| kind == kept),
+            "{kept} went: {kinds:?}"
+        );
+    }
+    assert_eq!(phase, "listing");
+    assert_eq!(
+        again.as_ref().map(refused_with).as_deref(),
+        Some("rebuild_not_closed")
+    );
+    rebuilt.cleanup().await?;
+    fresh.cleanup().await
 }
 
 /// A tip answered 404 once and then with its block is asked again within

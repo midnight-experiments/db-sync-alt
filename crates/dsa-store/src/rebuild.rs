@@ -11,7 +11,8 @@
 //! The rows below the horizon are written once, with the position target
 //! H − 1, tip H − 1 + k and horizon H; the follower then makes the window
 //! final through its ordinary updates, which this module lets run on a
-//! database that builds. Publication is one transaction: the newest spend
+//! database that builds. A build whose window a check closed is cleared of
+//! its base and window and built again in the same database. Publication is one transaction: the newest spend
 //! below H when the window holds none (K10), the pruned form of the keep rule
 //! applied once, the follower's state rows, the first-served times, `verify`
 //! with every check, the open gate and the end of `dsa_rebuild`.
@@ -23,7 +24,7 @@ use serde_json::Value;
 use tokio_postgres::Transaction;
 
 use crate::{
-    Error, Store,
+    Error, NODE_RELATIONS, Store,
     follow::{
         BlockRow, Columns, EpochParamRow, FinalBlock, INSERT_ASSET_ROWS, INSERT_ASSETS,
         INSERT_DATUMS, INSERT_EPOCH_PARAMS, INSERT_HEADERS, INSERT_INPUTS, INSERT_OUTPUTS,
@@ -35,6 +36,11 @@ use crate::{
 
 /// The origin kind and the position's reason while a build runs.
 pub const REBUILDING: &str = "rebuilding";
+
+/// The items a cleared build keeps: final facts below the horizon (the
+/// places of transactions, their validity, the burns below it, datums
+/// checked against their hashes) and the build's request counts.
+const KEPT_ITEMS: [&str; 5] = ["position", "valid", "burn", "datum", "requests"];
 
 const SCHEMA: &str = "CREATE SCHEMA dsa_rebuild;
 REVOKE ALL ON SCHEMA dsa_rebuild FROM PUBLIC;
@@ -64,6 +70,17 @@ pub enum Building {
         plan: Value,
         phase: String,
         calls: i64,
+    },
+    /// A build whose window a check closed: its plan, phase and provider
+    /// requests so far, the check's code (the position's reason) and the
+    /// service state recorded with it (`state`, `reason`, `detail`,
+    /// `last_error`; null when none was recorded).
+    Closed {
+        plan: Value,
+        phase: String,
+        calls: i64,
+        reason: String,
+        service_state: Value,
     },
 }
 
@@ -301,7 +318,7 @@ async fn insert(
 
 impl Store {
     /// What the database holds for a build. A database that serves or holds
-    /// anything else, or a build a check closed, is refused.
+    /// anything else is refused.
     pub async fn building(&mut self, profile: &Profile) -> Result<Building, Error> {
         let identity: bool = self
             .client
@@ -321,14 +338,6 @@ impl Store {
             let (kind, serving, reason, progress): (Option<String>, bool, String, bool) =
                 (row.get(0), row.get(1), row.get(2), row.get(3));
             if kind.as_deref() == Some(REBUILDING) && progress && !serving {
-                if reason != REBUILDING {
-                    return Err(Error::Mismatch {
-                        error: "rebuild_refused",
-                        item: "reason".to_owned(),
-                        expected: REBUILDING.to_owned(),
-                        actual: reason,
-                    });
-                }
                 let row = self
                     .client
                     .query_one(
@@ -336,11 +345,26 @@ impl Store {
                         &[],
                     )
                     .await?;
-                return Ok(Building::Stopped {
-                    plan: row.get(0),
-                    phase: row.get(1),
-                    calls: row.get(2),
-                });
+                let (plan, phase, calls) = (row.get(0), row.get(1), row.get(2));
+                if reason != REBUILDING {
+                    let service_state: Option<Value> = self
+                        .client
+                        .query_opt(
+                            "SELECT jsonb_build_object('state',state,'reason',reason,'detail',detail,'last_error',last_error)
+                             FROM dsa.service_state WHERE id=1",
+                            &[],
+                        )
+                        .await?
+                        .map(|row| row.get(0));
+                    return Ok(Building::Closed {
+                        plan,
+                        phase,
+                        calls,
+                        reason,
+                        service_state: service_state.unwrap_or(Value::Null),
+                    });
+                }
+                return Ok(Building::Stopped { plan, phase, calls });
             }
         }
         match self.destination(profile).await? {
@@ -375,6 +399,74 @@ impl Store {
             .execute(
                 "UPDATE dsa.identity SET origin=jsonb_build_object('kind',$1::text) WHERE id=1",
                 &[&REBUILDING],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Clears a build whose window a check closed, so that the same database
+    /// builds its base and window again: the served tables and the
+    /// follower's state (its request counts per day kept) are emptied, the
+    /// four ID sequences start again, the position is what a new build
+    /// leaves (reason `rebuilding`, no positions, the default retention),
+    /// and every stored item goes except `KEPT_ITEMS`; the build continues
+    /// at `listing`. One transaction; any other database is refused
+    /// (`rebuild_not_closed`).
+    pub async fn clear_building_window(&mut self) -> Result<(), Error> {
+        self.lock_writer().await?;
+        let transaction = self.writer_transaction().await?;
+        let row = transaction
+            .query_one(
+                "SELECT i.origin->>'kind',p.serving,p.reason,to_regclass('dsa_rebuild.progress') IS NOT NULL
+                 FROM dsa.identity i CROSS JOIN dsa.position p WHERE i.id=1 AND p.id=1 FOR UPDATE OF p",
+                &[],
+            )
+            .await?;
+        let (kind, serving, reason, progress): (Option<String>, bool, String, bool) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        if kind.as_deref() != Some(REBUILDING) || serving || reason == REBUILDING || !progress {
+            return Err(Error::Refusal("rebuild_not_closed"));
+        }
+        let tables = NODE_RELATIONS
+            .iter()
+            .map(|table| format!("serve.{table}"))
+            .chain(
+                load::STATE_TABLES
+                    .split(',')
+                    .filter(|table| *table != "dsa.calls")
+                    .map(str::to_owned),
+            )
+            .collect::<Vec<_>>()
+            .join(",");
+        transaction
+            .batch_execute(&format!("TRUNCATE {tables}"))
+            .await?;
+        for table in ["multi_asset", "datum", "pool_hash", "epoch_stake"] {
+            transaction
+                .query_one(&format!("SELECT setval('dsa.{table}_id_seq',1,false)"), &[])
+                .await?;
+        }
+        transaction
+            .execute(
+                "UPDATE dsa.position SET serving=false,reason=$1,
+                 target_height=NULL,target_hash=NULL,target_time=NULL,
+                 tip_height=NULL,tip_hash=NULL,tip_time=NULL,
+                 horizon_height=NULL,horizon_hash=NULL,horizon_time=NULL,
+                 retention_seconds=DEFAULT,updated_at=now() WHERE id=1",
+                &[&REBUILDING],
+            )
+            .await?;
+        transaction
+            .execute(
+                "DELETE FROM dsa_rebuild.item WHERE kind<>ALL($1)",
+                &[&KEPT_ITEMS.as_slice()],
+            )
+            .await?;
+        transaction
+            .execute(
+                "UPDATE dsa_rebuild.progress SET phase='listing',detail='{}'::jsonb,updated_at=clock_timestamp() WHERE id=1",
+                &[],
             )
             .await?;
         transaction.commit().await?;
