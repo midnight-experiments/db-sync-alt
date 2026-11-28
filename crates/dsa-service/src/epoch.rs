@@ -142,6 +142,10 @@ impl Distribution {
 pub enum StakeError {
     #[error("{0}")]
     Provider(dsa_provider::Error),
+    /// The read's first request, the epoch's summary, failed in transport on
+    /// every attempt: the provider answered nothing.
+    #[error("{0}")]
+    Unanswered(dsa_provider::Error),
     /// The provider has no active stake for the epoch yet.
     #[error("provider_epoch_not_ready")]
     NotReady,
@@ -177,7 +181,7 @@ impl From<dsa_provider::Error> for StakeError {
 impl StakeError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Provider(error) => error.code,
+            Self::Provider(error) | Self::Unanswered(error) => error.code,
             Self::NotReady => "provider_epoch_not_ready",
             Self::Changed => "provider_epoch_changed",
             Self::Total { .. } => "provider_epoch_total_mismatch",
@@ -192,7 +196,9 @@ impl StakeError {
     /// The code and what failed: the pool, the list or check, both sums.
     pub fn report(&self) -> Value {
         match self {
-            Self::Provider(error) => json!({"error":error.code,"provider":error}),
+            Self::Provider(error) | Self::Unanswered(error) => {
+                json!({"error":error.code,"provider":error})
+            }
             Self::Total { expected, actual } => {
                 json!({"error":self.code(),"active_stake":expected.to_string(),"sum":actual.to_string()})
             }
@@ -213,7 +219,7 @@ impl StakeError {
     pub fn refusal(&self) -> bool {
         match self {
             Self::Provider(error) => !error.transport() && matches!(error.kind, Kind::Retry { .. }),
-            Self::Changed | Self::Stopped => false,
+            Self::Unanswered(_) | Self::Changed | Self::Stopped => false,
             _ => true,
         }
     }
@@ -450,7 +456,11 @@ pub async fn read_stake(
     };
     let summary = read
         .send("epochs", || provider.epoch(epoch))
-        .await?
+        .await
+        .map_err(|error| match error {
+            StakeError::Provider(error) if error.transport() => StakeError::Unanswered(error),
+            error => error,
+        })?
         .ok_or(StakeError::NotReady)?;
     let total = summary
         .active_stake
