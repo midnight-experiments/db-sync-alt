@@ -2610,11 +2610,13 @@ async fn listings_that_miss_an_address_output_refuse_the_build() -> Result {
 /// each differing output with what the provider said of it: which
 /// derivation found it, the `consumed_by_tx` that its creating
 /// transaction's answer gave and whether the address's listing shows it.
-/// Three answers of the creating transaction at height 2 that contradict
+/// Four answers of the creating transaction at height 2 that contradict
 /// the chain: output 0 unspent (`consumed_by_tx` null) while its spend in
 /// the window is missing from the list from H on; output 3 spent by a
 /// transaction of the list below H while the listing shows it; output 4
-/// with other lovelace than the listing's.
+/// with other lovelace than the listing's; output 2 at an address of no
+/// profile, so that the address's derivation does not hold it although the
+/// address's list holds its creating transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn an_address_outputs_mismatch_names_what_the_provider_said() -> Result {
@@ -2678,6 +2680,16 @@ async fn an_address_outputs_mismatch_names_what_the_provider_said() -> Result {
                 output["amount"][0]["quantity"] = json!("2999999")
             }),
             json!({"output": point(4), "found_by": "both", "in_address_history": true,
+                "consumed_by_tx": null, "listed": true}),
+        ),
+        (
+            "output_at_another_address_in_the_history",
+            rewritten(2, |output, _| {
+                output["address"] = json!(dsa_testkit::listing::address_text(&enterprise_address(
+                    1, [0x44; 28]
+                )))
+            }),
+            json!({"output": point(2), "found_by": "listings", "in_address_history": false,
                 "consumed_by_tx": null, "listed": true}),
         ),
     ] {
@@ -4843,16 +4855,46 @@ fn refused_with(error: &dsa_store::Error) -> String {
         .to_owned()
 }
 
+/// The gate of a database being built: whether it serves, the reason its
+/// position records and, with `reader`, how the gate refuses the reader
+/// (SQLSTATE, message and detail of the server's error).
+async fn gate_of(database: &Database, reader: bool) -> Result<serde_json::Value> {
+    let serves = serving(database).await?;
+    let reason: String = common::connect(&database.config)
+        .await?
+        .query_one("SELECT reason FROM dsa.position WHERE id=1", &[])
+        .await?
+        .get(0);
+    let mut gate = json!({"serving": serves, "reason": reason});
+    if reader {
+        let refused = common::connect(&database.reader_config())
+            .await?
+            .query_one("SELECT count(*) FROM block", &[])
+            .await
+            .err();
+        let server = refused.as_ref().and_then(|error| error.as_db_error());
+        gate["reader"] = json!({
+            "sqlstate": refused.as_ref().and_then(|error| error.code()).map(|code| code.code()),
+            "message": server.map(|server| server.message()),
+            "detail": server.and_then(|server| server.detail())});
+    }
+    Ok(gate)
+}
+
 /// Every other command against a database whose build stopped in its
 /// window, through the functions the commands run (the test profile's k is
 /// not the network's, so the binary would refuse the profile first):
-/// `verify` and `snapshot` meet the closed gate, `restore` and `convert`
+/// `verify` and `snapshot` meet the closed gate's own error (SQLSTATE 55000,
+/// `db_sync_alt_not_serving`, detail `unready`), `restore` and `convert`
 /// refuse a database that is not empty, `grant-reader` grants and the reader
-/// still cannot read, `run` and `follow` refuse a database that does not
-/// serve, `compare` cannot read side A, and `status` calls it unready. A
-/// second build beside a running one is refused by the writer lock, and a
-/// build into a database that serves as not empty. The stopped build then
-/// continues to the conversion's digest.
+/// meets the gate, `run` and `follow` refuse a database that does not
+/// serve, `compare` cannot read side A (its cause `comparison_not_serving`),
+/// and `status` calls it unready. After every command the gate is closed with
+/// the reason `rebuilding`, which a build continues (any other reason is a
+/// build closed by a check, which the next build clears). A second build
+/// beside a running one is refused by the writer lock, and a build into a
+/// database that serves as not empty. The stopped build then continues to
+/// the conversion's digest and serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn the_other_commands_refuse_a_database_being_built() -> Result {
@@ -4873,6 +4915,9 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
     empty(&rebuilt, &profile).await?;
     let fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), None).await;
     stopped_in_window(&profile, &fake, &rebuilt).await?;
+    // The gate after the stop and after each command.
+    let mut gates: Vec<(&str, serde_json::Value)> =
+        vec![("stopped", gate_of(&rebuilt, false).await?)];
     let mut outcomes: BTreeMap<&str, String> = BTreeMap::new();
     // The whole report of the refusals that wrap the gate's.
     let mut reports: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
@@ -4884,16 +4929,19 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
     if let Err(error) = store.verify(&profile).await {
         reports.insert("verify", error.report());
     }
+    gates.push(("verify", gate_of(&rebuilt, false).await?));
     if let Err(error) = store
         .snapshot(&profile, &files.path().join("built.snapshot"))
         .await
     {
         reports.insert("snapshot", error.report());
     }
+    gates.push(("snapshot", gate_of(&rebuilt, false).await?));
     outcomes.insert(
         "restore",
         outcome(store.restore(&profile, &file, None).await.map(|_| ())),
     );
+    gates.push(("restore", gate_of(&rebuilt, false).await?));
     outcomes.insert(
         "grant-reader",
         outcome(
@@ -4904,6 +4952,7 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
         ),
     );
     drop(store);
+    gates.push(("grant-reader", gate_of(&rebuilt, true).await?));
     let reader_gate = common::connect(&rebuilt.reader_config())
         .await?
         .query_one("SELECT count(*) FROM block", &[])
@@ -4933,6 +4982,7 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
             .err()
             .map_or("ok".to_owned(), |error| refused_with(&error)),
     );
+    gates.push(("convert", gate_of(&rebuilt, true).await?));
     let followed = support::follow_to(
         &profile,
         &fake,
@@ -4944,6 +4994,7 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
         "follow",
         followed.err().map_or("ok".to_owned(), |error| code(&error)),
     );
+    gates.push(("follow", gate_of(&rebuilt, true).await?));
     let open: run::Open = {
         let config = rebuilt.config.clone();
         Arc::new(move |_| {
@@ -4986,6 +5037,7 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
             .err()
             .map_or("ok".to_owned(), |error| code(&error)),
     );
+    gates.push(("run", gate_of(&rebuilt, true).await?));
     // Side B, the conversion, is open to its reader.
     Store::connect(converted.config.clone(), None)
         .await?
@@ -5016,6 +5068,7 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
     if let Err(error) = compared {
         reports.insert("compare", error.report());
     }
+    gates.push(("compare", gate_of(&rebuilt, true).await?));
     let view = Store::connect(rebuilt.config.clone(), None)
         .await?
         .service_view(&profile, None)
@@ -5034,6 +5087,7 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
             document["position"]["reason"].as_str().unwrap_or_default()
         ),
     );
+    gates.push(("status", gate_of(&rebuilt, true).await?));
     // A second build beside a running one: the first holds the writer
     // lock while its listing waits four seconds for its first answer, longer
     // than the second waits for the lock.
@@ -5092,22 +5146,36 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
             .err()
             .map_or("ok".to_owned(), |error| code(&error)),
     );
+    gates.push(("other builds", gate_of(&rebuilt, true).await?));
     println!(
         "{}",
-        json!({"event":"other_commands","outcomes":outcomes,"reports":reports})
+        json!({"event":"other_commands","outcomes":outcomes,"reports":reports,"gates":gates})
     );
-    // `verify`, `snapshot` and `compare` (on side A) meet the gate's own
-    // refusal.
-    assert_eq!(reports["compare"]["side"], "a", "{}", reports["compare"]);
-    for command in ["verify", "snapshot", "compare"] {
-        let report = reports
-            .get(command)
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        assert!(
-            report.contains("55000") || report.contains("not_serving"),
-            "{command}: {report}"
-        );
+    // `verify` and `snapshot` meet the gate's own error, `compare` names
+    // side A as not serving.
+    let gate_error = json!({"error":"database_error","sqlstate":"55000",
+        "message":"db_sync_alt_not_serving","detail":"unready"});
+    for command in ["verify", "snapshot"] {
+        assert_eq!(reports.get(command), Some(&gate_error), "{command}");
+    }
+    assert_eq!(
+        reports.get("compare"),
+        Some(&json!({"error":"comparison_source_failed","side":"a",
+            "cause":{"error":"comparison_not_serving"}})),
+        "compare"
+    );
+    // No command opened the gate or recorded a reason of its own: the
+    // build stays one that continues.
+    for (command, gate) in &gates {
+        assert_eq!(gate["serving"], false, "{command}: {gate}");
+        assert_eq!(gate["reason"], "rebuilding", "{command}: {gate}");
+        if let Some(reader) = gate.get("reader") {
+            assert_eq!(
+                reader,
+                &json!({"sqlstate":"55000","message":"db_sync_alt_not_serving","detail":"unready"}),
+                "{command}: {gate}"
+            );
+        }
     }
     let expected = BTreeMap::from([
         ("restore", "destination_not_empty"),
@@ -5128,11 +5196,14 @@ async fn the_other_commands_refuse_a_database_being_built() -> Result {
     let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
         .await
         .map_err(|error| format!("continued: {}", error.report()))?;
+    assert!(report.resumed, "the build did not continue the stopped one");
     same(
         &report.verified,
         &conversion,
         "continued after the commands",
     )?;
+    let published = gate_of(&rebuilt, false).await?;
+    assert_eq!(published["serving"], true, "{published}");
     rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await
