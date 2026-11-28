@@ -17,7 +17,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -25,7 +25,7 @@ use std::{
 use common::Database;
 use dsa_service::{
     block::Limits,
-    follow::{self, Progress, Settings},
+    follow::{self, Progress, Settings, State},
     retry::Stop,
 };
 use dsa_store::Store;
@@ -986,10 +986,19 @@ async fn epoch_parameters_come_first_and_stake_never_delays_an_update() -> Resul
     start.cleanup().await
 }
 
+/// The waits between reads of one epoch whose read keeps failing, as the
+/// provider page states them; the last repeats.
+const STAKE_WAITS: [u64; 11] = [1, 2, 4, 8, 16, 30, 60, 300, 600, 3_600, 21_600];
+
+/// The wait a published stake failure names before the epoch's next read.
+fn stake_wait(failure: &Value) -> u64 {
+    failure["retry_at"].as_u64().unwrap() - failure["at"].as_u64().unwrap()
+}
+
 /// An ended epoch whose stake cannot sum to its active stake is retried at
-/// growing waits for that epoch (1, 2, 4, 8, 16, 30, 60, 300, then 600
-/// seconds), while the next epoch's stake is read and stored; the last
-/// failure names the epoch and both numbers.
+/// growing waits for that epoch (1, 2, 4, 8, 16, 30, 60, 300, 600, 3,600,
+/// then 21,600 seconds), while the next epoch's stake is read and stored;
+/// the last failure names the epoch and both numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
@@ -1035,7 +1044,7 @@ async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
         // wait before the next attempt.
         let mut waits = BTreeMap::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
-        while waits.keys().next_back().is_none_or(|last| *last < 10) {
+        while waits.keys().next_back().is_none_or(|last| *last < 11) {
             let failure = view.borrow().stake_failure.clone();
             if let Some(failure) = failure.filter(|failure| failure["epoch"] == refused) {
                 assert_eq!(failure["error"]["error"], "provider_epoch_total_mismatch");
@@ -1046,12 +1055,11 @@ async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
                         .is_some_and(|sum| sum != "1")
                 );
                 let count = failure["failures"].as_u64().unwrap();
-                let wait = failure["retry_at"].as_u64().unwrap() - failure["at"].as_u64().unwrap();
-                waits.insert(count, wait);
+                waits.insert(count, stake_wait(&failure));
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "ten failures never published: {waits:?}"
+                "eleven failures never published: {waits:?}"
             );
             let _ = tokio::time::timeout(Duration::from_millis(200), view.changed()).await;
         }
@@ -1062,9 +1070,8 @@ async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
     let (report, (waits, epochs)) = tokio::join!(run, drive);
     report.map_err(|error| error.report().to_string())?;
     let epochs = epochs?;
-    let schedule = [1, 2, 4, 8, 16, 30, 60, 300, 600];
     for (count, wait) in &waits {
-        let expected = schedule[(*count as usize - 1).min(schedule.len() - 1)];
+        let expected = STAKE_WAITS[(*count as usize - 1).min(STAKE_WAITS.len() - 1)];
         assert_eq!(*wait, expected, "failure {count}: {waits:?}");
     }
     assert!(
@@ -1077,6 +1084,571 @@ async fn a_refused_epoch_backs_off_and_does_not_hold_back_the_next() -> Result {
         json!({"event":"refused_stake_epoch","refused":refused,"next":next,"waits":waits,
             "summary_requests":fake.requests(&format!("/epochs/{refused}"))})
     );
+    start.cleanup().await
+}
+
+/// The most reads of an epoch that never succeeds in the 24 hours from its
+/// first read, as the provider page states it.
+const STAKE_READS_FIRST_DAY: u64 = 14;
+/// One day, in seconds.
+const DAY_SECONDS: u64 = 86_400;
+
+/// The epochs with a stored stake distribution, oldest first.
+async fn stake_epochs(config: &tokio_postgres::Config) -> Result<Vec<u32>> {
+    Ok(common::connect(config)
+        .await?
+        .query(
+            "SELECT DISTINCT epoch_no FROM serve.epoch_stake ORDER BY 1",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get::<_, i32>(0) as u32)
+        .collect())
+}
+
+/// Deletes the stored stake distribution of `epoch`, which lies above the
+/// oldest stored one, so that the window still reaches it.
+async fn delete_stake(config: &tokio_postgres::Config, epoch: u32) -> Result {
+    let epochs = stake_epochs(config).await?;
+    assert!(
+        epochs.contains(&epoch) && epochs.first().is_some_and(|oldest| *oldest < epoch),
+        "epoch {epoch} of {epochs:?}"
+    );
+    common::connect(config)
+        .await?
+        .execute(
+            "DELETE FROM serve.epoch_stake WHERE epoch_no=$1",
+            &[&(epoch as i32)],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Deletes the newest stored stake distribution, so that the window misses
+/// exactly that epoch, and returns it.
+async fn one_missing_epoch(start: &Start) -> Result<u32> {
+    let newest = *stake_epochs(&start.database.config)
+        .await?
+        .last()
+        .expect("stored stake");
+    delete_stake(&start.database.config, newest).await?;
+    Ok(newest)
+}
+
+/// The fake provider over the generated chain, serving through the stored
+/// tip: the follower starts at the tip, and the target's epoch has ended for
+/// the provider (an epoch holds at most k blocks).
+async fn at_the_tip(start: &Start, hook: Option<Hook>) -> Fake {
+    let fake = Fake::with_chain(
+        Chain::from_generated(
+            &start.g,
+            dsa_service::epoch::stake_prefix(&start.profile.network),
+        ),
+        hook,
+    )
+    .await;
+    fake.serve(served(&start.g, start.target + K));
+    fake
+}
+
+/// Whether the published stake failure names `epoch`.
+fn names(progress: &Progress, epoch: u32) -> bool {
+    progress
+        .stake_failure
+        .as_ref()
+        .is_some_and(|failure| failure["epoch"] == epoch)
+}
+
+/// Waits (in real time, at most two minutes) until the stake of `epoch` is
+/// stored.
+async fn until_stored(config: &tokio_postgres::Config, epoch: u32) -> Result {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !stake_epochs(config).await?.contains(&epoch) {
+        assert!(Instant::now() < deadline, "epoch {epoch} never stored");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// One simulated day at the tip while every read of one epoch fails: each
+/// published failure of the epoch seen, by its count, and the time of the
+/// epoch's first read.
+struct Day {
+    failures: BTreeMap<u64, Value>,
+    first_read: u64,
+}
+
+impl Day {
+    fn within(&self, at: u64) -> bool {
+        at < self.first_read + DAY_SECONDS
+    }
+
+    /// Reads of the epoch in the 24 hours from its first read: the count of
+    /// the last failure published in them, which a missed value cannot
+    /// change.
+    fn reads(&self) -> u64 {
+        self.failures
+            .values()
+            .filter(|failure| self.within(failure["at"].as_u64().unwrap()))
+            .map(|failure| failure["failures"].as_u64().unwrap())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Follows at the tip, polling every 120 seconds, until one simulated day
+/// has passed since the first read of `epoch` or the run ends.
+async fn a_day_at_the_tip(start: &Start, fake: &Fake, epoch: u32) -> Result<Day> {
+    let summary = format!("/api/v0/epochs/{epoch}");
+    let settings = Settings {
+        poll_interval: Duration::from_secs(120),
+        ..Settings::default()
+    };
+    let (stopper, stop) = Stop::new();
+    let (progress, mut view) = watch::channel(Progress::default());
+    let ended = AtomicBool::new(false);
+    let run = async {
+        let report = follow::follow(context(
+            &start.profile,
+            fake,
+            &start.database.config,
+            settings,
+            stop,
+            progress,
+        ))
+        .await;
+        ended.store(true, Ordering::SeqCst);
+        report
+    };
+    let drive = async {
+        let mut failures = BTreeMap::new();
+        let deadline = Instant::now() + Duration::from_secs(900);
+        while !ended.load(Ordering::SeqCst) {
+            let failure = view.borrow_and_update().stake_failure.clone();
+            if let Some(failure) = failure.filter(|failure| failure["epoch"] == epoch) {
+                failures.insert(failure["failures"].as_u64().unwrap(), failure);
+            }
+            let first = times_of(fake, &summary).first().copied();
+            if first.is_some_and(|first| fake.clock.now() > first + DAY_SECONDS) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a simulated day never passed: {failures:?}"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(100), view.changed()).await;
+        }
+        let _ = stopper.send(true);
+        failures
+    };
+    let (report, failures) = tokio::join!(run, drive);
+    report.map_err(|error| error.report().to_string())?;
+    assert!(
+        fake.clock.now() > times_of(fake, &summary)[0] + DAY_SECONDS,
+        "the run ended within the day"
+    );
+    Ok(Day {
+        failures,
+        first_read: times_of(fake, &summary)[0],
+    })
+}
+
+/// With the provider refusing one ended epoch's stake on every read, a
+/// simulated day of following at the tip reads that epoch at most the times
+/// the provider page states, the waits reach 6 hours, and the requests stay
+/// within that many whole reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_refused_epoch_is_read_at_most_the_documented_times_a_day() -> Result {
+    let start = Start::new(41, 60, 30).await?;
+    let epoch = one_missing_epoch(&start).await?;
+    let fake = at_the_tip(&start, None).await;
+    fake.chain
+        .lock()
+        .unwrap()
+        .pools
+        .reported_total
+        .insert(epoch, 1);
+    let day = a_day_at_the_tip(&start, &fake, epoch).await?;
+    for failure in day.failures.values() {
+        assert_eq!(
+            failure["error"]["error"], "provider_epoch_total_mismatch",
+            "{failure}"
+        );
+    }
+    let reads = day.reads();
+    assert!(
+        (1..=STAKE_READS_FIRST_DAY).contains(&reads),
+        "{reads} reads in a day: {:?}",
+        day.failures
+    );
+    assert!(
+        day.failures
+            .values()
+            .any(|failure| stake_wait(failure) == 21_600),
+        "{:?}",
+        day.failures
+    );
+    // Every request of a read of the epoch: its summary and the pool
+    // endpoints. A read ends where the next one's summary starts.
+    let summary = format!("/api/v0/epochs/{epoch}");
+    let log = fake.log.lock().unwrap().clone();
+    let requests = log
+        .iter()
+        .filter(|(path, _)| *path == summary || path.starts_with("/api/v0/pools"))
+        .collect::<Vec<_>>();
+    let one_read = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, (path, _))| *path == summary)
+        .nth(1)
+        .map(|(index, _)| index)
+        .expect("a second read");
+    let in_day = requests.iter().filter(|(_, at)| day.within(*at)).count();
+    assert!(
+        in_day <= STAKE_READS_FIRST_DAY as usize * one_read,
+        "{in_day} requests in a day, {one_read} a read"
+    );
+    println!(
+        "{}",
+        json!({"event":"refused_stake_epoch_day","epoch":epoch,"reads":reads,"requests":in_day,
+            "requests_per_read":one_read,"waits":day.failures.iter().map(|(count, failure)| (count, stake_wait(failure))).collect::<BTreeMap<_, _>>()})
+    );
+    start.cleanup().await
+}
+
+/// One pool's history answering 503 on every attempt: each read sends it 5
+/// times (one spell of the client's shared wait per read), the read ends in
+/// a transport failure, and the epoch's reads follow the same waits as a
+/// refusal, up to 6 hours and at most the documented reads a day.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_stake_request_failing_in_transport_backs_off_like_a_refusal() -> Result {
+    let start = Start::new(43, 60, 30).await?;
+    let epoch = one_missing_epoch(&start).await?;
+    let fake = at_the_tip(&start, None).await;
+    let history = {
+        let mut chain = fake.chain.lock().unwrap();
+        let pool = chain.pools.stake[&epoch]
+            .keys()
+            .next()
+            .cloned()
+            .expect("a pool");
+        let history = format!("/pools/{}/history", scripted::pool_id(&pool));
+        chain.fault(&history, Behavior::status(503), usize::MAX);
+        history
+    };
+    let day = a_day_at_the_tip(&start, &fake, epoch).await?;
+    for (count, failure) in &day.failures {
+        assert_eq!(
+            failure["error"]["error"], "provider_unavailable",
+            "{failure}"
+        );
+        let expected = STAKE_WAITS[(*count as usize - 1).min(STAKE_WAITS.len() - 1)];
+        assert_eq!(stake_wait(failure), expected, "failure {count}: {failure}");
+    }
+    assert!(
+        day.failures
+            .values()
+            .any(|failure| stake_wait(failure) == 21_600),
+        "{:?}",
+        day.failures
+    );
+    let reads = day.reads();
+    assert!(
+        (1..=STAKE_READS_FIRST_DAY).contains(&reads),
+        "{reads} reads in a day: {:?}",
+        day.failures
+    );
+    let attempts = fake
+        .times(&history)
+        .into_iter()
+        .filter(|at| day.within(*at))
+        .count() as u64;
+    assert_eq!(attempts, 5 * reads, "{reads} reads");
+    println!(
+        "{}",
+        json!({"event":"transport_stake_epoch_day","epoch":epoch,"reads":reads,"history_attempts":attempts})
+    );
+    start.cleanup().await
+}
+
+/// During an outage of the epoch summary (60 answers of 503, twelve reads
+/// unanswered), a read started by the stop target's stake step waits at
+/// most 600 seconds: the first answered summary comes at most 631 seconds
+/// after the last unanswered one, and the epoch is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_stake_read_the_provider_never_answers_waits_at_most_ten_minutes() -> Result {
+    let start = Start::new(47, 60, 30).await?;
+    let epoch = one_missing_epoch(&start).await?;
+    let summary = format!("/api/v0/epochs/{epoch}");
+    let hook: Hook = {
+        let summary = summary.clone();
+        let refused = AtomicUsize::new(0);
+        Arc::new(move |path, _: &mut Chain, _| {
+            (path == summary && refused.fetch_add(1, Ordering::SeqCst) < 60)
+                .then(|| Behavior::status(503))
+        })
+    };
+    let fake = at_the_tip(&start, Some(hook)).await;
+    let report = follow_to(
+        &start.profile,
+        &fake,
+        &start.database.config,
+        until(start.target),
+    )
+    .await
+    .map_err(|error| error.report().to_string())?;
+    assert_eq!(report.stopped, "stop_target");
+    let times = times_of(&fake, &summary);
+    assert_eq!(times.len(), 61, "{times:?}");
+    let gap = times[60] - times[59];
+    assert!(
+        gap <= 631,
+        "{gap} s after the last unanswered summary: {times:?}"
+    );
+    assert!(stake_epochs(&start.database.config).await?.contains(&epoch));
+    println!(
+        "{}",
+        json!({"event":"unanswered_stake_epoch","epoch":epoch,"summaries":times.len(),"gap_seconds":gap})
+    );
+    start.cleanup().await
+}
+
+/// An epoch whose read failed and that then leaves the window, because the
+/// horizon moved, is not named in the published stake failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_stake_failure_below_the_window_is_not_shown() -> Result {
+    let start = Start::new(53, 100, 30).await?;
+    let g = start.g.known_from_start();
+    let refused = one_missing_epoch(&start).await?;
+    let fake = at_the_tip(&start, None).await;
+    fake.chain
+        .lock()
+        .unwrap()
+        .pools
+        .reported_total
+        .insert(refused, 1);
+    // The horizon moves to the first block of epoch refused + 3: the window
+    // then starts at refused + 1.
+    let leave = g
+        .blocks
+        .iter()
+        .find(|block| block.epoch == refused + 3)
+        .expect("epoch refused + 3")
+        .height;
+    let settings = Settings {
+        prune_interval: Duration::from_secs(60),
+        ..Settings::default()
+    };
+    let (stopper, stop) = Stop::new();
+    let (progress, mut view) = watch::channel(Progress::default());
+    let config = start.database.config.clone();
+    let run = follow::follow(context(
+        &start.profile,
+        &fake,
+        &config,
+        settings,
+        stop,
+        progress,
+    ));
+    let drive = async {
+        progress_until(&mut view, |progress| names(progress, refused)).await;
+        fake.serve(served(&g, leave + K));
+        progress_until(&mut view, |progress| progress.target == Some(leave)).await;
+        // Every newer epoch is stored first, so that no later store
+        // publishes the failure again.
+        for epoch in refused + 1..=refused + 3 {
+            until_stored(&config, epoch).await?;
+        }
+        common::connect(&config)
+            .await?
+            .execute(
+                "UPDATE dsa.first_served SET first_served_at=first_served_at-interval '2 days' WHERE height<$1",
+                &[&(leave as i32)],
+            )
+            .await?;
+        let aged = fake.clock.now();
+        until_true(|| fake.clock.now() > aged + 60).await;
+        fake.serve(served(&g, leave + K + 4));
+        progress_until(&mut view, |progress| {
+            progress.target == Some(leave + 4) && !names(progress, refused)
+        })
+        .await;
+        let shown = view.borrow().stake_failure.clone();
+        let horizon = Store::connect(config.clone(), None)
+            .await?
+            .follow_state(&start.profile)
+            .await
+            .map_err(named)?
+            .horizon
+            .height;
+        let _ = stopper.send(true);
+        Result::<_>::Ok((shown, horizon))
+    };
+    let (report, driven) = tokio::join!(run, drive);
+    report.map_err(|error| error.report().to_string())?;
+    let (shown, horizon) = driven?;
+    assert!(
+        g.block(horizon).unwrap().epoch >= refused + 3,
+        "horizon {horizon}"
+    );
+    assert_eq!(shown, None);
+    start.cleanup().await
+}
+
+/// Epochs A and B fail; B is then stored: the published stake failure is
+/// A's last one again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_stored_epoch_leaves_the_failure_of_another_shown() -> Result {
+    let start = Start::new(59, 60, 30).await?;
+    let config = start.database.config.clone();
+    let epochs = stake_epochs(&config).await?;
+    assert!(epochs.len() >= 3, "{epochs:?}");
+    let (a, b) = (epochs[epochs.len() - 2], epochs[epochs.len() - 1]);
+    delete_stake(&config, a).await?;
+    let fake = at_the_tip(&start, None).await;
+    fake.chain.lock().unwrap().pools.reported_total.insert(a, 1);
+    let (stopper, stop) = Stop::new();
+    let (progress, mut view) = watch::channel(Progress::default());
+    let run = follow::follow(context(
+        &start.profile,
+        &fake,
+        &config,
+        Settings::default(),
+        stop,
+        progress,
+    ));
+    let drive = async {
+        // A fails until its next read is 6 hours away.
+        progress_until(&mut view, |progress| {
+            names(progress, a)
+                && progress.stake_failure.as_ref().unwrap()["failures"]
+                    .as_u64()
+                    .is_some_and(|failures| failures >= 11)
+        })
+        .await;
+        let a_last = view.borrow().stake_failure.clone().unwrap();
+        delete_stake(&config, b).await?;
+        fake.chain.lock().unwrap().pools.reported_total.insert(b, 1);
+        progress_until(&mut view, |progress| names(progress, b)).await;
+        fake.chain.lock().unwrap().pools.reported_total.remove(&b);
+        progress_until(&mut view, |progress| !names(progress, b)).await;
+        let shown = view.borrow().stake_failure.clone();
+        let stored = stake_epochs(&config).await?;
+        let _ = stopper.send(true);
+        Result::<_>::Ok((a_last, shown, stored))
+    };
+    let (report, driven) = tokio::join!(run, drive);
+    report.map_err(|error| error.report().to_string())?;
+    let (a_last, shown, stored) = driven?;
+    assert!(stored.contains(&b) && !stored.contains(&a), "{stored:?}");
+    assert_eq!(shown.as_ref(), Some(&a_last));
+    assert_eq!(stake_wait(&a_last), 21_600, "{a_last}");
+    start.cleanup().await
+}
+
+/// The warning's epoch, refused at the tip, is stored while the follower
+/// waits for the next epoch's parameters away from the tip: the published
+/// `stake_missing` ends then, not at the next step at the tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn the_stake_missing_warning_ends_when_its_epoch_is_stored_away_from_the_tip() -> Result {
+    let start = Start::new(61, 80, 30).await?;
+    let g = start.g.known_from_start();
+    let config = start.database.config.clone();
+    let epoch = one_missing_epoch(&start).await?;
+    let target_epoch = g.block(start.target).unwrap().epoch;
+    assert_eq!(epoch, target_epoch);
+    // Once armed, the epoch's summary is answered 3 seconds late in real
+    // time, below the client's idle timeout.
+    let summary = format!("/api/v0/epochs/{epoch}");
+    let slow = Arc::new(AtomicBool::new(false));
+    let delayed = Arc::new(AtomicUsize::new(0));
+    let hook: Hook = {
+        let (slow, delayed) = (slow.clone(), delayed.clone());
+        Arc::new(move |path, chain: &mut Chain, _| {
+            if path != summary || !slow.load(Ordering::SeqCst) {
+                return None;
+            }
+            delayed.fetch_add(1, Ordering::SeqCst);
+            Some(chain.answer(path).delayed(3_000))
+        })
+    };
+    let fake = at_the_tip(&start, Some(hook)).await;
+    fake.chain
+        .lock()
+        .unwrap()
+        .pools
+        .reported_total
+        .insert(epoch, 1);
+    let next = g
+        .blocks
+        .iter()
+        .find(|block| block.epoch == epoch + 1)
+        .expect("the next epoch")
+        .height;
+    let (stopper, stop) = Stop::new();
+    let (progress, mut view) = watch::channel(Progress::default());
+    let run = follow::follow(context(
+        &start.profile,
+        &fake,
+        &config,
+        Settings::default(),
+        stop,
+        progress,
+    ));
+    let drive = async {
+        progress_until(&mut view, |progress| {
+            names(progress, epoch)
+                && progress
+                    .stake_missing
+                    .is_some_and(|missing| missing.epoch == epoch)
+        })
+        .await;
+        fake.chain
+            .lock()
+            .unwrap()
+            .pools
+            .reported_total
+            .remove(&epoch);
+        slow.store(true, Ordering::SeqCst);
+        until_true(|| delayed.load(Ordering::SeqCst) > 0).await;
+        // While the read waits for its summary, the follower leaves the
+        // tip and waits for the parameters of the next epoch.
+        let parameters = fake
+            .chain
+            .lock()
+            .unwrap()
+            .parameters
+            .remove(&(epoch + 1))
+            .unwrap();
+        fake.serve(served(&g, next + K + 2));
+        until_stored(&config, epoch).await?;
+        progress_until(&mut view, |progress| progress.stake_missing.is_none()).await;
+        let seen = view.borrow().clone();
+        fake.chain
+            .lock()
+            .unwrap()
+            .parameters
+            .insert(epoch + 1, parameters);
+        let _ = stopper.send(true);
+        Result::<_>::Ok(seen)
+    };
+    let (report, seen) = tokio::join!(run, drive);
+    report.map_err(|error| error.report().to_string())?;
+    let seen = seen?;
+    assert_eq!(
+        (seen.state, seen.reason.as_str()),
+        (State::Waiting, "epoch_parameters_pending"),
+        "{seen:?}"
+    );
+    assert!(seen.target.is_some_and(|target| target < next), "{seen:?}");
+    assert_eq!(seen.stake_failure, None);
     start.cleanup().await
 }
 

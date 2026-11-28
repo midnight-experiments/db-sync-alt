@@ -152,8 +152,9 @@ pub struct ProviderTip {
     pub observed_at: u64,
 }
 
-/// The target's epoch without a stored stake distribution while the
-/// follower is at the tip, and since when (Unix seconds).
+/// The target's epoch without a stored stake distribution, as noted at the
+/// tip, and since when (Unix seconds); none once that epoch's distribution is
+/// stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct StakeMissing {
     pub epoch: u32,
@@ -181,8 +182,9 @@ pub struct Progress {
     pub last_error: Option<Value>,
     /// The stored target as the loop knows it.
     pub target: Option<u32>,
-    /// The last failed stake read: its epoch, when it failed, when it is
-    /// tried again, its failures in a row and the error with its cause.
+    /// The last failure of an epoch still missing: its epoch, when it
+    /// failed, when it is tried again, its failures in a row and the error
+    /// with its cause.
     pub stake_failure: Option<Value>,
     pub stake_missing: Option<StakeMissing>,
 }
@@ -464,16 +466,26 @@ enum Outcome {
     },
 }
 
-/// The waits after a stake read the provider's answers made fail, for one
-/// epoch, in seconds; the last repeats. A transport failure waits by
-/// [`crate::retry::BACKOFF`].
-pub const STAKE_REFUSED_BACKOFF: [u64; 9] = [1, 2, 4, 8, 16, 30, 60, 300, 600];
+/// The waits after a failed stake read of one epoch, in seconds, by its
+/// failures in a row; the last repeats. Every kind of failure climbs it: a
+/// refusal of the answers, a transport failure, a store error. It starts
+/// again only when the epoch's distribution is stored or the epoch leaves
+/// the window.
+pub const STAKE_BACKOFF: [u64; 11] = [1, 2, 4, 8, 16, 30, 60, 300, 600, 3_600, 21_600];
 
-/// The next attempt at one epoch's stake.
-#[derive(Clone, Copy, Debug, Default)]
+/// The longest wait after a read whose epoch summary the provider never
+/// answered ([`StakeError::Unanswered`]): such a read costs at most
+/// [`epoch::REQUEST_ATTEMPTS`] requests, and after an outage it runs again
+/// within this time.
+pub const STAKE_UNANSWERED_MAX_WAIT: u64 = 600;
+
+/// The next attempt at one epoch's stake and its last failure.
+#[derive(Clone, Debug, Default)]
 struct StakeRetry {
     failures: usize,
     at: u64,
+    /// The last failure as `stake_failure` shows it.
+    report: Option<Value>,
 }
 
 /// The background stake read: one epoch at a time, the oldest without stake
@@ -1421,7 +1433,7 @@ impl<'a> Follower<'a> {
         result: Result<Result<Distribution, StakeError>, tokio::task::JoinError>,
     ) {
         let now = self.now();
-        let (failure, refusal) = match result {
+        let (failure, unanswered) = match result {
             Ok(Ok(distribution)) => {
                 let Some(store) = self.store.as_mut() else {
                     // Read again once the connection is back.
@@ -1438,13 +1450,13 @@ impl<'a> Follower<'a> {
                         );
                         self.progress.send_modify(|progress| {
                             if progress
-                                .stake_failure
-                                .as_ref()
-                                .is_some_and(|failure| failure["epoch"] == epoch)
+                                .stake_missing
+                                .is_some_and(|missing| missing.epoch == epoch)
                             {
-                                progress.stake_failure = None;
+                                progress.stake_missing = None;
                             }
                         });
+                        self.publish_stake_failure();
                         return;
                     }
                     Err(error) => {
@@ -1455,14 +1467,15 @@ impl<'a> Follower<'a> {
                     }
                 }
             }
-            Ok(Err(error)) => (error.report(), error.refusal()),
+            Ok(Err(error)) => (error.report(), matches!(error, StakeError::Unanswered(_))),
             Err(_) => (json!({"error":"stake_task_failed"}), false),
         };
         let retry = self.stake.retries.entry(epoch).or_default();
-        let wait = if refusal {
-            STAKE_REFUSED_BACKOFF[retry.failures.min(STAKE_REFUSED_BACKOFF.len() - 1)]
+        let ladder = STAKE_BACKOFF[retry.failures.min(STAKE_BACKOFF.len() - 1)];
+        let wait = if unanswered {
+            ladder.min(STAKE_UNANSWERED_MAX_WAIT)
         } else {
-            crate::retry::BACKOFF[retry.failures.min(crate::retry::BACKOFF.len() - 1)]
+            ladder
         };
         retry.failures += 1;
         retry.at = now + wait;
@@ -1473,8 +1486,21 @@ impl<'a> Follower<'a> {
             json!({"event":"stake_read_failed","epoch":epoch,"error":report["error"],
                 "retry_at":retry.at,"failures":retry.failures})
         );
+        retry.report = Some(report);
+        self.publish_stake_failure();
+    }
+
+    /// Shows the last failure of an epoch still missing, or none.
+    fn publish_stake_failure(&self) {
+        let last = self
+            .stake
+            .retries
+            .iter()
+            .filter_map(|(epoch, retry)| Some((retry.report.as_ref()?, *epoch)))
+            .max_by_key(|(report, epoch)| (report["at"].as_u64(), *epoch))
+            .map(|(report, _)| report.clone());
         self.progress
-            .send_modify(|progress| progress.stake_failure = Some(report));
+            .send_modify(|progress| progress.stake_failure = last);
     }
 
     /// Starts the read of the oldest epoch up to the target's that has no
@@ -1503,6 +1529,7 @@ impl<'a> Follower<'a> {
         self.stake
             .retries
             .retain(|epoch, _| window.missing.contains(epoch));
+        self.publish_stake_failure();
         let missing = window.missing.contains(&through).then(|| {
             self.progress
                 .borrow()

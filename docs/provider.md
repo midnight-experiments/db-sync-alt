@@ -48,13 +48,23 @@ Within a read, a request that fails in transport (a timeout, a dropped
 connection, a 5xx) is sent again after the wait the client names, up to 5
 times, and a 402, 418 or 429 is waited out until the time it names; one failed
 request does not cost the whole read. A read that fails is tried again for
-that epoch only: after a transport failure in 1, 2, 4, 8 and 16 seconds and
-then every 30 seconds; after a refusal of the answers (a sum that does not match, a pool listed twice, an
-invalid row) in 1, 2, 4, 8, 16, 30, 60 and 300 seconds and then every 600
-seconds. Meanwhile the newer epochs are read, so one epoch that cannot be read
-does not hold back the others. `/status` shows the last failure in
-`epochs.stake_failure`, with the epoch, the number of failures, the time of
-the next attempt and the error with its cause ([troubleshooting](troubleshooting.md#stake-distributions)),
+that epoch only, whatever made it fail (a transport failure, a sum that does
+not match, a pool listed twice, an invalid row): after 1, 2, 4, 8, 16, 30, 60,
+300, 600 and 3,600 seconds and then every 21,600 seconds (6 hours). A read
+whose first request, the epoch's summary from `/epochs/{n}`, gets no answer
+costs at most 5 requests and is tried again after at most 600 seconds, so
+that it runs soon after an outage. Meanwhile the newer epochs are read, so one
+epoch that cannot be read does not hold back the others.
+
+One read of an ended epoch costs about one request per registered pool (about
+2,900 on Mainnet). An epoch that never succeeds is read at most 14 times in
+the 24 hours from its first read and at most 4 times a day after, not
+counting the reads whose summary gets no answer: about 41,000 and then 12,000
+requests a day on Mainnet.
+
+`/status` shows in `epochs.stake_failure` the last failure of an epoch whose
+distribution is still missing, with the epoch, the number of failures, the
+time of the next attempt and the error with its cause ([troubleshooting](troubleshooting.md#stake-distributions)),
 and the warning `stake_missing:<epoch>` while the target's epoch has had no
 stored distribution for more than 10 minutes at the tip.
 
