@@ -37,8 +37,8 @@ const REREADS: usize = 3;
 
 /// The items an address listing and the lists from H on store, discarded
 /// when they are read again: kinds, and cursor keys by prefix.
-const SINCE_KINDS: [&str; 3] = ["address_listed", "since", "tip"];
-const SINCE_CURSORS: [&str; 3] = ["address:", "since:", "burns"];
+pub(super) const SINCE_KINDS: [&str; 3] = ["address_listed", "since", "tip"];
+pub(super) const SINCE_CURSORS: [&str; 3] = ["address:", "since:", "burns"];
 
 impl Build<'_> {
     /// The sources of the listings: units and addresses, as `unit:` and

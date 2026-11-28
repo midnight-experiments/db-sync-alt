@@ -208,9 +208,10 @@ out; `rebuild_listing_moving` when an address's outputs kept changing over
 eight reads, whose union is then taken; `rebuild_reading_again` when a unit's
 history and quantity did not agree and the unit is read again;
 `rebuild_tip_left_chain` when the lists from H on are read again;
-`rebuild_listings_discarded` when a refusal makes the next run read the
-listings again, with `address_histories` true when the profile addresses'
-full lists below H go too; in the window the `update` and
+`rebuild_listings_discarded` when a refusal makes the next run read again
+what its cause requires, with `continue_at` (the phase the next run continues
+at), `unit_listings` true when the unit listings go and `address_histories`
+true when the profile addresses' full lists below H go too; in the window the `update` and
 `follower_state` lines of following; `rebuild_published` with the content
 digest and the requests; `rebuild_failed` with the error's report, the code
 and any `detail`, when the build ends on an answer of the provider, one of its
@@ -262,18 +263,27 @@ A database that a build fills never serves until the build has published:
 To discard a build, drop the database and create it again
 ([PostgreSQL](postgresql.md#the-database-and-its-logins)).
 
-After `rebuild_supply_mismatch`, `rebuild_listing_incomplete`,
-`rebuild_address_outputs_mismatch`, `provider_tip_left_chain` or
-`provider_transaction_unknown` before the window, the build discards its
-listings, the readings of the units and the lists from H on: the same command
-reads them again, and keeps the places, the validity answers and the other
-results below H. After `rebuild_listing_incomplete` and
-`rebuild_address_outputs_mismatch` it also discards each profile address's
-full list below H and the outputs of its transactions, from which the
-address's outputs are derived the second time: the answer that missed an
-output may be on either side, so the same command reads both again. After
-`provider_mint_history_mismatch`, the same command reads the units that have
-no reading yet. A check that closes the build's gate in
+A refusal before the window discards what its cause requires, and the same
+command reads that again:
+
+- After `rebuild_supply_mismatch`, `rebuild_listing_incomplete` or
+  `rebuild_address_outputs_mismatch`, the build discards its listings, the
+  readings of the units and the lists from H on, and keeps the places, the
+  validity answers and the other results below H. After
+  `rebuild_listing_incomplete` and `rebuild_address_outputs_mismatch` it also
+  discards each profile address's full list below H and the outputs of its
+  transactions, from which the address's outputs are derived the second time:
+  the answer that missed an output may be on either side, so the same command
+  reads both again.
+- After `provider_tip_left_chain`, it discards the address listings and the
+  lists from H on only, which the same command reads again up to a new tip;
+  the unit listings, the readings and the lists below H stay.
+- After `provider_transaction_unknown` for a transaction that a list from H on
+  or a history named (phases `since` and `transactions`), it discards what it
+  discards after `rebuild_supply_mismatch`. For a transaction below H it
+  discards nothing: the same command asks for that transaction again.
+- After `provider_mint_history_mismatch`, the same command reads the units
+  that have no reading yet. A check that closes the build's gate in
 the window (`asset_conservation` or another) ends the build for that database:
 the same command refuses it (`rebuild_refused`); drop the database and build
 again.

@@ -2403,10 +2403,24 @@ async fn refused_then_continued(
     profile: &Profile,
     g: &Generated,
     through: u32,
-    (hook, on): (Hook, Arc<AtomicBool>),
+    hook: (Hook, Arc<AtomicBool>),
     converted: &Database,
     conversion: &dsa_store::verify::Verification,
 ) -> Result<serde_json::Value> {
+    let (outcome, _) =
+        refused_then_continued_paths(profile, g, through, hook, converted, conversion).await?;
+    Ok(outcome)
+}
+
+/// `refused_then_continued`, with the paths the continued build asked.
+async fn refused_then_continued_paths(
+    profile: &Profile,
+    g: &Generated,
+    through: u32,
+    (hook, on): (Hook, Arc<AtomicBool>),
+    converted: &Database,
+    conversion: &dsa_store::verify::Verification,
+) -> Result<(serde_json::Value, Vec<String>)> {
     let rebuilt = Database::new().await?;
     empty(&rebuilt, profile).await?;
     let fake = Fake::with_chain(edge_chain(profile, g, through), Some(hook)).await;
@@ -2428,13 +2442,20 @@ async fn refused_then_continued(
         }
         Err(error) => json!({"code":code(&error),"error":error.report()}),
     };
-    let requests = json!({"refused":first,"continued":fake.paths().len() - first});
+    let paths = fake.paths().split_off(first);
+    let requests = json!({"refused":first,"continued":paths.len()});
     rebuilt.cleanup().await?;
-    Ok(match refusal {
+    let outcome = match refusal {
         Ok(_) => json!({"code":null,"serving":serves,"requests":requests,"continued":continued}),
         Err(error) => json!({"code":code(&error),"error":error.report(),"serving":serves,
             "requests":requests,"continued":continued}),
-    })
+    };
+    Ok((outcome, paths))
+}
+
+/// Paths among `paths` that contain `part`.
+fn holding(paths: &[String], part: &str) -> usize {
+    paths.iter().filter(|path| path.contains(part)).count()
 }
 
 /// The outcome of `refused_then_continued` is the refusal `expected` with
@@ -2634,8 +2655,9 @@ async fn an_address_outputs_mismatch_names_what_the_provider_said() -> Result {
 /// after the lists from H on: the address listings and the lists are read
 /// again three times, and the fourth reading ends the build with
 /// `provider_tip_left_chain` while nothing serves. The same command, with
-/// the tip left in place, reads them again and equals the conversion row by
-/// row.
+/// the tip left in place, reads the address listings and the lists from H
+/// on again, keeps the unit listings and the readings, and equals the
+/// conversion row by row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
@@ -2658,7 +2680,7 @@ async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
         })
     };
     let on = Arc::new(AtomicBool::new(true));
-    let outcome = refused_then_continued(
+    let (outcome, paths) = refused_then_continued_paths(
         &profile,
         &chain.g,
         EDGE_END + 1,
@@ -2668,13 +2690,181 @@ async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
     )
     .await?;
     let replaced = replaced.load(Ordering::SeqCst);
+    let cnight = profile.assets.cnight.unit();
+    let (unit_listing, history) = (
+        format!("/assets/{cnight}/utxos?"),
+        format!("/assets/{cnight}/history?"),
+    );
+    let reserve = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    let continued = json!({"unit_listings":holding(&paths, &unit_listing),
+        "histories":holding(&paths, &history),"reserve_listings":holding(&paths, &reserve)});
     println!(
         "{}",
-        json!({"event":"tip_left_chain_four_times","outcome":outcome,"tip_replaced":replaced})
+        json!({"event":"tip_left_chain_four_times","outcome":outcome,"tip_replaced":replaced,
+            "continued_paths":continued})
     );
     refused_then_equal(&outcome, "provider_tip_left_chain");
     assert_eq!(outcome["error"]["detail"]["reads"], 4, "{outcome}");
     assert_eq!(replaced, 4, "checks of the tip");
+    // The continuation reads the address listings and the lists from H on
+    // again, and keeps the unit listings and the readings.
+    assert_eq!(continued["unit_listings"], 0, "{continued}");
+    assert_eq!(continued["histories"], 0, "{continued}");
+    assert!(
+        continued["reserve_listings"].as_u64() > Some(0),
+        "{continued}"
+    );
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// What the ten chain's tests refer to.
+struct Ten {
+    g: Generated,
+    /// Heights 2–11: ten transactions below H that each mint cNIGHT into
+    /// one output at an ordinary address, 2 cNIGHT in the first, 3 in the
+    /// second, 1 in each other.
+    creators: Vec<String>,
+    /// Height 35, in the window: spends the first creator's output (A).
+    x: String,
+}
+
+/// Mainnet profile, k 12, the edge chain's H and T: ten creating
+/// transactions below H with one output each, so that the build asks each
+/// one's validity, and X and Y in the window spending A (2 cNIGHT) and B
+/// (3 cNIGHT). The other blocks are empty.
+fn ten_chain(profile: &Profile) -> Ten {
+    let ordinary = |index: u8| {
+        let mut key = [0x4e; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let mut s = Script::new(profile);
+    s.block(Vec::new());
+    let mut creators = Vec::new();
+    for n in 0..10_u8 {
+        let amount = match n {
+            0 => 2,
+            1 => 3,
+            _ => 1,
+        };
+        let tx = s.tx().mint(&policy, &name, amount).output(
+            Output::new(ordinary(n), 1_500_000 + u64::from(n)).token(&policy, &name, amount),
+        );
+        creators.push(s.block(vec![tx])[0].clone());
+    }
+    let mut x = String::new();
+    for height in 12..=EDGE_END {
+        let spent = match height {
+            35 => Some((0, 2)),
+            36 => Some((1, 3)),
+            _ => None,
+        };
+        let transaction = spent.map(|(creator, amount)| {
+            s.tx().input(&creators[creator], 0).output(
+                Output::new(ordinary(20 + creator as u8), 1_400_000).token(&policy, &name, amount),
+            )
+        });
+        let hashes = s.block(transaction.into_iter().collect());
+        if height == 35 {
+            x = hashes[0].clone();
+        }
+    }
+    Ten {
+        g: s.g,
+        creators,
+        x,
+    }
+}
+
+/// A hook that answers 404 for the path that ends with `path`.
+fn unknown(path: String) -> Hook {
+    Arc::new(move |asked: &str, _: &mut Chain, _| {
+        asked.ends_with(&path).then(|| Behavior::status(404))
+    })
+}
+
+/// `/txs/{hash}` of a creating transaction below H answers 404 while the
+/// build asks the transactions' validity: after `fatal_after` the build
+/// ends with `provider_transaction_unknown` and nothing serves. Listing
+/// again does not cure an unknown transaction below H, so the build
+/// discards nothing: the same command, answered honestly, asks for the
+/// transaction again, reads no unit listing again and equals the
+/// conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_unknown_transaction_below_the_horizon_keeps_the_listings() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &ten.g, &converted).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let hook = while_on(on.clone(), unknown(format!("/txs/{}", ten.creators[4])));
+    let (outcome, paths) = refused_then_continued_paths(
+        &profile,
+        &ten.g,
+        EDGE_END,
+        (hook, on),
+        &converted,
+        &conversion,
+    )
+    .await?;
+    let unit_listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let asked = holding(&paths, &format!("/txs/{}", ten.creators[4]));
+    println!(
+        "{}",
+        json!({"event":"unknown_below_the_horizon","outcome":outcome,
+            "continued_unit_listings":holding(&paths, &unit_listing),"asked_again":asked})
+    );
+    refused_then_equal(&outcome, "provider_transaction_unknown");
+    assert_eq!(
+        holding(&paths, &unit_listing),
+        0,
+        "the unit listings were read again"
+    );
+    assert!(asked > 0, "the unknown transaction was not asked again");
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// `/txs/{hash}/utxos` of X, a transaction in the window that the unit's
+/// list from H on names, answers 404 while the build reads the
+/// transactions from H on: after `fatal_after` the build ends with
+/// `provider_transaction_unknown`. The lists from H on may have named a
+/// transaction that left the chain, so the build discards the listings and
+/// the lists from H on: the same command, answered honestly, reads the unit
+/// listings again and equals the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_unknown_transaction_since_the_horizon_reads_the_listings_again() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &ten.g, &converted).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let hook = while_on(on.clone(), unknown(format!("/txs/{}/utxos", ten.x)));
+    let (outcome, paths) = refused_then_continued_paths(
+        &profile,
+        &ten.g,
+        EDGE_END,
+        (hook, on),
+        &converted,
+        &conversion,
+    )
+    .await?;
+    let unit_listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    println!(
+        "{}",
+        json!({"event":"unknown_since_the_horizon","outcome":outcome,
+            "continued_unit_listings":holding(&paths, &unit_listing)})
+    );
+    refused_then_equal(&outcome, "provider_transaction_unknown");
+    assert!(
+        holding(&paths, &unit_listing) > 0,
+        "the unit listings were not read again"
+    );
     converted.cleanup().await?;
     source.database.cleanup().await
 }

@@ -85,18 +85,6 @@ use self::{
 /// Items a phase holds before it stores them, unless the options say.
 const BATCH: usize = 200;
 
-/// Refusals of a build before its window whose cause can be a moment at
-/// which the provider's answers did not fit together: the same command
-/// reads the listings, the readings of the units and the lists from H on
-/// again, and keeps the places, validity answers and other results below H.
-const READ_AGAIN: [&str; 5] = [
-    "rebuild_supply_mismatch",
-    "rebuild_listing_incomplete",
-    "rebuild_address_outputs_mismatch",
-    "provider_tip_left_chain",
-    "provider_transaction_unknown",
-];
-
 /// What is discarded to read the listings again: stored kinds, and cursors
 /// by key prefix.
 const LISTING_KINDS: [&str; 6] = [
@@ -109,16 +97,64 @@ const LISTING_KINDS: [&str; 6] = [
 ];
 const LISTING_CURSORS: [&str; 6] = ["units", "unit:", "address:", "since:", "burns", "history:"];
 
-/// Refusals of a listing that misses an output. The answer that missed it
-/// may be on either side of the comparison, so the profile addresses' full
-/// lists below H and the outputs of their transactions, from which their
-/// outputs are derived a second time, are read again with the listings.
-const ADDRESS_HISTORIES_AGAIN: [&str; 2] = [
-    "rebuild_listing_incomplete",
-    "rebuild_address_outputs_mismatch",
-];
+/// The profile addresses' full lists below H and the outputs of their
+/// transactions, from which their outputs are derived a second time.
 const ADDRESS_HISTORY_KINDS: [&str; 2] = ["address_tx", "held"];
 const ADDRESS_HISTORY_CURSORS: [&str; 1] = ["held:"];
+
+/// What the next run reads again after a refusal before the window: the
+/// stored kinds and the cursors (by key prefix) it discards, and the phase
+/// it continues at.
+#[derive(Debug, PartialEq)]
+struct ReadAgain {
+    kinds: Vec<&'static str>,
+    cursors: Vec<&'static str>,
+    phase: &'static str,
+}
+
+/// What a refusal in `phase` discards, by its cause; `None`: nothing, and
+/// the next run continues at the stored phase.
+///
+/// A refusal whose cause can be a moment at which the provider's answers
+/// did not fit together reads the listings, the readings of the units and
+/// the lists from H on again, and keeps the places, validity answers and
+/// other results below H. One of a listing that misses an output also
+/// reads the profile addresses' full lists below H again: the answer that
+/// missed it may be on either side of their comparison. A tip that left
+/// the chain discards only what the lists from H on read: the unit
+/// listings and the lists below H are final. A transaction that a list
+/// from H on or a history named and the provider does not know is read
+/// again with them; one below H (in the listing of a crowded height, the
+/// readings, the address histories or the validity answers) is asked
+/// again, and listing again does not cure it.
+fn read_again(code: &str, phase: &str) -> Option<ReadAgain> {
+    if phase_index(phase) >= phase_index("window") {
+        return None;
+    }
+    let listings = ReadAgain {
+        kinds: LISTING_KINDS.to_vec(),
+        cursors: LISTING_CURSORS.to_vec(),
+        phase: "listing",
+    };
+    match code {
+        "rebuild_supply_mismatch" => Some(listings),
+        "rebuild_listing_incomplete" | "rebuild_address_outputs_mismatch" => {
+            let mut again = listings;
+            again.kinds.extend(ADDRESS_HISTORY_KINDS);
+            again.cursors.extend(ADDRESS_HISTORY_CURSORS);
+            Some(again)
+        }
+        "provider_tip_left_chain" => Some(ReadAgain {
+            kinds: listing::SINCE_KINDS.to_vec(),
+            cursors: listing::SINCE_CURSORS.to_vec(),
+            phase: "since",
+        }),
+        "provider_transaction_unknown" if matches!(phase, "since" | "transactions") => {
+            Some(listings)
+        }
+        _ => None,
+    }
+}
 
 /// The version of the software that begins a build; a build is continued
 /// only by the same version.
@@ -392,8 +428,8 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
 /// Builds the database from the provider, or continues a build that
 /// stopped, and publishes it. A build that ends without publishing records
 /// its requests and its error as the stopped service state `status` prints;
-/// after a refusal of `READ_AGAIN` before the window, the next run of the
-/// command reads the listings again.
+/// after a refusal before the window, the next run of the command reads
+/// again what `read_again` names.
 pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
     let connect = Arc::new(context.connect);
     let recorder = Arc::clone(&connect);
@@ -416,26 +452,18 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         if let Ok(mut store) = recorder().await
             && let Some(progress) = store.building_progress().await.ok().flatten()
         {
-            if READ_AGAIN.contains(&code.as_str())
-                && phase_index(&progress.phase) < phase_index("window")
-            {
-                let histories = ADDRESS_HISTORIES_AGAIN.contains(&code.as_str());
-                let (mut kinds, mut cursors) = (LISTING_KINDS.to_vec(), LISTING_CURSORS.to_vec());
-                if histories {
-                    kinds.extend(ADDRESS_HISTORY_KINDS);
-                    cursors.extend(ADDRESS_HISTORY_CURSORS);
-                }
-                if store
-                    .discard_building_items(&kinds, &cursors, Some("listing"))
+            if let Some(again) = read_again(&code, &progress.phase)
+                && store
+                    .discard_building_items(&again.kinds, &again.cursors, Some(again.phase))
                     .await
                     .is_ok()
-                {
-                    eprintln!(
-                        "{}",
-                        json!({"event":"rebuild_listings_discarded","error":code,"phase":progress.phase,
-                            "address_histories":histories})
-                    );
-                }
+            {
+                eprintln!(
+                    "{}",
+                    json!({"event":"rebuild_listings_discarded","error":code,"phase":progress.phase,
+                        "continue_at":again.phase,"unit_listings":again.kinds.contains(&"listed"),
+                        "address_histories":again.kinds.contains(&"held")})
+                );
             }
             let _ = store.record_calls(&provider.counts()).await;
             // A run that sent no request leaves the stored counts as they
@@ -635,4 +663,62 @@ async fn run(context: Context<'_>, sent_at_start: BTreeMap<String, u64>) -> Resu
         counts,
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each refusal before the window discards what its cause requires and
+    /// the next run continues where that is read again.
+    #[test]
+    fn a_refusal_discards_by_its_cause() {
+        let discarded = |code, phase| {
+            read_again(code, phase).map(|again| {
+                (
+                    again.phase,
+                    again.kinds.contains(&"listed"),
+                    again.kinds.contains(&"held"),
+                )
+            })
+        };
+        assert_eq!(
+            discarded("rebuild_supply_mismatch", "base"),
+            Some(("listing", true, false))
+        );
+        for code in [
+            "rebuild_listing_incomplete",
+            "rebuild_address_outputs_mismatch",
+        ] {
+            assert_eq!(discarded(code, "history"), Some(("listing", true, true)));
+        }
+        assert_eq!(
+            discarded("provider_tip_left_chain", "since"),
+            Some(("since", false, false))
+        );
+        let tip = read_again("provider_tip_left_chain", "since").unwrap();
+        assert!(
+            !tip.cursors
+                .iter()
+                .any(|prefix| ["unit:", "history:", "held:"].contains(prefix))
+        );
+        for phase in ["since", "transactions"] {
+            assert_eq!(
+                discarded("provider_transaction_unknown", phase),
+                Some(("listing", true, false))
+            );
+        }
+        for phase in ["listing", "quantities", "addresses", "validity", "carried"] {
+            assert_eq!(
+                discarded("provider_transaction_unknown", phase),
+                None,
+                "{phase}"
+            );
+        }
+        assert_eq!(discarded("rebuild_supply_mismatch", "window"), None);
+        assert_eq!(
+            discarded("provider_mint_history_mismatch", "quantities"),
+            None
+        );
+    }
 }
