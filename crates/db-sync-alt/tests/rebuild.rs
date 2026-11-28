@@ -2679,6 +2679,55 @@ async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
     source.database.cleanup().await
 }
 
+/// A tip answered 404 once and then with its block is asked again within
+/// the outcome rules: it has not left the chain, so the address listings
+/// and the lists from H on are not read again, and the build equals the
+/// conversion. The reserve chain's tip, height 61, spends a reserve output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_tip_answered_404_once_is_asked_again() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, true);
+    let tip = format!("/blocks/{}", EDGE_END + 1);
+    let asked = |fake: &Fake| {
+        fake.paths()
+            .iter()
+            .filter(|path| path.ends_with(&tip))
+            .count()
+    };
+    let listing = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    let plain = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END + 1), None).await;
+    built_equal(&profile, &chain.g, &plain, "tip answered").await?;
+    let answered = Arc::new(AtomicBool::new(false));
+    let hook: Hook = {
+        let (answered, tip) = (answered.clone(), tip.clone());
+        Arc::new(move |path: &str, _: &mut Chain, _| {
+            (path.ends_with(&tip) && !answered.swap(true, Ordering::SeqCst))
+                .then(|| Behavior::status(404))
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END + 1), Some(hook)).await;
+    let report = built_equal(&profile, &chain.g, &fake, "tip answered 404 once").await?;
+    println!(
+        "{}",
+        json!({"event":"tip_answered_404_once","tip_asked":asked(&fake),
+            "tip_asked_without_404":asked(&plain),"reserve_listings":fake.requests(&listing),
+            "reserve_listings_without_404":plain.requests(&listing),"calls":report.calls})
+    );
+    assert!(
+        answered.load(Ordering::SeqCst),
+        "the tip was not answered 404"
+    );
+    assert!(asked(&fake) >= 2, "the tip was asked once");
+    assert_eq!(asked(&fake), asked(&plain) + 1, "the tip asked again once");
+    assert_eq!(
+        fake.requests(&listing),
+        plain.requests(&listing),
+        "the address listings were read again"
+    );
+    Ok(())
+}
+
 /// A tip block that spends an output relevant by its address alone is
 /// served while the listings are read and replaced for good when the lists
 /// from H on begin: the address listing did not show the output, which was

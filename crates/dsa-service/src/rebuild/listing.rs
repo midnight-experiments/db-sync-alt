@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 
 use super::{
     Build,
-    asker::{PASSES, every_page, index16, info, required, stable, transactions_page, utxos},
+    asker::{
+        PASSES, every_page, found_within, index16, info, required, stable, transactions_page, utxos,
+    },
     content::{Content, Event, Moved, Spent, outpoint},
     progress::{Cursor, parse, to_value},
 };
@@ -368,8 +370,10 @@ impl Build<'_> {
             }
             let tip = self.since_tip().await?;
             self.since_lists(tip.height).await?;
+            // Another block at the tip's height, or a 404 that lasted
+            // `fatal_after`, is a tip that left the chain.
             let provider = self.asker.provider.clone();
-            let now = self.asker.ask(|| provider.block_at(tip.height)).await?;
+            let now = found_within(&self.asker, || provider.block_at(tip.height)).await?;
             if now.as_ref().is_some_and(|header| header.hash == tip.hash) {
                 break;
             }

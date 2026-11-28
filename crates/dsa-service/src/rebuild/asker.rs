@@ -104,14 +104,10 @@ pub(super) fn index16(value: impl TryInto<u16>) -> Result<u16, Error> {
         .map_err(|_| Error::answer("provider_output_index", json!({})))
 }
 
-/// An answer the build needs: a 404 is asked again with the outcome rules
-/// of every other refused answer, and once that has lasted `fatal_after`
-/// the build ends with `code`.
-pub(super) async fn required<T, F, Fut>(
-    asker: &Asker,
-    (code, mut detail): (&'static str, Value),
-    call: F,
-) -> Result<T, Error>
+/// An answer that may be missing: a 404 is asked again with the outcome
+/// rules of every other refused answer. `Err(seconds)` once the 404 has
+/// lasted `fatal_after`, those seconds.
+async fn found_or_lasted<T, F, Fut>(asker: &Asker, call: F) -> Result<Result<T, u64>, Error>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<Option<T>, dsa_provider::Error>>,
@@ -132,14 +128,42 @@ where
         })
         .await;
     match answer {
+        Ok(value) => Ok(Ok(value)),
         Err(Error::Lasting { seconds, error })
             if error.report()["error"] == "provider_not_found" =>
         {
-            detail["lasted_seconds"] = json!(seconds);
-            Err(Error::answer(code, detail))
+            Ok(Err(seconds))
         }
-        other => other,
+        Err(other) => Err(other),
     }
+}
+
+/// An answer that may be missing, asked within the outcome rules: a 404 is
+/// asked again as every other refused answer is, and is `None` only once it
+/// has lasted `fatal_after`.
+pub(super) async fn found_within<T, F, Fut>(asker: &Asker, call: F) -> Result<Option<T>, Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<Option<T>, dsa_provider::Error>>,
+{
+    Ok(found_or_lasted(asker, call).await?.ok())
+}
+
+/// An answer the build needs: `found_within`, and a 404 that lasted
+/// `fatal_after` ends the build with `code`.
+pub(super) async fn required<T, F, Fut>(
+    asker: &Asker,
+    (code, mut detail): (&'static str, Value),
+    call: F,
+) -> Result<T, Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<Option<T>, dsa_provider::Error>>,
+{
+    found_or_lasted(asker, call).await?.map_err(|seconds| {
+        detail["lasted_seconds"] = json!(seconds);
+        Error::answer(code, detail)
+    })
 }
 
 /// `/txs/{hash}/utxos` of a transaction the build needs.
