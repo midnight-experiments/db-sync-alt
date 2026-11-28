@@ -8,7 +8,7 @@
 use bytes::Bytes;
 
 use crate::{
-    Error, Provider,
+    Error, Provider, RequestFamily,
     client::Family,
     pages::{PAGE_SIZE, TransactionPage},
     types::{
@@ -149,7 +149,10 @@ impl Provider {
     }
 
     pub async fn latest_block(&self) -> Result<Header, Error> {
-        let body = self.found(self.get("/blocks/latest", Family::Small).await?)?;
+        let body = self.found(
+            self.get("/blocks/latest", Family::Small, RequestFamily::Headers)
+                .await?,
+        )?;
         self.parsed(parse::header(&body, None))
     }
 
@@ -159,7 +162,11 @@ impl Provider {
             return Err(Error::configuration("request.block_height"));
         }
         let body = self
-            .get(&format!("/blocks/{height}"), Family::Small)
+            .get(
+                &format!("/blocks/{height}"),
+                Family::Small,
+                RequestFamily::Headers,
+            )
             .await?;
         body.map(|body| self.parsed(parse::header(&body, Some(height))))
             .transpose()
@@ -172,7 +179,9 @@ impl Provider {
         page: Page,
     ) -> Result<Option<Vec<Header>>, Error> {
         let path = format!("/blocks/{block}/next?count=100&page={}", page.number());
-        let body = self.get(&path, Family::Small).await?;
+        let body = self
+            .get(&path, Family::Small, RequestFamily::Headers)
+            .await?;
         body.map(|body| self.parsed(parse::headers(&body)))
             .transpose()
     }
@@ -184,7 +193,9 @@ impl Provider {
         page: Page,
     ) -> Result<Option<TransactionPage>, Error> {
         let path = paged(&format!("/blocks/{block}/txs/cbor"), page, false);
-        let body = self.get(&path, Family::Block).await?;
+        let body = self
+            .get(&path, Family::Block, RequestFamily::Transactions)
+            .await?;
         body.map(|body| self.parsed(parse::page(block, page, body)))
             .transpose()
     }
@@ -192,14 +203,22 @@ impl Provider {
     /// `None` when the provider does not know the datum.
     pub async fn datum(&self, hash: &Hash32) -> Result<Option<Datum>, Error> {
         let body = self
-            .get(&format!("/scripts/datum/{hash}/cbor"), Family::Datum)
+            .get(
+                &format!("/scripts/datum/{hash}/cbor"),
+                Family::Datum,
+                RequestFamily::Datums,
+            )
             .await?;
         body.map(|body| self.parsed(parse::datum(body))).transpose()
     }
 
     pub async fn transaction_metadata(&self, transaction: &Hash32) -> Result<Metadata, Error> {
         let body = self
-            .get(&format!("/txs/{transaction}/metadata"), Family::Metadata)
+            .get(
+                &format!("/txs/{transaction}/metadata"),
+                Family::Metadata,
+                RequestFamily::Metadata,
+            )
             .await?;
         let body = self.found(body)?;
         self.parsed(parse::metadata(body))
@@ -217,7 +236,10 @@ impl Provider {
     /// `None` until the epoch's nonce is known.
     pub async fn epoch_parameters(&self, epoch: u32) -> Result<Option<EpochParameters>, Error> {
         let path = format!("/epochs/{}/parameters", epoch_path(epoch)?);
-        match self.get(&path, Family::Small).await? {
+        match self
+            .get(&path, Family::Small, RequestFamily::Epochs)
+            .await?
+        {
             Some(body) => self.parsed(parse::epoch_parameters(epoch, &body)),
             None => Ok(None),
         }
@@ -226,7 +248,10 @@ impl Provider {
     /// `None` until the epoch's active stake is known.
     pub async fn epoch(&self, epoch: u32) -> Result<Option<EpochInfo>, Error> {
         let path = format!("/epochs/{}", epoch_path(epoch)?);
-        match self.get(&path, Family::Small).await? {
+        match self
+            .get(&path, Family::Small, RequestFamily::Epochs)
+            .await?
+        {
             Some(body) => self.parsed(parse::epoch(epoch, &body)),
             None => Ok(None),
         }
@@ -234,34 +259,44 @@ impl Provider {
 
     pub async fn pools(&self, page: Page) -> Result<Vec<PoolId>, Error> {
         let body = self.found(
-            self.get(&paged("/pools", page, false), Family::Small)
-                .await?,
+            self.get(
+                &paged("/pools", page, false),
+                Family::Small,
+                RequestFamily::Pools,
+            )
+            .await?,
         )?;
         self.parsed(parse::list(&body, PAGE_SIZE))
     }
 
     pub async fn extended_pools(&self, page: Page) -> Result<Vec<PoolStake>, Error> {
         let path = paged("/pools/extended", page, false);
-        let body = self.found(self.get(&path, Family::Small).await?)?;
+        let body = self.found(self.get(&path, Family::Small, RequestFamily::Pools).await?)?;
         self.parsed(parse::list(&body, PAGE_SIZE))
     }
 
     pub async fn retired_pools(&self, page: Page) -> Result<Vec<RetiredPool>, Error> {
         let path = paged("/pools/retired", page, true);
-        let body = self.found(self.get(&path, Family::Small).await?)?;
+        let body = self.found(self.get(&path, Family::Small, RequestFamily::Pools).await?)?;
         self.parsed(parse::list(&body, PAGE_SIZE))
     }
 
     /// `None` when the provider does not know the pool.
     pub async fn pool(&self, pool: &PoolId) -> Result<Option<PoolStake>, Error> {
-        let body = self.get(&format!("/pools/{pool}"), Family::Small).await?;
+        let body = self
+            .get(
+                &format!("/pools/{pool}"),
+                Family::Small,
+                RequestFamily::Pools,
+            )
+            .await?;
         body.map(|body| self.parsed(parse::pool(pool, &body)))
             .transpose()
     }
 
     pub async fn pool_history(&self, pool: &PoolId, page: Page) -> Result<Vec<PoolHistory>, Error> {
         let path = paged(&format!("/pools/{pool}/history"), page, true);
-        let body = self.found(self.get(&path, Family::Small).await?)?;
+        let body = self.found(self.get(&path, Family::Small, RequestFamily::Pools).await?)?;
         self.parsed(parse::list(&body, PAGE_SIZE))
     }
 
@@ -275,19 +310,29 @@ impl Provider {
             "/epochs/{}/stakes/{pool}?count=1&page=1",
             epoch_path(epoch)?
         );
-        let body = self.found(self.get(&path, Family::Small).await?)?;
+        let body = self.found(
+            self.get(&path, Family::Small, RequestFamily::Epochs)
+                .await?,
+        )?;
         self.parsed(parse::list(&body, 1))
     }
 
     pub async fn genesis(&self) -> Result<Genesis, Error> {
-        let body = self.found(self.get("/genesis", Family::Small).await?)?;
+        let body = self.found(
+            self.get("/genesis", Family::Small, RequestFamily::Genesis)
+                .await?,
+        )?;
         self.parsed(parse::json(&body))
     }
 
     /// One page of a list; a 404 is an empty list (an asset or address the
     /// provider has never seen).
-    async fn list_page<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, Error> {
-        match self.get(path, Family::List).await? {
+    async fn list_page<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        counted: RequestFamily,
+    ) -> Result<Vec<T>, Error> {
+        match self.get(path, Family::List, counted).await? {
             Some(body) => self.parsed(parse::list(&body, PAGE_SIZE)),
             None => Ok(Vec::new()),
         }
@@ -303,7 +348,7 @@ impl Provider {
         page: Page,
     ) -> Result<Vec<ListedOutput>, Error> {
         let path = ranged(&format!("/assets/{unit}/utxos"), heights, page, false)?;
-        let rows: Vec<ListedOutput> = self.list_page(&path).await?;
+        let rows: Vec<ListedOutput> = self.list_page(&path, RequestFamily::Listings).await?;
         if rows.iter().any(|row| {
             row.block_height.is_none_or(|height| {
                 heights.from.is_some_and(|from| height < from)
@@ -327,7 +372,10 @@ impl Provider {
         page: Page,
     ) -> Result<Vec<ListedOutput>, Error> {
         let rows: Vec<ListedOutput> = self
-            .list_page(&paged(&format!("/addresses/{address}/utxos"), page, false))
+            .list_page(
+                &paged(&format!("/addresses/{address}/utxos"), page, false),
+                RequestFamily::Listings,
+            )
             .await?;
         if rows.iter().any(|row| row.address != address.to_string()) || !outputs_valid(&rows) {
             return Err(self.invalid("provider_invalid_response"));
@@ -377,7 +425,7 @@ impl Provider {
         heights: Heights,
         descending: bool,
     ) -> Result<Vec<ListedTransaction>, Error> {
-        let rows: Vec<ListedTransaction> = self.list_page(path).await?;
+        let rows: Vec<ListedTransaction> = self.list_page(path, RequestFamily::Listings).await?;
         let place = |row: &ListedTransaction| (row.block_height, row.tx_index);
         if rows.iter().any(|row| {
             row.block_height >= HEIGHT_LIMIT
@@ -402,7 +450,11 @@ impl Provider {
         transaction: &Hash32,
     ) -> Result<Option<TransactionUtxos>, Error> {
         let body = self
-            .get(&format!("/txs/{transaction}/utxos"), Family::Outputs)
+            .get(
+                &format!("/txs/{transaction}/utxos"),
+                Family::Outputs,
+                RequestFamily::Outputs,
+            )
             .await?;
         let Some(body) = body else {
             return Ok(None);
@@ -420,7 +472,11 @@ impl Provider {
         transaction: &Hash32,
     ) -> Result<Option<TransactionInfo>, Error> {
         let body = self
-            .get(&format!("/txs/{transaction}"), Family::Small)
+            .get(
+                &format!("/txs/{transaction}"),
+                Family::Small,
+                RequestFamily::Transactions,
+            )
             .await?;
         let Some(body) = body else {
             return Ok(None);
@@ -437,7 +493,13 @@ impl Provider {
 
     /// `/assets/{unit}`; `None` for an asset that was never minted.
     pub async fn asset(&self, unit: &Unit) -> Result<Option<AssetInfo>, Error> {
-        let body = self.get(&format!("/assets/{unit}"), Family::Small).await?;
+        let body = self
+            .get(
+                &format!("/assets/{unit}"),
+                Family::Small,
+                RequestFamily::Assets,
+            )
+            .await?;
         let Some(body) = body else {
             return Ok(None);
         };
@@ -456,7 +518,10 @@ impl Provider {
     /// and burns.
     pub async fn asset_history(&self, unit: &Unit, page: Page) -> Result<Vec<AssetEvent>, Error> {
         let rows: Vec<AssetEvent> = self
-            .list_page(&paged(&format!("/assets/{unit}/history"), page, false))
+            .list_page(
+                &paged(&format!("/assets/{unit}/history"), page, false),
+                RequestFamily::Assets,
+            )
             .await?;
         if rows.iter().any(|row| row.quantity().is_none()) {
             return Err(self.invalid("provider_invalid_response"));
@@ -474,7 +539,10 @@ impl Provider {
             return Err(Error::configuration("request.policy"));
         }
         let rows: Vec<PolicyAsset> = self
-            .list_page(&paged(&format!("/assets/policy/{policy}"), page, false))
+            .list_page(
+                &paged(&format!("/assets/policy/{policy}"), page, false),
+                RequestFamily::Listings,
+            )
             .await?;
         if rows
             .iter()
@@ -492,7 +560,7 @@ impl Provider {
             "/epochs/{}/blocks?count=1&page=1&order=desc",
             epoch_path(epoch)?
         );
-        let rows: Vec<Hash32> = self.list_page(&path).await?;
+        let rows: Vec<Hash32> = self.list_page(&path, RequestFamily::Epochs).await?;
         if rows.len() > 1 {
             return Err(self.invalid("provider_bad_page"));
         }
@@ -501,7 +569,13 @@ impl Provider {
 
     /// The header of the block `hash`; `None` when the provider does not know it.
     pub async fn block_by_hash(&self, hash: &Hash32) -> Result<Option<Header>, Error> {
-        let body = self.get(&format!("/blocks/{hash}"), Family::Small).await?;
+        let body = self
+            .get(
+                &format!("/blocks/{hash}"),
+                Family::Small,
+                RequestFamily::Headers,
+            )
+            .await?;
         let Some(body) = body else {
             return Ok(None);
         };
