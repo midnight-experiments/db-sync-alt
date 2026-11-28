@@ -3354,6 +3354,306 @@ async fn a_listing_in_segments_is_faster_and_gives_the_conversion() -> Result {
     source.database.cleanup().await
 }
 
+/// A chain whose cNIGHT outputs below the listing test's H are `counts`
+/// (height, outputs minted by one transaction at that height, at ordinary
+/// addresses), with `spends` (height, (creating height, output index)).
+/// Returns the chain and each height's creating transaction.
+fn segment_chain(
+    profile: &Profile,
+    counts: &[(u32, u32)],
+    spends: &[(u32, (u32, u16))],
+) -> (Generated, BTreeMap<u32, String>) {
+    let ordinary = |index: u32| {
+        let mut key = [0x3a; 28];
+        key[0] = (index % 251) as u8;
+        key[1] = (index / 251) as u8;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let mut s = Script::new(profile);
+    s.block(Vec::new());
+    let mut creators: BTreeMap<u32, String> = BTreeMap::new();
+    for height in 2..=LISTING_END {
+        let mut transactions = Vec::new();
+        if let Some((_, count)) = counts.iter().find(|(h, _)| *h == height) {
+            let mut tx = s.tx().mint(&policy, &name, i128::from(*count));
+            for n in 0..*count {
+                let lovelace = 1_200_000 + u64::from(height) * 1_000 + u64::from(n);
+                tx = tx.output(Output::new(ordinary(n), lovelace).token(&policy, &name, 1));
+            }
+            transactions.push(tx);
+        }
+        for (_, (created, index)) in spends.iter().filter(|(h, _)| *h == height) {
+            let creator = creators[created].clone();
+            transactions.push(
+                s.tx().input(&creator, *index).output(
+                    Output::new(ordinary(900 + height), 1_100_000).token(&policy, &name, 1),
+                ),
+            );
+        }
+        let hashes = s.block(transactions);
+        if counts.iter().any(|(h, _)| *h == height) {
+            creators.insert(height, hashes[0].clone());
+        }
+    }
+    (s.g, creators)
+}
+
+/// The choices of a build of a segment chain: the listing test's H and T,
+/// `segments` (0: the default).
+fn segment_options(segments: usize) -> Options {
+    Options {
+        horizon_block: Some(LISTING_HORIZON),
+        target_block: Some(LISTING_TARGET),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: 0,
+        batch_items: 0,
+        listing_segments: segments,
+    }
+}
+
+/// How a built database compares with the conversion: the rows only one
+/// side holds, the descriptor IDs that differ and the digests' difference
+/// (`null` when equal).
+async fn against_conversion(
+    profile: &Profile,
+    report: &Report,
+    rebuilt: &Database,
+    converted: &Database,
+    conversion: &dsa_store::verify::Verification,
+) -> Result<serde_json::Value> {
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let ids = descriptor_ids(profile, rebuilt).await?;
+    let differs = same(&report.verified, conversion, "segments")
+        .err()
+        .map(|error| error.to_string());
+    Ok(json!({"rows":rows,"ids":ids,"differs":differs}))
+}
+
+fn equals_conversion(outcome: &serde_json::Value) -> bool {
+    outcome["rows"] == json!({}) && outcome["ids"] == json!([]) && outcome["differs"].is_null()
+}
+
+/// The heights read through their transactions (`from=h&to=h` on the
+/// unit's transaction list).
+fn crowded_heights_read(paths: &[String], unit: &str) -> Vec<u32> {
+    let list = format!("/assets/{unit}/transactions?");
+    let mut heights: Vec<u32> = paths
+        .iter()
+        .filter(|path| path.contains(&list))
+        .filter_map(|path| {
+            let from = path
+                .split("from=")
+                .nth(1)?
+                .split('&')
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            let to = path
+                .split("to=")
+                .nth(1)?
+                .split('&')
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            (from == to).then_some(from)
+        })
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+    heights
+}
+
+/// The heights of the crowded segment chain with more than 25 outputs:
+/// 100 or more at the unit's first height, at the end and the start of
+/// segments, in a segment's middle and at H − 1; exactly 100 at a segment's
+/// end and 99 at the next segment's start.
+const CROWDED: [(u32, u32); 7] = [
+    (2, 120),
+    (9, 120),
+    (10, 120),
+    (23, 130),
+    (27, 100),
+    (28, 99),
+    (72, 120),
+];
+
+/// The crowded segment chain: 25 outputs at every other height below H,
+/// and spends of crowded outputs in the window and after T.
+fn crowded_segment_chain(profile: &Profile) -> Generated {
+    let counts: Vec<(u32, u32)> = (2..LISTING_HORIZON)
+        .map(|height| {
+            let crowded = CROWDED.iter().find(|(h, _)| *h == height);
+            (height, crowded.map_or(25, |(_, count)| *count))
+        })
+        .collect();
+    segment_chain(
+        profile,
+        &counts,
+        &[(76, (9, 5)), (85, (72, 7)), (88, (23, 3))],
+    )
+    .0
+}
+
+/// Heights with 100 or more outputs at the edges of segments and inside
+/// them: with eight segments and with one, the build equals the conversion
+/// row by row and the crowded heights are read through their transactions.
+/// Then a unit whose first output is near H: three heights, two crowded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn crowded_heights_at_segment_edges_give_the_conversion() -> Result {
+    let profile = profile(1);
+    let unit = profile.assets.cnight.unit();
+    let near = segment_chain(
+        &profile,
+        &[(70, 120), (71, 50), (72, 120)],
+        &[(76, (70, 1)), (85, (72, 7))],
+    )
+    .0;
+    let mut results = Vec::new();
+    for (name, g, expected) in [
+        (
+            "edges",
+            crowded_segment_chain(&profile),
+            vec![2_u32, 9, 10, 23, 27, 72],
+        ),
+        ("near_h", near, vec![70, 72]),
+    ] {
+        let converted = Database::new().await?;
+        let (source, conversion) =
+            conversion_at(&profile, &g, &converted, LISTING_HORIZON, LISTING_TARGET).await?;
+        for segments in [0_usize, 1] {
+            let rebuilt = Database::new().await?;
+            empty(&rebuilt, &profile).await?;
+            let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), None).await;
+            let (_stopper, stop) = Stop::new();
+            let report = build_with(&profile, &fake, &rebuilt, segment_options(segments), stop)
+                .await
+                .map_err(|error| format!("{name} {segments}: {}", error.report()))?;
+            let outcome =
+                against_conversion(&profile, &report, &rebuilt, &converted, &conversion).await?;
+            let paths = fake.paths();
+            let heights = crowded_heights_read(&paths, &unit);
+            println!(
+                "{}",
+                json!({"event":"crowded_segment_edges","chain":name,"segments":segments,
+                    "outcome":outcome,"crowded_read":heights,"calls":report.calls})
+            );
+            results.push((
+                name,
+                segments,
+                equals_conversion(&outcome),
+                heights == expected,
+            ));
+            rebuilt.cleanup().await?;
+        }
+        converted.cleanup().await?;
+        source.database.cleanup().await?;
+    }
+    for (name, segments, equal, crowded_as_expected) in results {
+        assert!(equal, "{name} with {segments} segments differs");
+        assert!(
+            crowded_as_expected,
+            "{name} with {segments}: crowded heights"
+        );
+    }
+    Ok(())
+}
+
+/// The crowded segment chain built with the default eight segments and
+/// killed in its unit listing: the build's future is dropped when the fake
+/// receives the k-th `/assets/{unit}/utxos` request, with the segments'
+/// cursors as the run left them, and the same command continues it. Each
+/// continuation equals the conversion row by row, and at least one kill
+/// leaves open segments. `DSA_REBUILD_SEGMENT_KILL_STEP` (default 4) spaces
+/// the kill points: 1 kills at every listing request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_inside_its_segments_continues_to_the_conversion() -> Result {
+    let profile = profile(1);
+    let step = setting("DSA_REBUILD_SEGMENT_KILL_STEP", 4).max(1) as usize;
+    let g = crowded_segment_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) =
+        conversion_at(&profile, &g, &converted, LISTING_HORIZON, LISTING_TARGET).await?;
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let whole = Database::new().await?;
+    empty(&whole, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    build_with(&profile, &fake, &whole, segment_options(0), stop)
+        .await
+        .map_err(|error| format!("whole: {}", error.report()))?;
+    whole.cleanup().await?;
+    let total = fake
+        .paths()
+        .iter()
+        .filter(|path| path.contains(&listing))
+        .count();
+    let points: Vec<usize> = (1..=total)
+        .filter(|k| *k == 1 || *k == total || (k - 2) % step == 0)
+        .collect();
+    let mut outcomes = Vec::new();
+    for kill_at in points {
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &profile).await?;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (killer, mut killed) = watch::channel(false);
+        let hook: Hook = {
+            let (seen, listing) = (seen.clone(), listing.clone());
+            Arc::new(move |path: &str, _: &mut Chain, _| {
+                if path.contains(&listing) && seen.fetch_add(1, Ordering::SeqCst) + 1 == kill_at {
+                    let _ = killer.send(true);
+                }
+                None
+            })
+        };
+        let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), Some(hook)).await;
+        let (_stopper, stop) = Stop::new();
+        let first = tokio::select! {
+            result = build_with(&profile, &fake, &rebuilt, segment_options(0), stop) => Some(result.is_ok()),
+            _ = killed.wait_for(|killed| *killed) => None,
+        };
+        let open: i64 = common::connect(&rebuilt.config)
+            .await?
+            .query_one(
+                "SELECT count(*) FROM dsa_rebuild.item WHERE kind='cursor' AND key LIKE 'unit:%@%'
+                 AND NOT (value->>'done')::boolean",
+                &[],
+            )
+            .await
+            .map(|row| row.get(0))
+            .unwrap_or(0);
+        let (_stopper, stop) = Stop::new();
+        let continued = build_with(&profile, &fake, &rebuilt, segment_options(0), stop).await;
+        let outcome = match &continued {
+            Ok(report) => {
+                against_conversion(&profile, report, &rebuilt, &converted, &conversion).await?
+            }
+            Err(error) => json!({"error": error.report()}),
+        };
+        println!(
+            "{}",
+            json!({"event":"killed_inside_segments","kill_at":kill_at,"of":total,
+                "first_finished":first,"open_segments":open,"outcome":outcome})
+        );
+        outcomes.push((kill_at, open, equals_conversion(&outcome)));
+        rebuilt.cleanup().await?;
+    }
+    converted.cleanup().await?;
+    source.database.cleanup().await?;
+    assert!(
+        outcomes.iter().any(|(_, open, _)| *open > 0),
+        "no kill left open segments: {outcomes:?}"
+    );
+    for (kill_at, _, equal) in &outcomes {
+        assert!(equal, "killed at listing request {kill_at}: {outcomes:?}");
+    }
+    Ok(())
+}
+
 /// A tip answered 404 once and then with its block is asked again within
 /// the outcome rules: it has not left the chain, so the address listings
 /// and the lists from H on are not read again, and the build equals the
