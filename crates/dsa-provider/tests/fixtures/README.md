@@ -32,4 +32,7 @@ bytes and original response-file hashes, block heights and transaction indices.
 Readers: `tests/corpus.rs` replays `mainnet-corpus.json.gz` and
 `preprod-corpus.json.gz` with their manifests; `tests/pages.rs` reads
 `pagination-finalized.json` and its manifest; `tests/supplements.rs` reads
-`collateral-omission-cbor.json` and `collateral-omission-utxos.json`.
+`collateral-omission-cbor.json` and `collateral-omission-utxos.json`, and a
+phase-2-invalid Mainnet transaction whose collateral return holds native
+tokens: its body from `crates/db-sync-alt/tests/fixtures/recorded-transactions.json`
+and the provider's answer from `crates/dsa-testkit/tests/fixtures/listing-answers.json`.

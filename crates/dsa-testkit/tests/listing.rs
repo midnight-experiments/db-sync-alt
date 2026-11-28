@@ -1,6 +1,6 @@
 //! The fake provider's listings have the members of the backend's answers:
-//! the recorded Preprod answers in `fixtures/listing-answers.json` against
-//! the fake's answers over a generated chain, endpoint by endpoint.
+//! the recorded answers in `fixtures/listing-answers.json` against the
+//! fake's answers over a generated chain, endpoint by endpoint.
 
 use std::collections::BTreeSet;
 
@@ -83,6 +83,20 @@ fn the_fake_renders_listings_with_the_backends_members() {
         .find(|(_, facts)| facts.valid && !facts.inputs.is_empty() && !facts.outputs.is_empty())
         .map(|(hash, _)| hash.clone())
         .unwrap();
+    // A transaction that fails phase 2 and whose collateral return holds a
+    // native token, as the recorded Mainnet one's holds cNIGHT and another.
+    let (invalid, body_outputs) = g
+        .facts
+        .iter()
+        .find(|(_, facts)| {
+            !facts.valid
+                && facts
+                    .collateral_return
+                    .as_ref()
+                    .is_some_and(|output| !output.tokens.is_empty())
+        })
+        .map(|(hash, facts)| (hash.clone(), facts.outputs.len()))
+        .expect("an invalid transaction whose collateral return holds a token");
     let last = g.blocks.last().unwrap();
     let mut fake = |path: &str| -> Value {
         let answer = chain.answer(&format!("/api/v0{path}"));
@@ -125,7 +139,12 @@ fn the_fake_renders_listings_with_the_backends_members() {
                 profile.addresses.mapping
             )),
         ),
+        (
+            "transaction_utxos_invalid",
+            fake(&format!("/txs/{invalid}/utxos")),
+        ),
         ("transaction", fake(&format!("/txs/{spending}"))),
+        ("transaction_invalid", fake(&format!("/txs/{invalid}"))),
         ("asset", fake(&format!("/assets/{cnight}"))),
         (
             "policy_assets",
@@ -195,6 +214,29 @@ fn the_fake_renders_listings_with_the_backends_members() {
                     }
                 }
             }
+        }
+        if name == "transaction_utxos_invalid" {
+            // The collateral input is the one input and the collateral
+            // return the one output, neither flagged; the return is at the
+            // body's output count and holds its native tokens.
+            let recorded_outputs = 2;
+            for (row, outputs) in [(&answer, body_outputs), (real, recorded_outputs)] {
+                let inputs = row["inputs"].as_array().unwrap();
+                assert_eq!(inputs.len(), 1, "{name}: {row}");
+                assert_eq!(inputs[0]["collateral"], false, "{name}: {row}");
+                let returned = row["outputs"].as_array().unwrap();
+                assert_eq!(returned.len(), 1, "{name}: {row}");
+                assert_eq!(returned[0]["collateral"], false, "{name}: {row}");
+                assert_eq!(returned[0]["output_index"], outputs, "{name}: {row}");
+                assert!(
+                    returned[0]["amount"].as_array().map(Vec::len) > Some(1),
+                    "{name}: the return holds no native token: {row}"
+                );
+            }
+        }
+        if name == "transaction_invalid" {
+            assert_eq!(answer["valid_contract"], false, "{name}: {answer}");
+            assert_eq!(real["valid_contract"], false, "{name}: {real}");
         }
         if name == "epoch_blocks" {
             assert!(answer[0].is_string() && real[0].is_string());
