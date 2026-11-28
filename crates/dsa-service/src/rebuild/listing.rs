@@ -48,7 +48,7 @@ impl Build<'_> {
         let mut units: BTreeSet<String> = self.relevance.rule.exact_units().clone();
         for policy in self.relevance.rule.governance_policies().clone() {
             let provider = self.asker.provider.clone();
-            let rows = every_page(&self.asker, "listings", |page| {
+            let rows = every_page(&self.asker, |page| {
                 let (provider, policy) = (provider.clone(), policy.clone());
                 async move { provider.policy_assets(&policy, page).await }
             })
@@ -105,9 +105,7 @@ impl Build<'_> {
             };
             let rows = self
                 .asker
-                .ask("listings", || {
-                    provider.asset_outputs(&parsed, range, Page::first())
-                })
+                .ask(|| provider.asset_outputs(&parsed, range, Page::first()))
                 .await?;
             let (taken, next) = if rows.len() < 100 {
                 (rows, None)
@@ -149,7 +147,7 @@ impl Build<'_> {
             to: Some(height),
         };
         let provider = self.asker.provider.clone();
-        let transactions = every_page(&self.asker, "listings", |page| {
+        let transactions = every_page(&self.asker, |page| {
             let (provider, unit) = (provider.clone(), unit.clone());
             async move { provider.asset_transactions(&unit, at, page, false).await }
         })
@@ -188,7 +186,6 @@ impl Build<'_> {
         let provider = self.asker.provider.clone();
         let rows = stable(
             &self.asker,
-            "listings",
             |row: &ListedOutput| outpoint(row.tx_hash.as_str(), row.output_index),
             |page| {
                 let (provider, parsed) = (provider.clone(), parsed.clone());
@@ -245,16 +242,16 @@ impl Build<'_> {
         let provider = self.asker.provider.clone();
         let mut last = json!({});
         for attempt in 1..=READINGS {
-            let events = every_page(&self.asker, "assets", |page| {
+            let events = every_page(&self.asker, |page| {
                 let (provider, parsed) = (provider.clone(), parsed.clone());
                 async move { provider.asset_history(&parsed, page).await }
             })
             .await?;
             let answer = if known {
                 let unknown = ("provider_unit_unknown", json!({"unit": unit}));
-                Some(required(&self.asker, "assets", unknown, || provider.asset(&parsed)).await?)
+                Some(required(&self.asker, unknown, || provider.asset(&parsed)).await?)
             } else {
-                self.asker.ask("assets", || provider.asset(&parsed)).await?
+                self.asker.ask(|| provider.asset(&parsed)).await?
             };
             let count = answer.as_ref().map_or(0, |info| info.mint_or_burn_count);
             let quantity: Option<i128> = answer
@@ -372,10 +369,7 @@ impl Build<'_> {
             let tip = self.since_tip().await?;
             self.since_lists(tip.height).await?;
             let provider = self.asker.provider.clone();
-            let now = self
-                .asker
-                .ask("headers", || provider.block_at(tip.height))
-                .await?;
+            let now = self.asker.ask(|| provider.block_at(tip.height)).await?;
             if now.as_ref().is_some_and(|header| header.hash == tip.hash) {
                 break;
             }
@@ -404,10 +398,7 @@ impl Build<'_> {
             return parse(stored);
         }
         let provider = self.asker.provider.clone();
-        let tip = self
-            .asker
-            .ask("headers", || provider.latest_block())
-            .await?;
+        let tip = self.asker.ask(|| provider.latest_block()).await?;
         self.put_one("tip", "since", &tip).await?;
         Ok(tip)
     }

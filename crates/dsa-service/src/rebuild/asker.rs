@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    follow::{Error, Requests, guarded},
+    follow::{Error, guarded},
     retry::{Backoff, Stop, Time, pause_until},
 };
 
@@ -24,24 +24,23 @@ pub(super) const PASSES: usize = 8;
 /// Provider requests with the follower's outcome rules: a refusal of every
 /// request is waited out, a transport failure or a refused answer is retried
 /// with backoff until it has lasted `fatal_after`, a fatal one ends the build.
+/// The client counts each request it sends in its endpoint family.
 #[derive(Clone)]
 pub(super) struct Asker {
     pub(super) provider: Provider,
-    pub(super) requests: Requests,
     pub(super) time: Arc<dyn Time>,
     pub(super) stop: Stop,
     pub(super) fatal_after: Duration,
 }
 
 impl Asker {
-    pub(super) async fn ask<T, F, Fut>(&self, family: &'static str, call: F) -> Result<T, Error>
+    pub(super) async fn ask<T, F, Fut>(&self, call: F) -> Result<T, Error>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, dsa_provider::Error>>,
     {
         let mut backoff = Backoff::default();
         loop {
-            self.requests.count(family);
             let error = match guarded(&self.stop, call()).await {
                 Ok(value) => return Ok(value),
                 Err(Error::Provider(error)) => error,
@@ -110,7 +109,6 @@ pub(super) fn index16(value: impl TryInto<u16>) -> Result<u16, Error> {
 /// the build ends with `code`.
 pub(super) async fn required<T, F, Fut>(
     asker: &Asker,
-    family: &'static str,
     (code, mut detail): (&'static str, Value),
     call: F,
 ) -> Result<T, Error>
@@ -120,7 +118,7 @@ where
 {
     let time = Arc::clone(&asker.time);
     let answer = asker
-        .ask(family, || {
+        .ask(|| {
             let (answer, time) = (call(), Arc::clone(&time));
             async move {
                 answer.await?.ok_or_else(|| dsa_provider::Error {
@@ -152,10 +150,7 @@ pub(super) async fn utxos(asker: &Asker, transaction: &str) -> Result<Transactio
         "provider_transaction_unknown",
         json!({"transaction": transaction}),
     );
-    required(asker, "outputs", unknown, || {
-        provider.transaction_utxos(&key)
-    })
-    .await
+    required(asker, unknown, || provider.transaction_utxos(&key)).await
 }
 
 /// `/txs/{hash}` of a transaction the build needs.
@@ -166,10 +161,7 @@ pub(super) async fn info(asker: &Asker, transaction: &str) -> Result<Transaction
         "provider_transaction_unknown",
         json!({"transaction": transaction}),
     );
-    required(asker, "transactions", unknown, || {
-        provider.transaction(&key)
-    })
-    .await
+    required(asker, unknown, || provider.transaction(&key)).await
 }
 
 /// One page of the transaction list of a source, `unit:` or `address:`.
@@ -184,9 +176,7 @@ pub(super) async fn transactions_page(
     if let Some(unit) = source.strip_prefix("unit:") {
         let unit: Unit = unit.parse().map_err(Error::Provider)?;
         asker
-            .ask("listings", || {
-                provider.asset_transactions(&unit, heights, page, descending)
-            })
+            .ask(|| provider.asset_transactions(&unit, heights, page, descending))
             .await
     } else {
         let address: AddressText = source
@@ -195,9 +185,7 @@ pub(super) async fn transactions_page(
             .parse()
             .map_err(Error::Provider)?;
         asker
-            .ask("listings", || {
-                provider.address_transactions(&address, heights, page, descending)
-            })
+            .ask(|| provider.address_transactions(&address, heights, page, descending))
             .await
     }
 }
@@ -236,11 +224,7 @@ pub(super) async fn pages_below(
 
 /// Reads every page of a list (`page` from 1), until a page has fewer than
 /// 100 rows.
-pub(super) async fn every_page<T, F, Fut>(
-    asker: &Asker,
-    family: &'static str,
-    fetch: F,
-) -> Result<Vec<T>, Error>
+pub(super) async fn every_page<T, F, Fut>(asker: &Asker, fetch: F) -> Result<Vec<T>, Error>
 where
     F: Fn(Page) -> Fut,
     Fut: Future<Output = Result<Vec<T>, dsa_provider::Error>>,
@@ -248,7 +232,7 @@ where
     let mut rows = Vec::new();
     let mut page = Page::first();
     loop {
-        let answer = asker.ask(family, || fetch(page)).await?;
+        let answer = asker.ask(|| fetch(page)).await?;
         let full = answer.len() >= 100;
         rows.extend(answer);
         if !full {
@@ -265,7 +249,6 @@ where
 /// unspent when it was read, and a row spent since is found by its spend.
 pub(super) async fn stable<T, F, Fut>(
     asker: &Asker,
-    family: &'static str,
     key: impl Fn(&T) -> String,
     fetch: F,
 ) -> Result<Vec<T>, Error>
@@ -274,10 +257,10 @@ where
     F: Fn(Page) -> Fut,
     Fut: Future<Output = Result<Vec<T>, dsa_provider::Error>>,
 {
-    let mut last = every_page(asker, family, &fetch).await?;
+    let mut last = every_page(asker, &fetch).await?;
     let mut union: BTreeMap<String, T> = last.iter().map(|row| (key(row), row.clone())).collect();
     for _ in 1..PASSES {
-        let next = every_page(asker, family, &fetch).await?;
+        let next = every_page(asker, &fetch).await?;
         if next == last {
             return Ok(next);
         }

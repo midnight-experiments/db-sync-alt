@@ -3141,7 +3141,7 @@ async fn stored_requests(database: &Database) -> Result<Vec<(String, serde_json:
 /// as they are; another retention, window or horizon is
 /// `rebuild_plan_mismatch`. Continued with the same choices it equals
 /// the conversion, and its report holds the real window, the base's counts
-/// and the requests of the whole build by family.
+/// and the requests of the whole build by family, which add up to `calls`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_stopped_build_continues_only_as_it_began() -> Result {
@@ -3286,14 +3286,77 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         "counts {}",
         report.counts
     );
-    assert!(
-        requests as i64 >= report.calls - IN_FLIGHT,
-        "requests by family {requests} against {} sent",
-        report.calls
+    assert_eq!(
+        requests as i64, report.calls,
+        "requests by family against those sent"
     );
     rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await
+}
+
+/// The endpoint family a request path is counted in by the client.
+fn family_of(path: &str) -> &'static str {
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.split_once("/v0/").map_or(path, |(_, rest)| rest);
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["assets", "policy", ..] | ["assets", _, "utxos" | "transactions"] | ["addresses", ..] => {
+            "listings"
+        }
+        ["assets", ..] => "assets",
+        ["blocks", _, "txs", "cbor"] => "transactions",
+        ["blocks", ..] => "headers",
+        ["txs", _, "utxos"] => "outputs",
+        ["txs", _, "metadata"] => "metadata",
+        ["txs", ..] => "transactions",
+        ["scripts", "datum", ..] => "datums",
+        ["epochs", ..] => "epochs",
+        ["pools", ..] => "pools",
+        ["genesis"] => "genesis",
+        _ => "unknown",
+    }
+}
+
+/// The requests of a build by family are those the provider received: four
+/// requests in flight at ten a second, the reserve address's list below H
+/// shorter than one page (the pages asked with page 1 are dropped when it
+/// ends, sent or not) and one 429 with `retry-after: 1` that every request
+/// in flight waits out. Each family of the report equals the fake's tally of
+/// the paths it received, and the families add up to `calls`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn requests_by_family_are_those_the_provider_received() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, false);
+    let limited = Arc::new(AtomicBool::new(false));
+    let hook: Hook = {
+        let limited = limited.clone();
+        Arc::new(move |path: &str, _: &mut Chain, _| {
+            (path.contains("/txs/") && !limited.swap(true, Ordering::SeqCst))
+                .then(|| Behavior::status(429).retry_after("1"))
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END), Some(hook)).await;
+    let report = built_equal(&profile, &chain.g, &fake, "requests by family").await?;
+    let mut received: BTreeMap<String, u64> = BTreeMap::new();
+    for path in fake.paths() {
+        *received.entry(family_of(&path).to_owned()).or_default() += 1;
+    }
+    let list = format!("/addresses/{}/transactions?", profile.addresses.reserve);
+    println!(
+        "{}",
+        json!({"event":"requests_by_family","report":report.requests,"received":received,
+            "calls":report.calls,"reserve_list_pages":fake.requests(&list)})
+    );
+    assert!(limited.load(Ordering::SeqCst), "no request was refused");
+    assert_eq!(
+        report.requests, received,
+        "families against the paths received"
+    );
+    let total: u64 = report.requests.values().sum();
+    assert_eq!(total as i64, report.calls, "families against calls");
+    Ok(())
 }
 
 /// The window of a given horizon is the chain time from it to the target:

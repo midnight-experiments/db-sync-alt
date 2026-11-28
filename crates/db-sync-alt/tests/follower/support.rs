@@ -194,7 +194,6 @@ pub fn context<'a>(
         time: fake.clock.clone(),
         stop,
         progress,
-        requests: None,
     }
 }
 

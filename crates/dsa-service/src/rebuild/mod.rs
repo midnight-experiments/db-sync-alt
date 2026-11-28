@@ -72,7 +72,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::{
-    follow::{Connect, Error, Progress, Requests, Settings},
+    follow::{Connect, Error, Progress, Settings},
     retry::{Stop, Time},
 };
 
@@ -197,8 +197,10 @@ pub struct Report {
     /// Provider requests of the whole build, earlier runs included.
     pub calls: i64,
     /// Requests of the whole build per endpoint family, the window and its
-    /// stake and earlier runs included; a request sent again after a failed
-    /// attempt counts again.
+    /// stake and earlier runs included, counted when they are sent; a
+    /// request sent again after a failed attempt counts again. They add up
+    /// to `calls`: `unrecorded` holds the requests of earlier runs that
+    /// ended before they recorded their families.
     pub requests: BTreeMap<String, u64>,
     /// What the base holds.
     pub counts: Value,
@@ -219,8 +221,8 @@ struct Build<'a> {
     recorded: Instant,
     /// The provider requests of the earlier runs of the build.
     calls_before: i64,
-    /// The client's count of requests when this run began.
-    sent_at_start: i64,
+    /// The client's requests by family when this run began.
+    sent_at_start: BTreeMap<String, u64>,
     /// Items a phase holds before it stores them.
     batch: usize,
     /// The build's phase is its progress's reason until the window, whose
@@ -285,7 +287,7 @@ async fn check_network(asker: &Asker, profile: &Profile) -> Result<(), Error> {
         return Ok(());
     };
     let provider = asker.provider.clone();
-    let genesis = asker.ask("genesis", || provider.genesis()).await?;
+    let genesis = asker.ask(|| provider.genesis()).await?;
     if genesis.network_magic != expected {
         return Err(refusal(
             "provider_network_mismatch",
@@ -303,7 +305,7 @@ async fn check_network(asker: &Asker, profile: &Profile) -> Result<(), Error> {
 async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Plan, Error> {
     let provider = asker.provider.clone();
     let k = profile.cardano.security_parameter;
-    let latest = asker.ask("headers", || provider.latest_block()).await?;
+    let latest = asker.ask(|| provider.latest_block()).await?;
     let final_height = latest.height.checked_sub(k).ok_or_else(|| {
         refusal(
             "provider_chain_shorter",
@@ -321,7 +323,7 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
         let provider = provider.clone();
         async move {
             asker
-                .ask("headers", || provider.block_at(height))
+                .ask(|| provider.block_at(height))
                 .await?
                 .map(|header| header.time)
                 .ok_or_else(|| Error::answer("provider_block_missing", json!({"height": height})))
@@ -400,10 +402,11 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         connect: Box::new(move || connect()),
         ..context
     };
-    // This run's requests per family, the window's included: recorded also
-    // when the run ends without publishing.
-    let requests = Requests::default();
-    let result = run(context, requests.clone()).await;
+    // This run's requests per family, the window's included, are the
+    // client's counts since now: recorded also when the run ends without
+    // publishing.
+    let sent_at_start = provider.sent_by_family();
+    let result = run(context, sent_at_start.clone()).await;
     if let Err(error) = &result {
         let report = error.report();
         let code = report["error"]
@@ -437,7 +440,7 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
             let _ = store.record_calls(&provider.counts()).await;
             // A run that sent no request leaves the stored counts as they
             // are: the build of another version keeps its own.
-            let run = requests.get();
+            let run = sent_since(&provider, &sent_at_start);
             if !run.is_empty() {
                 let _ = store
                     .put_building_items("requests", &[("run".to_owned(), json!(run))])
@@ -451,11 +454,28 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
     result
 }
 
+/// The client's requests by family since `start`, families without one
+/// left out.
+fn sent_since(provider: &Provider, start: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    provider
+        .sent_by_family()
+        .into_iter()
+        .map(|(family, count)| {
+            let before = start.get(&family).copied().unwrap_or(0);
+            (family, count.saturating_sub(before))
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
 /// The requests per family of the runs of a build before this one: the
 /// stored total of the earlier runs and the last run's own count, folded
 /// into one total once this version continues the build, before this run
-/// sends a request.
-async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Error> {
+/// sends a request. `calls` is what the earlier runs recorded in total; a
+/// run that ended before it recorded its families (killed in the window,
+/// whose follower records the requests per day as it goes) leaves fewer in
+/// the families, and the difference is the family `unrecorded`.
+async fn earlier_requests(store: &mut Store, calls: i64) -> Result<BTreeMap<String, u64>, Error> {
     let stored = store.building_items("requests").await?;
     let mut earlier: BTreeMap<String, u64> = BTreeMap::new();
     for kind in ["earlier", "run"] {
@@ -466,6 +486,11 @@ async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Er
         for (family, count) in counts {
             *earlier.entry(family).or_default() += count;
         }
+    }
+    let recorded: u64 = earlier.values().sum();
+    let gap = u64::try_from(calls).unwrap_or(0).saturating_sub(recorded);
+    if gap > 0 {
+        *earlier.entry("unrecorded".to_owned()).or_default() += gap;
     }
     store
         .put_building_items(
@@ -479,7 +504,7 @@ async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Er
     Ok(earlier)
 }
 
-async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> {
+async fn run(context: Context<'_>, sent_at_start: BTreeMap<String, u64>) -> Result<Report, Error> {
     let started = Instant::now();
     let Context {
         profile,
@@ -494,7 +519,6 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
     let connect = Arc::new(connect);
     let asker = Asker {
         provider: provider.clone(),
-        requests,
         time,
         stop,
         fatal_after: settings.fatal_after,
@@ -502,7 +526,6 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
     let mut store = connect().await?;
     store.lock_writer().await?;
     let mut earlier = BTreeMap::new();
-    let (mut calls_before, mut sent_at_start) = (0, crate::follow::sent(&provider));
     let (plan, phase, resumed) = match store.building(profile).await? {
         Building::Empty => {
             check_network(&asker, profile).await?;
@@ -517,7 +540,11 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
                     json!({"stored": plan["version"], "running": VERSION}),
                 ));
             }
-            earlier = earlier_requests(&mut store).await?;
+            // The requests of the earlier runs, as they recorded them per day
+            // and in total, before this run sends one.
+            let per_day = store.calls(NaiveDate::default()).await?;
+            let recorded = calls.max(per_day.iter().map(|(_, count)| count).sum());
+            earlier = earlier_requests(&mut store, recorded).await?;
             let plan: Plan = parse(plan)?;
             let given = Flags::of(&options);
             if plan.network != profile.network || plan.flags != given {
@@ -526,12 +553,7 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
                     json!({"stored": plan.flags, "given": given}),
                 ));
             }
-            // The requests of the earlier runs, as they recorded them per day
-            // and in total, before this run sends one.
-            let per_day = store.calls(NaiveDate::default()).await?;
-            calls_before = calls.max(per_day.iter().map(|(_, count)| count).sum());
             provider.seed_counts(&per_day);
-            sent_at_start = crate::follow::sent(&provider);
             check_network(&asker, profile).await?;
             (plan, phase, true)
         }
@@ -546,7 +568,7 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         plan: plan.clone(),
         phase,
         recorded: Instant::now(),
-        calls_before,
+        calls_before: i64::try_from(earlier.values().sum::<u64>()).unwrap_or(i64::MAX),
         sent_at_start,
         batch: if options.batch_items == 0 {
             BATCH
@@ -605,7 +627,7 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         calls,
         requests: {
             let mut requests = earlier;
-            for (family, count) in build.asker.requests.get() {
+            for (family, count) in build.sent() {
                 *requests.entry(family).or_default() += count;
             }
             requests

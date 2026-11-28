@@ -48,7 +48,7 @@ impl Build<'_> {
             let (provider, asker) = (provider.clone(), asker.clone());
             async move {
                 let key = hash32(&datum)?;
-                let answer = asker.ask("datums", || provider.datum(&key)).await?;
+                let answer = asker.ask(|| provider.datum(&key)).await?;
                 Ok::<_, Error>((datum, answer))
             }
         }))
@@ -112,7 +112,7 @@ impl Build<'_> {
     async fn header_at(&self, height: u32) -> Result<Header, Error> {
         let provider = self.asker.provider.clone();
         self.asker
-            .ask("headers", || provider.block_at(height))
+            .ask(|| provider.block_at(height))
             .await?
             .ok_or_else(|| Error::answer("provider_block_missing", json!({"height": height})))
     }
@@ -267,14 +267,14 @@ impl Build<'_> {
             // by db-sync, which writes them at the epoch's first block.
             let block = self
                 .asker
-                .ask("epochs", || provider.epoch_last_block(cutoff))
+                .ask(|| provider.epoch_last_block(cutoff))
                 .await?
                 .ok_or_else(|| {
                     Error::answer("provider_epoch_blocks_missing", json!({"epoch": cutoff}))
                 })?;
             let header = self
                 .asker
-                .ask("headers", || provider.block_by_hash(&block))
+                .ask(|| provider.block_by_hash(&block))
                 .await?
                 .ok_or_else(|| Error::answer("provider_block_missing", json!({"block": block})))?;
             headers.push((format!("epoch:{cutoff}"), to_value(header)?));
@@ -282,7 +282,7 @@ impl Build<'_> {
             // reader, which counts the request itself.
             let params = self
                 .asker
-                .ask("epochs", || provider.epoch_parameters(cutoff))
+                .ask(|| provider.epoch_parameters(cutoff))
                 .await?
                 .and_then(|params| params.nonce.map(|nonce| (nonce, params.max_tx_size)));
             let (nonce, max_tx_size) = params.ok_or_else(|| {
@@ -306,7 +306,7 @@ impl Build<'_> {
         while chain.len() < k as usize + 1 {
             let rows = self
                 .asker
-                .ask("headers", || provider.next_blocks(&first.hash, page))
+                .ask(|| provider.next_blocks(&first.hash, page))
                 .await?
                 .ok_or_else(|| Error::answer("provider_fork_point_unknown", json!({})))?;
             if rows.is_empty() {
