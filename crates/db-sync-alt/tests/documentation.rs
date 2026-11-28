@@ -10,7 +10,11 @@ use std::{
     process::Command,
 };
 
-use dsa_service::status::{self, Serving, Settings, State, Status};
+use dsa_service::{
+    epoch::REQUEST_ATTEMPTS,
+    follow::{STAKE_BACKOFF, STAKE_UNANSWERED_MAX_WAIT},
+    status::{self, Serving, Settings, State, Status},
+};
 use dsa_store::service_view::ReaderCheck;
 use serde_json::Value;
 
@@ -583,6 +587,90 @@ fn the_operations_page_explains_every_health_reason_and_status_field() {
         errors.is_empty(),
         "## /status in docs/operations.md:\n{}",
         errors.join("\n")
+    );
+}
+
+/// A number as the pages write it: thousands separated by commas.
+fn grouped(number: u64) -> String {
+    let digits = number.to_string();
+    let mut text = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            text.push(',');
+        }
+        text.push(digit);
+    }
+    text
+}
+
+/// The most reads of an epoch that never succeeds, by `waits`: in the 24
+/// hours from its first read, and in any later day. Each read starts the
+/// wait of its failures in a row after the one before; a read that takes
+/// time only makes the count smaller.
+fn stake_reads_a_day(waits: &[u64]) -> (u64, u64) {
+    const DAY: u64 = 86_400;
+    let (mut reads, mut at) = (0, 0);
+    while at < DAY {
+        at += waits[(reads as usize).min(waits.len() - 1)];
+        reads += 1;
+    }
+    let last = waits[waits.len() - 1];
+    (reads, DAY.div_ceil(last))
+}
+
+#[test]
+fn the_provider_page_states_the_stake_waits_and_reads_a_day() {
+    let provider = plain(
+        &section(
+            &sections(&read("docs/provider.md"), "## "),
+            "Stake distributions",
+        )
+        .text,
+    );
+    let (last, rest) = STAKE_BACKOFF.split_last().expect("waits");
+    let (before_last, first) = rest.split_last().expect("waits");
+    let waits = format!(
+        "after {} and {} seconds and then every {} seconds ({} hours)",
+        first
+            .iter()
+            .map(|wait| grouped(*wait))
+            .collect::<Vec<_>>()
+            .join(", "),
+        grouped(*before_last),
+        grouped(*last),
+        last / 3_600,
+    );
+    assert!(
+        provider.contains(&waits),
+        "the provider page lacks {waits:?}"
+    );
+    let unanswered = format!(
+        "costs at most {REQUEST_ATTEMPTS} requests and is tried again after at most {} seconds",
+        grouped(STAKE_UNANSWERED_MAX_WAIT)
+    );
+    assert!(
+        provider.contains(&unanswered),
+        "the provider page lacks {unanswered:?}"
+    );
+    let (first_day, later) = stake_reads_a_day(&STAKE_BACKOFF);
+    let reads = format!(
+        "is read at most {first_day} times in the 24 hours from its first read and at most {later} times a day after"
+    );
+    assert!(
+        provider.contains(&reads),
+        "the provider page lacks {reads:?}"
+    );
+    let troubleshooting = plain(
+        &section(
+            &sections(&read("docs/troubleshooting.md"), "## "),
+            "Stake distributions",
+        )
+        .text,
+    );
+    let grow = format!("waits that grow to {} hours", last / 3_600);
+    assert!(
+        troubleshooting.contains(&grow),
+        "the troubleshooting page lacks {grow:?}"
     );
 }
 

@@ -323,15 +323,27 @@ async fn every_stake_refusal_names_its_cause() {
 }
 
 /// A read of ended epoch 9 on a fresh fake provider with `fault` on the
-/// history of pool c, on `clock`: its result and the requests it sent.
+/// history of pool c, on `clock`: its result, the requests it sent and those
+/// of that history.
 async fn read_with(
     fault: Option<(Behavior, usize)>,
     clock: Arc<Simulated>,
 ) -> (Result<epoch::Distribution, StakeError>, usize, usize) {
-    let fake = Fake::start(scripted(), 10).await;
     let history = format!("/pools/{}/history", pool_id(&pool("c")));
+    read_faulted(&history, fault, clock).await
+}
+
+/// A read of ended epoch 9 on a fresh fake provider with `fault` on the
+/// requests whose path contains `path`, on `clock`: its result, the requests
+/// it sent and those to `path`.
+async fn read_faulted(
+    path: &str,
+    fault: Option<(Behavior, usize)>,
+    clock: Arc<Simulated>,
+) -> (Result<epoch::Distribution, StakeError>, usize, usize) {
+    let fake = Fake::start(scripted(), 10).await;
     if let Some((behavior, times)) = fault {
-        fake.chain.lock().unwrap().fault(&history, behavior, times);
+        fake.chain.lock().unwrap().fault(path, behavior, times);
     }
     let read = epoch::read_stake(
         &fake.provider_on(clock.clone()),
@@ -341,14 +353,14 @@ async fn read_with(
         "preprod",
     )
     .await;
-    let of_c = fake
+    let of_path = fake
         .server
         .state
         .paths()
         .iter()
-        .filter(|path| path.contains(&history))
+        .filter(|sent| sent.contains(path))
         .count();
-    (read, fake.requests(), of_c)
+    (read, fake.requests(), of_path)
 }
 
 /// A request that times out in the middle of a history read is sent again
@@ -371,6 +383,36 @@ async fn five_timeouts_of_one_request_end_the_read() {
     let (read, _, of_c) = read_with(Some((timeout, 5)), Simulated::new()).await;
     let error = read.unwrap_err();
     assert_eq!(error.code(), "provider_timeout", "{}", error.report());
+    assert_eq!(of_c, 5);
+}
+
+/// A read whose first request, the epoch's summary, fails in transport on
+/// every attempt is unanswered after 5 requests, with the report of the
+/// provider error; a later request failing the same way ends the read as a
+/// provider error.
+#[tokio::test]
+async fn a_read_whose_first_request_is_never_answered_is_unanswered() {
+    let unavailable = Behavior::status(503);
+    let (read, sent, of_summary) = read_faulted(
+        "/epochs/9",
+        Some((unavailable.clone(), 5)),
+        Simulated::new(),
+    )
+    .await;
+    let error = read.unwrap_err();
+    let StakeError::Unanswered(provider) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(error.code(), "provider_unavailable");
+    assert_eq!(
+        error.report(),
+        StakeError::Provider(provider.clone()).report()
+    );
+    assert_eq!((sent, of_summary), (5, 5));
+    let (read, _, of_c) = read_with(Some((unavailable, 5)), Simulated::new()).await;
+    let error = read.unwrap_err();
+    assert!(matches!(error, StakeError::Provider(_)), "{error:?}");
+    assert_eq!(error.code(), "provider_unavailable");
     assert_eq!(of_c, 5);
 }
 
