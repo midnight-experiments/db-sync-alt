@@ -914,26 +914,40 @@ async fn measure(
     Ok(costs)
 }
 
+/// Two converted stores of the same chain, filled with rows outside every
+/// update: the large one ten times more than the small one.
+async fn filled_pair(first: u32) -> Result<(Setup, Setup)> {
+    let small = Setup::new(19, first, 60, true, WEEK).await?;
+    let large = Setup::new(19, first, 60, true, WEEK).await?;
+    let window = small.follower.target.height;
+    fill(&small.database.config, &small.profile, 1_000, 50, window).await?;
+    fill(&large.database.config, &large.profile, 1_000, 500, window).await?;
+    Ok((small, large))
+}
+
 /// Every statement of an update and the held-output lookup use indexes, and
 /// their buffer count does not follow the size of the store: with ten times
 /// more rows outside the update an index can be one level deeper and a page
 /// can split, which costs a few buffers per row, while a statement that read
 /// the other rows would cost ten times more. A plan also counts the catalogue
-/// entries that its statement reads again after a cache invalidation (an
-/// autoanalyze, for example), so a statement above its bound is measured once
-/// more, in the next update of the same shape on both stores: the test fails
-/// when the statement is above its bound in both measurements or the second
-/// update does not run it. The horizon advance is timed on a Mainnet-size
-/// store.
+/// rows its statement reads to fill the session's caches again. When other
+/// sessions commit more invalidation messages than the server queues (4,096)
+/// while a store's session is busy, that session's caches are reset, and its
+/// next update reads catalogue rows in the planning and the execution of its
+/// statements, also on tables of a few rows (`upsert_calls`: 4 buffers to 11
+/// on the large store); a reset that puts a statement above its bound was not
+/// reproduced. A statement above its bound is measured once more: at step 0,
+/// the first update after a fill, on a new pair of filled stores; at steps 1
+/// and 2, in the next update of the same shape on the same stores. The test
+/// fails when the statement is above its bound in both measurements or the
+/// second update does not run it. The horizon advance is timed on a
+/// Mainnet-size store.
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn update_cost_is_bounded_by_the_update() -> Result {
     let first = 1_000_000;
-    let mut small = Setup::new(19, first, 60, true, WEEK).await?;
-    let mut large = Setup::new(19, first, 60, true, WEEK).await?;
+    let (mut small, mut large) = filled_pair(first).await?;
     let window = small.follower.target.height;
-    fill(&small.database.config, &small.profile, 1_000, 50, window).await?;
-    fill(&large.database.config, &large.profile, 1_000, 500, window).await?;
     let mut results = Vec::new();
     for step in 0..3u64 {
         let fork = step == 1;
@@ -945,6 +959,12 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
             .collect::<Vec<_>>();
         let again = if above.is_empty() {
             BTreeMap::new()
+        } else if step == 0 {
+            let (mut fresh_small, mut fresh_large) = filled_pair(first).await?;
+            let again = measure(&mut fresh_small, &mut fresh_large, false, 0).await?;
+            fresh_small.cleanup().await?;
+            fresh_large.cleanup().await?;
+            again
         } else {
             measure(&mut small, &mut large, fork, step).await?
         };
@@ -970,7 +990,7 @@ async fn update_cost_is_bounded_by_the_update() -> Result {
             results.push(json!({"step":step,"statement":label,"buffers_small":cost.small,"buffers_large":cost.large}));
         }
         for (label, cost) in &again {
-            results.push(json!({"step":step,"repeat":true,"statement":label,"buffers_small":cost.small,"buffers_large":cost.large}));
+            results.push(json!({"step":step,"repeat":true,"fresh_stores":step==0,"statement":label,"buffers_small":cost.small,"buffers_large":cost.large}));
         }
     }
     let client = connect(&large.database.config).await?;
