@@ -4491,6 +4491,114 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
     source.database.cleanup().await
 }
 
+/// A build killed in its window after the follower stored the requests
+/// per day of an update (its future dropped: no error path runs, so the
+/// run's families are those of its last record before the window). The
+/// same command folds what the earlier run recorded and its families do
+/// not hold into the family `unrecorded`: exactly the gap between the
+/// larger of the recorded total and the requests per day and the stored
+/// families. Its `calls` is that recorded total plus the requests it sent,
+/// and its families add up to `calls`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_in_its_window_counts_what_it_recorded() -> Result {
+    let profile = profile(1);
+    let edges = edges(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &edges.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    // Slow stake reads keep the build in its window after its update.
+    let hook: Hook = Arc::new(|path: &str, chain: &mut Chain, _| {
+        path.contains("/pools")
+            .then(|| chain.answer(path).delayed(300))
+    });
+    let fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), Some(hook)).await;
+    let client = common::connect(&rebuilt.config).await?;
+    let updated = async {
+        loop {
+            let target: Option<i32> = client
+                .query_one(
+                    "SELECT target_height::integer FROM dsa.position WHERE id=1",
+                    &[],
+                )
+                .await
+                .ok()
+                .and_then(|row| row.get(0));
+            if target.is_some_and(|target| target >= EDGE_HORIZON as i32) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let (_stopper, stop) = Stop::new();
+    let options = Options {
+        horizon_block: Some(EDGE_HORIZON),
+        target_block: Some(EDGE_TARGET),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: 0,
+        batch_items: 0,
+        listing_segments: 0,
+    };
+    tokio::select! {
+        _ = build_with(&profile, &fake, &rebuilt, options.clone(), stop) => {
+            return Err("the build ended before it was killed".into());
+        }
+        () = updated => {}
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let progress: i64 = client
+        .query_one("SELECT calls FROM dsa_rebuild.progress WHERE id=1", &[])
+        .await?
+        .get(0);
+    let per_day: i64 = client
+        .query_one(
+            "SELECT coalesce(sum(requests),0)::bigint FROM dsa.calls",
+            &[],
+        )
+        .await?
+        .get(0);
+    let families: u64 = stored_requests(&rebuilt)
+        .await?
+        .iter()
+        .flat_map(|(_, counts)| counts.as_object().cloned().unwrap_or_default())
+        .filter_map(|(_, count)| count.as_u64())
+        .sum();
+    let recorded = progress.max(per_day);
+    let gap = u64::try_from(recorded)? - families;
+    let first = fake.paths().len();
+    let (_stopper, stop) = Stop::new();
+    let report = build_with(&profile, &fake, &rebuilt, options, stop)
+        .await
+        .map_err(|error| format!("continued: {}", error.report()))?;
+    let sent = fake.paths().len() - first;
+    let total: u64 = report.requests.values().sum();
+    println!(
+        "{}",
+        json!({"event":"killed_in_window","progress_calls":progress,"per_day":per_day,
+            "families":families,"gap":gap,"continued_sent":sent,"calls":report.calls,
+            "requests":report.requests,"answered":fake.paths().len()})
+    );
+    same(&report.verified, &conversion, "killed in its window")?;
+    assert!(gap > 0, "no request recorded beyond the families");
+    assert_eq!(
+        report.requests.get("unrecorded"),
+        Some(&gap),
+        "{:?}",
+        report.requests
+    );
+    assert_eq!(
+        report.calls,
+        recorded + sent as i64,
+        "calls against what was recorded and sent"
+    );
+    assert_eq!(total as i64, report.calls, "families against calls");
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
 /// The endpoint family a request path is counted in by the client.
 fn family_of(path: &str) -> &'static str {
     let path = path.split('?').next().unwrap_or(path);

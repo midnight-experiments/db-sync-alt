@@ -229,8 +229,16 @@ that were sent), `requests` (the same requests by endpoint family, counted
 when they are sent: a request sent again after a failed attempt counts again,
 and a page asked ahead that its list did not need before it was sent does not
 count; the families add up to `calls`), `counts` (what the base holds) and
-`seconds`. A build whose earlier run was killed before it recorded its
-families holds those requests in the family `unrecorded`.
+`seconds`.
+
+A run stopped by SIGINT or SIGTERM records all its requests. A run that is
+killed leaves them as of its last record: before the window, at the start of
+each phase and at least every 30 seconds; in the window, at each update the
+follower stores (the requests sent until that update's blocks were read) and
+at least every ten minutes without one. The next run counts the recorded
+requests in `calls`, and those the killed run's families do not hold in the
+family `unrecorded`. The requests the killed run sent after its last record
+are in no count.
 
 ## Stop, continue, discard
 
