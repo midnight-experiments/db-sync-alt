@@ -3059,8 +3059,11 @@ async fn a_cleared_build_holds_what_a_new_build_holds() -> Result {
 /// A build whose window a check closed is built again in the same database.
 /// X's and Y's answers give A and B each other's amount, so the supply proof
 /// passes and `asset_conservation` closes the window at X. A run of another
-/// version is refused before it writes (`rebuild_version_mismatch`, every
-/// table and stored item as they were). The same command, answered
+/// version and a run without the horizon given are refused before they
+/// write (`rebuild_version_mismatch`, `rebuild_plan_mismatch`): each table's
+/// rows, every stored item, the position, the progress and the service
+/// state are as they were, and the service state holds the check's record
+/// (its code, transaction and amounts). The same command, answered
 /// honestly, clears the base and the window and equals the conversion row
 /// by row; it asks no `/txs/{hash}` of the ten creating transactions (their
 /// validity answers are kept) and reads no cNIGHT list below H (their places
@@ -3086,7 +3089,8 @@ async fn a_window_check_failure_is_built_again_in_the_same_database() -> Result 
         .err()
         .ok_or("the build with swapped amounts published")?;
     assert_eq!(code(&error), "asset_conservation", "{}", error.report());
-    // Another version refuses the closed build and changes nothing.
+    // Another version, and the same version with other flags, refuse the
+    // closed build and change nothing.
     let client = common::connect(&rebuilt.config).await?;
     let items = "SELECT kind,key,value FROM dsa_rebuild.item ORDER BY kind,key";
     let stored = |rows: Vec<tokio_postgres::Row>| {
@@ -3100,22 +3104,70 @@ async fn a_window_check_failure_is_built_again_in_the_same_database() -> Result 
             })
             .collect::<Vec<_>>()
     };
+    let state = "SELECT jsonb_build_object(
+        'service_state',(SELECT to_jsonb(s)-'updated_at' FROM dsa.service_state s),
+        'position',(SELECT to_jsonb(p)-'updated_at' FROM dsa.position p),
+        'progress',(SELECT to_jsonb(g)-'updated_at' FROM dsa_rebuild.progress g))";
+    let snapshot = || async {
+        Result::Ok((
+            table_rows(&rebuilt).await?,
+            stored(client.query(items, &[]).await?),
+            client
+                .query_one(state, &[])
+                .await?
+                .get::<_, serde_json::Value>(0),
+        ))
+    };
     let other_version = format!("{}+other", env!("CARGO_PKG_VERSION"));
     let set_version = "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}',to_jsonb($1::text)) WHERE id=1";
     client.execute(set_version, &[&other_version]).await?;
-    let (rows_before, items_before) = (
-        table_rows(&rebuilt).await?,
-        stored(client.query(items, &[]).await?),
-    );
+    let before_version = snapshot().await?;
     let (_stopper, stop) = Stop::new();
     let version = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop).await;
-    let (rows_after, items_after) = (
-        table_rows(&rebuilt).await?,
-        stored(client.query(items, &[]).await?),
-    );
+    let after_version = snapshot().await?;
     client
         .execute(set_version, &[&env!("CARGO_PKG_VERSION")])
         .await?;
+    let before_flags = snapshot().await?;
+    let forgotten = Options {
+        horizon_block: None,
+        target_block: Some(EDGE_TARGET),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: 0,
+        batch_items: 0,
+        listing_segments: 0,
+    };
+    let (_stopper, stop) = Stop::new();
+    let flags = build_with(&profile, &fake, &rebuilt, forgotten, stop).await;
+    let after_flags = snapshot().await?;
+    let check = &after_flags.2["service_state"];
+    println!(
+        "{}",
+        json!({"event":"closed_build_refused_twice","service_state":check,
+            "other_version":version.as_ref().err().map(code),"other_flags":flags.as_ref().err().map(code)})
+    );
+    assert_eq!(
+        flags.as_ref().err().map(code).as_deref(),
+        Some("rebuild_plan_mismatch")
+    );
+    assert_eq!(
+        before_version, after_version,
+        "another version changed the build"
+    );
+    assert_eq!(before_flags, after_flags, "other flags changed the build");
+    assert_eq!(check["reason"], "asset_conservation", "{check}");
+    assert_eq!(
+        check["last_error"]["error"], "asset_conservation",
+        "{check}"
+    );
+    let detail = &check["last_error"]["detail"];
+    assert_eq!(detail["transaction"], ten.x.as_str(), "{check}");
+    assert_eq!(
+        (&detail["held"], &detail["outputs"]),
+        (&json!("3"), &json!("2")),
+        "{check}"
+    );
     on.store(false, Ordering::SeqCst);
     let first = fake.paths().len();
     let (_stopper, stop) = Stop::new();
@@ -3151,11 +3203,6 @@ async fn a_window_check_failure_is_built_again_in_the_same_database() -> Result 
     assert_eq!(
         version.as_ref().err().map(code).as_deref(),
         Some("rebuild_version_mismatch")
-    );
-    assert_eq!(rows_before, rows_after, "another version changed a table");
-    assert_eq!(
-        items_before, items_after,
-        "another version changed a stored item"
     );
     same(&report.verified, &conversion, "built again")?;
     assert_eq!(rows, json!({}), "rows differ");

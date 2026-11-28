@@ -297,7 +297,9 @@ result except the places, the validity answers, the burns below H, the datums
 and the request counts, which are final facts below H) and continues at
 `listing`. The supply proof, the second derivation, every check of the window
 and `verify` run again. When the same check fails again, an answer kept below
-H may be its cause: drop the database and build again.
+H may be its cause: drop the database and build again. Until the clear, the
+service state keeps the check's record (`status` shows it): a run refused
+before, by another version or other flags, does not replace it.
 
 ## Check a published file
 

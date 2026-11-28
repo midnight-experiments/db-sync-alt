@@ -66,7 +66,11 @@ use dsa_chain::{
     profiles::{Profile, network_magic},
 };
 use dsa_provider::Provider;
-use dsa_store::{Store, rebuild::Building, verify::Verification};
+use dsa_store::{
+    Store,
+    rebuild::{Building, REBUILDING},
+    verify::Verification,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -489,9 +493,14 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
                     .put_building_items("requests", &[("run".to_owned(), json!(run))])
                     .await;
             }
-            let _ = store
-                .record_state("stopped", &code, &json!({}), Some(&report))
-                .await;
+            // A build whose window a check closed keeps the service state
+            // the check recorded until it is cleared: a run refused before
+            // the clear leaves it, so the clear logs the check's record.
+            if progress.reason == REBUILDING || progress.reason == code {
+                let _ = store
+                    .record_state("stopped", &code, &json!({}), Some(&report))
+                    .await;
+            }
         }
     }
     result
