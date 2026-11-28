@@ -1940,6 +1940,53 @@ fn invalid_chain(profile: &Profile) -> Invalids {
     }
 }
 
+/// A first run whose cNIGHT listing names a second, nonexistent output of
+/// the invalid transaction at height 20 (beside its collateral return)
+/// counts two candidates of it, takes it as valid without asking, and ends
+/// with `rebuild_supply_mismatch`. The same command, answered honestly, has
+/// one candidate of it: the validity the first run's candidates told is
+/// not kept, the transaction is asked, and the build equals the conversion
+/// row by row, with the transaction invalid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_validity_the_candidates_told_is_worked_out_again() -> Result {
+    let profile = profile(1);
+    let chain = invalid_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &chain.g, &converted).await?;
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let invalid = chain.newest.clone();
+    let on = Arc::new(AtomicBool::new(true));
+    let hook = rows_hook(listing, on.clone(), move |rows| {
+        if let Some(at) = rows
+            .iter()
+            .position(|row| row["tx_hash"] == invalid.as_str())
+        {
+            let mut phantom = rows[at].clone();
+            phantom["output_index"] = json!(phantom["output_index"].as_u64().unwrap_or(0) + 1);
+            rows.insert(at + 1, phantom);
+        }
+    });
+    let (outcome, paths) = refused_then_continued_paths(
+        &profile,
+        &chain.g,
+        EDGE_END,
+        (hook, on),
+        &converted,
+        &conversion,
+    )
+    .await?;
+    let asked = holding(&paths, &format!("/txs/{}", chain.newest));
+    println!(
+        "{}",
+        json!({"event":"validity_worked_out_again","outcome":outcome,"asked_in_continuation":asked})
+    );
+    refused_then_equal(&outcome, "rebuild_supply_mismatch");
+    assert!(asked > 0, "the invalid transaction was not asked");
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
 /// Phase-2-invalid transactions as the backend renders them (their
 /// collateral inputs as ordinary inputs, their collateral return as their
 /// one ordinary output): a return at a height with more than 100 outputs of

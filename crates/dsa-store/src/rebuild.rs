@@ -38,8 +38,9 @@ use crate::{
 pub const REBUILDING: &str = "rebuilding";
 
 /// The items a cleared build keeps: final facts below the horizon (the
-/// places of transactions, their validity, the burns below it, datums
-/// checked against their hashes) and the build's request counts.
+/// places of transactions, the provider's answers of their validity, the
+/// burns below it, datums checked against their hashes) and the build's
+/// request counts.
 const KEPT_ITEMS: [&str; 5] = ["position", "valid", "burn", "datum", "requests"];
 
 const SCHEMA: &str = "CREATE SCHEMA dsa_rebuild;
