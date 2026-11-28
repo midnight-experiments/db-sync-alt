@@ -4594,7 +4594,18 @@ async fn a_build_killed_in_its_window_counts_what_it_recorded() -> Result {
         }
         () = updated => {}
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The dropped run's stake read runs in a task of its own and may still
+    // ask: wait until the provider has had no request for a second, as a
+    // killed process sends none.
+    let mut answered = fake.paths().len();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = fake.paths().len();
+        if now == answered {
+            break;
+        }
+        answered = now;
+    }
     let progress: i64 = client
         .query_one("SELECT calls FROM dsa_rebuild.progress WHERE id=1", &[])
         .await?
