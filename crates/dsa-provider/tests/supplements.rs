@@ -144,6 +144,64 @@ fn an_invalid_transaction_resolves_only_its_return_at_the_body_output_count() {
     );
 }
 
+/// A real phase-2-invalid Mainnet transaction whose collateral return
+/// holds cNIGHT and another native token: its recorded body (`db-sync-alt`'s
+/// `recorded-transactions.json`) and the provider's recorded answer
+/// (`/txs/{hash}/utxos` in the testkit's `listing-answers.json`). The one
+/// output of the answer, not flagged and at the body's output count,
+/// resolves to the body's collateral return with every native asset.
+#[test]
+fn a_recorded_invalid_transaction_resolves_its_return_with_its_native_assets() {
+    let recorded: serde_json::Value = serde_json::from_str(include_str!(
+        "../../db-sync-alt/tests/fixtures/recorded-transactions.json"
+    ))
+    .unwrap();
+    let answers: serde_json::Value = serde_json::from_str(include_str!(
+        "../../dsa-testkit/tests/fixtures/listing-answers.json"
+    ))
+    .unwrap();
+    let reply: TransactionOutputs =
+        serde_json::from_value(answers["transaction_utxos_invalid"]["body"].clone()).unwrap();
+    let hash = answers["transaction_utxos_invalid"]["body"]["hash"]
+        .as_str()
+        .unwrap();
+    let record: Record = serde_json::from_value(
+        recorded["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["tx_hash"] == hash)
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    let raw = hex::decode(record.cbor).unwrap();
+    let tx = transaction::decode(&raw, &record.tx_hash).unwrap();
+    assert!(!tx.is_valid());
+    let index = tx.outputs().len() as u16;
+    let resolved = resolve_outputs(&tx, &reply).unwrap();
+    assert_eq!(resolved.keys().copied().collect::<Vec<_>>(), vec![index]);
+    assert_eq!(&resolved[&index], tx.collateral_return().unwrap());
+    let assets: Vec<(String, i128)> = resolved[&index]
+        .assets
+        .iter()
+        .map(|asset| (format!("{}{}", asset.policy, asset.name), asset.quantity))
+        .collect();
+    assert_eq!(
+        assets,
+        vec![
+            (
+                "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854".to_owned(),
+                200_475_998
+            ),
+            (
+                "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f534e454b".to_owned(),
+                16_838
+            ),
+        ]
+    );
+}
+
 #[path = "support/recorded.rs"]
 mod recorded;
 

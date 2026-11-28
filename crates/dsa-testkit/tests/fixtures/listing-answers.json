@@ -1,5 +1,5 @@
 {
- "source": "Answers of the provider (public chain data), rows cut to a few: Preprod recorded on 2026-11-24, the ranged unit listing on Mainnet recorded on 2026-11-25",
+ "source": "Answers of the provider (public chain data), rows cut to a few: Preprod recorded on 2026-11-24, the ranged unit listing on Mainnet recorded on 2026-11-25, a Mainnet transaction that failed phase 2, whose collateral return holds cNIGHT and another token, recorded on 2026-11-27",
  "asset_utxos": {
   "path": "/assets/d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1/utxos?count=100&page=4&order=asc",
   "body": [
@@ -719,5 +719,103 @@
     "block_time": 1795418086
    }
   ]
+ },
+ "transaction_utxos_invalid": {
+  "path": "/txs/0fe2b6d8a2e05e29100440473c45823d8b12914ffb87b9ea477c420cc208049a/utxos",
+  "body": {
+   "hash": "0fe2b6d8a2e05e29100440473c45823d8b12914ffb87b9ea477c420cc208049a",
+   "inputs": [
+    {
+     "address": "addr1vy8z5453727kkpkm4vr9dg7sd2ftt8mglrtdh6g2p9kxcccv6znvr",
+     "amount": [
+      {
+       "unit": "lovelace",
+       "quantity": "17167640"
+      },
+      {
+       "unit": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854",
+       "quantity": "200475998"
+      },
+      {
+       "unit": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f534e454b",
+       "quantity": "16838"
+      }
+     ],
+     "tx_hash": "3b07bec2d74b11709c62d46ab7656be716595d173f24baef42a1388a4f1b33d7",
+     "output_index": 2,
+     "data_hash": null,
+     "inline_datum": null,
+     "reference_script_hash": null,
+     "collateral": false,
+     "reference": false
+    }
+   ],
+   "outputs": [
+    {
+     "address": "addr1vy8z5453727kkpkm4vr9dg7sd2ftt8mglrtdh6g2p9kxcccv6znvr",
+     "amount": [
+      {
+       "unit": "lovelace",
+       "quantity": "13343647"
+      },
+      {
+       "unit": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854",
+       "quantity": "200475998"
+      },
+      {
+       "unit": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f534e454b",
+       "quantity": "16838"
+      }
+     ],
+     "output_index": 2,
+     "data_hash": null,
+     "inline_datum": null,
+     "collateral": false,
+     "reference_script_hash": null,
+     "consumed_by_tx": "ec700058f84b5d3e9f706ef6dc0a472d861d72835c48debf9a898ab537971600"
+    }
+   ]
+  }
+ },
+ "transaction_invalid": {
+  "path": "/txs/0fe2b6d8a2e05e29100440473c45823d8b12914ffb87b9ea477c420cc208049a",
+  "body": {
+   "hash": "0fe2b6d8a2e05e29100440473c45823d8b12914ffb87b9ea477c420cc208049a",
+   "block": "682b107258f2b4bd96342b40b2dba1f40ee27ae712dab37fe0208d8b439ce5df",
+   "block_height": 13922321,
+   "block_time": 1789035044,
+   "slot": 197468753,
+   "index": 5,
+   "output_amount": [
+    {
+     "unit": "lovelace",
+     "quantity": "13343647"
+    },
+    {
+     "unit": "0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa4e49474854",
+     "quantity": "200475998"
+    },
+    {
+     "unit": "279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f534e454b",
+     "quantity": "16838"
+    }
+   ],
+   "fees": "3823993",
+   "deposit": "0",
+   "size": 859,
+   "invalid_before": "197467724",
+   "invalid_hereafter": "197478724",
+   "utxo_count": 2,
+   "withdrawal_count": 0,
+   "mir_cert_count": 0,
+   "delegation_count": 0,
+   "stake_cert_count": 0,
+   "pool_update_count": 0,
+   "pool_retire_count": 0,
+   "asset_mint_or_burn_count": 0,
+   "redeemer_count": 0,
+   "valid_contract": false,
+   "treasury_donation": "0"
+  }
  }
 }
