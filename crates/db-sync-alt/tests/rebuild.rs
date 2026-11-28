@@ -3654,6 +3654,72 @@ async fn a_build_killed_inside_its_segments_continues_to_the_conversion() -> Res
     Ok(())
 }
 
+/// A build killed when its segments were planned, one of whose open
+/// segment cursors then lacks its end: the same command refuses with
+/// `rebuild_progress_invalid` naming that cursor, before it reads the
+/// segment as one height.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_segment_cursor_without_its_end_refuses_the_build() -> Result {
+    let profile = profile(1);
+    let g = crowded_segment_chain(&profile);
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (killer, mut killed) = watch::channel(false);
+    let hook: Hook = {
+        let (seen, listing) = (seen.clone(), listing.clone());
+        Arc::new(move |path: &str, _: &mut Chain, _| {
+            if path.contains(&listing) && seen.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                let _ = killer.send(true);
+            }
+            None
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), Some(hook)).await;
+    let (_stopper, stop) = Stop::new();
+    tokio::select! {
+        _ = build_with(&profile, &fake, &rebuilt, segment_options(0), stop) => {
+            return Err("the build ended before its second listing request".into());
+        }
+        _ = killed.wait_for(|killed| *killed) => {}
+    }
+    let client = common::connect(&rebuilt.config).await?;
+    let segment: String = client
+        .query_one(
+            "SELECT key FROM dsa_rebuild.item WHERE kind='cursor' AND key LIKE 'unit:%@%'
+             AND NOT (value->>'done')::boolean ORDER BY key DESC LIMIT 1",
+            &[],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "UPDATE dsa_rebuild.item SET value=value-'to' WHERE kind='cursor' AND key=$1",
+            &[&segment],
+        )
+        .await?;
+    let (_stopper, stop) = Stop::new();
+    let refused = build_with(&profile, &fake, &rebuilt, segment_options(0), stop)
+        .await
+        .err()
+        .ok_or("the build published")?;
+    println!(
+        "{}",
+        json!({"event":"segment_without_end","cursor":segment,"refusal":refused.report()})
+    );
+    assert_eq!(
+        code(&refused),
+        "rebuild_progress_invalid",
+        "{}",
+        refused.report()
+    );
+    assert_eq!(refused.report()["detail"], json!({"cursor": segment}));
+    assert!(!serving(&rebuilt).await?, "the database serves");
+    rebuilt.cleanup().await
+}
+
 /// A tip answered 404 once and then with its block is asked again within
 /// the outcome rules: it has not left the chain, so the address listings
 /// and the lists from H on are not read again, and the build equals the

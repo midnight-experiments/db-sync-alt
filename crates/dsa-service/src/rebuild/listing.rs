@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::{
     Build,
     asker::{
-        Asker, PASSES, every_page, found_within, index16, info, required, stable,
+        Asker, PASSES, every_page, found_within, index16, info, refusal, required, stable,
         transactions_page, utxos,
     },
     content::{Content, Event, Moved, Spent, outpoint},
@@ -246,19 +246,22 @@ impl Build<'_> {
             }
             let cursor: Cursor = parse(value)?;
             if !cursor.done {
-                open.push((segment, cursor));
+                // A segment's cursor is stored with its end.
+                let to = cursor.to.ok_or_else(|| {
+                    refusal("rebuild_progress_invalid", json!({"cursor": segment}))
+                })?;
+                open.push((segment, cursor, to));
             }
         }
-        let step = |asker: Asker, unit: Unit, segment: String, cursor: Cursor| async move {
-            let to = cursor.to.unwrap_or(cursor.from);
+        let step = |asker: Asker, unit: Unit, segment: String, cursor: Cursor, to: u32| async move {
             let result = range_step(&asker, &unit, cursor.from, to).await;
-            (segment, cursor, result)
+            (segment, cursor, to, result)
         };
         let mut steps = FuturesUnordered::new();
-        for (segment, cursor) in open {
-            steps.push(step(self.asker.clone(), unit.clone(), segment, cursor));
+        for (segment, cursor, to) in open {
+            steps.push(step(self.asker.clone(), unit.clone(), segment, cursor, to));
         }
-        while let Some((segment, mut cursor, result)) = steps.next().await {
+        while let Some((segment, mut cursor, to, result)) = steps.next().await {
             let (taken, next) = result?;
             self.listed("listed", &taken).await?;
             match next {
@@ -267,7 +270,7 @@ impl Build<'_> {
             }
             self.put_one("cursor", &segment, &cursor).await?;
             if !cursor.done {
-                steps.push(step(self.asker.clone(), unit.clone(), segment, cursor));
+                steps.push(step(self.asker.clone(), unit.clone(), segment, cursor, to));
             }
         }
         Ok(())
