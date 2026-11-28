@@ -212,17 +212,6 @@ impl StakeError {
             _ => json!({"error":self.code()}),
         }
     }
-
-    /// A refusal of what the provider answered, as opposed to a transport
-    /// failure or an epoch that moved during the read: retried at growing
-    /// waits.
-    pub fn refusal(&self) -> bool {
-        match self {
-            Self::Provider(error) => !error.transport() && matches!(error.kind, Kind::Retry { .. }),
-            Self::Unanswered(_) | Self::Changed | Self::Stopped => false,
-            _ => true,
-        }
-    }
 }
 
 /// The prefix of the network's stake addresses.

@@ -464,10 +464,18 @@ enum Outcome {
     },
 }
 
-/// The waits after a stake read the provider's answers made fail, for one
-/// epoch, in seconds; the last repeats. A transport failure waits by
-/// [`crate::retry::BACKOFF`].
-pub const STAKE_REFUSED_BACKOFF: [u64; 9] = [1, 2, 4, 8, 16, 30, 60, 300, 600];
+/// The waits after a failed stake read of one epoch, in seconds, by its
+/// failures in a row; the last repeats. Every kind of failure climbs it: a
+/// refusal of the answers, a transport failure, a store error. It starts
+/// again only when the epoch's distribution is stored or the epoch leaves
+/// the window.
+pub const STAKE_BACKOFF: [u64; 11] = [1, 2, 4, 8, 16, 30, 60, 300, 600, 3_600, 21_600];
+
+/// The longest wait after a read whose epoch summary the provider never
+/// answered ([`StakeError::Unanswered`]): such a read costs at most
+/// [`epoch::REQUEST_ATTEMPTS`] requests, and after an outage it runs again
+/// within this time.
+pub const STAKE_UNANSWERED_MAX_WAIT: u64 = 600;
 
 /// The next attempt at one epoch's stake.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1421,7 +1429,7 @@ impl<'a> Follower<'a> {
         result: Result<Result<Distribution, StakeError>, tokio::task::JoinError>,
     ) {
         let now = self.now();
-        let (failure, refusal) = match result {
+        let (failure, unanswered) = match result {
             Ok(Ok(distribution)) => {
                 let Some(store) = self.store.as_mut() else {
                     // Read again once the connection is back.
@@ -1455,14 +1463,15 @@ impl<'a> Follower<'a> {
                     }
                 }
             }
-            Ok(Err(error)) => (error.report(), error.refusal()),
+            Ok(Err(error)) => (error.report(), matches!(error, StakeError::Unanswered(_))),
             Err(_) => (json!({"error":"stake_task_failed"}), false),
         };
         let retry = self.stake.retries.entry(epoch).or_default();
-        let wait = if refusal {
-            STAKE_REFUSED_BACKOFF[retry.failures.min(STAKE_REFUSED_BACKOFF.len() - 1)]
+        let ladder = STAKE_BACKOFF[retry.failures.min(STAKE_BACKOFF.len() - 1)];
+        let wait = if unanswered {
+            ladder.min(STAKE_UNANSWERED_MAX_WAIT)
         } else {
-            crate::retry::BACKOFF[retry.failures.min(crate::retry::BACKOFF.len() - 1)]
+            ladder
         };
         retry.failures += 1;
         retry.at = now + wait;
