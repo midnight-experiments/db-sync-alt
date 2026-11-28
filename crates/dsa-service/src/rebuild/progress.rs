@@ -22,6 +22,9 @@ pub(super) struct Cursor {
     pub(super) from: u32,
     pub(super) page: u32,
     pub(super) done: bool,
+    /// The last height of a segment of a unit listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) to: Option<u32>,
 }
 
 pub(super) const PHASES: [&str; 14] = [

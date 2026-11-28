@@ -87,6 +87,7 @@ fn kill_options(case: &Case, batch: usize) -> Options {
         retention_seconds: DAY,
         shortest_window_seconds: 0,
         batch_items: batch,
+        listing_segments: 0,
     }
 }
 
@@ -118,6 +119,7 @@ async fn build(
         retention_seconds: DAY,
         shortest_window_seconds: 0,
         batch_items: 0,
+        listing_segments: 0,
     };
     build_with(profile, fake, database, options, stop).await
 }
@@ -3167,6 +3169,189 @@ async fn a_window_check_failure_is_built_again_in_the_same_database() -> Result 
     source.database.cleanup().await
 }
 
+/// The listing test's horizon and target, and the last block it serves.
+const LISTING_HORIZON: u32 = 73;
+const LISTING_TARGET: u32 = 80;
+const LISTING_END: u32 = 95;
+
+/// Heights 2–72 each hold one transaction that mints 25 cNIGHT into 25
+/// outputs at ordinary addresses: 1,775 rows below the listing test's H,
+/// which a listing in one sequence reads in more than twenty requests;
+/// height 76 spends one of height 2. The other blocks are empty.
+fn crowded_listing_chain(profile: &Profile) -> Generated {
+    let ordinary = |index: u8| {
+        let mut key = [0x5c; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let mut s = Script::new(profile);
+    s.block(Vec::new());
+    let mut first = String::new();
+    for height in 2..=LISTING_END {
+        let mut transactions = Vec::new();
+        if height < LISTING_HORIZON {
+            let mut tx = s.tx().mint(&policy, &name, 25);
+            for n in 0..25_u8 {
+                let lovelace = 1_200_000 + u64::from(height) * 100 + u64::from(n);
+                tx = tx.output(Output::new(ordinary(n), lovelace).token(&policy, &name, 1));
+            }
+            transactions.push(tx);
+        } else if height == LISTING_HORIZON + 3 {
+            transactions.push(
+                s.tx()
+                    .input(&first, 0)
+                    .output(Output::new(ordinary(30), 1_100_000).token(&policy, &name, 1)),
+            );
+        }
+        let hashes = s.block(transactions);
+        if height == 2 {
+            first = hashes[0].clone();
+        }
+    }
+    s.g
+}
+
+/// The unit listing in height segments read side by side is faster than in
+/// one sequence and gives the conversion. Every cNIGHT listing request
+/// answers after `DSA_REBUILD_LISTING_LATENCY_MS` (default 1,000; the
+/// hosted provider's are 0.25–7 s). Two builds into new databases: one
+/// sequence (each request `from` the last to H − 1), and segments. Both
+/// equal the conversion row by row; the listing phase (from `listing` to
+/// `quantities` in the progress) is at least twice as fast in segments,
+/// with at least two and at most the in-flight limit of requests at once,
+/// and at most one more request per segment after the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_listing_in_segments_is_faster_and_gives_the_conversion() -> Result {
+    let profile = profile(1);
+    let g = crowded_listing_chain(&profile);
+    let latency = setting("DSA_REBUILD_LISTING_LATENCY_MS", 1000);
+    let converted = Database::new().await?;
+    let (source, conversion) =
+        conversion_at(&profile, &g, &converted, LISTING_HORIZON, LISTING_TARGET).await?;
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let segmented = 8;
+    let mut runs = Vec::new();
+    for segments in [1, segmented] {
+        let hook: Hook = {
+            let listing = listing.clone();
+            Arc::new(move |path: &str, chain: &mut Chain, _| {
+                path.contains(&listing)
+                    .then(|| chain.answer(path).delayed(latency))
+            })
+        };
+        let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), Some(hook)).await;
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &profile).await?;
+        let (progress, mut view) = watch::channel(Progress::default());
+        let phases = tokio::spawn(async move {
+            let (mut listing_at, mut quantities_at) = (None, None);
+            while view.changed().await.is_ok() {
+                let reason = view.borrow_and_update().reason.clone();
+                let now = Instant::now();
+                match reason.as_str() {
+                    "listing" => listing_at = listing_at.or(Some(now)),
+                    "quantities" => quantities_at = quantities_at.or(Some(now)),
+                    _ => {}
+                }
+            }
+            (listing_at, quantities_at)
+        });
+        let (_stopper, stop) = Stop::new();
+        let report = rebuild::rebuild(rebuild::Context {
+            profile: &profile,
+            provider: fake.provider_with(|config| {
+                config.idle_timeout = Duration::from_secs(30);
+                config.request_timeout = Duration::from_secs(60);
+            }),
+            connect: connect(&rebuilt.config),
+            settings: Settings {
+                max_in_flight: 4,
+                fatal_after: Duration::from_secs(600),
+                ..Settings::default()
+            },
+            options: Options {
+                horizon_block: Some(LISTING_HORIZON),
+                target_block: Some(LISTING_TARGET),
+                window_seconds: None,
+                retention_seconds: DAY,
+                shortest_window_seconds: 0,
+                batch_items: 0,
+                listing_segments: segments,
+            },
+            time: fake.clock.clone(),
+            stop,
+            progress,
+        })
+        .await
+        .map_err(|error| format!("segments {segments}: {}", error.report()))?;
+        let (listing_at, quantities_at) = phases.await?;
+        let seconds = quantities_at
+            .zip(listing_at)
+            .map(|(end, start)| end.duration_since(start).as_secs_f64())
+            .ok_or("the listing phase was not observed")?;
+        same(&report.verified, &conversion, "listing in segments")?;
+        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+        let paths: Vec<String> = fake
+            .paths()
+            .into_iter()
+            .filter(|path| path.contains(&listing))
+            .collect();
+        let at_once = fake.server.state.maximum_active.load(Ordering::SeqCst);
+        runs.push(
+            json!({"segments":segments,"listing_seconds":seconds,"requests":paths.len(),
+            "at_once":at_once,"rows":rows,"paths":paths}),
+        );
+        rebuilt.cleanup().await?;
+    }
+    let (sequence, side_by_side) = (&runs[0], &runs[1]);
+    let seconds = |run: &serde_json::Value| run["listing_seconds"].as_f64().unwrap_or(0.0);
+    let ratio = seconds(sequence) / seconds(side_by_side).max(f64::EPSILON);
+    println!(
+        "{}",
+        json!({"event":"listing_in_segments","latency_ms":latency,"ratio":ratio,
+            "runs":runs.iter().map(|run| json!({"segments":run["segments"],
+                "listing_seconds":run["listing_seconds"],"requests":run["requests"],
+                "at_once":run["at_once"]})).collect::<Vec<_>>()})
+    );
+    for run in &runs {
+        assert_eq!(run["rows"], json!({}), "rows differ: {run}");
+    }
+    // One sequence: every request reads from its `from` to H − 1, each from
+    // the last one's next height.
+    let to = format!("&to={}", LISTING_HORIZON - 1);
+    let froms: Vec<u32> = sequence["paths"]
+        .as_array()
+        .ok_or("paths")?
+        .iter()
+        .filter_map(|path| path.as_str())
+        .map(|path| {
+            assert!(path.ends_with(&to), "{path}");
+            path.split("&from=")
+                .nth(1)
+                .and_then(|rest| rest.split('&').next())
+                .and_then(|from| from.parse().ok())
+                .unwrap_or(u32::MAX)
+        })
+        .collect();
+    assert!(froms.len() >= 20, "{froms:?}");
+    assert!(froms.windows(2).all(|pair| pair[0] < pair[1]), "{froms:?}");
+    assert!(ratio >= 2.0, "segments {ratio} times as fast");
+    let at_once = side_by_side["at_once"].as_u64().unwrap_or(0);
+    assert!((2..=4).contains(&at_once), "{at_once} requests at once");
+    let requests = |run: &serde_json::Value| run["requests"].as_u64().unwrap_or(0);
+    assert!(
+        requests(side_by_side) < requests(sequence) + segmented as u64,
+        "{} requests against {}",
+        requests(side_by_side),
+        requests(sequence)
+    );
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
 /// A tip answered 404 once and then with its block is asked again within
 /// the outcome rules: it has not left the chain, so the address listings
 /// and the lists from H on are not read again, and the build equals the
@@ -3450,6 +3635,7 @@ async fn a_build_without_positions_takes_them_from_the_provider() -> Result {
         retention_seconds: DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, options, stop)
         .await
@@ -3495,6 +3681,7 @@ async fn a_window_below_the_retention_starts_at_the_newest_block_before_it() -> 
         retention_seconds: 2 * DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, options, stop)
         .await
@@ -3542,6 +3729,7 @@ async fn positions_out_of_range_refuse_the_build_before_it_starts() -> Result {
         retention_seconds: 2 * DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let mut outcomes = Vec::new();
     for (name, choices, expected) in [
@@ -3696,6 +3884,7 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         retention_seconds: retention,
         shortest_window_seconds: 0,
         batch_items: 0,
+        listing_segments: 0,
     };
     let (stopper, stop) = Stop::new();
     let run = build_with(
@@ -3919,6 +4108,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
         retention_seconds: DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, long, stop)
         .await
@@ -3945,6 +4135,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
                 retention_seconds: DAY,
                 shortest_window_seconds: DAY,
                 batch_items: 0,
+                listing_segments: 0,
             },
         ),
         (
@@ -3957,6 +4148,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
                 retention_seconds: 7 * DAY,
                 shortest_window_seconds: DAY,
                 batch_items: 0,
+                listing_segments: 0,
             },
         ),
     ] {

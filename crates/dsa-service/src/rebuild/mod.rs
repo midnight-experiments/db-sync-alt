@@ -85,6 +85,10 @@ use self::{
 /// Items a phase holds before it stores them, unless the options say.
 const BATCH: usize = 200;
 
+/// Height segments a unit listing with more than one page is read in, side
+/// by side, unless the options say.
+const LISTING_SEGMENTS: usize = 1;
+
 /// What is discarded to read the listings again: stored kinds, and cursors
 /// by key prefix.
 const LISTING_KINDS: [&str; 6] = [
@@ -174,6 +178,9 @@ pub struct Options {
     pub shortest_window_seconds: i64,
     /// Items a phase holds before it stores them; 200 when 0.
     pub batch_items: usize,
+    /// Height segments a unit listing with more than one page is read in;
+    /// `LISTING_SEGMENTS` when 0, one after another when 1.
+    pub listing_segments: usize,
 }
 
 /// The choices a build began with; a stopped build continues only with the
@@ -261,6 +268,8 @@ struct Build<'a> {
     sent_at_start: BTreeMap<String, u64>,
     /// Items a phase holds before it stores them.
     batch: usize,
+    /// Height segments of a unit listing with more than one page.
+    listing_segments: usize,
     /// The build's phase is its progress's reason until the window, whose
     /// follower reports its own.
     progress: watch::Sender<Progress>,
@@ -629,6 +638,11 @@ async fn run(context: Context<'_>, sent_at_start: BTreeMap<String, u64>) -> Resu
             BATCH
         } else {
             options.batch_items
+        },
+        listing_segments: if options.listing_segments == 0 {
+            LISTING_SEGMENTS
+        } else {
+            options.listing_segments
         },
         progress,
     };
