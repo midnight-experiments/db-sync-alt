@@ -152,8 +152,9 @@ pub struct ProviderTip {
     pub observed_at: u64,
 }
 
-/// The target's epoch without a stored stake distribution while the
-/// follower is at the tip, and since when (Unix seconds).
+/// The target's epoch without a stored stake distribution, as noted at the
+/// tip, and since when (Unix seconds); none once that epoch's distribution is
+/// stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct StakeMissing {
     pub epoch: u32,
@@ -181,8 +182,9 @@ pub struct Progress {
     pub last_error: Option<Value>,
     /// The stored target as the loop knows it.
     pub target: Option<u32>,
-    /// The last failed stake read: its epoch, when it failed, when it is
-    /// tried again, its failures in a row and the error with its cause.
+    /// The last failure of an epoch still missing: its epoch, when it
+    /// failed, when it is tried again, its failures in a row and the error
+    /// with its cause.
     pub stake_failure: Option<Value>,
     pub stake_missing: Option<StakeMissing>,
 }
@@ -477,11 +479,13 @@ pub const STAKE_BACKOFF: [u64; 11] = [1, 2, 4, 8, 16, 30, 60, 300, 600, 3_600, 2
 /// within this time.
 pub const STAKE_UNANSWERED_MAX_WAIT: u64 = 600;
 
-/// The next attempt at one epoch's stake.
-#[derive(Clone, Copy, Debug, Default)]
+/// The next attempt at one epoch's stake and its last failure.
+#[derive(Clone, Debug, Default)]
 struct StakeRetry {
     failures: usize,
     at: u64,
+    /// The last failure as `stake_failure` shows it.
+    report: Option<Value>,
 }
 
 /// The background stake read: one epoch at a time, the oldest without stake
@@ -1446,13 +1450,13 @@ impl<'a> Follower<'a> {
                         );
                         self.progress.send_modify(|progress| {
                             if progress
-                                .stake_failure
-                                .as_ref()
-                                .is_some_and(|failure| failure["epoch"] == epoch)
+                                .stake_missing
+                                .is_some_and(|missing| missing.epoch == epoch)
                             {
-                                progress.stake_failure = None;
+                                progress.stake_missing = None;
                             }
                         });
+                        self.publish_stake_failure();
                         return;
                     }
                     Err(error) => {
@@ -1482,8 +1486,21 @@ impl<'a> Follower<'a> {
             json!({"event":"stake_read_failed","epoch":epoch,"error":report["error"],
                 "retry_at":retry.at,"failures":retry.failures})
         );
+        retry.report = Some(report);
+        self.publish_stake_failure();
+    }
+
+    /// Shows the last failure of an epoch still missing, or none.
+    fn publish_stake_failure(&self) {
+        let last = self
+            .stake
+            .retries
+            .iter()
+            .filter_map(|(epoch, retry)| Some((retry.report.as_ref()?, *epoch)))
+            .max_by_key(|(report, epoch)| (report["at"].as_u64(), *epoch))
+            .map(|(report, _)| report.clone());
         self.progress
-            .send_modify(|progress| progress.stake_failure = Some(report));
+            .send_modify(|progress| progress.stake_failure = last);
     }
 
     /// Starts the read of the oldest epoch up to the target's that has no
@@ -1512,6 +1529,7 @@ impl<'a> Follower<'a> {
         self.stake
             .retries
             .retain(|epoch, _| window.missing.contains(epoch));
+        self.publish_stake_failure();
         let missing = window.missing.contains(&through).then(|| {
             self.progress
                 .borrow()

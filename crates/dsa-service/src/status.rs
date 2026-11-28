@@ -221,7 +221,7 @@ pub struct Epochs {
     pub current_epoch: Option<u32>,
     pub newest_parameters_epoch: Option<u32>,
     pub newest_stake_epoch: Option<u32>,
-    /// The last failed stake read, until its epoch's stake is stored.
+    /// The last failure of an epoch still missing.
     pub stake_failure: Option<Value>,
 }
 
