@@ -66,13 +66,17 @@ use dsa_chain::{
     profiles::{Profile, network_magic},
 };
 use dsa_provider::Provider;
-use dsa_store::{Store, rebuild::Building, verify::Verification};
+use dsa_store::{
+    Store,
+    rebuild::{Building, REBUILDING},
+    verify::Verification,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::{
-    follow::{Connect, Error, Progress, Requests, Settings},
+    follow::{Connect, Error, Progress, Settings},
     retry::{Stop, Time},
 };
 
@@ -85,17 +89,14 @@ use self::{
 /// Items a phase holds before it stores them, unless the options say.
 const BATCH: usize = 200;
 
-/// Refusals of a build before its window whose cause can be a moment at
-/// which the provider's answers did not fit together: the same command
-/// reads the listings, the readings of the units and the lists from H on
-/// again, and keeps the places, validity answers and other results below H.
-const READ_AGAIN: [&str; 5] = [
-    "rebuild_supply_mismatch",
-    "rebuild_listing_incomplete",
-    "rebuild_address_outputs_mismatch",
-    "provider_tip_left_chain",
-    "provider_transaction_unknown",
-];
+/// Height segments a unit listing with more than one page is read in, side
+/// by side, unless the options say. Measured on the hosted provider's
+/// Mainnet cNIGHT listing with 2, 4 and 8: a request answers in 0.25 to 7
+/// seconds, slower the further its range starts from the unit's first
+/// output and nearly as fast with eight in flight as with two; eight
+/// segments give the shortest listing, at four requests in flight and at
+/// eight.
+const LISTING_SEGMENTS: usize = 8;
 
 /// What is discarded to read the listings again: stored kinds, and cursors
 /// by key prefix.
@@ -109,16 +110,64 @@ const LISTING_KINDS: [&str; 6] = [
 ];
 const LISTING_CURSORS: [&str; 6] = ["units", "unit:", "address:", "since:", "burns", "history:"];
 
-/// Refusals of a listing that misses an output. The answer that missed it
-/// may be on either side of the comparison, so the profile addresses' full
-/// lists below H and the outputs of their transactions, from which their
-/// outputs are derived a second time, are read again with the listings.
-const ADDRESS_HISTORIES_AGAIN: [&str; 2] = [
-    "rebuild_listing_incomplete",
-    "rebuild_address_outputs_mismatch",
-];
+/// The profile addresses' full lists below H and the outputs of their
+/// transactions, from which their outputs are derived a second time.
 const ADDRESS_HISTORY_KINDS: [&str; 2] = ["address_tx", "held"];
 const ADDRESS_HISTORY_CURSORS: [&str; 1] = ["held:"];
+
+/// What the next run reads again after a refusal before the window: the
+/// stored kinds and the cursors (by key prefix) it discards, and the phase
+/// it continues at.
+#[derive(Debug, PartialEq)]
+struct ReadAgain {
+    kinds: Vec<&'static str>,
+    cursors: Vec<&'static str>,
+    phase: &'static str,
+}
+
+/// What a refusal in `phase` discards, by its cause; `None`: nothing, and
+/// the next run continues at the stored phase.
+///
+/// A refusal whose cause can be a moment at which the provider's answers
+/// did not fit together reads the listings, the readings of the units and
+/// the lists from H on again, and keeps the places, validity answers and
+/// other results below H. One of a listing that misses an output also
+/// reads the profile addresses' full lists below H again: the answer that
+/// missed it may be on either side of their comparison. A tip that left
+/// the chain discards only what the lists from H on read: the unit
+/// listings and the lists below H are final. A transaction that a list
+/// from H on or a history named and the provider does not know is read
+/// again with them; one below H (in the listing of a crowded height, the
+/// readings, the address histories or the validity answers) is asked
+/// again, and listing again does not cure it.
+fn read_again(code: &str, phase: &str) -> Option<ReadAgain> {
+    if phase_index(phase) >= phase_index("window") {
+        return None;
+    }
+    let listings = ReadAgain {
+        kinds: LISTING_KINDS.to_vec(),
+        cursors: LISTING_CURSORS.to_vec(),
+        phase: "listing",
+    };
+    match code {
+        "rebuild_supply_mismatch" => Some(listings),
+        "rebuild_listing_incomplete" | "rebuild_address_outputs_mismatch" => {
+            let mut again = listings;
+            again.kinds.extend(ADDRESS_HISTORY_KINDS);
+            again.cursors.extend(ADDRESS_HISTORY_CURSORS);
+            Some(again)
+        }
+        "provider_tip_left_chain" => Some(ReadAgain {
+            kinds: listing::SINCE_KINDS.to_vec(),
+            cursors: listing::SINCE_CURSORS.to_vec(),
+            phase: "since",
+        }),
+        "provider_transaction_unknown" if matches!(phase, "since" | "transactions") => {
+            Some(listings)
+        }
+        _ => None,
+    }
+}
 
 /// The version of the software that begins a build; a build is continued
 /// only by the same version.
@@ -138,6 +187,9 @@ pub struct Options {
     pub shortest_window_seconds: i64,
     /// Items a phase holds before it stores them; 200 when 0.
     pub batch_items: usize,
+    /// Height segments a unit listing with more than one page is read in;
+    /// `LISTING_SEGMENTS` when 0, one after another when 1.
+    pub listing_segments: usize,
 }
 
 /// The choices a build began with; a stopped build continues only with the
@@ -197,8 +249,10 @@ pub struct Report {
     /// Provider requests of the whole build, earlier runs included.
     pub calls: i64,
     /// Requests of the whole build per endpoint family, the window and its
-    /// stake and earlier runs included; a request sent again after a failed
-    /// attempt counts again.
+    /// stake and earlier runs included, counted when they are sent; a
+    /// request sent again after a failed attempt counts again. They add up
+    /// to `calls`: `unrecorded` holds the requests of earlier runs that
+    /// ended before they recorded their families.
     pub requests: BTreeMap<String, u64>,
     /// What the base holds.
     pub counts: Value,
@@ -219,10 +273,12 @@ struct Build<'a> {
     recorded: Instant,
     /// The provider requests of the earlier runs of the build.
     calls_before: i64,
-    /// The client's count of requests when this run began.
-    sent_at_start: i64,
+    /// The client's requests by family when this run began.
+    sent_at_start: BTreeMap<String, u64>,
     /// Items a phase holds before it stores them.
     batch: usize,
+    /// Height segments of a unit listing with more than one page.
+    listing_segments: usize,
     /// The build's phase is its progress's reason until the window, whose
     /// follower reports its own.
     progress: watch::Sender<Progress>,
@@ -285,7 +341,7 @@ async fn check_network(asker: &Asker, profile: &Profile) -> Result<(), Error> {
         return Ok(());
     };
     let provider = asker.provider.clone();
-    let genesis = asker.ask("genesis", || provider.genesis()).await?;
+    let genesis = asker.ask(|| provider.genesis()).await?;
     if genesis.network_magic != expected {
         return Err(refusal(
             "provider_network_mismatch",
@@ -303,7 +359,7 @@ async fn check_network(asker: &Asker, profile: &Profile) -> Result<(), Error> {
 async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Plan, Error> {
     let provider = asker.provider.clone();
     let k = profile.cardano.security_parameter;
-    let latest = asker.ask("headers", || provider.latest_block()).await?;
+    let latest = asker.ask(|| provider.latest_block()).await?;
     let final_height = latest.height.checked_sub(k).ok_or_else(|| {
         refusal(
             "provider_chain_shorter",
@@ -321,7 +377,7 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
         let provider = provider.clone();
         async move {
             asker
-                .ask("headers", || provider.block_at(height))
+                .ask(|| provider.block_at(height))
                 .await?
                 .map(|header| header.time)
                 .ok_or_else(|| Error::answer("provider_block_missing", json!({"height": height})))
@@ -388,10 +444,11 @@ async fn plan(asker: &Asker, profile: &Profile, options: &Options) -> Result<Pla
 }
 
 /// Builds the database from the provider, or continues a build that
-/// stopped, and publishes it. A build that ends without publishing records
+/// stopped or whose window a check closed (cleared first), and publishes
+/// it. A build that ends without publishing records
 /// its requests and its error as the stopped service state `status` prints;
-/// after a refusal of `READ_AGAIN` before the window, the next run of the
-/// command reads the listings again.
+/// after a refusal before the window, the next run of the command reads
+/// again what `read_again` names.
 pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
     let connect = Arc::new(context.connect);
     let recorder = Arc::clone(&connect);
@@ -400,10 +457,11 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         connect: Box::new(move || connect()),
         ..context
     };
-    // This run's requests per family, the window's included: recorded also
-    // when the run ends without publishing.
-    let requests = Requests::default();
-    let result = run(context, requests.clone()).await;
+    // This run's requests per family, the window's included, are the
+    // client's counts since now: recorded also when the run ends without
+    // publishing.
+    let sent_at_start = provider.sent_by_family();
+    let result = run(context, sent_at_start.clone()).await;
     if let Err(error) = &result {
         let report = error.report();
         let code = report["error"]
@@ -413,49 +471,63 @@ pub async fn rebuild(context: Context<'_>) -> Result<Report, Error> {
         if let Ok(mut store) = recorder().await
             && let Some(progress) = store.building_progress().await.ok().flatten()
         {
-            if READ_AGAIN.contains(&code.as_str())
-                && phase_index(&progress.phase) < phase_index("window")
-            {
-                let histories = ADDRESS_HISTORIES_AGAIN.contains(&code.as_str());
-                let (mut kinds, mut cursors) = (LISTING_KINDS.to_vec(), LISTING_CURSORS.to_vec());
-                if histories {
-                    kinds.extend(ADDRESS_HISTORY_KINDS);
-                    cursors.extend(ADDRESS_HISTORY_CURSORS);
-                }
-                if store
-                    .discard_building_items(&kinds, &cursors, Some("listing"))
+            if let Some(again) = read_again(&code, &progress.phase)
+                && store
+                    .discard_building_items(&again.kinds, &again.cursors, Some(again.phase))
                     .await
                     .is_ok()
-                {
-                    eprintln!(
-                        "{}",
-                        json!({"event":"rebuild_listings_discarded","error":code,"phase":progress.phase,
-                            "address_histories":histories})
-                    );
-                }
+            {
+                eprintln!(
+                    "{}",
+                    json!({"event":"rebuild_listings_discarded","error":code,"phase":progress.phase,
+                        "continue_at":again.phase,"unit_listings":again.kinds.contains(&"listed"),
+                        "address_histories":again.kinds.contains(&"held")})
+                );
             }
             let _ = store.record_calls(&provider.counts()).await;
             // A run that sent no request leaves the stored counts as they
             // are: the build of another version keeps its own.
-            let run = requests.get();
+            let run = sent_since(&provider, &sent_at_start);
             if !run.is_empty() {
                 let _ = store
                     .put_building_items("requests", &[("run".to_owned(), json!(run))])
                     .await;
             }
-            let _ = store
-                .record_state("stopped", &code, &json!({}), Some(&report))
-                .await;
+            // A build whose window a check closed keeps the service state
+            // the check recorded until it is cleared: a run refused before
+            // the clear leaves it, so the clear logs the check's record.
+            if progress.reason == REBUILDING || progress.reason == code {
+                let _ = store
+                    .record_state("stopped", &code, &json!({}), Some(&report))
+                    .await;
+            }
         }
     }
     result
 }
 
+/// The client's requests by family since `start`, families without one
+/// left out.
+fn sent_since(provider: &Provider, start: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    provider
+        .sent_by_family()
+        .into_iter()
+        .map(|(family, count)| {
+            let before = start.get(&family).copied().unwrap_or(0);
+            (family, count.saturating_sub(before))
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
 /// The requests per family of the runs of a build before this one: the
 /// stored total of the earlier runs and the last run's own count, folded
 /// into one total once this version continues the build, before this run
-/// sends a request.
-async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Error> {
+/// sends a request. `calls` is what the earlier runs recorded in total; a
+/// run that ended before it recorded its families (killed in the window,
+/// whose follower records the requests per day as it goes) leaves fewer in
+/// the families, and the difference is the family `unrecorded`.
+async fn earlier_requests(store: &mut Store, calls: i64) -> Result<BTreeMap<String, u64>, Error> {
     let stored = store.building_items("requests").await?;
     let mut earlier: BTreeMap<String, u64> = BTreeMap::new();
     for kind in ["earlier", "run"] {
@@ -466,6 +538,11 @@ async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Er
         for (family, count) in counts {
             *earlier.entry(family).or_default() += count;
         }
+    }
+    let recorded: u64 = earlier.values().sum();
+    let gap = u64::try_from(calls).unwrap_or(0).saturating_sub(recorded);
+    if gap > 0 {
+        *earlier.entry("unrecorded".to_owned()).or_default() += gap;
     }
     store
         .put_building_items(
@@ -479,7 +556,28 @@ async fn earlier_requests(store: &mut Store) -> Result<BTreeMap<String, u64>, Er
     Ok(earlier)
 }
 
-async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> {
+/// The plan of a stored build that this run continues: begun by this
+/// version, for this network and with the same flags. Checked before the
+/// run writes anything or sends a request.
+fn continued_plan(plan: Value, profile: &Profile, options: &Options) -> Result<Plan, Error> {
+    if plan["version"] != json!(VERSION) {
+        return Err(refusal(
+            "rebuild_version_mismatch",
+            json!({"stored": plan["version"], "running": VERSION}),
+        ));
+    }
+    let plan: Plan = parse(plan)?;
+    let given = Flags::of(options);
+    if plan.network != profile.network || plan.flags != given {
+        return Err(refusal(
+            "rebuild_plan_mismatch",
+            json!({"stored": plan.flags, "given": given}),
+        ));
+    }
+    Ok(plan)
+}
+
+async fn run(context: Context<'_>, sent_at_start: BTreeMap<String, u64>) -> Result<Report, Error> {
     let started = Instant::now();
     let Context {
         profile,
@@ -494,48 +592,50 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
     let connect = Arc::new(connect);
     let asker = Asker {
         provider: provider.clone(),
-        requests,
         time,
         stop,
         fatal_after: settings.fatal_after,
     };
     let mut store = connect().await?;
     store.lock_writer().await?;
-    let mut earlier = BTreeMap::new();
-    let (mut calls_before, mut sent_at_start) = (0, crate::follow::sent(&provider));
-    let (plan, phase, resumed) = match store.building(profile).await? {
+    let (plan, phase, calls) = match store.building(profile).await? {
         Building::Empty => {
             check_network(&asker, profile).await?;
             let plan = plan(&asker, profile, &options).await?;
             store.start_building(profile, &to_value(&plan)?).await?;
-            (plan, "listing".to_owned(), false)
+            (plan, "listing".to_owned(), None)
         }
         Building::Stopped { plan, phase, calls } => {
-            if plan["version"] != json!(VERSION) {
-                return Err(refusal(
-                    "rebuild_version_mismatch",
-                    json!({"stored": plan["version"], "running": VERSION}),
-                ));
-            }
-            earlier = earlier_requests(&mut store).await?;
-            let plan: Plan = parse(plan)?;
-            let given = Flags::of(&options);
-            if plan.network != profile.network || plan.flags != given {
-                return Err(refusal(
-                    "rebuild_plan_mismatch",
-                    json!({"stored": plan.flags, "given": given}),
-                ));
-            }
-            // The requests of the earlier runs, as they recorded them per day
-            // and in total, before this run sends one.
-            let per_day = store.calls(NaiveDate::default()).await?;
-            calls_before = calls.max(per_day.iter().map(|(_, count)| count).sum());
-            provider.seed_counts(&per_day);
-            sent_at_start = crate::follow::sent(&provider);
-            check_network(&asker, profile).await?;
-            (plan, phase, true)
+            (continued_plan(plan, profile, &options)?, phase, Some(calls))
+        }
+        Building::Closed {
+            plan,
+            calls,
+            reason,
+            service_state,
+            ..
+        } => {
+            let plan = continued_plan(plan, profile, &options)?;
+            // The failed check's record goes with the clear: logged first.
+            eprintln!(
+                "{}",
+                json!({"event":"rebuild_window_cleared","error":reason,"service_state":service_state})
+            );
+            store.clear_building_window().await?;
+            (plan, "listing".to_owned(), Some(calls))
         }
     };
+    let resumed = calls.is_some();
+    let mut earlier = BTreeMap::new();
+    if let Some(calls) = calls {
+        // The requests of the earlier runs, as they recorded them per day
+        // and in total, before this run sends one.
+        let per_day = store.calls(NaiveDate::default()).await?;
+        let recorded = calls.max(per_day.iter().map(|(_, count)| count).sum());
+        earlier = earlier_requests(&mut store, recorded).await?;
+        provider.seed_counts(&per_day);
+        check_network(&asker, profile).await?;
+    }
     let mut build = Build {
         profile,
         relevance: Relevance::of(profile),
@@ -546,12 +646,17 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         plan: plan.clone(),
         phase,
         recorded: Instant::now(),
-        calls_before,
+        calls_before: i64::try_from(earlier.values().sum::<u64>()).unwrap_or(i64::MAX),
         sent_at_start,
         batch: if options.batch_items == 0 {
             BATCH
         } else {
             options.batch_items
+        },
+        listing_segments: if options.listing_segments == 0 {
+            LISTING_SEGMENTS
+        } else {
+            options.listing_segments
         },
         progress,
     };
@@ -605,7 +710,7 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         calls,
         requests: {
             let mut requests = earlier;
-            for (family, count) in build.asker.requests.get() {
+            for (family, count) in build.sent() {
                 *requests.entry(family).or_default() += count;
             }
             requests
@@ -613,4 +718,62 @@ async fn run(context: Context<'_>, requests: Requests) -> Result<Report, Error> 
         counts,
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each refusal before the window discards what its cause requires and
+    /// the next run continues where that is read again.
+    #[test]
+    fn a_refusal_discards_by_its_cause() {
+        let discarded = |code, phase| {
+            read_again(code, phase).map(|again| {
+                (
+                    again.phase,
+                    again.kinds.contains(&"listed"),
+                    again.kinds.contains(&"held"),
+                )
+            })
+        };
+        assert_eq!(
+            discarded("rebuild_supply_mismatch", "base"),
+            Some(("listing", true, false))
+        );
+        for code in [
+            "rebuild_listing_incomplete",
+            "rebuild_address_outputs_mismatch",
+        ] {
+            assert_eq!(discarded(code, "history"), Some(("listing", true, true)));
+        }
+        assert_eq!(
+            discarded("provider_tip_left_chain", "since"),
+            Some(("since", false, false))
+        );
+        let tip = read_again("provider_tip_left_chain", "since").unwrap();
+        assert!(
+            !tip.cursors
+                .iter()
+                .any(|prefix| ["unit:", "history:", "held:"].contains(prefix))
+        );
+        for phase in ["since", "transactions"] {
+            assert_eq!(
+                discarded("provider_transaction_unknown", phase),
+                Some(("listing", true, false))
+            );
+        }
+        for phase in ["listing", "quantities", "addresses", "validity", "carried"] {
+            assert_eq!(
+                discarded("provider_transaction_unknown", phase),
+                None,
+                "{phase}"
+            );
+        }
+        assert_eq!(discarded("rebuild_supply_mismatch", "window"), None);
+        assert_eq!(
+            discarded("provider_mint_history_mismatch", "quantities"),
+            None
+        );
+    }
 }

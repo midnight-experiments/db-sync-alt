@@ -291,9 +291,6 @@ pub struct Context<'a> {
     pub time: Arc<dyn Time>,
     pub stop: Stop,
     pub progress: watch::Sender<Progress>,
-    /// Counts the run's requests per family into these, shared with the
-    /// caller (a build counts its window so); new ones when not given.
-    pub requests: Option<Requests>,
 }
 
 /// Work that runs on the writer's connection between two steps of the loop,
@@ -552,7 +549,6 @@ impl<'a> Follower<'a> {
             time,
             stop,
             progress,
-            requests,
         } = context;
         let mut store = connect().await?;
         let stored = load(&store, profile, settings.building).await?;
@@ -578,7 +574,7 @@ impl<'a> Follower<'a> {
             selection: Selection::new(profile),
             profile,
             provider,
-            requests: requests.unwrap_or_default(),
+            requests: Requests::default(),
             connect,
             settings,
             stop,

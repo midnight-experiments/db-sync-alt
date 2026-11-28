@@ -71,16 +71,16 @@ only for what it does not hold yet.
 
 | Phase | What it reads |
 | --- | --- |
-| `listing` | The outputs the node needs that are unspent now and were created below H: for each asset unit of the profile (with every unit of the two governance policies, from `/assets/policy/{policy}`) `/assets/{unit}/utxos` by ranges of creation height, read in sequence; for each address of the profile `/addresses/{address}/utxos`, read again until two reads agree, or the union of eight reads. |
+| `listing` | The outputs the node needs that are unspent now and were created below H: for each asset unit of the profile (with every unit of the two governance policies, from `/assets/policy/{policy}`) `/assets/{unit}/utxos` by ranges of creation height: one request for every height below H and, when its page is full, eight segments of the heights left, of equal width, read side by side within `--max-in-flight` and the pace; for each address of the profile `/addresses/{address}/utxos`, read again until two reads agree, or the union of eight reads. |
 | `quantities` | For each asset unit of the listing and each fixed-supply asset, one unit at a time: every page of its mints and burns (`/assets/{unit}/history`), then its quantity (`/assets/{unit}`). A unit's reading is taken when no transaction occurs twice in the history, the history has as many rows as the quantity's answer counts and its amounts add up to the quantity; otherwise the unit is read again, five readings in all, and then the build ends with `provider_mint_history_mismatch`. A unit of the network's table of fixed-supply assets exists on the network: the provider must know it (`provider_unit_unknown`). |
-| `since` | The provider's tip, then every transaction from H up to that tip's height that created an output holding a unit read in `quantities` or touched a profile address (`/assets/{unit}/transactions`, `/addresses/{address}/transactions`). When the tip's block has left the chain by the time these lists are read, the address listings and the lists are read again, at most three times (`provider_tip_left_chain`). A transaction that burns all it spends of a unit is in no list of the unit, only in its history: each burn that no list names is placed by its own `/txs/{hash}`. A mint creates an output holding its unit, so a mint from H on is in the unit's list: a mint that no list names is below H. |
+| `since` | The provider's tip, then every transaction from H up to that tip's height that created an output holding a unit read in `quantities` or touched a profile address (`/assets/{unit}/transactions`, `/addresses/{address}/transactions`). When the tip's block has left the chain by the time these lists are read (another block at its height, or a 404 that lasted as long as any refused answer may), the address listings and the lists are read again, at most three times (`provider_tip_left_chain`). A transaction that burns all it spends of a unit is in no list of the unit, only in its history: each burn that no list names is placed by its own `/txs/{hash}`. A mint creates an output holding its unit, so a mint from H on is in the unit's list: a mint that no list names is below H. |
 | `transactions` | The inputs of those transactions (`/txs/{hash}/utxos`). |
 | `addresses` | For each address of the profile, its full transaction list up to H − 1, and the outputs of every transaction in it with the transaction that spent each one (`consumed_by_tx` of `/txs/{hash}/utxos`). |
 | `history` | The full transaction lists of the asset units up to H − 1: the block and position of each transaction that created an output unspent at H. |
 | `validity` | Whether those transactions passed (`/txs/{hash}`), where their outputs do not already tell. |
 | `datums` | A datum the node reads that is not inline in its output (`/scripts/datum/{hash}/cbor`). |
 | `carried` | The governance and permissioned-candidates transactions below H that the keep rule keeps, from the lists read backward from H − 1. |
-| `epochs` | The epoch values below the window: the newest block (looked for in the epoch and up to fifteen epochs before it) and the parameters of each of the two epochs before H's epoch, and the headers from H − 1 to H − 1 + k. Missing parameters end the build with `provider_epoch_parameters_missing`, a newest block found in none of those epochs with `provider_epoch_blocks_missing`. |
+| `epochs` | The epoch values below the window: the newest block and the parameters of each of the two epochs before H's epoch, and the headers from H − 1 to H − 1 + k. An epoch without a block ends the build with `provider_epoch_blocks_missing`, missing parameters with `provider_epoch_parameters_missing`. |
 | `base` | No new read: the supply proof (below), then the rows below H, written in one transaction. |
 | `window` | Every block from H to T, made final exactly as the service follows the chain, with all its checks; then the stake distributions of the epochs from two before H's through T's. |
 | `publish` | The publication (below). |
@@ -208,24 +208,37 @@ out; `rebuild_listing_moving` when an address's outputs kept changing over
 eight reads, whose union is then taken; `rebuild_reading_again` when a unit's
 history and quantity did not agree and the unit is read again;
 `rebuild_tip_left_chain` when the lists from H on are read again;
-`rebuild_listings_discarded` when a refusal makes the next run read the
-listings again, with `address_histories` true when the profile addresses'
-full lists below H go too; in the window the `update` and
+`rebuild_listings_discarded` when a refusal makes the next run read again
+what its cause requires, with `continue_at` (the phase the next run continues
+at), `unit_listings` true when the unit listings go and `address_histories`
+true when the profile addresses' full lists below H go too;
+`rebuild_window_cleared` with the check's code (`error`) and the service state
+recorded with it (`service_state`) when a build whose window a check closed
+is built again; in the window the `update` and
 `follower_state` lines of following; `rebuild_published` with the content
 digest and the requests; `rebuild_failed` with the error's report, the code
 and any `detail`, when the build ends on an answer of the provider, one of its
 own checks or refusals, or a stop. A code that the database gives, such as
-`destination_not_empty`, `rebuild_refused` or a fault that `verify` finds at
+`destination_not_empty` or a fault that `verify` finds at
 the publication, is on the failure's own line alone. The report on standard
 output holds the `plan`
 (network, horizon, target, tip, the window as the chain time from H to T, the
 retention, the `version` that began the build and its `flags`), `resumed`,
 the `verified` report of `verify`, `calls` (the requests of the whole build
-that were sent), `requests` (the requests asked, by endpoint family: a request
-sent again after a failed attempt counts again, and a page asked ahead counts
-whether or not it was sent before its list ended, or in the window before its
-update reached a limit, so the sum can be above `calls`), `counts` (what the
-base holds) and `seconds`.
+that were sent), `requests` (the same requests by endpoint family, counted
+when they are sent: a request sent again after a failed attempt counts again,
+and a page asked ahead that its list did not need before it was sent does not
+count; the families add up to `calls`), `counts` (what the base holds) and
+`seconds`.
+
+A run stopped by SIGINT or SIGTERM records all its requests. A run that is
+killed leaves them as of its last record: before the window, at the start of
+each phase and at least every 30 seconds; in the window, at each update the
+follower stores (the requests sent until that update's blocks were read) and
+at least every ten minutes without one. The next run counts the recorded
+requests in `calls`, and those the killed run's families do not hold in the
+family `unrecorded`. The requests the killed run sent after its last record
+are in no count.
 
 ## Stop, continue, discard
 
@@ -261,21 +274,40 @@ A database that a build fills never serves until the build has published:
 To discard a build, drop the database and create it again
 ([PostgreSQL](postgresql.md#the-database-and-its-logins)).
 
-After `rebuild_supply_mismatch`, `rebuild_listing_incomplete`,
-`rebuild_address_outputs_mismatch`, `provider_tip_left_chain` or
-`provider_transaction_unknown` before the window, the build discards its
-listings, the readings of the units and the lists from H on: the same command
-reads them again, and keeps the places, the validity answers and the other
-results below H. After `rebuild_listing_incomplete` and
-`rebuild_address_outputs_mismatch` it also discards each profile address's
-full list below H and the outputs of its transactions, from which the
-address's outputs are derived the second time: the answer that missed an
-output may be on either side, so the same command reads both again. After
-`provider_mint_history_mismatch`, the same command reads the units that have
-no reading yet. A check that closes the build's gate in
-the window (`asset_conservation` or another) ends the build for that database:
-the same command refuses it (`rebuild_refused`); drop the database and build
-again.
+A refusal before the window discards what its cause requires, and the same
+command reads that again:
+
+- After `rebuild_supply_mismatch`, `rebuild_listing_incomplete` or
+  `rebuild_address_outputs_mismatch`, the build discards its listings, the
+  readings of the units and the lists from H on, and keeps the places, the
+  validity answers and the other results below H. After
+  `rebuild_listing_incomplete` and `rebuild_address_outputs_mismatch` it also
+  discards each profile address's full list below H and the outputs of its
+  transactions, from which the address's outputs are derived the second time:
+  the answer that missed an output may be on either side, so the same command
+  reads both again.
+- After `provider_tip_left_chain`, it discards the address listings and the
+  lists from H on only, which the same command reads again up to a new tip;
+  the unit listings, the readings and the lists below H stay.
+- After `provider_transaction_unknown` for a transaction that a list from H on
+  or a history named (phases `since` and `transactions`), it discards what it
+  discards after `rebuild_supply_mismatch`. For a transaction below H it
+  discards nothing: the same command asks for that transaction again.
+- After `provider_mint_history_mismatch`, the same command reads the units
+  that have no reading yet.
+
+A check that closes the build's gate in the window (`asset_conservation` or
+another) ends the run. The same command, with the same flags and version,
+then builds again in the same database: it logs `rebuild_window_cleared`
+with the check's code and the service state recorded with it, clears the base
+and the window (the served tables, the follower's state and every stored
+result except the places, the validity answers, the burns below H, the datums
+and the request counts, which are final facts below H) and continues at
+`listing`. The supply proof, the second derivation, every check of the window
+and `verify` run again. When the same check fails again, an answer kept below
+H may be its cause: drop the database and build again. Until the clear, the
+service state keeps the check's record (`status` shows it): a run refused
+before, by another version or other flags, does not replace it.
 
 ## Check a published file
 
@@ -299,31 +331,34 @@ cannot give the file's digest.
 
 ## Cost
 
-Measured on Preprod, at 2 requests a second:
+Measured on Preprod:
 
 - A build with the horizon and target of the Preprod snapshot file of release
-  0.5.1 (5,414,627 and 5,449,279: 34,653 blocks, about 8.9 days) gave the
-  file's content digest
-  `5a5a4636b1e18c2af73b0bd7c71e1398f38a493f055fca83e631225388572b94`. It sent
-  26,653 requests in 3 h 46 min: 664 before the window, 108 of them for the
+  0.6.0 (5,414,627 and 5,455,057: 40,430 blocks, about 10.4 days), at 3
+  requests a second, gave the file's content digest
+  `6b37a7162b44182e733c66d1e5d2833fa1f00f39e17e27a3e1234640451502b0`. It sent
+  32,182 requests in 3 h 1 min: 670 before the window, 108 of them for the
   full lists of the five profile addresses below H and the outputs of their
-  103 transactions. `verify` passed, and [`compare`](comparison.md) against a
-  restore of the file found no difference.
-- A build with the default positions, a 7-day window of 27,296 blocks, sent
-  20,331 requests in 2 h 53 min. `verify` passed. `run` followed from the
-  built database to the chain's tip, and `compare` against a database that
-  had followed the chain found no difference.
-
-Each build was stopped once with SIGTERM and continued with the same command;
-its time is that of its two runs together.
+  transactions, and 31,512 for the window and its stake distributions.
+  `verify` passed, and [`compare`](comparison.md) against a restore of the
+  file found no difference.
+- A build with the default positions, a 7-day window of 27,296 blocks, at 2
+  requests a second, sent 20,331 requests in 2 h 53 min. `verify` passed.
+  `run` followed from the built database to the chain's tip, and `compare`
+  against a database that had followed the chain found no difference. The
+  build was stopped once with SIGTERM and continued with the same command;
+  its time is that of its two runs together.
 
 Mainnet: a build has not been run. The expected request count for a 7-day
 window is an estimate, from Mainnet's counts of outputs and transactions and
 the request pattern measured on Preprod: about 270,000 requests, and the
 histories of the profile addresses on top (about 5,900 requests for the
-mapping address). No duration is given: on Mainnet the unit listing answered
-in about 6.5 seconds a request, whatever the range of heights asked, and a
-build reads it in sequence (about 2,500 requests for cNIGHT). That is about
+mapping address). No duration is given for a whole build. On 2026-11-28 a
+Mainnet unit listing request answered in 0.25 to 7 seconds, slower the
+further its range of heights starts from the unit's first output; a build
+reads cNIGHT's listing (about 2,400 requests) in eight segments side by side,
+which those times put at about 35 to 60 minutes with four requests in flight,
+against about 3.5 hours in one sequence. That is about
 two orders of magnitude more requests than restoring a recent snapshot file
 and catching up from it: a restore sends no request, and catching up sends
 about one request per block ([provider](provider.md#catching-up)).

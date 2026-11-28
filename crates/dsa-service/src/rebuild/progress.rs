@@ -11,8 +11,8 @@ use dsa_store::Store;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use super::{Build, Plan, asker::refusal};
-use crate::follow::{Error, sent};
+use super::{Build, Plan, asker::refusal, sent_since};
+use crate::follow::Error;
 
 /// The progress is recorded at least this often while a phase runs.
 const RECORD_INTERVAL: Duration = Duration::from_secs(30);
@@ -22,6 +22,9 @@ pub(super) struct Cursor {
     pub(super) from: u32,
     pub(super) page: u32,
     pub(super) done: bool,
+    /// The last height of a segment of a unit listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) to: Option<u32>,
 }
 
 pub(super) const PHASES: [&str; 14] = [
@@ -72,10 +75,15 @@ pub(super) fn detail(
 
 impl Build<'_> {
     /// The provider requests of the whole build: those the earlier runs
-    /// recorded and those this run has sent. (The client's own counts keep
-    /// eight days only.)
+    /// recorded and those this run has sent.
     pub(super) fn calls(&self) -> i64 {
-        self.calls_before + sent(&self.asker.provider) - self.sent_at_start
+        let sent: u64 = self.sent().values().sum();
+        self.calls_before + i64::try_from(sent).unwrap_or(i64::MAX)
+    }
+
+    /// The requests this run has sent, by endpoint family.
+    pub(super) fn sent(&self) -> BTreeMap<String, u64> {
+        sent_since(&self.asker.provider, &self.sent_at_start)
     }
 
     pub(super) async fn store(&mut self) -> Result<&mut Store, Error> {
@@ -140,7 +148,7 @@ impl Build<'_> {
         });
         let transactions = (count("since") - count("moved")).max(0);
         let detail = detail(phase, calls, &self.plan, transactions, window);
-        let run = json!(self.asker.requests.get());
+        let run = json!(self.sent());
         let store = self.store().await?;
         store.record_calls(&per_day).await?;
         store

@@ -13,7 +13,7 @@ use chrono::NaiveDate;
 use dsa_provider::{
     Clock, Config, Error, Kind, Provider,
     pages::BlockPages,
-    types::{Hash32, Page, PoolId},
+    types::{AddressText, Hash32, Heights, Page, PoolId, Unit},
 };
 use dsa_testkit::{
     chain::Chain,
@@ -566,6 +566,104 @@ async fn call_counts_are_kept_per_utc_day_and_seeded_at_start() {
     );
 }
 
+/// Each endpoint counts in its family. A request counts when it is sent: a
+/// call dropped while it waits for the pace and an attempt the gate refuses
+/// are counted neither in a family nor in the day.
+#[tokio::test]
+async fn requests_count_by_family_when_they_are_sent() {
+    let unknown = Server::start(|_, _| Behavior::status(404)).await;
+    let (provider, _) = client(&unknown.url, |_| {});
+    let unit: Unit = "d2dbff622e509dda256fedbd31ef6e9fd98ed49ad91d5c0e07f68af1"
+        .parse()
+        .unwrap();
+    let address: AddressText = "addr_test1synthetic".parse().unwrap();
+    let (p, all) = (Page::first(), Heights::default());
+    let policy = unit.policy().to_owned();
+    assert!(
+        provider
+            .asset_outputs(&unit, all, p)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        provider
+            .address_outputs(&address, p)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        provider
+            .asset_transactions(&unit, all, p, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        provider
+            .address_transactions(&address, all, p, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(provider.policy_assets(&policy, p).await.unwrap().is_empty());
+    assert!(provider.asset(&unit).await.unwrap().is_none());
+    assert!(provider.asset_history(&unit, p).await.unwrap().is_empty());
+    assert!(provider.block_by_hash(&hash('1')).await.unwrap().is_none());
+    assert!(provider.block_at(7).await.unwrap().is_none());
+    assert!(provider.transaction(&hash('2')).await.unwrap().is_none());
+    assert!(
+        provider
+            .transaction_utxos(&hash('3'))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(provider.epoch_last_block(667).await.unwrap().is_none());
+    let expected = [
+        ("assets", 2),
+        ("epochs", 1),
+        ("headers", 2),
+        ("listings", 5),
+    ]
+    .into_iter()
+    .chain([("outputs", 1), ("transactions", 1)])
+    .map(|(family, count)| (family.to_owned(), count))
+    .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(provider.sent_by_family(), expected);
+    assert_eq!(unknown.state.count(), 12);
+
+    let server = Server::start(|path, _| {
+        if path.ends_with("/blocks/latest") {
+            Behavior::status(429).retry_after("60")
+        } else {
+            Behavior::json(genesis())
+        }
+    })
+    .await;
+    let (provider, _) = client(&server.url, |config| config.requests_per_second = 0.5);
+    provider.genesis().await.unwrap();
+    let waiting = tokio::time::timeout(Duration::from_millis(300), provider.genesis()).await;
+    assert!(
+        waiting.is_err(),
+        "the second call did not wait for the pace"
+    );
+    let refused = provider.latest_block().await.unwrap_err();
+    assert_eq!(refused.http_status, Some(429));
+    let gated = provider.genesis().await.unwrap_err();
+    assert_eq!(gated.http_status, None, "the gated attempt was sent");
+    assert_eq!(server.state.count(), 2);
+    let sent = provider.sent_by_family();
+    assert_eq!(
+        sent,
+        [("genesis".to_owned(), 1), ("headers".to_owned(), 1)]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(provider.counts(), vec![(day(NOW), 2)]);
+}
+
 #[tokio::test]
 async fn https_checks_certificate_trust_and_hostname() {
     for names in [vec!["127.0.0.1".to_owned()], vec!["localhost".to_owned()]] {
@@ -723,6 +821,17 @@ async fn every_endpoint_reads_its_primary_shape_at_its_path() {
     assert_eq!(outputs.outputs.len(), 1);
     assert!(outputs.body.is_some());
     assert_eq!(server.state.count(), answers.len());
+    let families = [("datums", 1), ("epochs", 3), ("genesis", 1), ("headers", 3)]
+        .into_iter()
+        .chain([
+            ("metadata", 1),
+            ("outputs", 1),
+            ("pools", 5),
+            ("transactions", 1),
+        ])
+        .map(|(family, count)| (family.to_owned(), count))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(provider.sent_by_family(), families);
 }
 
 #[tokio::test]

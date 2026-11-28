@@ -23,6 +23,7 @@ use super::{
     Build, Relevance,
     asker::{check, index16, invalid, refusal},
     content::{Carried, Content, Event, Place, Unspent},
+    validity::inferred_valid,
 };
 use crate::follow::{Error, block_row};
 
@@ -192,7 +193,11 @@ impl Build<'_> {
     /// The base: rows below H, supply at H after the proof, the position.
     pub(super) async fn base(&mut self) -> Result<(), Error> {
         let unspent = self.unspent_at_horizon().await?;
-        let valid: BTreeMap<String, bool> = self.typed("valid").await?;
+        // The provider's answers, and the validity the candidates tell.
+        let mut valid: BTreeMap<String, bool> = self.typed("valid").await?;
+        for transaction in inferred_valid(&unspent) {
+            valid.entry(transaction).or_insert(true);
+        }
         let datums = self.items("datum").await?;
         let carried: BTreeMap<String, Vec<Carried>> = self.typed("carried").await?;
         let headers: BTreeMap<String, Header> = self.typed("header").await?;

@@ -36,6 +36,7 @@ use dsa_service::{
     rebuild::{self, Options, Report},
     retry::Stop,
 };
+use dsa_store::rebuild::Building;
 use dsa_testkit::{
     chain::{Block, Chain},
     generate::{self, Counts, Generated},
@@ -86,6 +87,7 @@ fn kill_options(case: &Case, batch: usize) -> Options {
         retention_seconds: DAY,
         shortest_window_seconds: 0,
         batch_items: batch,
+        listing_segments: 0,
     }
 }
 
@@ -117,6 +119,7 @@ async fn build(
         retention_seconds: DAY,
         shortest_window_seconds: 0,
         batch_items: 0,
+        listing_segments: 0,
     };
     build_with(profile, fake, database, options, stop).await
 }
@@ -1803,10 +1806,10 @@ async fn a_crowded_height_since_the_horizon_gives_the_conversion() -> Result {
     Ok(())
 }
 
-/// An epoch without a block two epochs before H's has no parameters at the
-/// provider, as db-sync writes an epoch's parameters at its first block: the
-/// build refuses with `provider_epoch_parameters_missing` and nothing serves.
-/// (Every epoch of Mainnet and Preprod has blocks.)
+/// An epoch without a block two epochs before H's has no newest block and,
+/// at a provider fed by db-sync, no parameters: the build asks once and
+/// refuses with `provider_epoch_blocks_missing` naming the epoch, and
+/// nothing serves. (Every epoch of Mainnet and Preprod has blocks.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn an_epoch_without_a_block_below_the_horizon_refuses_the_build() -> Result {
@@ -1822,11 +1825,11 @@ async fn an_epoch_without_a_block_below_the_horizon_refuses_the_build() -> Resul
     );
     assert_eq!(
         code(&error),
-        "provider_epoch_parameters_missing",
+        "provider_epoch_blocks_missing",
         "{}",
         error.report()
     );
-    assert_eq!(error.report()["detail"]["epoch"], empty);
+    assert_eq!(error.report()["detail"], json!({"epoch": empty}));
     assert!(!serves, "the database serves");
     Ok(())
 }
@@ -1935,6 +1938,53 @@ fn invalid_chain(profile: &Profile) -> Invalids {
         record,
         newest,
     }
+}
+
+/// A first run whose cNIGHT listing names a second, nonexistent output of
+/// the invalid transaction at height 20 (beside its collateral return)
+/// counts two candidates of it, takes it as valid without asking, and ends
+/// with `rebuild_supply_mismatch`. The same command, answered honestly, has
+/// one candidate of it: the validity the first run's candidates told is
+/// not kept, the transaction is asked, and the build equals the conversion
+/// row by row, with the transaction invalid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_validity_the_candidates_told_is_worked_out_again() -> Result {
+    let profile = profile(1);
+    let chain = invalid_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &chain.g, &converted).await?;
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let invalid = chain.newest.clone();
+    let on = Arc::new(AtomicBool::new(true));
+    let hook = rows_hook(listing, on.clone(), move |rows| {
+        if let Some(at) = rows
+            .iter()
+            .position(|row| row["tx_hash"] == invalid.as_str())
+        {
+            let mut phantom = rows[at].clone();
+            phantom["output_index"] = json!(phantom["output_index"].as_u64().unwrap_or(0) + 1);
+            rows.insert(at + 1, phantom);
+        }
+    });
+    let (outcome, paths) = refused_then_continued_paths(
+        &profile,
+        &chain.g,
+        EDGE_END,
+        (hook, on),
+        &converted,
+        &conversion,
+    )
+    .await?;
+    let asked = holding(&paths, &format!("/txs/{}", chain.newest));
+    println!(
+        "{}",
+        json!({"event":"validity_worked_out_again","outcome":outcome,"asked_in_continuation":asked})
+    );
+    refused_then_equal(&outcome, "rebuild_supply_mismatch");
+    assert!(asked > 0, "the invalid transaction was not asked");
+    converted.cleanup().await?;
+    source.database.cleanup().await
 }
 
 /// Phase-2-invalid transactions as the backend renders them (their
@@ -2403,10 +2453,24 @@ async fn refused_then_continued(
     profile: &Profile,
     g: &Generated,
     through: u32,
-    (hook, on): (Hook, Arc<AtomicBool>),
+    hook: (Hook, Arc<AtomicBool>),
     converted: &Database,
     conversion: &dsa_store::verify::Verification,
 ) -> Result<serde_json::Value> {
+    let (outcome, _) =
+        refused_then_continued_paths(profile, g, through, hook, converted, conversion).await?;
+    Ok(outcome)
+}
+
+/// `refused_then_continued`, with the paths the continued build asked.
+async fn refused_then_continued_paths(
+    profile: &Profile,
+    g: &Generated,
+    through: u32,
+    (hook, on): (Hook, Arc<AtomicBool>),
+    converted: &Database,
+    conversion: &dsa_store::verify::Verification,
+) -> Result<(serde_json::Value, Vec<String>)> {
     let rebuilt = Database::new().await?;
     empty(&rebuilt, profile).await?;
     let fake = Fake::with_chain(edge_chain(profile, g, through), Some(hook)).await;
@@ -2428,13 +2492,20 @@ async fn refused_then_continued(
         }
         Err(error) => json!({"code":code(&error),"error":error.report()}),
     };
-    let requests = json!({"refused":first,"continued":fake.paths().len() - first});
+    let paths = fake.paths().split_off(first);
+    let requests = json!({"refused":first,"continued":paths.len()});
     rebuilt.cleanup().await?;
-    Ok(match refusal {
+    let outcome = match refusal {
         Ok(_) => json!({"code":null,"serving":serves,"requests":requests,"continued":continued}),
         Err(error) => json!({"code":code(&error),"error":error.report(),"serving":serves,
             "requests":requests,"continued":continued}),
-    })
+    };
+    Ok((outcome, paths))
+}
+
+/// Paths among `paths` that contain `part`.
+fn holding(paths: &[String], part: &str) -> usize {
+    paths.iter().filter(|path| path.contains(part)).count()
 }
 
 /// The outcome of `refused_then_continued` is the refusal `expected` with
@@ -2634,8 +2705,9 @@ async fn an_address_outputs_mismatch_names_what_the_provider_said() -> Result {
 /// after the lists from H on: the address listings and the lists are read
 /// again three times, and the fourth reading ends the build with
 /// `provider_tip_left_chain` while nothing serves. The same command, with
-/// the tip left in place, reads them again and equals the conversion row by
-/// row.
+/// the tip left in place, reads the address listings and the lists from H
+/// on again, keeps the unit listings and the readings, and equals the
+/// conversion row by row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
@@ -2658,7 +2730,7 @@ async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
         })
     };
     let on = Arc::new(AtomicBool::new(true));
-    let outcome = refused_then_continued(
+    let (outcome, paths) = refused_then_continued_paths(
         &profile,
         &chain.g,
         EDGE_END + 1,
@@ -2668,15 +2740,1182 @@ async fn a_tip_that_keeps_leaving_the_chain_refuses_until_it_stays() -> Result {
     )
     .await?;
     let replaced = replaced.load(Ordering::SeqCst);
+    let cnight = profile.assets.cnight.unit();
+    let (unit_listing, history) = (
+        format!("/assets/{cnight}/utxos?"),
+        format!("/assets/{cnight}/history?"),
+    );
+    let reserve = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    let continued = json!({"unit_listings":holding(&paths, &unit_listing),
+        "histories":holding(&paths, &history),"reserve_listings":holding(&paths, &reserve)});
     println!(
         "{}",
-        json!({"event":"tip_left_chain_four_times","outcome":outcome,"tip_replaced":replaced})
+        json!({"event":"tip_left_chain_four_times","outcome":outcome,"tip_replaced":replaced,
+            "continued_paths":continued})
     );
     refused_then_equal(&outcome, "provider_tip_left_chain");
     assert_eq!(outcome["error"]["detail"]["reads"], 4, "{outcome}");
     assert_eq!(replaced, 4, "checks of the tip");
+    // The continuation reads the address listings and the lists from H on
+    // again, and keeps the unit listings and the readings.
+    assert_eq!(continued["unit_listings"], 0, "{continued}");
+    assert_eq!(continued["histories"], 0, "{continued}");
+    assert!(
+        continued["reserve_listings"].as_u64() > Some(0),
+        "{continued}"
+    );
     converted.cleanup().await?;
     source.database.cleanup().await
+}
+
+/// What the ten chain's tests refer to.
+struct Ten {
+    g: Generated,
+    /// Heights 2–11: ten transactions below H that each mint cNIGHT into
+    /// one output at an ordinary address, 2 cNIGHT in the first, 3 in the
+    /// second, 1 in each other.
+    creators: Vec<String>,
+    /// Height 35, in the window: spends the first creator's output (A).
+    x: String,
+    /// Height 36, in the window: spends the second creator's output (B).
+    y: String,
+}
+
+/// Mainnet profile, k 12, the edge chain's H and T: ten creating
+/// transactions below H with one output each, so that the build asks each
+/// one's validity, and X and Y in the window spending A (2 cNIGHT) and B
+/// (3 cNIGHT). The other blocks are empty.
+fn ten_chain(profile: &Profile) -> Ten {
+    let ordinary = |index: u8| {
+        let mut key = [0x4e; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let mut s = Script::new(profile);
+    s.block(Vec::new());
+    let mut creators = Vec::new();
+    for n in 0..10_u8 {
+        let amount = match n {
+            0 => 2,
+            1 => 3,
+            _ => 1,
+        };
+        let tx = s.tx().mint(&policy, &name, amount).output(
+            Output::new(ordinary(n), 1_500_000 + u64::from(n)).token(&policy, &name, amount),
+        );
+        creators.push(s.block(vec![tx])[0].clone());
+    }
+    let (mut x, mut y) = (String::new(), String::new());
+    for height in 12..=EDGE_END {
+        let spent = match height {
+            35 => Some((0, 2)),
+            36 => Some((1, 3)),
+            _ => None,
+        };
+        let transaction = spent.map(|(creator, amount)| {
+            s.tx().input(&creators[creator], 0).output(
+                Output::new(ordinary(20 + creator as u8), 1_400_000).token(&policy, &name, amount),
+            )
+        });
+        let hashes = s.block(transaction.into_iter().collect());
+        match height {
+            35 => x = hashes[0].clone(),
+            36 => y = hashes[0].clone(),
+            _ => {}
+        }
+    }
+    Ten {
+        g: s.g,
+        creators,
+        x,
+        y,
+    }
+}
+
+/// A hook that answers 404 for the path that ends with `path`.
+fn unknown(path: String) -> Hook {
+    Arc::new(move |asked: &str, _: &mut Chain, _| {
+        asked.ends_with(&path).then(|| Behavior::status(404))
+    })
+}
+
+/// `/txs/{hash}` of a creating transaction below H answers 404 while the
+/// build asks the transactions' validity: after `fatal_after` the build
+/// ends with `provider_transaction_unknown` and nothing serves. Listing
+/// again does not cure an unknown transaction below H, so the build
+/// discards nothing: the same command, answered honestly, asks for the
+/// transaction again, reads no unit listing again and equals the
+/// conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_unknown_transaction_below_the_horizon_keeps_the_listings() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &ten.g, &converted).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let hook = while_on(on.clone(), unknown(format!("/txs/{}", ten.creators[4])));
+    let (outcome, paths) = refused_then_continued_paths(
+        &profile,
+        &ten.g,
+        EDGE_END,
+        (hook, on),
+        &converted,
+        &conversion,
+    )
+    .await?;
+    let unit_listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let asked = holding(&paths, &format!("/txs/{}", ten.creators[4]));
+    println!(
+        "{}",
+        json!({"event":"unknown_below_the_horizon","outcome":outcome,
+            "continued_unit_listings":holding(&paths, &unit_listing),"asked_again":asked})
+    );
+    refused_then_equal(&outcome, "provider_transaction_unknown");
+    assert_eq!(
+        holding(&paths, &unit_listing),
+        0,
+        "the unit listings were read again"
+    );
+    assert!(asked > 0, "the unknown transaction was not asked again");
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// `/txs/{hash}/utxos` of X, a transaction in the window that the unit's
+/// list from H on names, answers 404 while the build reads the
+/// transactions from H on: after `fatal_after` the build ends with
+/// `provider_transaction_unknown`. The lists from H on may have named a
+/// transaction that left the chain, so the build discards the listings and
+/// the lists from H on: the same command, answered honestly, reads the unit
+/// listings again and equals the conversion row by row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn an_unknown_transaction_since_the_horizon_reads_the_listings_again() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &ten.g, &converted).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let hook = while_on(on.clone(), unknown(format!("/txs/{}/utxos", ten.x)));
+    let (outcome, paths) = refused_then_continued_paths(
+        &profile,
+        &ten.g,
+        EDGE_END,
+        (hook, on),
+        &converted,
+        &conversion,
+    )
+    .await?;
+    let unit_listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    println!(
+        "{}",
+        json!({"event":"unknown_since_the_horizon","outcome":outcome,
+            "continued_unit_listings":holding(&paths, &unit_listing)})
+    );
+    refused_then_equal(&outcome, "provider_transaction_unknown");
+    assert!(
+        holding(&paths, &unit_listing) > 0,
+        "the unit listings were not read again"
+    );
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// A hook that, while `on` is set, gives the inputs A and B of X and Y each
+/// other's cNIGHT amount in their `/txs/{hash}/utxos` answers: the amounts
+/// at H still add up to the supply, so the proof passes, and the window's
+/// conservation check of X fails.
+fn swapped(profile: &Profile, ten: &Ten, on: Arc<AtomicBool>) -> Hook {
+    let cnight = profile.assets.cnight.unit();
+    let amounts = [
+        (ten.creators[0].clone(), "3"),
+        (ten.creators[1].clone(), "2"),
+    ];
+    let paths = [
+        format!("/txs/{}/utxos", ten.x),
+        format!("/txs/{}/utxos", ten.y),
+    ];
+    Arc::new(move |path: &str, chain: &mut Chain, _| {
+        if !on.load(Ordering::SeqCst) || !paths.iter().any(|end| path.ends_with(end)) {
+            return None;
+        }
+        let mut answer: serde_json::Value = serde_json::from_str(&chain.answer(path).body).ok()?;
+        for input in answer["inputs"].as_array_mut()? {
+            let Some((_, other)) = amounts
+                .iter()
+                .find(|(hash, _)| input["tx_hash"] == hash.as_str())
+            else {
+                continue;
+            };
+            for amount in input["amount"].as_array_mut()? {
+                if amount["unit"] == cnight.as_str() {
+                    amount["quantity"] = json!(other);
+                }
+            }
+        }
+        Some(Behavior::json(answer))
+    })
+}
+
+/// The rows of every table of the schemas `serve` and `dsa`, by name.
+async fn table_rows(database: &Database) -> Result<BTreeMap<String, i64>> {
+    let client = common::connect(&database.config).await?;
+    let names: Vec<String> = client
+        .query(
+            "SELECT n.nspname||'.'||c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+             WHERE c.relkind IN ('r','p') AND n.nspname IN ('serve','dsa') ORDER BY 1",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut rows = BTreeMap::new();
+    for name in names {
+        let count: i64 = client
+            .query_one(&format!("SELECT count(*) FROM {name}"), &[])
+            .await?
+            .get(0);
+        rows.insert(name, count);
+    }
+    Ok(rows)
+}
+
+/// The position without its time and the four ID sequences.
+async fn position_and_sequences(database: &Database) -> Result<serde_json::Value> {
+    let client = common::connect(&database.config).await?;
+    let position: serde_json::Value = client
+        .query_one(
+            "SELECT to_jsonb(p)-'updated_at' FROM dsa.position p WHERE id=1",
+            &[],
+        )
+        .await?
+        .get(0);
+    let mut sequences = serde_json::Map::new();
+    for table in ["multi_asset", "datum", "pool_hash", "epoch_stake"] {
+        let row = client
+            .query_one(
+                &format!("SELECT last_value,is_called FROM dsa.{table}_id_seq"),
+                &[],
+            )
+            .await?;
+        sequences.insert(
+            table.to_owned(),
+            json!([row.get::<_, i64>(0), row.get::<_, bool>(1)]),
+        );
+    }
+    Ok(json!({"position": position, "sequences": sequences}))
+}
+
+/// A build whose window a check closed (X's input A stored with B's amount,
+/// so `asset_conservation` fails at X), cleared by the store: every table
+/// of `serve` and `dsa` is empty but `identity`, `position` and `calls`;
+/// the position and the four ID sequences are those a new build starts
+/// with; the stored items are the places, validity answers, burns below H,
+/// datums and request counts, and the build continues at `listing`. A
+/// second clear is refused: a cleared build is not closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_cleared_build_holds_what_a_new_build_holds() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let fake = Fake::with_chain(
+        edge_chain(&profile, &ten.g, EDGE_END),
+        Some(swapped(&profile, &ten, on)),
+    )
+    .await;
+    let (_stopper, stop) = Stop::new();
+    let error = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("the build with swapped amounts published")?;
+    let mut store = connect(&rebuilt.config)().await?;
+    let closed = store.building(&profile).await?;
+    let before = table_rows(&rebuilt).await?;
+    store.clear_building_window().await?;
+    let after = table_rows(&rebuilt).await?;
+    let cleared = position_and_sequences(&rebuilt).await?;
+    let client = common::connect(&rebuilt.config).await?;
+    let kinds: Vec<String> = client
+        .query("SELECT DISTINCT kind FROM dsa_rebuild.item ORDER BY 1", &[])
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let phase: String = client
+        .query_one("SELECT phase FROM dsa_rebuild.progress WHERE id=1", &[])
+        .await?
+        .get(0);
+    let again = store.clear_building_window().await.err();
+    let fresh = Database::new().await?;
+    empty(&fresh, &profile).await?;
+    connect(&fresh.config)()
+        .await?
+        .start_building(&profile, &json!({"version": "fresh"}))
+        .await?;
+    let started = position_and_sequences(&fresh).await?;
+    println!(
+        "{}",
+        json!({"event":"cleared_build","error":error.report(),"closed":format!("{closed:?}"),
+            "rows_before":before,"rows_after":after,"cleared":cleared,"new_build":started,
+            "kinds":kinds,"phase":phase,"second_clear":again.as_ref().map(refused_with)})
+    );
+    let Building::Closed { reason, .. } = closed else {
+        return Err(format!("not a closed build: {closed:?}").into());
+    };
+    assert_eq!(reason, "asset_conservation");
+    assert_eq!(code(&error), "asset_conservation", "{}", error.report());
+    assert!(
+        before["serve.tx_out"] > 0 && before["serve.block"] > 0,
+        "{before:?}"
+    );
+    for (table, rows) in &after {
+        if !["dsa.identity", "dsa.position", "dsa.calls"].contains(&table.as_str()) {
+            assert_eq!(*rows, 0, "{table} after the clear");
+        }
+    }
+    assert!(after["dsa.calls"] > 0, "the request counts per day went");
+    assert_eq!(cleared, started, "position and sequences");
+    assert!(
+        kinds
+            .iter()
+            .all(|kind| ["position", "valid", "burn", "datum", "requests"].contains(&kind.as_str())),
+        "{kinds:?}"
+    );
+    for kept in ["position", "valid", "requests"] {
+        assert!(
+            kinds.iter().any(|kind| kind == kept),
+            "{kept} went: {kinds:?}"
+        );
+    }
+    assert_eq!(phase, "listing");
+    assert_eq!(
+        again.as_ref().map(refused_with).as_deref(),
+        Some("rebuild_not_closed")
+    );
+    rebuilt.cleanup().await?;
+    fresh.cleanup().await
+}
+
+/// A build whose window a check closed is built again in the same database.
+/// X's and Y's answers give A and B each other's amount, so the supply proof
+/// passes and `asset_conservation` closes the window at X. A run of another
+/// version and a run without the horizon given are refused before they
+/// write (`rebuild_version_mismatch`, `rebuild_plan_mismatch`): each table's
+/// rows, every stored item, the position, the progress and the service
+/// state are as they were, and the service state holds the check's record
+/// (its code, transaction and amounts). The same command, answered
+/// honestly, clears the base and the window and equals the conversion row
+/// by row; it asks no `/txs/{hash}` of the ten creating transactions (their
+/// validity answers are kept) and reads no cNIGHT list below H (their places
+/// are kept), and its families add up to `calls`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_window_check_failure_is_built_again_in_the_same_database() -> Result {
+    let profile = profile(1);
+    let ten = ten_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &ten.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let on = Arc::new(AtomicBool::new(true));
+    let fake = Fake::with_chain(
+        edge_chain(&profile, &ten.g, EDGE_END),
+        Some(swapped(&profile, &ten, on.clone())),
+    )
+    .await;
+    let (_stopper, stop) = Stop::new();
+    let error = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .err()
+        .ok_or("the build with swapped amounts published")?;
+    assert_eq!(code(&error), "asset_conservation", "{}", error.report());
+    // Another version, and the same version with other flags, refuse the
+    // closed build and change nothing.
+    let client = common::connect(&rebuilt.config).await?;
+    let items = "SELECT kind,key,value FROM dsa_rebuild.item ORDER BY kind,key";
+    let stored = |rows: Vec<tokio_postgres::Row>| {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, serde_json::Value>(2),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let state = "SELECT jsonb_build_object(
+        'service_state',(SELECT to_jsonb(s)-'updated_at' FROM dsa.service_state s),
+        'position',(SELECT to_jsonb(p)-'updated_at' FROM dsa.position p),
+        'progress',(SELECT to_jsonb(g)-'updated_at' FROM dsa_rebuild.progress g))";
+    let snapshot = || async {
+        Result::Ok((
+            table_rows(&rebuilt).await?,
+            stored(client.query(items, &[]).await?),
+            client
+                .query_one(state, &[])
+                .await?
+                .get::<_, serde_json::Value>(0),
+        ))
+    };
+    let other_version = format!("{}+other", env!("CARGO_PKG_VERSION"));
+    let set_version = "UPDATE dsa_rebuild.progress SET plan=jsonb_set(plan,'{version}',to_jsonb($1::text)) WHERE id=1";
+    client.execute(set_version, &[&other_version]).await?;
+    let before_version = snapshot().await?;
+    let (_stopper, stop) = Stop::new();
+    let version = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop).await;
+    let after_version = snapshot().await?;
+    client
+        .execute(set_version, &[&env!("CARGO_PKG_VERSION")])
+        .await?;
+    let before_flags = snapshot().await?;
+    let forgotten = Options {
+        horizon_block: None,
+        target_block: Some(EDGE_TARGET),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: 0,
+        batch_items: 0,
+        listing_segments: 0,
+    };
+    let (_stopper, stop) = Stop::new();
+    let flags = build_with(&profile, &fake, &rebuilt, forgotten, stop).await;
+    let after_flags = snapshot().await?;
+    let check = &after_flags.2["service_state"];
+    println!(
+        "{}",
+        json!({"event":"closed_build_refused_twice","service_state":check,
+            "other_version":version.as_ref().err().map(code),"other_flags":flags.as_ref().err().map(code)})
+    );
+    assert_eq!(
+        flags.as_ref().err().map(code).as_deref(),
+        Some("rebuild_plan_mismatch")
+    );
+    assert_eq!(
+        before_version, after_version,
+        "another version changed the build"
+    );
+    assert_eq!(before_flags, after_flags, "other flags changed the build");
+    assert_eq!(check["reason"], "asset_conservation", "{check}");
+    assert_eq!(
+        check["last_error"]["error"], "asset_conservation",
+        "{check}"
+    );
+    let detail = &check["last_error"]["detail"];
+    assert_eq!(detail["transaction"], ten.x.as_str(), "{check}");
+    assert_eq!(
+        (&detail["held"], &detail["outputs"]),
+        (&json!("3"), &json!("2")),
+        "{check}"
+    );
+    on.store(false, Ordering::SeqCst);
+    let first = fake.paths().len();
+    let (_stopper, stop) = Stop::new();
+    let report = build(&profile, &fake, &rebuilt, EDGE_HORIZON, EDGE_TARGET, stop)
+        .await
+        .map_err(|error| format!("built again: {}", error.report()))?;
+    let paths = fake.paths().split_off(first);
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let ids = descriptor_ids(&profile, &rebuilt).await?;
+    let validity: usize = ten
+        .creators
+        .iter()
+        .map(|creator| {
+            paths
+                .iter()
+                .filter(|path| path.ends_with(&format!("/txs/{creator}")))
+                .count()
+        })
+        .sum();
+    let unit_list = format!("/assets/{}/transactions?", profile.assets.cnight.unit());
+    let below = paths
+        .iter()
+        .filter(|path| path.contains(&unit_list) && !path.contains("from="))
+        .count();
+    let total: u64 = report.requests.values().sum();
+    println!(
+        "{}",
+        json!({"event":"window_check_built_again","refusal":error.report(),
+            "other_version":version.as_ref().err().map(code),"rows":rows,"resumed":report.resumed,
+            "continued_requests":paths.len(),"validity_asked":validity,"unit_lists_below_h":below,
+            "requests":report.requests,"calls":report.calls})
+    );
+    assert_eq!(
+        version.as_ref().err().map(code).as_deref(),
+        Some("rebuild_version_mismatch")
+    );
+    same(&report.verified, &conversion, "built again")?;
+    assert_eq!(rows, json!({}), "rows differ");
+    assert_eq!(ids, json!([]), "descriptor IDs");
+    assert!(report.resumed);
+    assert_eq!(validity, 0, "validity answers asked again");
+    assert_eq!(below, 0, "cNIGHT lists below H read again");
+    assert_eq!(total as i64, report.calls, "families against calls");
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// The listing test's horizon and target, and the last block it serves.
+const LISTING_HORIZON: u32 = 73;
+const LISTING_TARGET: u32 = 80;
+const LISTING_END: u32 = 95;
+
+/// Heights 2–72 each hold one transaction that mints 25 cNIGHT into 25
+/// outputs at ordinary addresses: 1,775 rows below the listing test's H,
+/// which a listing in one sequence reads in more than twenty requests;
+/// height 76 spends one of height 2. The other blocks are empty.
+fn crowded_listing_chain(profile: &Profile) -> Generated {
+    let ordinary = |index: u8| {
+        let mut key = [0x5c; 28];
+        key[0] = index;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let mut s = Script::new(profile);
+    s.block(Vec::new());
+    let mut first = String::new();
+    for height in 2..=LISTING_END {
+        let mut transactions = Vec::new();
+        if height < LISTING_HORIZON {
+            let mut tx = s.tx().mint(&policy, &name, 25);
+            for n in 0..25_u8 {
+                let lovelace = 1_200_000 + u64::from(height) * 100 + u64::from(n);
+                tx = tx.output(Output::new(ordinary(n), lovelace).token(&policy, &name, 1));
+            }
+            transactions.push(tx);
+        } else if height == LISTING_HORIZON + 3 {
+            transactions.push(
+                s.tx()
+                    .input(&first, 0)
+                    .output(Output::new(ordinary(30), 1_100_000).token(&policy, &name, 1)),
+            );
+        }
+        let hashes = s.block(transactions);
+        if height == 2 {
+            first = hashes[0].clone();
+        }
+    }
+    s.g
+}
+
+/// The unit listing in height segments read side by side is faster than in
+/// one sequence and gives the conversion. Every cNIGHT listing request
+/// answers after `DSA_REBUILD_LISTING_LATENCY_MS` (default 1,000; the
+/// hosted provider's are 0.25–7 s). Two builds into new databases: one
+/// sequence (each request `from` the last to H − 1), and the default
+/// segments. Both
+/// equal the conversion row by row; the listing phase (from `listing` to
+/// `quantities` in the progress) is at least twice as fast in segments,
+/// with at least two and at most the in-flight limit of requests at once,
+/// and at most one more request per segment after the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_listing_in_segments_is_faster_and_gives_the_conversion() -> Result {
+    let profile = profile(1);
+    let g = crowded_listing_chain(&profile);
+    let latency = setting("DSA_REBUILD_LISTING_LATENCY_MS", 1000);
+    let converted = Database::new().await?;
+    let (source, conversion) =
+        conversion_at(&profile, &g, &converted, LISTING_HORIZON, LISTING_TARGET).await?;
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    // The default: eight segments.
+    let segmented = 8;
+    let mut runs = Vec::new();
+    for segments in [1, 0] {
+        let hook: Hook = {
+            let listing = listing.clone();
+            Arc::new(move |path: &str, chain: &mut Chain, _| {
+                path.contains(&listing)
+                    .then(|| chain.answer(path).delayed(latency))
+            })
+        };
+        let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), Some(hook)).await;
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &profile).await?;
+        let (progress, mut view) = watch::channel(Progress::default());
+        let phases = tokio::spawn(async move {
+            let (mut listing_at, mut quantities_at) = (None, None);
+            while view.changed().await.is_ok() {
+                let reason = view.borrow_and_update().reason.clone();
+                let now = Instant::now();
+                match reason.as_str() {
+                    "listing" => listing_at = listing_at.or(Some(now)),
+                    "quantities" => quantities_at = quantities_at.or(Some(now)),
+                    _ => {}
+                }
+            }
+            (listing_at, quantities_at)
+        });
+        let (_stopper, stop) = Stop::new();
+        let report = rebuild::rebuild(rebuild::Context {
+            profile: &profile,
+            provider: fake.provider_with(|config| {
+                config.idle_timeout = Duration::from_secs(30);
+                config.request_timeout = Duration::from_secs(60);
+            }),
+            connect: connect(&rebuilt.config),
+            settings: Settings {
+                max_in_flight: 4,
+                fatal_after: Duration::from_secs(600),
+                ..Settings::default()
+            },
+            options: Options {
+                horizon_block: Some(LISTING_HORIZON),
+                target_block: Some(LISTING_TARGET),
+                window_seconds: None,
+                retention_seconds: DAY,
+                shortest_window_seconds: 0,
+                batch_items: 0,
+                listing_segments: segments,
+            },
+            time: fake.clock.clone(),
+            stop,
+            progress,
+        })
+        .await
+        .map_err(|error| format!("segments {segments}: {}", error.report()))?;
+        let (listing_at, quantities_at) = phases.await?;
+        let seconds = quantities_at
+            .zip(listing_at)
+            .map(|(end, start)| end.duration_since(start).as_secs_f64())
+            .ok_or("the listing phase was not observed")?;
+        same(&report.verified, &conversion, "listing in segments")?;
+        let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+        let paths: Vec<String> = fake
+            .paths()
+            .into_iter()
+            .filter(|path| path.contains(&listing))
+            .collect();
+        let at_once = fake.server.state.maximum_active.load(Ordering::SeqCst);
+        runs.push(
+            json!({"segments":segments,"listing_seconds":seconds,"requests":paths.len(),
+            "at_once":at_once,"rows":rows,"paths":paths}),
+        );
+        rebuilt.cleanup().await?;
+    }
+    let (sequence, side_by_side) = (&runs[0], &runs[1]);
+    let seconds = |run: &serde_json::Value| run["listing_seconds"].as_f64().unwrap_or(0.0);
+    let ratio = seconds(sequence) / seconds(side_by_side).max(f64::EPSILON);
+    println!(
+        "{}",
+        json!({"event":"listing_in_segments","latency_ms":latency,"ratio":ratio,
+            "runs":runs.iter().map(|run| json!({"segments":run["segments"],
+                "listing_seconds":run["listing_seconds"],"requests":run["requests"],
+                "at_once":run["at_once"]})).collect::<Vec<_>>()})
+    );
+    for run in &runs {
+        assert_eq!(run["rows"], json!({}), "rows differ: {run}");
+    }
+    // One sequence: every request reads from its `from` to H − 1, each from
+    // the last one's next height.
+    let to = format!("&to={}", LISTING_HORIZON - 1);
+    let froms: Vec<u32> = sequence["paths"]
+        .as_array()
+        .ok_or("paths")?
+        .iter()
+        .filter_map(|path| path.as_str())
+        .map(|path| {
+            assert!(path.ends_with(&to), "{path}");
+            path.split("&from=")
+                .nth(1)
+                .and_then(|rest| rest.split('&').next())
+                .and_then(|from| from.parse().ok())
+                .unwrap_or(u32::MAX)
+        })
+        .collect();
+    assert!(froms.len() >= 20, "{froms:?}");
+    assert!(froms.windows(2).all(|pair| pair[0] < pair[1]), "{froms:?}");
+    assert!(ratio >= 2.0, "segments {ratio} times as fast");
+    let at_once = side_by_side["at_once"].as_u64().unwrap_or(0);
+    assert!((2..=4).contains(&at_once), "{at_once} requests at once");
+    let requests = |run: &serde_json::Value| run["requests"].as_u64().unwrap_or(0);
+    assert!(
+        requests(side_by_side) < requests(sequence) + segmented as u64,
+        "{} requests against {}",
+        requests(side_by_side),
+        requests(sequence)
+    );
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// A chain whose cNIGHT outputs below the listing test's H are `counts`
+/// (height, outputs minted by one transaction at that height, at ordinary
+/// addresses), with `spends` (height, (creating height, output index)).
+/// Returns the chain and each height's creating transaction.
+fn segment_chain(
+    profile: &Profile,
+    counts: &[(u32, u32)],
+    spends: &[(u32, (u32, u16))],
+) -> (Generated, BTreeMap<u32, String>) {
+    let ordinary = |index: u32| {
+        let mut key = [0x3a; 28];
+        key[0] = (index % 251) as u8;
+        key[1] = (index / 251) as u8;
+        enterprise_address(1, key)
+    };
+    let policy = profile.assets.cnight.policy.clone();
+    let name = profile.assets.cnight.name.clone();
+    let mut s = Script::new(profile);
+    s.block(Vec::new());
+    let mut creators: BTreeMap<u32, String> = BTreeMap::new();
+    for height in 2..=LISTING_END {
+        let mut transactions = Vec::new();
+        if let Some((_, count)) = counts.iter().find(|(h, _)| *h == height) {
+            let mut tx = s.tx().mint(&policy, &name, i128::from(*count));
+            for n in 0..*count {
+                let lovelace = 1_200_000 + u64::from(height) * 1_000 + u64::from(n);
+                tx = tx.output(Output::new(ordinary(n), lovelace).token(&policy, &name, 1));
+            }
+            transactions.push(tx);
+        }
+        for (_, (created, index)) in spends.iter().filter(|(h, _)| *h == height) {
+            let creator = creators[created].clone();
+            transactions.push(
+                s.tx().input(&creator, *index).output(
+                    Output::new(ordinary(900 + height), 1_100_000).token(&policy, &name, 1),
+                ),
+            );
+        }
+        let hashes = s.block(transactions);
+        if counts.iter().any(|(h, _)| *h == height) {
+            creators.insert(height, hashes[0].clone());
+        }
+    }
+    (s.g, creators)
+}
+
+/// The choices of a build of a segment chain: the listing test's H and T,
+/// `segments` (0: the default).
+fn segment_options(segments: usize) -> Options {
+    Options {
+        horizon_block: Some(LISTING_HORIZON),
+        target_block: Some(LISTING_TARGET),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: 0,
+        batch_items: 0,
+        listing_segments: segments,
+    }
+}
+
+/// How a built database compares with the conversion: the rows only one
+/// side holds, the descriptor IDs that differ and the digests' difference
+/// (`null` when equal).
+async fn against_conversion(
+    profile: &Profile,
+    report: &Report,
+    rebuilt: &Database,
+    converted: &Database,
+    conversion: &dsa_store::verify::Verification,
+) -> Result<serde_json::Value> {
+    let rows = harness::diff(&rebuilt.config, &converted.config).await?;
+    let ids = descriptor_ids(profile, rebuilt).await?;
+    let differs = same(&report.verified, conversion, "segments")
+        .err()
+        .map(|error| error.to_string());
+    Ok(json!({"rows":rows,"ids":ids,"differs":differs}))
+}
+
+fn equals_conversion(outcome: &serde_json::Value) -> bool {
+    outcome["rows"] == json!({}) && outcome["ids"] == json!([]) && outcome["differs"].is_null()
+}
+
+/// The heights read through their transactions (`from=h&to=h` on the
+/// unit's transaction list).
+fn crowded_heights_read(paths: &[String], unit: &str) -> Vec<u32> {
+    let list = format!("/assets/{unit}/transactions?");
+    let mut heights: Vec<u32> = paths
+        .iter()
+        .filter(|path| path.contains(&list))
+        .filter_map(|path| {
+            let from = path
+                .split("from=")
+                .nth(1)?
+                .split('&')
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            let to = path
+                .split("to=")
+                .nth(1)?
+                .split('&')
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            (from == to).then_some(from)
+        })
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+    heights
+}
+
+/// The heights of the crowded segment chain with more than 25 outputs:
+/// 100 or more at the unit's first height, at the end and the start of
+/// segments, in a segment's middle and at H − 1; exactly 100 at a segment's
+/// end and 99 at the next segment's start.
+const CROWDED: [(u32, u32); 7] = [
+    (2, 120),
+    (9, 120),
+    (10, 120),
+    (23, 130),
+    (27, 100),
+    (28, 99),
+    (72, 120),
+];
+
+/// The crowded segment chain: 25 outputs at every other height below H,
+/// and spends of crowded outputs in the window and after T.
+fn crowded_segment_chain(profile: &Profile) -> Generated {
+    let counts: Vec<(u32, u32)> = (2..LISTING_HORIZON)
+        .map(|height| {
+            let crowded = CROWDED.iter().find(|(h, _)| *h == height);
+            (height, crowded.map_or(25, |(_, count)| *count))
+        })
+        .collect();
+    segment_chain(
+        profile,
+        &counts,
+        &[(76, (9, 5)), (85, (72, 7)), (88, (23, 3))],
+    )
+    .0
+}
+
+/// Heights with 100 or more outputs at the edges of segments and inside
+/// them: with eight segments and with one, the build equals the conversion
+/// row by row and the crowded heights are read through their transactions.
+/// Then a unit whose first output is near H: three heights, two crowded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn crowded_heights_at_segment_edges_give_the_conversion() -> Result {
+    let profile = profile(1);
+    let unit = profile.assets.cnight.unit();
+    let near = segment_chain(
+        &profile,
+        &[(70, 120), (71, 50), (72, 120)],
+        &[(76, (70, 1)), (85, (72, 7))],
+    )
+    .0;
+    let mut results = Vec::new();
+    for (name, g, expected) in [
+        (
+            "edges",
+            crowded_segment_chain(&profile),
+            vec![2_u32, 9, 10, 23, 27, 72],
+        ),
+        ("near_h", near, vec![70, 72]),
+    ] {
+        let converted = Database::new().await?;
+        let (source, conversion) =
+            conversion_at(&profile, &g, &converted, LISTING_HORIZON, LISTING_TARGET).await?;
+        for segments in [0_usize, 1] {
+            let rebuilt = Database::new().await?;
+            empty(&rebuilt, &profile).await?;
+            let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), None).await;
+            let (_stopper, stop) = Stop::new();
+            let report = build_with(&profile, &fake, &rebuilt, segment_options(segments), stop)
+                .await
+                .map_err(|error| format!("{name} {segments}: {}", error.report()))?;
+            let outcome =
+                against_conversion(&profile, &report, &rebuilt, &converted, &conversion).await?;
+            let paths = fake.paths();
+            let heights = crowded_heights_read(&paths, &unit);
+            println!(
+                "{}",
+                json!({"event":"crowded_segment_edges","chain":name,"segments":segments,
+                    "outcome":outcome,"crowded_read":heights,"calls":report.calls})
+            );
+            results.push((
+                name,
+                segments,
+                equals_conversion(&outcome),
+                heights == expected,
+            ));
+            rebuilt.cleanup().await?;
+        }
+        converted.cleanup().await?;
+        source.database.cleanup().await?;
+    }
+    for (name, segments, equal, crowded_as_expected) in results {
+        assert!(equal, "{name} with {segments} segments differs");
+        assert!(
+            crowded_as_expected,
+            "{name} with {segments}: crowded heights"
+        );
+    }
+    Ok(())
+}
+
+/// The crowded segment chain built with the default eight segments and
+/// killed in its unit listing: the build's future is dropped when the fake
+/// receives the k-th `/assets/{unit}/utxos` request, with the segments'
+/// cursors as the run left them, and the same command continues it. Each
+/// continuation equals the conversion row by row, and at least one kill
+/// leaves open segments. `DSA_REBUILD_SEGMENT_KILL_STEP` (default 4) spaces
+/// the kill points: 1 kills at every listing request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_inside_its_segments_continues_to_the_conversion() -> Result {
+    let profile = profile(1);
+    let step = setting("DSA_REBUILD_SEGMENT_KILL_STEP", 4).max(1) as usize;
+    let g = crowded_segment_chain(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) =
+        conversion_at(&profile, &g, &converted, LISTING_HORIZON, LISTING_TARGET).await?;
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let whole = Database::new().await?;
+    empty(&whole, &profile).await?;
+    let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), None).await;
+    let (_stopper, stop) = Stop::new();
+    build_with(&profile, &fake, &whole, segment_options(0), stop)
+        .await
+        .map_err(|error| format!("whole: {}", error.report()))?;
+    whole.cleanup().await?;
+    let total = fake
+        .paths()
+        .iter()
+        .filter(|path| path.contains(&listing))
+        .count();
+    let points: Vec<usize> = (1..=total)
+        .filter(|k| *k == 1 || *k == total || (k - 2) % step == 0)
+        .collect();
+    let mut outcomes = Vec::new();
+    for kill_at in points {
+        let rebuilt = Database::new().await?;
+        empty(&rebuilt, &profile).await?;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (killer, mut killed) = watch::channel(false);
+        let hook: Hook = {
+            let (seen, listing) = (seen.clone(), listing.clone());
+            Arc::new(move |path: &str, _: &mut Chain, _| {
+                if path.contains(&listing) && seen.fetch_add(1, Ordering::SeqCst) + 1 == kill_at {
+                    let _ = killer.send(true);
+                }
+                None
+            })
+        };
+        let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), Some(hook)).await;
+        let (_stopper, stop) = Stop::new();
+        let first = tokio::select! {
+            result = build_with(&profile, &fake, &rebuilt, segment_options(0), stop) => Some(result.is_ok()),
+            _ = killed.wait_for(|killed| *killed) => None,
+        };
+        let open: i64 = common::connect(&rebuilt.config)
+            .await?
+            .query_one(
+                "SELECT count(*) FROM dsa_rebuild.item WHERE kind='cursor' AND key LIKE 'unit:%@%'
+                 AND NOT (value->>'done')::boolean",
+                &[],
+            )
+            .await
+            .map(|row| row.get(0))
+            .unwrap_or(0);
+        let (_stopper, stop) = Stop::new();
+        let continued = build_with(&profile, &fake, &rebuilt, segment_options(0), stop).await;
+        let outcome = match &continued {
+            Ok(report) => {
+                against_conversion(&profile, report, &rebuilt, &converted, &conversion).await?
+            }
+            Err(error) => json!({"error": error.report()}),
+        };
+        println!(
+            "{}",
+            json!({"event":"killed_inside_segments","kill_at":kill_at,"of":total,
+                "first_finished":first,"open_segments":open,"outcome":outcome})
+        );
+        outcomes.push((kill_at, open, equals_conversion(&outcome)));
+        rebuilt.cleanup().await?;
+    }
+    converted.cleanup().await?;
+    source.database.cleanup().await?;
+    assert!(
+        outcomes.iter().any(|(_, open, _)| *open > 0),
+        "no kill left open segments: {outcomes:?}"
+    );
+    for (kill_at, _, equal) in &outcomes {
+        assert!(equal, "killed at listing request {kill_at}: {outcomes:?}");
+    }
+    Ok(())
+}
+
+/// A build killed when its segments were planned, one of whose open
+/// segment cursors then lacks its end: the same command refuses with
+/// `rebuild_progress_invalid` naming that cursor, before it reads the
+/// segment as one height.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_segment_cursor_without_its_end_refuses_the_build() -> Result {
+    let profile = profile(1);
+    let g = crowded_segment_chain(&profile);
+    let listing = format!("/assets/{}/utxos?", profile.assets.cnight.unit());
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (killer, mut killed) = watch::channel(false);
+    let hook: Hook = {
+        let (seen, listing) = (seen.clone(), listing.clone());
+        Arc::new(move |path: &str, _: &mut Chain, _| {
+            if path.contains(&listing) && seen.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                let _ = killer.send(true);
+            }
+            None
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &g, LISTING_END), Some(hook)).await;
+    let (_stopper, stop) = Stop::new();
+    tokio::select! {
+        _ = build_with(&profile, &fake, &rebuilt, segment_options(0), stop) => {
+            return Err("the build ended before its second listing request".into());
+        }
+        _ = killed.wait_for(|killed| *killed) => {}
+    }
+    let client = common::connect(&rebuilt.config).await?;
+    let segment: String = client
+        .query_one(
+            "SELECT key FROM dsa_rebuild.item WHERE kind='cursor' AND key LIKE 'unit:%@%'
+             AND NOT (value->>'done')::boolean ORDER BY key DESC LIMIT 1",
+            &[],
+        )
+        .await?
+        .get(0);
+    client
+        .execute(
+            "UPDATE dsa_rebuild.item SET value=value-'to' WHERE kind='cursor' AND key=$1",
+            &[&segment],
+        )
+        .await?;
+    let (_stopper, stop) = Stop::new();
+    let refused = build_with(&profile, &fake, &rebuilt, segment_options(0), stop)
+        .await
+        .err()
+        .ok_or("the build published")?;
+    println!(
+        "{}",
+        json!({"event":"segment_without_end","cursor":segment,"refusal":refused.report()})
+    );
+    assert_eq!(
+        code(&refused),
+        "rebuild_progress_invalid",
+        "{}",
+        refused.report()
+    );
+    assert_eq!(refused.report()["detail"], json!({"cursor": segment}));
+    assert!(!serving(&rebuilt).await?, "the database serves");
+    rebuilt.cleanup().await
+}
+
+/// A tip answered 404 once and then with its block is asked again within
+/// the outcome rules: it has not left the chain, so the address listings
+/// and the lists from H on are not read again, and the build equals the
+/// conversion. The reserve chain's tip, height 61, spends a reserve output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_tip_answered_404_once_is_asked_again() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, true);
+    let tip = format!("/blocks/{}", EDGE_END + 1);
+    let asked = |fake: &Fake| {
+        fake.paths()
+            .iter()
+            .filter(|path| path.ends_with(&tip))
+            .count()
+    };
+    let listing = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    let plain = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END + 1), None).await;
+    built_equal(&profile, &chain.g, &plain, "tip answered").await?;
+    let answered = Arc::new(AtomicBool::new(false));
+    let hook: Hook = {
+        let (answered, tip) = (answered.clone(), tip.clone());
+        Arc::new(move |path: &str, _: &mut Chain, _| {
+            (path.ends_with(&tip) && !answered.swap(true, Ordering::SeqCst))
+                .then(|| Behavior::status(404))
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END + 1), Some(hook)).await;
+    let report = built_equal(&profile, &chain.g, &fake, "tip answered 404 once").await?;
+    println!(
+        "{}",
+        json!({"event":"tip_answered_404_once","tip_asked":asked(&fake),
+            "tip_asked_without_404":asked(&plain),"reserve_listings":fake.requests(&listing),
+            "reserve_listings_without_404":plain.requests(&listing),"calls":report.calls})
+    );
+    assert!(
+        answered.load(Ordering::SeqCst),
+        "the tip was not answered 404"
+    );
+    assert!(asked(&fake) >= 2, "the tip was asked once");
+    assert_eq!(asked(&fake), asked(&plain) + 1, "the tip asked again once");
+    assert_eq!(
+        fake.requests(&listing),
+        plain.requests(&listing),
+        "the address listings were read again"
+    );
+    Ok(())
+}
+
+/// The reserve chain's tip block, height 61, spends a reserve output; it is
+/// served while the listings are read and removed for good when the lists
+/// from H on begin, so `/blocks/61` answers 404 from then on. The build asks
+/// it again within the outcome rules until the 404 has lasted `fatal_after`,
+/// counts the tip as left, reads the address listings and the lists from H
+/// on again up to the new tip and equals the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_tip_answered_404_until_fatal_after_has_left_the_chain() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, true);
+    let tip = format!("/blocks/{}", EDGE_END + 1);
+    let removed = Arc::new(AtomicBool::new(false));
+    let hook: Hook = {
+        let removed = removed.clone();
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if path.contains("/transactions?")
+                && path.contains(&format!("from={EDGE_HORIZON}"))
+                && !removed.swap(true, Ordering::SeqCst)
+            {
+                chain.blocks_mut().pop();
+            }
+            None
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END + 1), Some(hook)).await;
+    let report = built_equal(&profile, &chain.g, &fake, "tip removed for good").await?;
+    let asked: Vec<u64> = fake
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.ends_with(&tip))
+        .map(|(_, at)| *at)
+        .collect();
+    let lasted = asked
+        .last()
+        .zip(asked.first())
+        .map_or(0, |(last, first)| last - first);
+    let listing = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    println!(
+        "{}",
+        json!({"event":"tip_404_until_fatal_after","tip_asked":asked.len(),"lasted_seconds":lasted,
+            "reserve_listings":fake.requests(&listing),"calls":report.calls})
+    );
+    assert!(removed.load(Ordering::SeqCst), "the tip was not removed");
+    assert!(lasted >= 600, "the 404 was asked again for {lasted} s only");
+    // Two passes that agree before the tip left the chain, two after.
+    assert!(
+        fake.requests(&listing) >= 4,
+        "the address listings were not read again"
+    );
+    Ok(())
 }
 
 /// A tip block that spends an output relevant by its address alone is
@@ -2913,6 +4152,7 @@ async fn a_build_without_positions_takes_them_from_the_provider() -> Result {
         retention_seconds: DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, options, stop)
         .await
@@ -2958,6 +4198,7 @@ async fn a_window_below_the_retention_starts_at_the_newest_block_before_it() -> 
         retention_seconds: 2 * DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, options, stop)
         .await
@@ -3005,6 +4246,7 @@ async fn positions_out_of_range_refuse_the_build_before_it_starts() -> Result {
         retention_seconds: 2 * DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let mut outcomes = Vec::new();
     for (name, choices, expected) in [
@@ -3141,7 +4383,7 @@ async fn stored_requests(database: &Database) -> Result<Vec<(String, serde_json:
 /// as they are; another retention, window or horizon is
 /// `rebuild_plan_mismatch`. Continued with the same choices it equals
 /// the conversion, and its report holds the real window, the base's counts
-/// and the requests of the whole build by family.
+/// and the requests of the whole build by family, which add up to `calls`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn a_stopped_build_continues_only_as_it_began() -> Result {
@@ -3159,6 +4401,7 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         retention_seconds: retention,
         shortest_window_seconds: 0,
         batch_items: 0,
+        listing_segments: 0,
     };
     let (stopper, stop) = Stop::new();
     let run = build_with(
@@ -3286,14 +4529,196 @@ async fn a_stopped_build_continues_only_as_it_began() -> Result {
         "counts {}",
         report.counts
     );
-    assert!(
-        requests as i64 >= report.calls - IN_FLIGHT,
-        "requests by family {requests} against {} sent",
-        report.calls
+    assert_eq!(
+        requests as i64, report.calls,
+        "requests by family against those sent"
     );
     rebuilt.cleanup().await?;
     converted.cleanup().await?;
     source.database.cleanup().await
+}
+
+/// A build killed in its window after the follower stored the requests
+/// per day of an update (its future dropped: no error path runs, so the
+/// run's families are those of its last record before the window). The
+/// same command folds what the earlier run recorded and its families do
+/// not hold into the family `unrecorded`: exactly the gap between the
+/// larger of the recorded total and the requests per day and the stored
+/// families. Its `calls` is that recorded total plus the requests it sent,
+/// and its families add up to `calls`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_build_killed_in_its_window_counts_what_it_recorded() -> Result {
+    let profile = profile(1);
+    let edges = edges(&profile);
+    let converted = Database::new().await?;
+    let (source, conversion) = edge_conversion(&profile, &edges.g, &converted).await?;
+    let rebuilt = Database::new().await?;
+    empty(&rebuilt, &profile).await?;
+    // Slow stake reads keep the build in its window after its update.
+    let hook: Hook = Arc::new(|path: &str, chain: &mut Chain, _| {
+        path.contains("/pools")
+            .then(|| chain.answer(path).delayed(300))
+    });
+    let fake = Fake::with_chain(edge_chain(&profile, &edges.g, EDGE_END), Some(hook)).await;
+    let client = common::connect(&rebuilt.config).await?;
+    let updated = async {
+        loop {
+            let target: Option<i32> = client
+                .query_one(
+                    "SELECT target_height::integer FROM dsa.position WHERE id=1",
+                    &[],
+                )
+                .await
+                .ok()
+                .and_then(|row| row.get(0));
+            if target.is_some_and(|target| target >= EDGE_HORIZON as i32) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let (_stopper, stop) = Stop::new();
+    let options = Options {
+        horizon_block: Some(EDGE_HORIZON),
+        target_block: Some(EDGE_TARGET),
+        window_seconds: None,
+        retention_seconds: DAY,
+        shortest_window_seconds: 0,
+        batch_items: 0,
+        listing_segments: 0,
+    };
+    tokio::select! {
+        _ = build_with(&profile, &fake, &rebuilt, options.clone(), stop) => {
+            return Err("the build ended before it was killed".into());
+        }
+        () = updated => {}
+    }
+    // The dropped run's stake read runs in a task of its own and may still
+    // ask: wait until the provider has had no request for a second, as a
+    // killed process sends none.
+    let mut answered = fake.paths().len();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = fake.paths().len();
+        if now == answered {
+            break;
+        }
+        answered = now;
+    }
+    let progress: i64 = client
+        .query_one("SELECT calls FROM dsa_rebuild.progress WHERE id=1", &[])
+        .await?
+        .get(0);
+    let per_day: i64 = client
+        .query_one(
+            "SELECT coalesce(sum(requests),0)::bigint FROM dsa.calls",
+            &[],
+        )
+        .await?
+        .get(0);
+    let families: u64 = stored_requests(&rebuilt)
+        .await?
+        .iter()
+        .flat_map(|(_, counts)| counts.as_object().cloned().unwrap_or_default())
+        .filter_map(|(_, count)| count.as_u64())
+        .sum();
+    let recorded = progress.max(per_day);
+    let gap = u64::try_from(recorded)? - families;
+    let first = fake.paths().len();
+    let (_stopper, stop) = Stop::new();
+    let report = build_with(&profile, &fake, &rebuilt, options, stop)
+        .await
+        .map_err(|error| format!("continued: {}", error.report()))?;
+    let sent = fake.paths().len() - first;
+    let total: u64 = report.requests.values().sum();
+    println!(
+        "{}",
+        json!({"event":"killed_in_window","progress_calls":progress,"per_day":per_day,
+            "families":families,"gap":gap,"continued_sent":sent,"calls":report.calls,
+            "requests":report.requests,"answered":fake.paths().len()})
+    );
+    same(&report.verified, &conversion, "killed in its window")?;
+    assert!(gap > 0, "no request recorded beyond the families");
+    assert_eq!(
+        report.requests.get("unrecorded"),
+        Some(&gap),
+        "{:?}",
+        report.requests
+    );
+    assert_eq!(
+        report.calls,
+        recorded + sent as i64,
+        "calls against what was recorded and sent"
+    );
+    assert_eq!(total as i64, report.calls, "families against calls");
+    rebuilt.cleanup().await?;
+    converted.cleanup().await?;
+    source.database.cleanup().await
+}
+
+/// The endpoint family a request path is counted in by the client.
+fn family_of(path: &str) -> &'static str {
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.split_once("/v0/").map_or(path, |(_, rest)| rest);
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["assets", "policy", ..] | ["assets", _, "utxos" | "transactions"] | ["addresses", ..] => {
+            "listings"
+        }
+        ["assets", ..] => "assets",
+        ["blocks", _, "txs", "cbor"] => "transactions",
+        ["blocks", ..] => "headers",
+        ["txs", _, "utxos"] => "outputs",
+        ["txs", _, "metadata"] => "metadata",
+        ["txs", ..] => "transactions",
+        ["scripts", "datum", ..] => "datums",
+        ["epochs", ..] => "epochs",
+        ["pools", ..] => "pools",
+        ["genesis"] => "genesis",
+        _ => "unknown",
+    }
+}
+
+/// The requests of a build by family are those the provider received: four
+/// requests in flight at ten a second, the reserve address's list below H
+/// shorter than one page (the pages asked with page 1 are dropped when it
+/// ends, sent or not) and one 429 with `retry-after: 1` that every request
+/// in flight waits out. Each family of the report equals the fake's tally of
+/// the paths it received, and the families add up to `calls`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn requests_by_family_are_those_the_provider_received() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, false);
+    let limited = Arc::new(AtomicBool::new(false));
+    let hook: Hook = {
+        let limited = limited.clone();
+        Arc::new(move |path: &str, _: &mut Chain, _| {
+            (path.contains("/txs/") && !limited.swap(true, Ordering::SeqCst))
+                .then(|| Behavior::status(429).retry_after("1"))
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END), Some(hook)).await;
+    let report = built_equal(&profile, &chain.g, &fake, "requests by family").await?;
+    let mut received: BTreeMap<String, u64> = BTreeMap::new();
+    for path in fake.paths() {
+        *received.entry(family_of(&path).to_owned()).or_default() += 1;
+    }
+    let list = format!("/addresses/{}/transactions?", profile.addresses.reserve);
+    println!(
+        "{}",
+        json!({"event":"requests_by_family","report":report.requests,"received":received,
+            "calls":report.calls,"reserve_list_pages":fake.requests(&list)})
+    );
+    assert!(limited.load(Ordering::SeqCst), "no request was refused");
+    assert_eq!(
+        report.requests, received,
+        "families against the paths received"
+    );
+    let total: u64 = report.requests.values().sum();
+    assert_eq!(total as i64, report.calls, "families against calls");
+    Ok(())
 }
 
 /// The window of a given horizon is the chain time from it to the target:
@@ -3319,6 +4744,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
         retention_seconds: DAY,
         shortest_window_seconds: DAY,
         batch_items: 0,
+        listing_segments: 0,
     };
     let report = build_with(&profile, &fake, &rebuilt, long, stop)
         .await
@@ -3345,6 +4771,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
                 retention_seconds: DAY,
                 shortest_window_seconds: DAY,
                 batch_items: 0,
+                listing_segments: 0,
             },
         ),
         (
@@ -3357,6 +4784,7 @@ async fn the_window_of_a_build_is_its_chain_time() -> Result {
                 retention_seconds: 7 * DAY,
                 shortest_window_seconds: DAY,
                 batch_items: 0,
+                listing_segments: 0,
             },
         ),
     ] {

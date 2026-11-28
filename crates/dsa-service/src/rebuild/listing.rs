@@ -14,12 +14,15 @@ use dsa_chain::{assets::fixed_units, profiles::fixed_descriptor_ids};
 use dsa_provider::types::{
     AddressText, Header, Heights, ListedOutput, ListedTransaction, Page, TransactionUtxos, Unit,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 
 use super::{
     Build,
-    asker::{PASSES, every_page, index16, info, required, stable, transactions_page, utxos},
+    asker::{
+        Asker, PASSES, every_page, found_within, index16, info, refusal, required, stable,
+        transactions_page, utxos,
+    },
     content::{Content, Event, Moved, Spent, outpoint},
     progress::{Cursor, parse, to_value},
 };
@@ -35,8 +38,103 @@ const REREADS: usize = 3;
 
 /// The items an address listing and the lists from H on store, discarded
 /// when they are read again: kinds, and cursor keys by prefix.
-const SINCE_KINDS: [&str; 3] = ["address_listed", "since", "tip"];
-const SINCE_CURSORS: [&str; 3] = ["address:", "since:", "burns"];
+pub(super) const SINCE_KINDS: [&str; 3] = ["address_listed", "since", "tip"];
+pub(super) const SINCE_CURSORS: [&str; 3] = ["address:", "since:", "burns"];
+
+/// Up to `n` contiguous, disjoint ranges of equal width (within one height)
+/// that cover `[from, to]`, in ascending order; none is empty.
+pub(super) fn segments(from: u32, to: u32, n: usize) -> Vec<(u32, u32)> {
+    let width = u64::from(to - from) + 1;
+    let n = (n.max(1) as u64).min(width);
+    (0..n)
+        .map(|i| {
+            let start = u64::from(from) + i * width / n;
+            let end = u64::from(from) + (i + 1) * width / n - 1;
+            (start as u32, end as u32)
+        })
+        .collect()
+}
+
+/// One request of a unit listing: page 1 of the unit's unspent outputs
+/// created in `[from, to]`. Rows are kept only for the heights the page
+/// holds completely: with 100 rows, those below the height of the 100th,
+/// which the next request starts at; a height with 100 or more rows is
+/// read through its transactions. Returns the rows taken and the next
+/// `from`, `None` when the range is read.
+async fn range_step(
+    asker: &Asker,
+    unit: &Unit,
+    from: u32,
+    to: u32,
+) -> Result<(Vec<ListedOutput>, Option<u32>), Error> {
+    let provider = asker.provider.clone();
+    let range = Heights {
+        from: Some(from),
+        to: Some(to),
+    };
+    let rows = asker
+        .ask(|| provider.asset_outputs(unit, range, Page::first()))
+        .await?;
+    if rows.len() < 100 {
+        return Ok((rows, None));
+    }
+    let last = rows[99].block_height.unwrap_or(from);
+    if last > from {
+        let taken = rows
+            .into_iter()
+            .filter(|row| row.block_height.is_some_and(|height| height < last))
+            .collect();
+        return Ok((taken, Some(last)));
+    }
+    let taken = outputs_at_height(asker, unit, from).await?;
+    Ok((taken, (from < to).then_some(from + 1)))
+}
+
+/// The unspent outputs of `unit` created at one height that holds 100
+/// or more of them: the unit's transactions at that height (final: below
+/// H) and the outputs each one created that no transaction has spent,
+/// the rows not flagged `collateral` (a valid transaction's outputs, an
+/// invalid one's collateral return). No page of a moving list is
+/// involved.
+async fn outputs_at_height(
+    asker: &Asker,
+    unit: &Unit,
+    height: u32,
+) -> Result<Vec<ListedOutput>, Error> {
+    let at = Heights {
+        from: Some(height),
+        to: Some(height),
+    };
+    let provider = asker.provider.clone();
+    let transactions = every_page(asker, |page| {
+        let (provider, unit) = (provider.clone(), unit.clone());
+        async move { provider.asset_transactions(&unit, at, page, false).await }
+    })
+    .await?;
+    let mut rows = Vec::new();
+    for listed in transactions {
+        let answer = utxos(asker, listed.tx_hash.as_str()).await?;
+        for output in answer.outputs {
+            let holds = output
+                .amount
+                .iter()
+                .any(|amount| amount.unit == unit.as_str() && amount.quantity.0 > 0);
+            if output.collateral || output.consumed_by_tx.is_some() || !holds {
+                continue;
+            }
+            rows.push(ListedOutput {
+                address: output.address,
+                tx_hash: listed.tx_hash.clone(),
+                output_index: output.output_index,
+                amount: output.amount,
+                block_height: Some(height),
+                data_hash: output.data_hash,
+                inline_datum: output.inline_datum,
+            });
+        }
+    }
+    Ok(rows)
+}
 
 impl Build<'_> {
     /// The sources of the listings: units and addresses, as `unit:` and
@@ -48,7 +146,7 @@ impl Build<'_> {
         let mut units: BTreeSet<String> = self.relevance.rule.exact_units().clone();
         for policy in self.relevance.rule.governance_policies().clone() {
             let provider = self.asker.provider.clone();
-            let rows = every_page(&self.asker, "listings", |page| {
+            let rows = every_page(&self.asker, |page| {
                 let (provider, policy) = (provider.clone(), policy.clone());
                 async move { provider.policy_assets(&policy, page).await }
             })
@@ -85,98 +183,97 @@ impl Build<'_> {
     }
 
     /// The asset's unspent outputs created below H, in height ranges that
-    /// each fit one answer.
+    /// each fit one answer. The first request covers every height below H;
+    /// when its page is full, the heights from the next `from` to H − 1 are
+    /// split into `listing_segments` segments, stored at once with the
+    /// unit's cursor, and read side by side.
     async fn list_unit(&mut self, unit: &str) -> Result<(), Error> {
         let key = format!("unit:{unit}");
         let mut cursor = self.cursor(&key).await?;
         let parsed: Unit = unit.parse().map_err(Error::Provider)?;
         let below = self.plan.horizon - 1;
         while !cursor.done {
-            let from = cursor.from;
-            if from > below {
+            if cursor.from > below {
                 cursor.done = true;
                 self.put_one("cursor", &key, &cursor).await?;
                 break;
             }
-            let provider = self.asker.provider.clone();
-            let range = Heights {
-                from: Some(from),
-                to: Some(below),
-            };
-            let rows = self
-                .asker
-                .ask("listings", || {
-                    provider.asset_outputs(&parsed, range, Page::first())
-                })
-                .await?;
-            let (taken, next) = if rows.len() < 100 {
-                (rows, None)
-            } else {
-                let last = rows[99].block_height.unwrap_or(from);
-                if last > from {
-                    let taken = rows
-                        .into_iter()
-                        .filter(|row| row.block_height.is_some_and(|height| height < last))
-                        .collect();
-                    (taken, Some(last))
-                } else {
-                    (self.outputs_at_height(&parsed, from).await?, Some(from + 1))
-                }
-            };
+            let (taken, next) = range_step(&self.asker, &parsed, cursor.from, below).await?;
             self.listed("listed", &taken).await?;
             match next {
+                Some(next) if self.listing_segments > 1 => {
+                    // One statement: the unit's cursor done and every
+                    // segment's cursor, so the segments are planned once.
+                    let mut items = vec![(
+                        key.clone(),
+                        to_value(Cursor {
+                            from: next,
+                            done: true,
+                            ..Cursor::default()
+                        })?,
+                    )];
+                    for (from, to) in segments(next, below, self.listing_segments) {
+                        let segment = Cursor {
+                            from,
+                            to: Some(to),
+                            ..Cursor::default()
+                        };
+                        items.push((format!("{key}@{from}"), to_value(segment)?));
+                    }
+                    self.store()
+                        .await?
+                        .put_building_items("cursor", &items)
+                        .await?;
+                    break;
+                }
                 Some(next) => cursor.from = next,
                 None => cursor.done = true,
             }
             self.put_one("cursor", &key, &cursor).await?;
         }
-        Ok(())
+        self.list_segments(&key, &parsed).await
     }
 
-    /// The unspent outputs of `unit` created at one height that holds 100
-    /// or more of them: the unit's transactions at that height (final: below
-    /// H) and the outputs each one created that no transaction has spent,
-    /// the rows not flagged `collateral` (a valid transaction's outputs, an
-    /// invalid one's collateral return). No page of a moving list is
-    /// involved.
-    async fn outputs_at_height(
-        &self,
-        unit: &Unit,
-        height: u32,
-    ) -> Result<Vec<ListedOutput>, Error> {
-        let at = Heights {
-            from: Some(height),
-            to: Some(height),
-        };
-        let provider = self.asker.provider.clone();
-        let transactions = every_page(&self.asker, "listings", |page| {
-            let (provider, unit) = (provider.clone(), unit.clone());
-            async move { provider.asset_transactions(&unit, at, page, false).await }
-        })
-        .await?;
-        let mut rows = Vec::new();
-        for listed in transactions {
-            let answer = utxos(&self.asker, listed.tx_hash.as_str()).await?;
-            for output in answer.outputs {
-                let holds = output
-                    .amount
-                    .iter()
-                    .any(|amount| amount.unit == unit.as_str() && amount.quantity.0 > 0);
-                if output.collateral || output.consumed_by_tx.is_some() || !holds {
-                    continue;
-                }
-                rows.push(ListedOutput {
-                    address: output.address,
-                    tx_hash: listed.tx_hash.clone(),
-                    output_index: output.output_index,
-                    amount: output.amount,
-                    block_height: Some(height),
-                    data_hash: output.data_hash,
-                    inline_datum: output.inline_datum,
-                });
+    /// Steps the open segments of a unit listing side by side, within the
+    /// client's requests in flight and pace; each completed step's rows and
+    /// cursor are stored before its next step starts.
+    async fn list_segments(&mut self, key: &str, unit: &Unit) -> Result<(), Error> {
+        let prefix = format!("{key}@");
+        let mut open = Vec::new();
+        for (segment, value) in self.items("cursor").await? {
+            if !segment.starts_with(&prefix) {
+                continue;
+            }
+            let cursor: Cursor = parse(value)?;
+            if !cursor.done {
+                // A segment's cursor is stored with its end.
+                let to = cursor.to.ok_or_else(|| {
+                    refusal("rebuild_progress_invalid", json!({"cursor": segment}))
+                })?;
+                open.push((segment, cursor, to));
             }
         }
-        Ok(rows)
+        let step = |asker: Asker, unit: Unit, segment: String, cursor: Cursor, to: u32| async move {
+            let result = range_step(&asker, &unit, cursor.from, to).await;
+            (segment, cursor, to, result)
+        };
+        let mut steps = FuturesUnordered::new();
+        for (segment, cursor, to) in open {
+            steps.push(step(self.asker.clone(), unit.clone(), segment, cursor, to));
+        }
+        while let Some((segment, mut cursor, to, result)) = steps.next().await {
+            let (taken, next) = result?;
+            self.listed("listed", &taken).await?;
+            match next {
+                Some(next) => cursor.from = next,
+                None => cursor.done = true,
+            }
+            self.put_one("cursor", &segment, &cursor).await?;
+            if !cursor.done {
+                steps.push(step(self.asker.clone(), unit.clone(), segment, cursor, to));
+            }
+        }
+        Ok(())
     }
 
     async fn list_address(&mut self, address: &str) -> Result<(), Error> {
@@ -188,7 +285,6 @@ impl Build<'_> {
         let provider = self.asker.provider.clone();
         let rows = stable(
             &self.asker,
-            "listings",
             |row: &ListedOutput| outpoint(row.tx_hash.as_str(), row.output_index),
             |page| {
                 let (provider, parsed) = (provider.clone(), parsed.clone());
@@ -245,16 +341,16 @@ impl Build<'_> {
         let provider = self.asker.provider.clone();
         let mut last = json!({});
         for attempt in 1..=READINGS {
-            let events = every_page(&self.asker, "assets", |page| {
+            let events = every_page(&self.asker, |page| {
                 let (provider, parsed) = (provider.clone(), parsed.clone());
                 async move { provider.asset_history(&parsed, page).await }
             })
             .await?;
             let answer = if known {
                 let unknown = ("provider_unit_unknown", json!({"unit": unit}));
-                Some(required(&self.asker, "assets", unknown, || provider.asset(&parsed)).await?)
+                Some(required(&self.asker, unknown, || provider.asset(&parsed)).await?)
             } else {
-                self.asker.ask("assets", || provider.asset(&parsed)).await?
+                self.asker.ask(|| provider.asset(&parsed)).await?
             };
             let count = answer.as_ref().map_or(0, |info| info.mint_or_burn_count);
             let quantity: Option<i128> = answer
@@ -371,11 +467,10 @@ impl Build<'_> {
             }
             let tip = self.since_tip().await?;
             self.since_lists(tip.height).await?;
+            // Another block at the tip's height, or a 404 that lasted
+            // `fatal_after`, is a tip that left the chain.
             let provider = self.asker.provider.clone();
-            let now = self
-                .asker
-                .ask("headers", || provider.block_at(tip.height))
-                .await?;
+            let now = found_within(&self.asker, || provider.block_at(tip.height)).await?;
             if now.as_ref().is_some_and(|header| header.hash == tip.hash) {
                 break;
             }
@@ -404,10 +499,7 @@ impl Build<'_> {
             return parse(stored);
         }
         let provider = self.asker.provider.clone();
-        let tip = self
-            .asker
-            .ask("headers", || provider.latest_block())
-            .await?;
+        let tip = self.asker.ask(|| provider.latest_block()).await?;
         self.put_one("tip", "since", &tip).await?;
         Ok(tip)
     }
@@ -592,5 +684,56 @@ impl Build<'_> {
         let mut moved: BTreeMap<String, Moved> = self.typed("moved").await?;
         moved.retain(|transaction, _| since.contains_key(transaction));
         Ok(moved)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::segments;
+
+    /// Random ranges and counts: the segments cover the range once, in
+    /// order, none empty, as many as asked or as there are heights, of
+    /// widths that differ by at most one height.
+    #[test]
+    fn segments_cover_the_range_once() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..20_000 {
+            let from = (next() % 20_000_000) as u32;
+            let span = match case % 3 {
+                0 => next() % 20,
+                1 => next() % 2_000,
+                _ => next() % 2_000_000,
+            } as u32;
+            let to = from + span;
+            let n = (next() % 17) as usize;
+            let parts = segments(from, to, n);
+            let width = u64::from(span) + 1;
+            assert_eq!(
+                parts.len() as u64,
+                (n.max(1) as u64).min(width),
+                "{from} {to} {n}"
+            );
+            assert_eq!(
+                parts.first().map(|part| part.0),
+                Some(from),
+                "{from} {to} {n}"
+            );
+            assert_eq!(parts.last().map(|part| part.1), Some(to), "{from} {to} {n}");
+            for pair in parts.windows(2) {
+                assert_eq!(pair[0].1 + 1, pair[1].0, "{from} {to} {n}: {parts:?}");
+            }
+            let widths: Vec<u32> = parts.iter().map(|(a, b)| b - a + 1).collect();
+            assert!(widths.iter().all(|w| *w >= 1), "{from} {to} {n}: {parts:?}");
+            let (low, high) = (widths.iter().min(), widths.iter().max());
+            assert!(high.zip(low).is_some_and(|(h, l)| h - l <= 1), "{widths:?}");
+        }
+        assert_eq!(segments(5, 5, 8), vec![(5, 5)]);
+        assert_eq!(segments(1, 10, 3), vec![(1, 3), (4, 6), (7, 10)]);
     }
 }

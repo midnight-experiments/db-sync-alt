@@ -4,6 +4,7 @@
 //! endpoint answers touches no shared state.
 
 use std::{
+    collections::BTreeMap,
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -24,7 +25,7 @@ use tokio::{
 
 use crate::{
     Error, Kind,
-    counts::Counts,
+    counts::{Counts, RequestFamily},
     outputs,
     types::{Hash32, TransactionOutputs},
 };
@@ -355,6 +356,13 @@ impl Provider {
         self.0.counts.lock().unwrap().get()
     }
 
+    /// Requests sent per endpoint family since this client was made, by
+    /// the family's name. A request counts when it is sent: an attempt the
+    /// gate refuses or a call dropped before its turn is not in it.
+    pub fn sent_by_family(&self) -> BTreeMap<String, u64> {
+        self.0.counts.lock().unwrap().families()
+    }
+
     /// Restore persisted counts; for each day the larger count stays.
     pub fn seed_counts(&self, counts: &[(NaiveDate, i64)]) {
         self.0.counts.lock().unwrap().seed(counts);
@@ -496,7 +504,12 @@ impl Provider {
     }
 
     /// Wait for a permit and the pace, count the attempt and send.
-    async fn send(&self, path: &str, timeout: Duration) -> Result<Sent<'_>, Error> {
+    async fn send(
+        &self,
+        path: &str,
+        timeout: Duration,
+        family: RequestFamily,
+    ) -> Result<Sent<'_>, Error> {
         self.check_gate()?;
         let permit = self
             .0
@@ -507,7 +520,7 @@ impl Provider {
         let mut next = self.0.next_send.lock().await;
         tokio::time::sleep_until(*next).await;
         self.check_gate()?;
-        self.0.counts.lock().unwrap().count(self.now());
+        self.0.counts.lock().unwrap().count(self.now(), family);
         *next = Instant::now() + self.0.interval;
         drop(next);
         let url = self
@@ -555,8 +568,14 @@ impl Provider {
         }
     }
 
-    /// GET a buffered answer; `None` for a 404.
-    pub(crate) async fn get(&self, path: &str, family: Family) -> Result<Option<Bytes>, Error> {
+    /// GET a buffered answer; `None` for a 404. `counted` is the endpoint's
+    /// family in the request counts.
+    pub(crate) async fn get(
+        &self,
+        path: &str,
+        family: Family,
+        counted: RequestFamily,
+    ) -> Result<Option<Bytes>, Error> {
         let limit = match family {
             Family::Small => self.0.config.limits.small,
             Family::Block => self.0.config.limits.block,
@@ -570,7 +589,7 @@ impl Provider {
         } else {
             self.0.config.request_timeout
         };
-        let mut sent = self.send(path, timeout).await?;
+        let mut sent = self.send(path, timeout, counted).await?;
         let response = &mut sent.response;
         if response.status().as_u16() != 200 {
             self.status_error(response)?;
@@ -610,7 +629,9 @@ impl Provider {
     ) -> Result<Option<TransactionOutputs>, Error> {
         let limits = &self.0.config.limits;
         let path = format!("/txs/{hash}/utxos");
-        let mut sent = self.send(&path, self.0.config.outputs_timeout).await?;
+        let mut sent = self
+            .send(&path, self.0.config.outputs_timeout, RequestFamily::Outputs)
+            .await?;
         let response = &mut sent.response;
         if response.status().as_u16() != 200 {
             self.status_error(response)?;

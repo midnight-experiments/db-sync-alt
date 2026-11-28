@@ -43,7 +43,6 @@ impl Build<'_> {
             time: Arc::clone(&self.asker.time),
             stop: self.asker.stop.clone(),
             progress: self.progress.clone(),
-            requests: Some(self.asker.requests.clone()),
         })
         .await?;
         if report.stopped != "stop_target" {

@@ -1,37 +1,51 @@
 //! Phase-2 validity of the creating transactions below H.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::StreamExt;
 use serde_json::json;
 
-use super::{Build, asker::info, content::Place};
+use super::{
+    Build,
+    asker::info,
+    content::{Place, Unspent},
+};
 use crate::follow::Error;
 
+/// The creating transactions below H with two or more outputs unspent at
+/// H: valid, as a failing transaction creates one output. Worked out from
+/// each run's candidates and never stored, so that every stored validity is
+/// the provider's answer.
+pub(super) fn inferred_valid(unspent: &Unspent) -> BTreeSet<String> {
+    let mut outputs: BTreeMap<&str, usize> = BTreeMap::new();
+    for (transaction, _) in unspent.keys() {
+        *outputs.entry(transaction.as_str()).or_default() += 1;
+    }
+    outputs
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .map(|(transaction, _)| transaction.to_owned())
+        .collect()
+}
+
 impl Build<'_> {
-    /// Phase-2 validity of each creating transaction below H: a transaction
-    /// with two known outputs is valid (a failing one creates one output);
-    /// any other is read.
+    /// Phase-2 validity of each creating transaction below H that the
+    /// candidates do not tell (`inferred_valid`) and the provider has not
+    /// answered yet, from `/txs/{hash}`; the answers are stored.
     pub(super) async fn validity(&mut self) -> Result<(), Error> {
         let unspent = self.unspent_at_horizon().await?;
-        let mut outputs: BTreeMap<String, usize> = BTreeMap::new();
-        for (transaction, _) in unspent.keys() {
-            *outputs.entry(transaction.clone()).or_default() += 1;
-        }
+        let inferred = inferred_valid(&unspent);
         let known = self.items("valid").await?;
-        let mut settled = Vec::new();
-        let mut wanted = Vec::new();
-        for (transaction, count) in outputs {
-            if known.contains_key(&transaction) {
-                continue;
-            }
-            if count >= 2 {
-                settled.push((transaction, json!(true)));
-            } else {
-                wanted.push(transaction);
-            }
-        }
-        self.put("valid", settled).await?;
+        let wanted: Vec<String> = unspent
+            .keys()
+            .map(|(transaction, _)| transaction.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|transaction| {
+                !inferred.contains(*transaction) && !known.contains_key(*transaction)
+            })
+            .map(str::to_owned)
+            .collect();
         let placed: BTreeMap<String, Place> = self.typed("position").await?;
         let asker = self.asker.clone();
         let mut answers = futures_util::stream::iter(wanted.into_iter().map(|transaction| {

@@ -122,11 +122,17 @@ impl Fake {
     }
 
     pub fn provider(&self) -> Provider {
+        self.provider_with(|_| {})
+    }
+
+    /// The client of `provider`, its settings changed by `configure`.
+    pub fn provider_with(&self, configure: impl FnOnce(&mut Config)) -> Provider {
         let mut config = Config::new(self.server.url.clone(), self._key.path().join("key"));
         config.requests_per_second = 10.0;
         config.max_in_flight = 4;
         config.idle_timeout = Duration::from_secs(5);
         config.request_timeout = Duration::from_secs(10);
+        configure(&mut config);
         Provider::with_clock(config, self.clock.clone()).unwrap()
     }
 
@@ -194,7 +200,6 @@ pub fn context<'a>(
         time: fake.clock.clone(),
         stop,
         progress,
-        requests: None,
     }
 }
 
