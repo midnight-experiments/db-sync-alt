@@ -173,7 +173,7 @@ content the ledger accepts must never stop the follower.
 
 A stake read that fails is logged as `stake_read_failed` and shown in
 `epochs.stake_failure` of `/status`; it never stops following. The epoch is
-tried again at growing waits, and newer epochs are read meanwhile
+tried again at waits that grow to 6 hours, and newer epochs are read meanwhile
 ([provider](provider.md#stake-distributions)).
 
 | Code | Cause | What to do |
