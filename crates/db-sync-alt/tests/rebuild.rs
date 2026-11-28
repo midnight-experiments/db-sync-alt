@@ -3769,6 +3769,61 @@ async fn a_tip_answered_404_once_is_asked_again() -> Result {
     Ok(())
 }
 
+/// The reserve chain's tip block, height 61, spends a reserve output; it is
+/// served while the listings are read and removed for good when the lists
+/// from H on begin, so `/blocks/61` answers 404 from then on. The build asks
+/// it again within the outcome rules until the 404 has lasted `fatal_after`,
+/// counts the tip as left, reads the address listings and the lists from H
+/// on again up to the new tip and equals the conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an isolated PostgreSQL server"]
+async fn a_tip_answered_404_until_fatal_after_has_left_the_chain() -> Result {
+    let profile = profile(1);
+    let chain = reserve_chain(&profile, true);
+    let tip = format!("/blocks/{}", EDGE_END + 1);
+    let removed = Arc::new(AtomicBool::new(false));
+    let hook: Hook = {
+        let removed = removed.clone();
+        Arc::new(move |path: &str, chain: &mut Chain, _| {
+            if path.contains("/transactions?")
+                && path.contains(&format!("from={EDGE_HORIZON}"))
+                && !removed.swap(true, Ordering::SeqCst)
+            {
+                chain.blocks_mut().pop();
+            }
+            None
+        })
+    };
+    let fake = Fake::with_chain(edge_chain(&profile, &chain.g, EDGE_END + 1), Some(hook)).await;
+    let report = built_equal(&profile, &chain.g, &fake, "tip removed for good").await?;
+    let asked: Vec<u64> = fake
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.ends_with(&tip))
+        .map(|(_, at)| *at)
+        .collect();
+    let lasted = asked
+        .last()
+        .zip(asked.first())
+        .map_or(0, |(last, first)| last - first);
+    let listing = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    println!(
+        "{}",
+        json!({"event":"tip_404_until_fatal_after","tip_asked":asked.len(),"lasted_seconds":lasted,
+            "reserve_listings":fake.requests(&listing),"calls":report.calls})
+    );
+    assert!(removed.load(Ordering::SeqCst), "the tip was not removed");
+    assert!(lasted >= 600, "the 404 was asked again for {lasted} s only");
+    // Two passes that agree before the tip left the chain, two after.
+    assert!(
+        fake.requests(&listing) >= 4,
+        "the address listings were not read again"
+    );
+    Ok(())
+}
+
 /// A tip block that spends an output relevant by its address alone is
 /// served while the listings are read and replaced for good when the lists
 /// from H on begin: the address listing did not show the output, which was
