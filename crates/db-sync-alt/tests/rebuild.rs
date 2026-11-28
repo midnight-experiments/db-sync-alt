@@ -2241,6 +2241,22 @@ async fn movement_while_listing_keeps_the_conversion() -> Result {
 /// The last height of the moving chain.
 const MOVING_END: u32 = 100;
 
+/// Reads of an address listing that never agree before the build takes
+/// their union (the build's own number of passes).
+const PASSES: usize = 8;
+
+/// What the moving chain's test refers to.
+struct Moving {
+    g: Generated,
+    /// Height 2: five outputs at the reserve address; output 4 is never
+    /// spent on the chain.
+    creator: String,
+    /// Another block at height 62: the chain's block 62 with one more
+    /// transaction, which spends the reserve output 4. Its facts are in
+    /// `g.facts`; no block of `g` holds it.
+    branch: Block,
+}
+
 /// Mainnet profile, k 12, the edge chain's H and T. Heights 1 to 60 as the
 /// reserve chain without its spend at 61: cNIGHT minted at 1 into five
 /// outputs at ordinary addresses, five outputs at the reserve address at 2,
@@ -2249,8 +2265,9 @@ const MOVING_END: u32 = 100;
 /// reserve address that is still unspent (first the reserve output 2) and
 /// creates another there; height 65 also mints 4 cNIGHT into an output at
 /// an ordinary address, height 70 also spends the cNIGHT output 2 of height
-/// 1 and burns its 2 cNIGHT whole.
-fn moving_chain(profile: &Profile) -> Generated {
+/// 1 and burns its 2 cNIGHT whole. The reserve outputs 3 and 4 stay
+/// unspent; `branch` is a block 62 that spends the reserve output 4.
+fn moving_chain(profile: &Profile) -> Moving {
     let ordinary = |index: u8| {
         let mut key = [0x5c; 28];
         key[0] = index;
@@ -2313,7 +2330,21 @@ fn moving_chain(profile: &Profile) -> Generated {
             newest = (hashes[0].clone(), 0);
         }
     }
-    s.g
+    let spend = s
+        .tx()
+        .input(&creator, 4)
+        .output(Output::new(ordinary(7), 2_900_000));
+    let facts = spend.facts();
+    let spend = spend.build();
+    s.g.facts.insert(spend.hash.clone(), facts);
+    let mut branch = s.g.blocks[61].clone();
+    branch.hash = hash(format!("branch {} {}", branch.hash, spend.hash).as_bytes());
+    branch.transactions.push(spend);
+    Moving {
+        g: s.g,
+        creator,
+        branch,
+    }
 }
 
 /// The provider's chain moves while the build reads: served through 60 at
@@ -2321,32 +2352,74 @@ fn moving_chain(profile: &Profile) -> Generated {
 /// listing, each moving an output at that address, so that no two of its
 /// eight reads agree and the build takes their union; then a block joins
 /// before every answer of a list from H on (the burn at 70 among them, after
-/// every history was read). The build equals the conversion row by row.
+/// every history was read). The block that joins before the second read is
+/// another block 62, which also spends the reserve output 4 (X, never spent
+/// on the chain): only the first read lists X. The first request after the
+/// eighth read puts the chain's block 62 back (and the next block joins),
+/// so no list from H on names X's spend: X is found only in the union of
+/// the reads. The build equals the conversion row by row, X unspent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn movement_during_the_address_passes_and_the_lists_keeps_the_conversion() -> Result {
     let profile = profile(1);
-    let g = moving_chain(&profile);
+    let moving = moving_chain(&profile);
+    let g = moving.g;
     let all = g.blocks.clone();
     let listing = format!("/addresses/{}/utxos?", profile.addresses.reserve);
+    let x = (moving.creator.clone(), 4_u64);
     let during_passes = Arc::new(AtomicUsize::new(0));
     let during_lists = Arc::new(AtomicUsize::new(0));
+    // Whether each read of the reserve address's listing lists X.
+    let lists_x = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let restored = Arc::new(AtomicBool::new(false));
     let hook: Hook = {
-        let (listing, during_passes, during_lists) =
-            (listing.clone(), during_passes.clone(), during_lists.clone());
+        let (listing, during_passes, during_lists, lists_x, restored) = (
+            listing.clone(),
+            during_passes.clone(),
+            during_lists.clone(),
+            lists_x.clone(),
+            restored.clone(),
+        );
+        let branch = moving.branch.clone();
         Arc::new(move |path: &str, chain: &mut Chain, _| {
-            let joined = if path.contains(&listing) {
-                &during_passes
-            } else if path.contains("/transactions?") && path.contains("from=") {
-                &during_lists
-            } else {
-                return None;
+            let next = |chain: &mut Chain| {
+                let blocks = chain.blocks_mut();
+                let height = blocks.last().map_or(0, |block| block.height);
+                if let Some(block) = all.get(height as usize) {
+                    blocks.push(block.clone());
+                    return true;
+                }
+                false
             };
-            let blocks = chain.blocks_mut();
-            let height = blocks.last().map_or(0, |block| block.height);
-            if let Some(block) = all.get(height as usize) {
-                blocks.push(block.clone());
-                joined.fetch_add(1, Ordering::SeqCst);
+            if path.contains(&listing) {
+                let read = during_passes.fetch_add(1, Ordering::SeqCst) + 1;
+                if read == 2 {
+                    chain.blocks_mut().push(branch.clone());
+                } else {
+                    next(chain);
+                }
+                let answer = chain.answer(path);
+                let rows: Vec<serde_json::Value> =
+                    serde_json::from_str(&answer.body).unwrap_or_default();
+                lists_x.lock().unwrap().push(
+                    rows.iter()
+                        .any(|row| row["tx_hash"] == x.0.as_str() && row["output_index"] == x.1),
+                );
+                return Some(answer);
+            }
+            if during_passes.load(Ordering::SeqCst) >= PASSES
+                && !restored.swap(true, Ordering::SeqCst)
+            {
+                // The chain's block 62 back; the next block joins, so the
+                // listings are worked out again from the chain's blocks.
+                let blocks = chain.blocks_mut();
+                if let Some(at) = blocks.iter().position(|block| block.height == 62) {
+                    blocks[at] = all[61].clone();
+                }
+                next(chain);
+            }
+            if path.contains("/transactions?") && path.contains("from=") && next(chain) {
+                during_lists.fetch_add(1, Ordering::SeqCst);
             }
             None
         })
@@ -2358,6 +2431,7 @@ async fn movement_during_the_address_passes_and_the_lists_keeps_the_conversion()
         during_passes.load(Ordering::SeqCst),
         during_lists.load(Ordering::SeqCst),
     );
+    let lists_x = lists_x.lock().unwrap().clone();
     let served = fake
         .chain
         .lock()
@@ -2369,12 +2443,20 @@ async fn movement_during_the_address_passes_and_the_lists_keeps_the_conversion()
         "{}",
         json!({"event":"movement_during_passes_and_lists","reserve_listings":reads,
             "blocks_during_address_passes":during_passes,"blocks_during_lists":during_lists,
+            "reads_listing_x":lists_x,"restored":restored.load(Ordering::SeqCst),
             "served_through":served,"calls":report.calls})
     );
     // Eight reads of one page each, every one after a block that moved an
-    // output at the address: no two agreed, so the union was taken.
-    assert_eq!(reads, 8, "reads of the reserve address's listing");
-    assert_eq!(during_passes, 8, "blocks joined during the reads");
+    // output at the address: no two agreed, so the union was taken; X is in
+    // the first read only.
+    assert_eq!(reads, PASSES, "reads of the reserve address's listing");
+    assert_eq!(during_passes, PASSES, "blocks joined during the reads");
+    assert_eq!(
+        lists_x,
+        [vec![true], vec![false; PASSES - 1]].concat(),
+        "reads that list X"
+    );
+    assert!(restored.load(Ordering::SeqCst), "block 62 was not put back");
     assert!(
         during_lists >= 2,
         "blocks joined during the lists from H on"
