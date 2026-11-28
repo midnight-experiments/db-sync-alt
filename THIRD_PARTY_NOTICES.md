@@ -102,9 +102,9 @@ which the release archive and the container image carry.
 | cfg-if | 1.0.5 | `MIT OR Apache-2.0` |
 | chacha20 | 0.10.2 | `MIT OR Apache-2.0` |
 | chrono | 0.4.45 | `MIT OR Apache-2.0` |
-| clap | 4.6.8 | `MIT OR Apache-2.0` |
+| clap | 4.6.9 | `MIT OR Apache-2.0` |
 | clap_builder | 4.6.7 | `MIT OR Apache-2.0` |
-| clap_derive | 4.6.8 | `MIT OR Apache-2.0` |
+| clap_derive | 4.6.9 | `MIT OR Apache-2.0` |
 | clap_lex | 1.1.2 | `MIT OR Apache-2.0` |
 | cmov | 0.5.4 | `Apache-2.0 OR MIT` |
 | colorchoice | 1.0.5 | `MIT OR Apache-2.0` |
