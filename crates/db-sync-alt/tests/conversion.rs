@@ -61,6 +61,22 @@ async fn closed_conversion_reader(
     Ok(())
 }
 
+/// Whether a session of the conversion's source is in a transaction: running
+/// a statement, or idle inside a transaction block. An idle session also
+/// shows `xact_start` while it runs a transaction of its own to read the
+/// server's invalidation queue, which other sessions' DDL fills; its `state`
+/// stays `idle`.
+async fn source_in_transaction(source: &Database) -> Result<bool> {
+    Ok(source
+        .admin
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL AND state<>'idle')",
+            &[&source.name],
+        )
+        .await?
+        .get(0))
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated PostgreSQL server"]
 async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publication() -> Result
@@ -185,7 +201,7 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
                     );
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                let source_open:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+                let source_open = source_in_transaction(&source).await?;
                 assert!(
                     !source_open,
                     "source snapshot not released before local work"
@@ -207,7 +223,7 @@ async fn convert_pregranted_reader_original_nested_queries_cancel_retry_and_publ
             assert!(!status.success());
             let began = Instant::now();
             loop {
-                let active:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+                let active = source_in_transaction(&source).await?;
                 if !active {
                     break;
                 }
@@ -397,7 +413,7 @@ async fn convert_reader_recheck_late_row_grant_origin_and_index_conflict() -> Re
         }
         let began = Instant::now();
         loop {
-            let active:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+            let active = source_in_transaction(&source).await?;
             if !active {
                 break;
             }
@@ -1584,7 +1600,7 @@ async fn convert_destination_termination_stream_finish_and_post_source_commit_ki
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        let source_open:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+        let source_open = source_in_transaction(&source).await?;
         assert_eq!(
             source_open,
             mode == "stream",
@@ -1614,7 +1630,7 @@ async fn convert_destination_termination_stream_finish_and_post_source_commit_ki
         );
         let released = Instant::now();
         loop {
-            let held:bool=source.admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1 AND application_name='db-sync-alt-convert-source' AND xact_start IS NOT NULL)",&[&source.name]).await?.get(0);
+            let held = source_in_transaction(&source).await?;
             if !held {
                 break;
             }
